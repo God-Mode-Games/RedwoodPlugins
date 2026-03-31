@@ -1,0 +1,22 @@
+name: Notify HollowedOath of submodule update
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  dispatch:
+    name: Send repository_dispatch to HollowedOath
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Dispatch redwood-updated event
+        env:
+          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+        run: |
+          gh api repos/God-Mode-Games/HollowedOath/dispatches \
+            --method POST \
+            -f event_type=redwood-updated \
+            -f 'client_payload[sha]=${{ github.sha }}' \
+            -f 'client_payload[ref]=${{ github.ref_name }}'
