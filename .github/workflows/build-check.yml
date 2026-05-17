@@ -1,0 +1,238 @@
+name: Plugin CI
+
+# Runs on every PR and every push to main. The build job mirrors the canonical
+# Epic Marketplace path (RunUAT BuildPlugin) for each Redwood plugin in the
+# repo, so we catch compile/link breakage here — before notify-parent.yml fires
+# the auto-bump into HollowedOath. Lint runs on a cheap ubuntu runner; build
+# runs on the same self-hosted Windows pool HollowedOath uses, so the engine
+# install at $ENGINE_ROOT is reused across both repos' workflows.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Match HollowedOath: ready_for_review fires this on un-draft so draft
+    # authors can skip the expensive build until they're done iterating.
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  classify-changes:
+    name: Classify Changes
+    runs-on: ubuntu-latest
+    outputs:
+      has_source_changes: ${{ steps.check.outputs.has_source_changes }}
+      has_any_changes: ${{ steps.check.outputs.has_any_changes }}
+      is_meta_only: ${{ steps.check.outputs.is_meta_only }}
+
+    steps:
+      - name: Classify changed files
+        id: check
+        uses: actions/github-script@v8
+        with:
+          script: |
+            // Use the REST API rather than webhook payload.commits[*] — the
+            // payload arrays are unreliable for squash merges / large pushes.
+            let files = [];
+            if (context.eventName === 'pull_request') {
+              const { data } = await github.rest.pulls.listFiles({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                per_page: 100
+              });
+              files = data.map(f => f.filename);
+            } else if (context.eventName === 'push') {
+              const before = context.payload.before;
+              const after = context.payload.after;
+              const isNullSha = (s) => !s || /^0+$/.test(s);
+              if (isNullSha(before) || isNullSha(after)) {
+                console.log(`push: no compare baseline — treating as full change`);
+                files = ['<new-branch>'];
+              } else {
+                const { data } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead: `${before}...${after}`,
+                });
+                files = (data.files || []).map(f => f.filename);
+              }
+            }
+
+            const sourceExtensions = ['.cpp', '.h', '.hpp', '.c', '.inl', '.cs', '.uplugin'];
+            const isMetaPath = (p) =>
+              p.startsWith('.github/')
+              || p === '.gitignore'
+              || p === '.gitattributes'
+              || p === '.editorconfig';
+
+            let hasSource = false;
+            let isMetaOnly = files.length > 0;
+
+            for (const filename of files) {
+              const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase();
+              if (sourceExtensions.includes(ext)) {
+                hasSource = true;
+              }
+              if (!isMetaPath(filename)) {
+                isMetaOnly = false;
+              }
+            }
+
+            core.setOutput('has_source_changes', hasSource ? 'true' : 'false');
+            core.setOutput('has_any_changes', files.length > 0 ? 'true' : 'false');
+            core.setOutput('is_meta_only', isMetaOnly ? 'true' : 'false');
+            console.log(`event=${context.eventName} total=${files.length} source=${hasSource} meta-only=${isMetaOnly}`);
+
+  lint:
+    name: Lint
+    needs: [classify-changes]
+    if: >-
+      always() && !failure()
+      && needs.classify-changes.outputs.has_any_changes == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Check for unresolved conflict markers
+        shell: bash
+        run: |
+          # Mirrors HollowedOath's tree-wide check. LFS pointer blobs can
+          # silently carry conflict markers when resolved by "keep both."
+          matches="$(git grep -lE '^<<<<<<< |^>>>>>>> ' -- . ':!.github/workflows/' || true)"
+          if [[ -n "$matches" ]]; then
+            printf '%s\n' "$matches"
+            echo "::error::Unresolved git conflict markers found in tracked files."
+            exit 1
+          fi
+
+      - name: Validate .uplugin / .uproject JSON
+        shell: bash
+        run: |
+          # A malformed .uplugin will cause the editor to silently skip the
+          # plugin at load time — cheap to validate, expensive to debug after
+          # the fact.
+          failed=0
+          while IFS= read -r -d '' f; do
+            if ! jq empty "$f" 2>/dev/null; then
+              echo "::error file=$f::Invalid JSON"
+              failed=1
+            fi
+          done < <(find . \( -name '*.uplugin' -o -name '*.uproject' \) -type f -not -path './.git/*' -print0)
+          [[ $failed -eq 0 ]]
+
+  build-plugin:
+    name: Build Plugin (${{ matrix.plugin.name }})
+    needs: [classify-changes]
+    # Skip on draft PRs and on meta-only changes — self-hosted Windows time is
+    # the most expensive thing this workflow consumes.
+    if: >-
+      always() && !failure()
+      && needs.classify-changes.outputs.has_source_changes == 'true'
+      && !github.event.pull_request.draft
+    runs-on: [self-hosted, Windows]
+
+    strategy:
+      # First-class plugins build independently; failures should surface
+      # all at once rather than cascading.
+      fail-fast: false
+      matrix:
+        plugin:
+          - { name: RedwoodCore,  path: RedwoodCore/RedwoodCore.uplugin }
+          - { name: RedwoodGAS,   path: RedwoodGAS/RedwoodGAS.uplugin }
+          - { name: RedwoodChat,  path: RedwoodChat/RedwoodChat.uplugin }
+          - { name: RedwoodEOS,   path: RedwoodEOS/RedwoodEOS.uplugin }
+          - { name: RedwoodSteam, path: RedwoodSteam/RedwoodSteam.uplugin }
+
+    env:
+      ENGINE_ROOT: ${{ vars.ENGINE_ROOT }}
+
+    steps:
+      - name: Kill stale editor / UAT processes
+        shell: powershell
+        run: |
+          Get-Process -Name "UnrealEditor*","UnrealBuildTool*","AutomationTool*" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 2
+
+      - uses: actions/checkout@v6
+        with:
+          clean: false
+          fetch-depth: 1
+          lfs: true
+          submodules: false
+
+      - name: Pull engine
+        # Same pattern as HollowedOath/build-check.yml: fast-forward the
+        # private engine fork at $ENGINE_ROOT before building. Self-hosted
+        # runners persist between jobs, so this is incremental.
+        shell: powershell
+        env:
+          ENGINE_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+        run: |
+          git config --global --add safe.directory "$env:ENGINE_ROOT"
+          Push-Location "$env:ENGINE_ROOT"
+          $header = "Authorization: Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$env:ENGINE_TOKEN"))
+          $before = git rev-parse HEAD
+          git -c "http.extraHeader=$header" fetch origin
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::git fetch failed"; exit 1 }
+          git reset --hard origin/${{ vars.ENGINE_BRANCH }}
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::git reset failed"; exit 1 }
+          $after = git rev-parse HEAD
+          if ($before -ne $after) {
+            Write-Host "Engine updated $before -> $after, cleaning intermediates..."
+            $intDir = "$env:ENGINE_ROOT\Engine\Intermediate"
+            if (Test-Path $intDir) { Remove-Item -Recurse -Force $intDir }
+          }
+          Pop-Location
+
+      - name: Build engine
+        shell: powershell
+        timeout-minutes: 120
+        run: |
+          & "$env:ENGINE_ROOT\Engine\Build\BatchFiles\Build.bat" `
+            UnrealEditor Win64 Development `
+            -MaxParallelActions=16
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build plugin (${{ matrix.plugin.name }})
+        shell: powershell
+        timeout-minutes: 45
+        run: |
+          # BuildPlugin is Epic's canonical "compiles cleanly against the
+          # engine" check. We discard the packaged output — only the exit
+          # code matters for CI. Cross-plugin deps inside this repo (e.g.
+          # RedwoodGAS depending on Redwood from RedwoodCore) won't resolve
+          # under BuildPlugin's isolation model; if a matrix entry fails on
+          # an unresolved sibling module, swap that entry to a host-project
+          # build instead of this RunUAT call.
+          $out = "${{ github.workspace }}\.ci-build\${{ matrix.plugin.name }}"
+          if (Test-Path $out) { Remove-Item -Recurse -Force $out }
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          & "$env:ENGINE_ROOT\Engine\Build\BatchFiles\RunUAT.bat" `
+            BuildPlugin `
+            -Plugin="${{ github.workspace }}\${{ matrix.plugin.path }}" `
+            -Package="$out" `
+            -TargetPlatforms=Win64 `
+            -NoHostPlatform=False
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Clean packaged output
+        if: always()
+        shell: powershell
+        run: |
+          # Packaged plugin output is large (~hundreds of MB per plugin) and
+          # only useful as a build artifact; we don't ship from RedwoodPlugins
+          # CI, so reclaim the disk before the runner gets reused.
+          $out = "${{ github.workspace }}\.ci-build"
+          if (Test-Path $out) { Remove-Item -Recurse -Force $out }

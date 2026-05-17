@@ -1,13 +1,21 @@
 name: Notify HollowedOath of submodule update
 
+# Fires only after Plugin CI has finished on main with a green build —
+# `workflow_run` runs in the context of the default branch, so it can use the
+# repo's secrets even though the original trigger was a push. Gating here
+# (instead of on: push) means the auto-bump into HollowedOath can never fire
+# from a broken main commit.
+
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["Plugin CI"]
+    types: [completed]
+    branches: [main]
 
 jobs:
   dispatch:
     name: Send repository_dispatch to HollowedOath
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -18,5 +26,5 @@ jobs:
           gh api repos/God-Mode-Games/HollowedOath/dispatches \
             --method POST \
             -f event_type=redwood-updated \
-            -f 'client_payload[sha]=${{ github.sha }}' \
-            -f 'client_payload[ref]=${{ github.ref_name }}'
+            -f 'client_payload[sha]=${{ github.event.workflow_run.head_sha }}' \
+            -f 'client_payload[ref]=${{ github.event.workflow_run.head_branch }}'
