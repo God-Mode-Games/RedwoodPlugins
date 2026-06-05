@@ -92,7 +92,7 @@ void URedwoodCharacterComponent::BeginPlay() {
 void URedwoodCharacterComponent::OnControllerChanged(
   APawn *Pawn, AController *OldController, AController *NewController
 ) {
-  if (IsValid(NewController)) {
+  if (IsValid(NewController) && IsValid(NewController->PlayerState)) {
     URedwoodPlayerStateComponent *PlayerStateComponent =
       NewController->PlayerState
         ->FindComponentByClass<URedwoodPlayerStateComponent>();
