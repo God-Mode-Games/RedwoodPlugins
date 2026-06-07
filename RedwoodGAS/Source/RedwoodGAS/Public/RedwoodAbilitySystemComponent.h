@@ -98,6 +98,9 @@ public:
     return bDirty;
   }
 
+  UFUNCTION(BlueprintCallable, Category = "Redwood")
+  void ReinitializeASC();
+
 protected:
   TSharedPtr<FJsonObject> SerializeASC();
   void DeserializeASC(TSharedPtr<FJsonObject> Data);
@@ -110,6 +113,9 @@ private:
 
   UFUNCTION()
   void RedwoodPlayerStateCharacterUpdated();
+
+  UFUNCTION()
+  void RedwoodPlayerStateCharacterUpdatedRun(bool Proceed);
 
   bool bDirty = false;
   uint32 UpdateIntervalCounter = 0;
