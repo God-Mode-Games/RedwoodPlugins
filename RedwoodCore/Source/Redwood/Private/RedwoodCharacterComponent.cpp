@@ -111,6 +111,13 @@ void URedwoodCharacterComponent::OnControllerChanged(
 }
 
 void URedwoodCharacterComponent::RedwoodPlayerStatePlayerUpdated() {
+  // RedwoodPlayer is server-only and empty on clients; its values reach clients via
+  // replication and MC_RedwoodPlayerUpdated. Running this on a client would overwrite the
+  // replicated fields with blanks, so only mutate them on the authority.
+  if (!GetOwner() || !GetOwner()->HasAuthority()) {
+    return;
+  }
+
   APawn *Pawn = Cast<APawn>(GetOwner());
   AController *Controller = IsValid(Pawn) ? Pawn->GetController() : nullptr;
   APlayerState *PlayerState = IsValid(Controller)
@@ -226,6 +233,14 @@ void URedwoodCharacterComponent::MC_RedwoodPlayerUpdated_Implementation() {
 }
 
 void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
+  // RedwoodCharacter is server-only and empty on clients; its values reach clients via
+  // replication and MC_RedwoodCharacterUpdated. Running this on a client would overwrite
+  // the replicated fields with blanks (and deserialize empty data into the owner), so
+  // only mutate them on the authority.
+  if (!GetOwner() || !GetOwner()->HasAuthority()) {
+    return;
+  }
+
   APawn *Pawn = Cast<APawn>(GetOwner());
   AController *Controller = IsValid(Pawn) ? Pawn->GetController() : nullptr;
   APlayerState *PlayerState = IsValid(Controller)
