@@ -38,7 +38,7 @@ URedwoodPlayerStateComponent::URedwoodPlayerStateComponent(
       LogRedwood,
       Warning,
       TEXT(
-        "ARedwoodPlayerState is deprecated and will be removed in 5.0.0. Migrate to using URedwoodPlayerStateComponent on any other APlayerState actor."
+        "ARedwoodPlayerState is deprecated and will be removed in 5.0.0. Migrate to using URedwoodPlayerStateComponent on any other APlayerState actor. Actor: %s"
       ),
       *GetOwner()->GetName()
     );
