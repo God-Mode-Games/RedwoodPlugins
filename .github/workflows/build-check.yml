@@ -1,0 +1,63 @@
+name: Plugin CI
+
+# Runs on every PR and every push to main. This repo only does cheap structural
+# validation — unresolved conflict markers and .uplugin/.uproject JSON — on an
+# ubuntu runner. The heavy RunUAT BuildPlugin compile no longer runs here:
+# BuildPlugin builds each plugin in an isolated host project, so the in-repo
+# cross-plugin deps (e.g. RedwoodEOS -> Redwood from RedwoodCore) can't resolve
+# per-plugin. The real build now lives in HollowedOath, which consumes these
+# plugins as a submodule and compiles them together against the engine.
+# notify-parent.yml dispatches the submodule bump after this lint passes green
+# on main, so a malformed .uplugin still can't propagate downstream — the
+# expensive compile is HollowedOath's job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Check for unresolved conflict markers
+        shell: bash
+        run: |
+          # Mirrors HollowedOath's tree-wide check. LFS pointer blobs can
+          # silently carry conflict markers when resolved by "keep both."
+          matches="$(git grep -lE '^<<<<<<< |^>>>>>>> ' -- . ':!.github/workflows/' || true)"
+          if [[ -n "$matches" ]]; then
+            printf '%s\n' "$matches"
+            echo "::error::Unresolved git conflict markers found in tracked files."
+            exit 1
+          fi
+
+      - name: Validate .uplugin / .uproject JSON
+        shell: bash
+        run: |
+          # A malformed .uplugin will cause the editor to silently skip the
+          # plugin at load time — cheap to validate, expensive to debug after
+          # the fact.
+          failed=0
+          while IFS= read -r -d '' f; do
+            if ! jq empty "$f" 2>/dev/null; then
+              echo "::error file=$f::Invalid JSON"
+              failed=1
+            fi
+          done < <(find . \( -name '*.uplugin' -o -name '*.uproject' \) -type f -not -path './.git/*' -print0)
+          [[ $failed -eq 0 ]]
