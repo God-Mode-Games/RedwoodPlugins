@@ -36,6 +36,8 @@ void URedwoodCharacterComponent::GetLifetimeReplicatedProps(
   );
   DOREPLIFETIME(URedwoodCharacterComponent, RedwoodCharacterId);
   DOREPLIFETIME(URedwoodCharacterComponent, RedwoodCharacterName);
+  DOREPLIFETIME(URedwoodCharacterComponent, RedwoodPlayerUpdateCount);
+  DOREPLIFETIME(URedwoodCharacterComponent, RedwoodCharacterUpdateCount);
 }
 
 void URedwoodCharacterComponent::BeginPlay() {
@@ -92,7 +94,7 @@ void URedwoodCharacterComponent::BeginPlay() {
 void URedwoodCharacterComponent::OnControllerChanged(
   APawn *Pawn, AController *OldController, AController *NewController
 ) {
-  if (IsValid(NewController) && IsValid(NewController->PlayerState)) {
+  if (IsValid(NewController)) {
     URedwoodPlayerStateComponent *PlayerStateComponent =
       NewController->PlayerState
         ->FindComponentByClass<URedwoodPlayerStateComponent>();
@@ -111,10 +113,12 @@ void URedwoodCharacterComponent::OnControllerChanged(
 }
 
 void URedwoodCharacterComponent::RedwoodPlayerStatePlayerUpdated() {
-  // RedwoodPlayer is server-only and empty on clients; its values reach clients via
-  // replication and MC_RedwoodPlayerUpdated. Running this on a client would overwrite the
-  // replicated fields with blanks, so only mutate them on the authority.
-  if (!GetOwner() || !GetOwner()->HasAuthority()) {
+  // The source PlayerStateComponent->RedwoodPlayer struct is server-only and is
+  // empty on clients. This function copies it into the replicated fields below,
+  // so it must only run on the authority; clients receive the values via
+  // replication and learn about the update via OnRep_RedwoodPlayerUpdated.
+  // Running it on a client would overwrite the replicated fields with blanks.
+  if (GetOwnerRole() != ROLE_Authority) {
     return;
   }
 
@@ -145,7 +149,7 @@ void URedwoodCharacterComponent::RedwoodPlayerStatePlayerUpdated() {
         bStoreDataInActor ? (UObject *)Pawn : (UObject *)this,
         PlayerData.Data,
         *PlayerDataVariableName,
-        LatestMetadataSchemaVersion,
+        LatestPlayerDataSchemaVersion,
         bErrored
       );
 
@@ -223,21 +227,25 @@ void URedwoodCharacterComponent::RedwoodPlayerStatePlayerUpdated() {
       CustomPlayerName == nullptr ? DefaultPlayerName : *CustomPlayerName
     );
 
+    // Broadcast locally on the server, then bump the replicated counter so the
+    // notify fires on clients once the updated fields have been applied.
     OnRedwoodPlayerUpdated.Broadcast();
-    MC_RedwoodPlayerUpdated();
+    RedwoodPlayerUpdateCount++;
   }
 }
 
-void URedwoodCharacterComponent::MC_RedwoodPlayerUpdated_Implementation() {
+void URedwoodCharacterComponent::OnRep_RedwoodPlayerUpdated() {
   OnRedwoodPlayerUpdated.Broadcast();
 }
 
 void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
-  // RedwoodCharacter is server-only and empty on clients; its values reach clients via
-  // replication and MC_RedwoodCharacterUpdated. Running this on a client would overwrite
-  // the replicated fields with blanks (and deserialize empty data into the owner), so
-  // only mutate them on the authority.
-  if (!GetOwner() || !GetOwner()->HasAuthority()) {
+  // The source PlayerStateComponent->RedwoodCharacter struct is server-only and
+  // is empty on clients. This function copies it into the replicated fields
+  // below, so it must only run on the authority; clients receive the values via
+  // replication and learn about the update via OnRep_RedwoodCharacterUpdated.
+  // Running it on a client would overwrite the replicated fields (including
+  // RedwoodCharacterId) with blanks.
+  if (GetOwnerRole() != ROLE_Authority) {
     return;
   }
 
@@ -265,7 +273,7 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         bStoreDataInActor ? (UObject *)Pawn : (UObject *)this,
         RedwoodCharacterBackend.CharacterCreatorData,
         *CharacterCreatorDataVariableName,
-        LatestMetadataSchemaVersion,
+        LatestCharacterCreatorDataSchemaVersion,
         bErrored
       );
 
@@ -476,11 +484,13 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
       }
     }
 
+    // Broadcast locally on the server, then bump the replicated counter so the
+    // notify fires on clients once the updated fields have been applied.
     OnRedwoodCharacterUpdated.Broadcast();
-    MC_RedwoodCharacterUpdated();
+    RedwoodCharacterUpdateCount++;
   }
 }
 
-void URedwoodCharacterComponent::MC_RedwoodCharacterUpdated_Implementation() {
+void URedwoodCharacterComponent::OnRep_RedwoodCharacterUpdated() {
   OnRedwoodCharacterUpdated.Broadcast();
 }

@@ -2,13 +2,14 @@
 
 #include "RedwoodPlayerStateComponent.h"
 #include "RedwoodModule.h"
-#include "RedwoodPlayerState.h"
 #include "RedwoodServerGameSubsystem.h"
 #include "RedwoodZoneSpawn.h"
 
+#include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerState.h"
 #include "Kismet/GameplayStatics.h"
 #include "Net/OnlineEngineInterface.h"
+#include "Net/UnrealNetwork.h"
 
 URedwoodPlayerStateComponent::URedwoodPlayerStateComponent(
   const FObjectInitializer &ObjectInitializer
@@ -16,6 +17,7 @@ URedwoodPlayerStateComponent::URedwoodPlayerStateComponent(
   Super(ObjectInitializer) {
 
   PrimaryComponentTick.bCanEverTick = true;
+  SetIsReplicatedByDefault(true);
 
   OwnerPlayerState = Cast<APlayerState>(GetOwner());
   if (!OwnerPlayerState.IsValid()) {
@@ -33,18 +35,15 @@ URedwoodPlayerStateComponent::URedwoodPlayerStateComponent(
     return;
   }
 
-  if (Cast<ARedwoodPlayerState>(GetOwner())) {
-    UE_LOG(
-      LogRedwood,
-      Warning,
-      TEXT(
-        "ARedwoodPlayerState is deprecated and will be removed in 5.0.0. Migrate to using URedwoodPlayerStateComponent on any other APlayerState actor. Actor: %s"
-      ),
-      *GetOwner()->GetName()
-    );
-  }
-
   OwnerPlayerState->PrimaryActorTick.bCanEverTick = true;
+}
+
+void URedwoodPlayerStateComponent::GetLifetimeReplicatedProps(
+  TArray<FLifetimeProperty> &OutLifetimeProps
+) const {
+  Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+  DOREPLIFETIME(URedwoodPlayerStateComponent, PartyId);
 }
 
 void URedwoodPlayerStateComponent::TickComponent(
@@ -97,6 +96,20 @@ void URedwoodPlayerStateComponent::SetServerReady() {
   }
 }
 
+void URedwoodPlayerStateComponent::InitTransferring() {
+  bTransferring = true;
+
+  // Notify the owning client. The Client RPC routes through the
+  // PlayerState's owning controller's net connection, so only the
+  // player being transferred receives it. On a standalone/listen host
+  // the implementation runs locally and broadcasts directly.
+  Client_OnTransferring();
+}
+
+void URedwoodPlayerStateComponent::Client_OnTransferring_Implementation() {
+  OnTransferring.Broadcast();
+}
+
 void URedwoodPlayerStateComponent::SetRedwoodPlayer(
   FRedwoodPlayerData InRedwoodPlayer
 ) {
@@ -122,6 +135,60 @@ void URedwoodPlayerStateComponent::SetRedwoodCharacter(
   }
 
   OnRedwoodCharacterUpdated.Broadcast();
+}
+
+void URedwoodPlayerStateComponent::SetPartyId(const FString &InPartyId) {
+  if (AActor *Owner = GetOwner()) {
+    if (Owner->GetLocalRole() == ROLE_Authority && PartyId != InPartyId) {
+      PartyId = InPartyId;
+      OnPartyIdChanged.Broadcast();
+    }
+  }
+}
+
+void URedwoodPlayerStateComponent::OnRep_PartyId() {
+  OnPartyIdChanged.Broadcast();
+}
+
+TArray<URedwoodPlayerStateComponent *>
+URedwoodPlayerStateComponent::GetPartyMemberPlayerStateComponents(
+  bool bExcludeSelf
+) const {
+  TArray<URedwoodPlayerStateComponent *> Result;
+
+  UWorld *World = GetWorld();
+  AGameStateBase *GameState =
+    IsValid(World) ? World->GetGameState() : nullptr;
+
+  if (!IsValid(GameState)) {
+    return Result;
+  }
+
+  for (APlayerState *PlayerState : GameState->PlayerArray) {
+    if (!IsValid(PlayerState)) {
+      continue;
+    }
+
+    URedwoodPlayerStateComponent *PlayerStateComponent =
+      PlayerState->FindComponentByClass<URedwoodPlayerStateComponent>();
+
+    if (!IsValid(PlayerStateComponent)) {
+      continue;
+    }
+
+    if (PlayerStateComponent == this) {
+      if (!bExcludeSelf) {
+        Result.Add(PlayerStateComponent);
+      }
+      continue;
+    }
+
+    if (!PartyId.IsEmpty() && PlayerStateComponent->PartyId == PartyId) {
+      Result.Add(PlayerStateComponent);
+    }
+  }
+
+  return Result;
 }
 
 bool URedwoodPlayerStateComponent::GetSpawnData(

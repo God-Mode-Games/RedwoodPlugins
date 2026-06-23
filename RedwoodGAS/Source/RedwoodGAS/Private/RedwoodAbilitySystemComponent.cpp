@@ -163,10 +163,6 @@ bool URedwoodAbilitySystemComponent::AddPersistedData(
   return false;
 }
 
-void URedwoodAbilitySystemComponent::ReinitializeASC() {
-  RedwoodPlayerStateCharacterUpdatedRun(true);
-}
-
 void URedwoodAbilitySystemComponent::OnControllerChanged(
   APawn *Pawn, AController *OldController, AController *NewController
 ) {
@@ -187,17 +183,16 @@ void URedwoodAbilitySystemComponent::OnControllerChanged(
 }
 
 void URedwoodAbilitySystemComponent::RedwoodPlayerStateCharacterUpdated() {
-  // Automatic triggers (BeginPlay / OnControllerChanged / OnRedwoodCharacterUpdated) no longer
-  // deserialize directly. Deserialization is driven explicitly via ReinitializeASC() so callers
-  // can control its timing relative to ASC setup.
-  RedwoodPlayerStateCharacterUpdatedRun(false);
+  if (!bDisableAutoDeserialization) {
+    RedwoodPlayerStateCharacterUpdatedRun();
+  }
 }
 
-void URedwoodAbilitySystemComponent::RedwoodPlayerStateCharacterUpdatedRun(bool Proceed) {
-  if (!Proceed) {
-    return;
-  }
+void URedwoodAbilitySystemComponent::ReinitializeASC() {
+  RedwoodPlayerStateCharacterUpdatedRun();
+}
 
+void URedwoodAbilitySystemComponent::RedwoodPlayerStateCharacterUpdatedRun() {
   APawn *Pawn = Cast<APawn>(GetOwner());
   AController *Controller = IsValid(Pawn) ? Pawn->GetController() : nullptr;
   APlayerState *PlayerState = IsValid(Controller)
