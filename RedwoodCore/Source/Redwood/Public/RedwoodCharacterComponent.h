@@ -246,7 +246,7 @@ public:
   }
 
 private:
-  UFUNCTION(BlueprintCallable)
+  UFUNCTION()
   void OnControllerChanged(
     APawn *Pawn, AController *OldController, AController *NewController
   );

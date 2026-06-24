@@ -95,21 +95,19 @@ void URedwoodCharacterComponent::OnControllerChanged(
   APawn *Pawn, AController *OldController, AController *NewController
 ) {
   if (IsValid(NewController)) {
-    if (IsValid(NewController->PlayerState)) {
-      URedwoodPlayerStateComponent *PlayerStateComponent =
-        NewController->PlayerState
-          ->FindComponentByClass<URedwoodPlayerStateComponent>();
-      if (IsValid(PlayerStateComponent)) {
-        PlayerStateComponent->OnRedwoodPlayerUpdated.AddUniqueDynamic(
-          this, &URedwoodCharacterComponent::RedwoodPlayerStatePlayerUpdated
-        );
-        RedwoodPlayerStatePlayerUpdated();
-      
-        PlayerStateComponent->OnRedwoodCharacterUpdated.AddUniqueDynamic(
-          this, &URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated
-        );
-        RedwoodPlayerStateCharacterUpdated();
-      }
+    URedwoodPlayerStateComponent *PlayerStateComponent =
+      NewController->PlayerState
+        ->FindComponentByClass<URedwoodPlayerStateComponent>();
+    if (IsValid(PlayerStateComponent)) {
+      PlayerStateComponent->OnRedwoodPlayerUpdated.AddUniqueDynamic(
+        this, &URedwoodCharacterComponent::RedwoodPlayerStatePlayerUpdated
+      );
+      RedwoodPlayerStatePlayerUpdated();
+
+      PlayerStateComponent->OnRedwoodCharacterUpdated.AddUniqueDynamic(
+        this, &URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated
+      );
+      RedwoodPlayerStateCharacterUpdated();
     }
   }
 }
