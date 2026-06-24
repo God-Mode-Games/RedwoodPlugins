@@ -112,18 +112,28 @@ FString SerializeCanonicalObject(const TSharedPtr<FJsonObject> &Object) {
   if (!Object.IsValid()) {
     return TEXT("{}");
   }
-  TArray<FString> Keys;
-  Object->Values.GetKeys(Keys);
-  Keys.Sort();
+  // Collect key/value pairs and sort by key for canonical output. Deref of the
+  // JSON key (*Pair.Key) yields const TCHAR* whether keys are stored as FString
+  // or UE::FSharedString (5.8 FStringView keys), so this compiles under both and
+  // avoids re-indexing the map with an FString key.
+  TArray<TPair<FString, TSharedPtr<FJsonValue>>> Pairs;
+  Pairs.Reserve(Object->Values.Num());
+  for (const auto &Pair : Object->Values) {
+    Pairs.Emplace(FString(*Pair.Key), Pair.Value);
+  }
+  Pairs.Sort([](const TPair<FString, TSharedPtr<FJsonValue>> &A,
+                const TPair<FString, TSharedPtr<FJsonValue>> &B) {
+    return A.Key < B.Key;
+  });
 
   FString Out = TEXT("{");
-  for (int32 i = 0; i < Keys.Num(); ++i) {
+  for (int32 i = 0; i < Pairs.Num(); ++i) {
     if (i > 0) {
       Out.AppendChar(TEXT(','));
     }
-    Out += RwEscapeJsonString(Keys[i]);
+    Out += RwEscapeJsonString(Pairs[i].Key);
     Out.AppendChar(TEXT(':'));
-    Out += SerializeCanonicalJson(Object->Values[Keys[i]]);
+    Out += SerializeCanonicalJson(Pairs[i].Value);
   }
   Out.AppendChar(TEXT('}'));
   return Out;
@@ -293,7 +303,7 @@ TSharedPtr<FJsonObject> LoadSignedRedwoodConfig(
   // string/number formatting).
   TSharedPtr<FJsonObject> Unsigned = MakeShared<FJsonObject>();
   for (const auto &Pair : JsonObject->Values) {
-    if (Pair.Key.Equals(TEXT("signature"), ESearchCase::CaseSensitive)) {
+    if (FString(*Pair.Key).Equals(TEXT("signature"), ESearchCase::CaseSensitive)) {
       continue;
     }
     Unsigned->SetField(Pair.Key, Pair.Value);

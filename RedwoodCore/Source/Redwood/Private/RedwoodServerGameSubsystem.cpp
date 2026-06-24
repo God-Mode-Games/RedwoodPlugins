@@ -348,8 +348,10 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
         for (const auto &Pair : (*PartiesObj)->Values) {
           const TSharedPtr<FJsonObject> *PartyObj;
           if (Pair.Value->TryGetObject(PartyObj) && PartyObj) {
+            // Deref the JSON key (*Pair.Key) to FString; works whether keys are
+            // stored as FString or UE::FSharedString (5.8 FStringView keys).
             TrackedParties.Add(
-              Pair.Key, URedwoodCommonGameSubsystem::ParseParty(*PartyObj)
+              FString(*Pair.Key), URedwoodCommonGameSubsystem::ParseParty(*PartyObj)
             );
           }
         }
