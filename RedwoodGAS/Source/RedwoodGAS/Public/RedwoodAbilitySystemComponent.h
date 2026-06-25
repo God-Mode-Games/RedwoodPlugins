@@ -89,12 +89,6 @@ public:
   UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Redwood")
   TArray<TSubclassOf<UGameplayEffect>> EffectInclusionArray;
 
-  UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Redwood")
-  ERedwoodASCInclusionMode AttributeInclusionMode =
-    ERedwoodASCInclusionMode::Blacklist;
-  UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Redwood")
-  TArray<FGameplayAttribute> AttributeInclusionArray;
-
   UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Redwood")
   void MarkDirty() {
     bDirty = true;
