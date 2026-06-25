@@ -84,10 +84,22 @@ public:
   bool bDisableAutoDeserialization = false;
 
   UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Redwood")
+  ERedwoodASCInclusionMode AbilityInclusionMode =
+    ERedwoodASCInclusionMode::Blacklist;
+  UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Redwood")
+  TArray<TSubclassOf<UGameplayAbility>> AbilityInclusionArray;
+
+  UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Redwood")
   ERedwoodASCInclusionMode EffectInclusionMode =
     ERedwoodASCInclusionMode::Blacklist;
   UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Redwood")
   TArray<TSubclassOf<UGameplayEffect>> EffectInclusionArray;
+
+  UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Redwood")
+  ERedwoodASCInclusionMode AttributeInclusionMode =
+    ERedwoodASCInclusionMode::Blacklist;
+  UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Redwood")
+  TArray<FGameplayAttribute> AttributeInclusionArray;
 
   UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Redwood")
   void MarkDirty() {
