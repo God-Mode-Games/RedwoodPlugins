@@ -293,43 +293,9 @@ TSharedPtr<FJsonObject> URedwoodAbilitySystemComponent::SerializeASC() {
   }
   JsonObject->SetArrayField(TEXT("effects"), EffectObjects);
 
-  // -------------
-  // --ABILITIES--
-  // -------------
-  TArray<FGameplayAbilitySpecHandle> OutAbilityHandles;
-  GetAllAbilities(OutAbilityHandles);
-
-  TArray<TSharedPtr<FJsonValue>> AbilitiesArray;
-  for (const FGameplayAbilitySpecHandle &AbilityHandle : OutAbilityHandles) {
-    FGameplayAbilitySpec *AbilitySpec =
-      FindAbilitySpecFromHandle(AbilityHandle, EConsiderPending::PendingAdd);
-
-    if (AbilitySpec) {
-      FTopLevelAssetPath AbilityClassName =
-        AbilitySpec->Ability->GetClass()->GetClassPathName();
-      int32 Level = AbilitySpec->Level;
-      int32 InputID = AbilitySpec->InputID;
-
-      bool bFoundClass = false;
-      for (TSubclassOf<UGameplayAbility> Subclass : AbilityInclusionArray) {
-        if (Subclass != nullptr && AbilityClassName == Subclass->GetClassPathName()) {
-          bFoundClass = true;
-        }
-      }
-
-      if ((AbilityInclusionMode == ERedwoodASCInclusionMode::Blacklist && bFoundClass) || (AbilityInclusionMode == ERedwoodASCInclusionMode::Whitelist && !bFoundClass)) {
-        continue;
-      }
-
-      TSharedPtr<FJsonObject> AbilityObject = MakeShareable(new FJsonObject);
-      AbilityObject->SetStringField(TEXT("class"), AbilityClassName.ToString());
-      AbilityObject->SetNumberField(TEXT("level"), Level);
-      AbilityObject->SetNumberField(TEXT("inputId"), InputID);
-
-      AbilitiesArray.Add(MakeShareable(new FJsonValueObject(AbilityObject)));
-    }
-  }
-  JsonObject->SetArrayField(TEXT("abilities"), AbilitiesArray);
+  // Activatable abilities are intentionally NOT persisted: they are derived state, re-granted on
+  // load from their real sources (oathlines, equipped items, granting effects). Redwood persists
+  // only what is currently affecting the actor (effects) and its attributes.
 
   // --------------
   // --ATTRIBUTES--
@@ -576,26 +542,8 @@ void URedwoodAbilitySystemComponent::DeserializeASC(TSharedPtr<FJsonObject> Data
     }
   }
 
-  const TArray<TSharedPtr<FJsonValue>> *AbilitiesArray;
-  if (Data->TryGetArrayField(TEXT("abilities"), AbilitiesArray)) {
-    for (const TSharedPtr<FJsonValue> &AbilityValue : *AbilitiesArray) {
-      const TSharedPtr<FJsonObject> &AbilityObject = AbilityValue->AsObject();
-      if (AbilityObject) {
-        FString ClassName = AbilityObject->GetStringField(TEXT("class"));
-        int32 Level =
-          FMath::FloorToInt(AbilityObject->GetNumberField(TEXT("level")));
-        int32 InputID =
-          FMath::FloorToInt(AbilityObject->GetNumberField(TEXT("inputId")));
-
-        TSubclassOf<UGameplayAbility> AbilityClass =
-          LoadClass<UGameplayAbility>(nullptr, *ClassName);
-
-        FGameplayAbilitySpec NewSpec(AbilityClass, Level, InputID, this);
-
-        GiveAbility(NewSpec);
-      }
-    }
-  }
+  // Activatable abilities are not restored from persistence (see SerializeASC): they are re-granted
+  // on load by their real sources. Any legacy "abilities" array in older save data is ignored.
 
   const TArray<TSharedPtr<FJsonValue>> *AttributeSetsArray;
   if (Data->TryGetArrayField(TEXT("attributeSets"), AttributeSetsArray)) {
