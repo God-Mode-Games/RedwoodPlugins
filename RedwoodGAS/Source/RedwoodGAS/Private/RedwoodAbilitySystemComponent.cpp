@@ -297,76 +297,11 @@ TSharedPtr<FJsonObject> URedwoodAbilitySystemComponent::SerializeASC() {
   // load from their real sources (oathlines, equipped items, granting effects). Redwood persists
   // only what is currently affecting the actor (effects) and its attributes.
 
-  // --------------
-  // --ATTRIBUTES--
-  // --------------
-  TArray<TSharedPtr<FJsonValue>> AttributeSetsObject;
-  for (const UAttributeSet *Set : GetSpawnedAttributes()) {
-    if (!Set) {
-      continue;
-    }
-
-    TArray<FGameplayAttribute> OutAttributes;
-    UAttributeSet::GetAttributesFromSetClass(Set->GetClass(), OutAttributes);
-
-    TSet<uint32> AttributeInclusionHashes;
-    for (FGameplayAttribute Attribute : AttributeInclusionArray) {
-      if (Attribute.IsValid()) {
-        AttributeInclusionHashes.Add(GetTypeHash(Attribute));
-      }
-    }
-
-    TArray<TSharedPtr<FJsonValue>> AttributesObject;
-    for (const FGameplayAttribute &Attribute : OutAttributes) {
-      bool bInclusionArrayContainsAttribute =
-        AttributeInclusionHashes.Contains(GetTypeHash(Attribute));
-
-      if ((AttributeInclusionMode == ERedwoodASCInclusionMode::Blacklist && bInclusionArrayContainsAttribute) || (AttributeInclusionMode == ERedwoodASCInclusionMode::Whitelist && !bInclusionArrayContainsAttribute)) {
-        continue;
-      }
-
-      const FGameplayAttributeData *AttributeData =
-        Attribute.GetGameplayAttributeData(Set);
-
-      bool bHasBase = false;
-      float Base = 0;
-      float Current = Attribute.GetNumericValue(Set);
-      if (AttributeData) {
-        bHasBase = true;
-        Base = AttributeData->GetBaseValue();
-        Current = AttributeData->GetCurrentValue();
-      }
-
-      TSharedPtr<FJsonObject> AttributeObject = MakeShareable(new FJsonObject);
-      AttributeObject->SetStringField(TEXT("name"), Attribute.GetName());
-      if (bHasBase) {
-        AttributeObject->SetNumberField(TEXT("base"), Base);
-      } else {
-        TSharedPtr<FJsonValue> NullValue = MakeShareable(new FJsonValueNull);
-        AttributeObject->SetField(TEXT("base"), NullValue);
-      }
-      AttributeObject->SetNumberField(TEXT("current"), Current);
-
-      AttributesObject.Add(MakeShareable(new FJsonValueObject(AttributeObject))
-      );
-    }
-
-    if (AttributesObject.Num() > 0) {
-      FTopLevelAssetPath AttributeSetName = Set->GetClass()->GetClassPathName();
-
-      TSharedPtr<FJsonObject> AttributeSetObject =
-        MakeShareable(new FJsonObject);
-      AttributeSetObject->SetStringField(
-        TEXT("name"), AttributeSetName.ToString()
-      );
-      AttributeSetObject->SetArrayField(TEXT("attributes"), AttributesObject);
-
-      AttributeSetsObject.Add(
-        MakeShareable(new FJsonValueObject(AttributeSetObject))
-      );
-    }
-  }
-  JsonObject->SetArrayField(TEXT("attributeSets"), AttributeSetsObject);
+  // Attributes are intentionally NOT persisted: like activatable abilities, they are derived
+  // state. The owning game re-derives them on load from their real sources (base stats, level,
+  // equipment) and restores resource pools (e.g. health) from its own metadata. Persisting the
+  // derived values double-counts against those sources on reload, producing a positive feedback
+  // loop. Redwood persists only what is currently affecting the actor (effects).
 
   return JsonObject;
 }
@@ -383,11 +318,12 @@ void URedwoodAbilitySystemComponent::DeserializeASC(TSharedPtr<FJsonObject> Data
     return;
   }
 
+  // Only effects are persisted now; abilities and attributes are derived state, re-granted /
+  // re-derived on load by their real sources. Legacy "abilities" / "attributeSets" arrays in
+  // older saves are ignored.
   if (
     !Data->HasField(TEXT("timestampMs")) ||
-    !Data->HasField(TEXT("effects")) ||
-    !Data->HasField(TEXT("abilities")) ||
-    !Data->HasField(TEXT("attributeSets"))
+    !Data->HasField(TEXT("effects"))
   ) {
     return;
   }
@@ -542,83 +478,10 @@ void URedwoodAbilitySystemComponent::DeserializeASC(TSharedPtr<FJsonObject> Data
     }
   }
 
-  // Activatable abilities are not restored from persistence (see SerializeASC): they are re-granted
-  // on load by their real sources. Any legacy "abilities" array in older save data is ignored.
-
-  const TArray<TSharedPtr<FJsonValue>> *AttributeSetsArray;
-  if (Data->TryGetArrayField(TEXT("attributeSets"), AttributeSetsArray)) {
-    for (const TSharedPtr<FJsonValue> &AttributeSetValue :
-         *AttributeSetsArray) {
-      const TSharedPtr<FJsonObject> &AttributeSetObject =
-        AttributeSetValue->AsObject();
-      if (AttributeSetObject) {
-        FString AttributeSetName =
-          AttributeSetObject->GetStringField(TEXT("name"));
-
-        const TArray<UAttributeSet *> &AttributeSets = GetSpawnedAttributes();
-
-        UAttributeSet *AttributeSet = nullptr;
-
-        for (UAttributeSet *SpawnedAttributeSet : AttributeSets) {
-          if (SpawnedAttributeSet->GetClass()->GetClassPathName().ToString() == AttributeSetName) {
-            AttributeSet = SpawnedAttributeSet;
-            break;
-          }
-        }
-
-        if (!AttributeSet) {
-          UE_LOG(
-            LogRedwoodGAS,
-            Error,
-            TEXT(
-              "URedwoodAbilitySystemComponent::DeserializeASC: Could not find attribute set for class %s"
-            ),
-            *AttributeSetName
-          );
-          continue;
-        }
-
-        TArray<FGameplayAttribute> OutAttributes;
-        UAttributeSet::GetAttributesFromSetClass(
-          AttributeSet->GetClass(), OutAttributes
-        );
-
-        TArray<TSharedPtr<FJsonValue>> AttributesArray =
-          AttributeSetObject->GetArrayField(TEXT("attributes"));
-
-        for (const FGameplayAttribute &Attribute : OutAttributes) {
-          for (const TSharedPtr<FJsonValue> &AttributeValue : AttributesArray) {
-            const TSharedPtr<FJsonObject> &AttributeObject =
-              AttributeValue->AsObject();
-            if (AttributeObject) {
-              FString AttributeName =
-                AttributeObject->GetStringField(TEXT("name"));
-
-              if (AttributeName != Attribute.GetName()) {
-                continue;
-              }
-
-              FGameplayAttributeData *AttributeData =
-                Attribute.GetGameplayAttributeData(AttributeSet);
-
-              float Base = -1;
-              AttributeObject->TryGetNumberField(TEXT("base"), Base);
-              float Current = AttributeObject->GetNumberField(TEXT("current"));
-
-              if (AttributeData) {
-                AttributeData->SetBaseValue(Base);
-                AttributeData->SetCurrentValue(Current);
-              } else {
-                Attribute.SetNumericValueChecked(Current, AttributeSet);
-              }
-
-              break;
-            }
-          }
-        }
-      }
-    }
-  }
+  // Activatable abilities and attribute values are not restored from persistence (see
+  // SerializeASC): both are derived state. Abilities are re-granted on load by their real sources;
+  // attributes are re-derived by the owning game (base stats + equipment) with resource pools
+  // restored from its metadata. Any legacy "abilities" / "attributeSets" arrays are ignored.
 
   for (const TPair<FActiveGameplayEffectHandle, int32> &Pair :
        EffectsToExecutePeriods) {
