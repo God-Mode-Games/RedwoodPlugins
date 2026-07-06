@@ -427,6 +427,11 @@ private:
   bool bAuthenticated = false;
   FString PlayerId;
   FString AuthToken;
+  // Provider used for the successful initial authentication ("local",
+  // "hams_access", "discord", "twitch", etc). Reconnect reauthentication
+  // must reuse this instead of assuming "local" so sessions started via
+  // a non-local provider don't get rejected on reconnect.
+  FString LastAuthProvider;
   FString SelectedCharacterId;
   FString Nickname;
   FString CurrentRealmId;

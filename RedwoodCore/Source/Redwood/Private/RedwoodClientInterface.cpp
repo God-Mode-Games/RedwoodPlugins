@@ -133,6 +133,23 @@ void URedwoodClientInterface::InitializeDirectorConnection(
       Details.Error = TEXT("");
       OnDirectorConnected.ExecuteIfBound(Details);
       UE_LOG(LogRedwood, Log, TEXT("Connected to Director at %s"), *Uri);
+    } else if (!bAuthenticated || AuthToken.IsEmpty()) {
+      // This OnConnectedCallback fire is not a genuine post-auth
+      // reconnect — it's racing the in-flight initial login (e.g. a
+      // SocketIO polling->websocket transport upgrade that arrives
+      // before the initial player:login:username response). There is
+      // no session to reauthenticate yet, and emitting a login here
+      // with an empty AuthToken would get rejected by the director
+      // ("secret is a required field") without ever retrying, wedging
+      // the client. Do nothing and let the initial auth flow finish.
+      UE_LOG(
+        LogRedwood,
+        Log,
+        TEXT(
+          "Director connected event fired again at %s before initial authentication completed; ignoring (letting initial login finish)."
+        ),
+        *Uri
+      );
     } else {
       UE_LOG(
         LogRedwood,
@@ -146,7 +163,7 @@ void URedwoodClientInterface::InitializeDirectorConnection(
       Login(
         PlayerId,
         AuthToken,
-        "local",
+        LastAuthProvider,
         true,
         FRedwoodAuthUpdateDelegate::CreateLambda([this, OnDirectorConnected](
                                                    const FRedwoodAuthUpdate
@@ -465,7 +482,7 @@ void URedwoodClientInterface::Login(
   Director->Emit(
     TEXT("player:login:username"),
     Payload,
-    [this, Username, bRememberMe, OnUpdate](auto Response) {
+    [this, Username, Provider, bRememberMe, OnUpdate](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
       PlayerId = MessageObject->GetStringField(TEXT("playerId"));
@@ -479,6 +496,7 @@ void URedwoodClientInterface::Login(
         Update.Message = TEXT("");
 
         bAuthenticated = true;
+        LastAuthProvider = Provider;
 
         URedwoodSaveGame *SaveGame =
           Cast<URedwoodSaveGame>(UGameplayStatics::CreateSaveGameObject(
@@ -595,6 +613,7 @@ void URedwoodClientInterface::LoginWithDiscord(
               Update.Message = TEXT("");
 
               bAuthenticated = true;
+              LastAuthProvider = TEXT("discord");
               PlayerId = FinalMessageObject->GetStringField(TEXT("playerId"));
               AuthToken = FinalMessageObject->GetStringField(TEXT("token"));
               Nickname = FinalMessageObject->GetStringField(TEXT("nickname"));
@@ -715,6 +734,7 @@ void URedwoodClientInterface::LoginWithTwitch(
               Update.Message = TEXT("");
 
               bAuthenticated = true;
+              LastAuthProvider = TEXT("twitch");
               PlayerId = FinalMessageObject->GetStringField(TEXT("playerId"));
               AuthToken = FinalMessageObject->GetStringField(TEXT("token"));
               Nickname = FinalMessageObject->GetStringField(TEXT("nickname"));
