@@ -200,6 +200,13 @@ public:
     if (bUseContainers) {
       for (const FString &Id : DirtyContainerIds) {
         ++DirtyContainerGenerations.FindOrAdd(Id);
+        // A re-dirtied id cancels any pending deletion of the same row (delete-then-recreate,
+        // e.g. a bag unequipped then re-equipped inside one flush window). Without this, one
+        // flush sends the id as BOTH upsert and delete, and the backend transaction deletes
+        // last -- the recreated row is lost while both acks report success. Correct whether or
+        // not a delete is already in flight: an in-flight delete's ack then no-ops on the
+        // removed entry and the surviving dirty upsert recreates the row.
+        PendingDeletedContainerGenerations.Remove(Id);
       }
     }
   }
