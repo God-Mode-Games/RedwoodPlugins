@@ -1,6 +1,8 @@
 // Copyright Incanta Games. All Rights Reserved.
 
 #include "RedwoodCommonGameSubsystem.h"
+#include "RedwoodCharacterComponent.h"
+#include "RedwoodModule.h"
 
 #if WITH_EDITOR
   #include "RedwoodEditorSettings.h"
@@ -8,6 +10,7 @@
 
 #include "SIOJConvert.h"
 #include "SIOJsonObject.h"
+#include "UObject/UnrealType.h"
 
 void URedwoodCommonGameSubsystem::Initialize(
   FSubsystemCollectionBase &Collection
@@ -255,6 +258,81 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
   }
 
   return Character;
+}
+
+TArray<FRedwoodContainerRecord> URedwoodCommonGameSubsystem::ParseContainerRecords(
+  const TArray<TSharedPtr<FJsonValue>> &ContainersJsonArray
+) {
+  TArray<FRedwoodContainerRecord> Records;
+  Records.Reserve(ContainersJsonArray.Num());
+
+  for (const TSharedPtr<FJsonValue> &Value : ContainersJsonArray) {
+    TSharedPtr<FJsonObject> Row = Value->AsObject();
+    if (!Row.IsValid()) {
+      continue;
+    }
+
+    FRedwoodContainerRecord Record;
+    Row->TryGetStringField(TEXT("containerId"), Record.ContainerId);
+    int32 KindValue = 0;
+    Row->TryGetNumberField(TEXT("kind"), KindValue);
+    Record.Kind = static_cast<uint8>(KindValue);
+
+    USIOJsonObject *Contents = NewObject<USIOJsonObject>();
+    const TSharedPtr<FJsonObject> *ContentsObject = nullptr;
+    if (Row->TryGetObjectField(TEXT("contents"), ContentsObject)) {
+      Contents->SetRootObject(*ContentsObject);
+    }
+    Record.Contents = Contents;
+
+    Records.Add(MoveTemp(Record));
+  }
+
+  return Records;
+}
+
+TArray<FRedwoodContainerRecord> *
+URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(
+  URedwoodCharacterComponent *CharacterComponent
+) {
+  AActor *ComponentOwner = CharacterComponent->GetOwner();
+  UObject *Target = CharacterComponent->bStoreDataInActor
+    ? (UObject *)ComponentOwner
+    : (UObject *)CharacterComponent;
+
+  if (!IsValid(Target)) {
+    return nullptr;
+  }
+
+  FProperty *Prop = Target->GetClass()->FindPropertyByName(
+    *CharacterComponent->ContainersVariableName
+  );
+  FArrayProperty *ArrayProp = CastField<FArrayProperty>(Prop);
+  if (!ArrayProp) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("%s variable not found (or not an array) in %s"),
+      *CharacterComponent->ContainersVariableName,
+      *Target->GetName()
+    );
+    return nullptr;
+  }
+
+  FStructProperty *InnerStructProp = CastField<FStructProperty>(ArrayProp->Inner);
+  if (!InnerStructProp || InnerStructProp->Struct != FRedwoodContainerRecord::StaticStruct()) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("%s variable in %s is not a TArray<FRedwoodContainerRecord>"),
+      *CharacterComponent->ContainersVariableName,
+      *Target->GetName()
+    );
+    return nullptr;
+  }
+
+  return ArrayProp->ContainerPtrToValuePtr<TArray<FRedwoodContainerRecord>>(Target
+  );
 }
 
 FRedwoodGameServerProxy URedwoodCommonGameSubsystem::ParseServerProxy(

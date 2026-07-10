@@ -113,9 +113,11 @@ public:
   // TArray<FRedwoodContainerRecord> UPROPERTY on the owning actor, and only the DIRTY records
   // (MarkContainersDirty) plus any pending deletions (MarkContainersDeleted) are sent to the
   // realm:characters:containers:upsert sidecar route on flush -- so a change to one bag doesn't
-  // resend every other container. Load is a separate realm:characters:containers:load round trip
-  // (see OnRedwoodContainersLoaded), because container rows are not part of
-  // FRedwoodCharacterBackend / the realm:characters:set:server payload.
+  // resend every other container. LOADING, unlike flushing, rides the SAME round trip as the rest
+  // of the character (FRedwoodCharacterBackend::Containers, populated by the player-auth /
+  // character-load response) rather than its own route -- see
+  // RedwoodPlayerStateCharacterUpdated(), which copies it into ContainersVariableName before
+  // broadcasting OnRedwoodCharacterUpdated.
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
   bool bUseContainers = true;
 
@@ -273,21 +275,33 @@ public:
     return PendingDeletedContainerIds;
   }
 
+  // Unconditional full clear -- used where there is genuinely nothing to retry (e.g. the
+  // identity-mismatch safety rail in CreatePlayerCharacterDataObject skips the flush entirely for
+  // a stale/un-hydrated component, so there is no in-flight send whose ack this would race).
+  // The normal flush path does NOT call this -- see AckContainersFlushed below, which clears only
+  // the specific ids a successfully-acknowledged flush actually sent.
   void ClearContainersDirtyState() {
     DirtyContainerIdSet.Empty();
     PendingDeletedContainerIds.Empty();
   }
 
-  // Broadcast once the realm:characters:containers:load round trip completes and
-  // ContainersVariableName has been populated on the owning actor. The load request is kicked
-  // off at the END of RedwoodPlayerStateCharacterUpdated (after the fixed-channel
-  // Deserialize*/OnRedwoodCharacterUpdated processing), so this ALWAYS fires strictly after
-  // OnRedwoodCharacterUpdated for the same login/re-sync -- game code that needs both the
-  // legacy dense inventory arrays AND Containers (e.g. AClient's load hook) should treat this as
-  // a second, later-arriving signal, not assume Containers is already populated inside an
-  // OnRedwoodCharacterUpdated handler.
-  UPROPERTY(BlueprintAssignable, Category = "Redwood")
-  FRedwoodDynamicDelegate OnRedwoodContainersLoaded;
+  // Called by FlushContainersForCharacterComponent's Emit callback once
+  // realm:characters:containers:upsert acknowledges success for a flush that sent exactly
+  // UpsertedIds (upserts) and DeletedIds (deletions). Removes ONLY those ids -- not a blanket
+  // clear -- so a mutation that re-dirtied a container (or dirtied a new one) while the request
+  // was in flight is not silently dropped. A failed send, a disconnect, or this component being
+  // destroyed before the ack arrives all leave the affected ids dirty, so the next flush retries
+  // them; dirty state is never cleared on build/send, only on confirmed persistence.
+  void AckContainersFlushed(
+    const TArray<FString> &UpsertedIds, const TArray<FString> &DeletedIds
+  ) {
+    for (const FString &Id : UpsertedIds) {
+      DirtyContainerIdSet.Remove(Id);
+    }
+    for (const FString &Id : DeletedIds) {
+      PendingDeletedContainerIds.RemoveSingle(Id);
+    }
+  }
 
   UFUNCTION(BlueprintPure, Category = "Redwood")
   bool IsProgressDirty() const {
@@ -304,6 +318,10 @@ public:
     return bAbilitySystemDirty;
   }
 
+  // NOTE: deliberately does NOT touch the containers dirty state (DirtyContainerIdSet /
+  // PendingDeletedContainerIds) -- unlike every flag cleared below, containers ride their own
+  // acknowledged send (FlushContainersForCharacterComponent -> AckContainersFlushed), so clearing
+  // them here (before the ack) would drop a flush that later fails or never arrives.
   void ClearDirtyFlags() {
     bPlayerDataDirty = false;
     bCharacterCreatorDataDirty = false;
@@ -313,7 +331,6 @@ public:
     bProgressDirty = false;
     bDataDirty = false;
     bAbilitySystemDirty = false;
-    ClearContainersDirtyState();
   }
 
 private:

@@ -1344,6 +1344,11 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
             Pawn ? *Pawn->GetName() : TEXT("<none>")
           );
           CharacterComponent->ClearDirtyFlags();
+          // ClearDirtyFlags() deliberately leaves containers alone (they only clear on a
+          // send's ack) -- but this component is never going to be flushed at all (it's
+          // being skipped outright), so there is no in-flight send to race; clear its
+          // container dirty state directly instead of leaving it stuck forever.
+          CharacterComponent->ClearContainersDirtyState();
           continue;
         }
 
@@ -1516,51 +1521,14 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
   }
 }
 
-// Resolves ContainersVariableName to a TArray<FRedwoodContainerRecord> UPROPERTY on the
-// CharacterComponent's data-holding object (the owning actor, or the component itself when
-// bStoreDataInActor is false -- same choice every other channel above makes). Returns nullptr
-// (with an error logged) if the property is missing or isn't the expected array-of-struct shape.
-static TArray<FRedwoodContainerRecord> *ResolveContainersRecordsArray(
-  URedwoodCharacterComponent *CharacterComponent
-) {
-  AActor *ComponentOwner = CharacterComponent->GetOwner();
-  UObject *Target = CharacterComponent->bStoreDataInActor
-    ? (UObject *)ComponentOwner
-    : (UObject *)CharacterComponent;
-
-  if (!IsValid(Target)) {
-    return nullptr;
-  }
-
-  FProperty *Prop =
-    Target->GetClass()->FindPropertyByName(*CharacterComponent->ContainersVariableName);
-  FArrayProperty *ArrayProp = CastField<FArrayProperty>(Prop);
-  if (!ArrayProp) {
-    UE_LOG(
-      LogRedwood,
-      Error,
-      TEXT("%s variable not found (or not an array) in %s"),
-      *CharacterComponent->ContainersVariableName,
-      *Target->GetName()
-    );
-    return nullptr;
-  }
-
-  FStructProperty *InnerStructProp = CastField<FStructProperty>(ArrayProp->Inner);
-  if (!InnerStructProp || InnerStructProp->Struct != FRedwoodContainerRecord::StaticStruct()) {
-    UE_LOG(
-      LogRedwood,
-      Error,
-      TEXT("%s variable in %s is not a TArray<FRedwoodContainerRecord>"),
-      *CharacterComponent->ContainersVariableName,
-      *Target->GetName()
-    );
-    return nullptr;
-  }
-
-  return ArrayProp->ContainerPtrToValuePtr<TArray<FRedwoodContainerRecord>>(Target);
-}
-
+// Sends CharacterComponent's currently-dirty container records (plus pending deletions) to
+// realm:characters:containers:upsert. Dirty state is cleared ONLY on ack (the Emit callback's
+// Error.IsEmpty() check below) -- and only for the exact ids this call actually sent, since more
+// mutations may have re-dirtied something while the request was in flight. A failed send, a
+// disconnect, or the component/actor being destroyed mid-flight all leave the dirty state
+// (wholly or partially) set, so the next flush retries it; nothing is ever lost to an
+// unacknowledged send. TWeakObjectPtr guards the async callback the same way
+// FlushContainersForCharacterComponent's sibling channels' load callbacks already do.
 void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
   URedwoodPlayerStateComponent *PlayerStateComponent,
   URedwoodCharacterComponent *CharacterComponent
@@ -1573,7 +1541,7 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
   }
 
   TArray<FRedwoodContainerRecord> *RecordsArray =
-    ResolveContainersRecordsArray(CharacterComponent);
+    URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(CharacterComponent);
   if (!RecordsArray) {
     return;
   }
@@ -1582,6 +1550,9 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
   const TArray<FString> &DeletedIds = CharacterComponent->GetPendingDeletedContainerIds();
 
   TArray<TSharedPtr<FJsonValue>> ContainersJsonArray;
+  // The exact set of ids actually included in ContainersJsonArray below -- NOT simply DirtyIds,
+  // since a dirty id with no matching record (logged below) is never sent and must not be acked.
+  TArray<FString> SentUpsertIds;
   for (const FRedwoodContainerRecord &Record : *RecordsArray) {
     if (!DirtyIds.Contains(Record.ContainerId)) {
       continue;
@@ -1597,18 +1568,20 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
         : MakeShareable(new FJsonObject)
     );
     ContainersJsonArray.Add(MakeShareable(new FJsonValueObject(Item)));
+    SentUpsertIds.Add(Record.ContainerId);
   }
 
   if (ContainersJsonArray.Num() != DirtyIds.Num()) {
     // A dirty ContainerId that isn't in RecordsArray at all -- the game marked it dirty but
     // never wrote a matching record into Containers before the flush ran. Not fatal (the
     // deletion, if any, still goes out), but worth surfacing since it means that record is
-    // silently skipped this flush.
+    // silently skipped this flush. It stays dirty (not in SentUpsertIds) so a later flush,
+    // once a matching record exists, retries it.
     UE_LOG(
       LogRedwood,
       Warning,
       TEXT(
-        "FlushContainersForCharacterComponent: %d dirty ContainerId(s) had no matching record in %s (skipped)"
+        "FlushContainersForCharacterComponent: %d dirty ContainerId(s) had no matching record in %s (skipped, left dirty)"
       ),
       DirtyIds.Num() - ContainersJsonArray.Num(),
       *CharacterComponent->ContainersVariableName
@@ -1632,106 +1605,34 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
   Payload->SetArrayField(TEXT("containers"), ContainersJsonArray);
   Payload->SetArrayField(TEXT("deletedContainerIds"), DeletedJsonArray);
 
+  TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = CharacterComponent;
+  // DeletedIds is a reference into CharacterComponent's live PendingDeletedContainerIds array --
+  // snapshot it by value now, since the live array (and the dirty upsert set) may change again
+  // before this ack arrives.
+  TArray<FString> SentDeletedIds = DeletedIds;
+
   Sidecar->Emit(
     TEXT("realm:characters:containers:upsert"),
     Payload,
-    [](auto Response) {
+    [WeakCharacterComponent, SentUpsertIds, SentDeletedIds](auto Response) {
       TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
       FString Error = MessageStruct->GetStringField(TEXT("error"));
       if (!Error.IsEmpty()) {
         UE_LOG(
           LogRedwood, Error, TEXT("Failed to flush containers: %s"), *Error
         );
+        // Leave the dirty/pending-deletion state as-is -- the next flush retries these ids.
+        return;
       }
-    }
-  );
-}
 
-void URedwoodServerGameSubsystem::LoadContainersForCharacterComponent(
-  URedwoodPlayerStateComponent *PlayerStateComponent,
-  URedwoodCharacterComponent *CharacterComponent
-) {
-  TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = CharacterComponent;
-
-  if (!URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // Offline/PIE-disk saves don't carry container rows (the on-disk character JSON has no
-    // "containers" field) -- broadcast immediately with whatever Containers already holds
-    // (nothing, on a fresh load) so game code isn't left waiting on an event that will never
-    // fire, and the legacy dense-array leg stays the effective path there.
-    CharacterComponent->OnRedwoodContainersLoaded.Broadcast();
-    return;
-  }
-
-  if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
-    UE_LOG(
-      LogRedwood, Error, TEXT("Sidecar is not connected; cannot load containers")
-    );
-    return;
-  }
-
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetField(TEXT("id"), MakeShareable(new FJsonValueNull()));
-  Payload->SetStringField(
-    TEXT("characterId"), PlayerStateComponent->RedwoodCharacter.Id
-  );
-
-  Sidecar->Emit(
-    TEXT("realm:characters:containers:load"),
-    Payload,
-    [WeakCharacterComponent](auto Response) {
       URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
       if (!IsValid(CharacterComponent)) {
-        // The player disconnected (or the pawn/PlayerState was destroyed) while this request
-        // was in flight -- nothing left to populate.
+        // The player disconnected (or the pawn/PlayerState was destroyed) while this request was
+        // in flight -- nothing left to clear dirty state on.
         return;
       }
 
-      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
-      FString Error = MessageStruct->GetStringField(TEXT("error"));
-      if (!Error.IsEmpty()) {
-        UE_LOG(
-          LogRedwood, Error, TEXT("Failed to load containers: %s"), *Error
-        );
-        CharacterComponent->OnRedwoodContainersLoaded.Broadcast();
-        return;
-      }
-
-      TArray<FRedwoodContainerRecord> *RecordsArray =
-        ResolveContainersRecordsArray(CharacterComponent);
-      if (!RecordsArray) {
-        CharacterComponent->OnRedwoodContainersLoaded.Broadcast();
-        return;
-      }
-
-      RecordsArray->Reset();
-
-      const TArray<TSharedPtr<FJsonValue>> *ContainersJsonArray = nullptr;
-      if (MessageStruct->TryGetArrayField(TEXT("containers"), ContainersJsonArray)) {
-        RecordsArray->Reserve(ContainersJsonArray->Num());
-        for (const TSharedPtr<FJsonValue> &Value : *ContainersJsonArray) {
-          TSharedPtr<FJsonObject> Row = Value->AsObject();
-          if (!Row.IsValid()) {
-            continue;
-          }
-
-          FRedwoodContainerRecord Record;
-          Row->TryGetStringField(TEXT("containerId"), Record.ContainerId);
-          int32 KindValue = 0;
-          Row->TryGetNumberField(TEXT("kind"), KindValue);
-          Record.Kind = static_cast<uint8>(KindValue);
-
-          USIOJsonObject *Contents = NewObject<USIOJsonObject>();
-          const TSharedPtr<FJsonObject> *ContentsObject = nullptr;
-          if (Row->TryGetObjectField(TEXT("contents"), ContentsObject)) {
-            Contents->SetRootObject(*ContentsObject);
-          }
-          Record.Contents = Contents;
-
-          RecordsArray->Add(MoveTemp(Record));
-        }
-      }
-
-      CharacterComponent->OnRedwoodContainersLoaded.Broadcast();
+      CharacterComponent->AckContainersFlushed(SentUpsertIds, SentDeletedIds);
     }
   );
 }

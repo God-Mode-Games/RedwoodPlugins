@@ -597,9 +597,21 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
           PlayerStateComponent->SetRedwoodPlayer(
             URedwoodCommonGameSubsystem::ParsePlayerData(Player)
           );
-          PlayerStateComponent->SetRedwoodCharacter(
-            URedwoodCommonGameSubsystem::ParseCharacter(Character)
-          );
+
+          FRedwoodCharacterBackend ParsedCharacter =
+            URedwoodCommonGameSubsystem::ParseCharacter(Character);
+
+          // Container rows ride this SAME player-auth response (a sibling field to "character",
+          // not nested inside it -- see PlayerAuth.SidecarToRealm's IResponse), so they are
+          // present before SetRedwoodCharacter fires OnRedwoodCharacterUpdated below, instead of
+          // arriving later via a separate realm:characters:containers:load round trip.
+          const TArray<TSharedPtr<FJsonValue>> *ContainersJsonArray = nullptr;
+          if (MessageStruct->TryGetArrayField(TEXT("containers"), ContainersJsonArray)) {
+            ParsedCharacter.Containers =
+              URedwoodCommonGameSubsystem::ParseContainerRecords(*ContainersJsonArray);
+          }
+
+          PlayerStateComponent->SetRedwoodCharacter(ParsedCharacter);
           PlayerStateComponent->SetServerReady();
 
           // The realm backend pushes party data to this server when the

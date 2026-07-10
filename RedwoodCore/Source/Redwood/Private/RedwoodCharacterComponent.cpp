@@ -4,7 +4,6 @@
 #include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodModule.h"
 #include "RedwoodPlayerStateComponent.h"
-#include "RedwoodServerGameSubsystem.h"
 
 #include "Engine/GameInstance.h"
 #include "GameFramework/GameModeBase.h"
@@ -556,6 +555,20 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
       }
     }
 
+    // Containers ride the SAME round trip as every field above (RedwoodCharacterBackend.Containers
+    // -- populated by the player-auth / character-load response, not a separate
+    // realm:characters:containers:load call), so this runs BEFORE the OnRedwoodCharacterUpdated
+    // broadcast below like every other channel: game code reacting to that broadcast can rely on
+    // ContainersVariableName already reflecting the persisted rows, with no later-arriving
+    // corrective pass required.
+    if (bUseContainers) {
+      TArray<FRedwoodContainerRecord> *RecordsArray =
+        URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(this);
+      if (RecordsArray) {
+        *RecordsArray = RedwoodCharacterBackend.Containers;
+      }
+    }
+
     // Broadcast locally on the server, then bump the replicated counter so the
     // notify fires on clients once the updated fields have been applied.
     OnRedwoodCharacterUpdated.Broadcast();
@@ -563,19 +576,6 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
     MARK_PROPERTY_DIRTY_FROM_NAME(
       URedwoodCharacterComponent, RedwoodCharacterUpdateCount, this
     );
-
-    // Containers ride a separate realm:characters:containers:load round trip (they are not part
-    // of FRedwoodCharacterBackend / the payload OnRedwoodCharacterUpdated above was just built
-    // from), so this always completes strictly AFTER OnRedwoodCharacterUpdated for the same
-    // login/re-sync -- see OnRedwoodContainersLoaded's doc comment.
-    if (bUseContainers) {
-      if (UGameInstance *GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr) {
-        if (URedwoodServerGameSubsystem *ServerSubsystem =
-              GameInstance->GetSubsystem<URedwoodServerGameSubsystem>()) {
-          ServerSubsystem->LoadContainersForCharacterComponent(PlayerStateComponent, this);
-        }
-      }
-    }
   }
 }
 

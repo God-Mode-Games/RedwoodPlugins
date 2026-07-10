@@ -11,6 +11,7 @@
 #include "RedwoodCommonGameSubsystem.generated.h"
 
 class USIOJsonObject;
+class URedwoodCharacterComponent;
 
 UCLASS(BlueprintType)
 class REDWOOD_API URedwoodCommonGameSubsystem : public UGameInstanceSubsystem {
@@ -101,6 +102,25 @@ public:
   );
 
   static FRedwoodParty ParseParty(const TSharedPtr<FJsonObject> &PartyObj);
+
+  // Parses a wire "containers" JSON array (the {containerId, kind, contents} shape shared by the
+  // player-auth response and the realm:characters:containers:load response) into
+  // FRedwoodContainerRecord entries. Shared so both the character-arrival path
+  // (RedwoodGameModeComponent's RunSidecarPlayerAuth) and any other container-bearing response
+  // parse it identically.
+  static TArray<FRedwoodContainerRecord> ParseContainerRecords(
+    const TArray<TSharedPtr<FJsonValue>> &ContainersJsonArray
+  );
+
+  // Resolves CharacterComponent->ContainersVariableName to a TArray<FRedwoodContainerRecord>
+  // UPROPERTY on the component's data-holding object (the owning actor, or the component itself
+  // when bStoreDataInActor is false -- same choice every other channel makes). Returns nullptr
+  // (with an error logged) if the property is missing or isn't the expected array-of-struct
+  // shape. Shared by the flush path (FlushContainersForCharacterComponent) and the arrival path
+  // (RedwoodPlayerStateCharacterUpdated), which both need to reach the same array.
+  static TArray<FRedwoodContainerRecord> *ResolveContainersRecordsArray(
+    URedwoodCharacterComponent *CharacterComponent
+  );
 
 private:
 };
