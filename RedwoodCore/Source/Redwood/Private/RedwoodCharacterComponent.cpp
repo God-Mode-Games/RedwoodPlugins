@@ -561,6 +561,11 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
     // broadcast below like every other channel: game code reacting to that broadcast can rely on
     // ContainersVariableName already reflecting the persisted rows, with no later-arriving
     // corrective pass required.
+    // NOTE: RedwoodPlayerStateCharacterUpdated() re-runs on every OnControllerChanged, so this
+    // login snapshot re-applies RedwoodCharacterBackend.Containers to the wire array each time --
+    // safe today because there is no mid-session repossession path (this is a single-shot game
+    // load), but revisit once linkdead pawn retention (#1365) lands and a live pawn can be
+    // re-possessed after mutations have already dirtied the wire array past the login snapshot.
     if (bUseContainers) {
       TArray<FRedwoodContainerRecord> *RecordsArray =
         URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(this);

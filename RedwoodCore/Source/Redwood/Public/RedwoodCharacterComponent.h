@@ -191,25 +191,29 @@ public:
 
   // Records ContainerIds whose game-side record changed since the last flush. Dirty ids
   // accumulate (a second call before a flush unions in, it doesn't replace) so nothing is lost
-  // if multiple mutations land in the same tick.
+  // if multiple mutations land in the same tick. Each id carries a GENERATION counter (bumped on
+  // every mark) rather than a plain presence flag -- see AckContainersFlushed for why: it lets an
+  // ack tell "the id I sent" apart from "the id as it stands after a re-dirty that arrived while
+  // that send was still in flight".
   UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Redwood")
   void MarkContainersDirty(const TArray<FString> &DirtyContainerIds) {
     if (bUseContainers) {
       for (const FString &Id : DirtyContainerIds) {
-        DirtyContainerIdSet.Add(Id);
+        ++DirtyContainerGenerations.FindOrAdd(Id);
       }
     }
   }
 
   // Records ContainerIds whose row should be DELETED on next flush (e.g. a bag that got
   // discarded). A deleted id is dropped from the dirty-upsert set too -- there's no point
-  // upserting a row the same flush is about to delete.
+  // upserting a row the same flush is about to delete. Same generation-counter treatment as
+  // MarkContainersDirty, for the same reason.
   UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Redwood")
   void MarkContainersDeleted(const TArray<FString> &DeletedContainerIds) {
     if (bUseContainers) {
       for (const FString &Id : DeletedContainerIds) {
-        PendingDeletedContainerIds.AddUnique(Id);
-        DirtyContainerIdSet.Remove(Id);
+        ++PendingDeletedContainerGenerations.FindOrAdd(Id);
+        DirtyContainerGenerations.Remove(Id);
       }
     }
   }
@@ -262,17 +266,18 @@ public:
 
   UFUNCTION(BlueprintPure, Category = "Redwood")
   bool IsContainersDirty() const {
-    return DirtyContainerIdSet.Num() > 0 || PendingDeletedContainerIds.Num() > 0;
+    return DirtyContainerGenerations.Num() > 0 || PendingDeletedContainerGenerations.Num() > 0;
   }
 
   // Drained by URedwoodServerGameSubsystem::FlushContainersForCharacterComponent when building
-  // the upsert payload; not BlueprintCallable (Blueprint has no TSet<FString> pin type).
-  const TSet<FString> &GetDirtyContainerIds() const {
-    return DirtyContainerIdSet;
+  // the upsert payload; not BlueprintCallable (Blueprint has no TMap<FString, uint64> pin type).
+  // The value is the dirty GENERATION for that id -- see AckContainersFlushed.
+  const TMap<FString, uint64> &GetDirtyContainerGenerations() const {
+    return DirtyContainerGenerations;
   }
 
-  const TArray<FString> &GetPendingDeletedContainerIds() const {
-    return PendingDeletedContainerIds;
+  const TMap<FString, uint64> &GetPendingDeletedContainerGenerations() const {
+    return PendingDeletedContainerGenerations;
   }
 
   // Unconditional full clear -- used where there is genuinely nothing to retry (e.g. the
@@ -281,25 +286,35 @@ public:
   // The normal flush path does NOT call this -- see AckContainersFlushed below, which clears only
   // the specific ids a successfully-acknowledged flush actually sent.
   void ClearContainersDirtyState() {
-    DirtyContainerIdSet.Empty();
-    PendingDeletedContainerIds.Empty();
+    DirtyContainerGenerations.Empty();
+    PendingDeletedContainerGenerations.Empty();
   }
 
   // Called by FlushContainersForCharacterComponent's Emit callback once
   // realm:characters:containers:upsert acknowledges success for a flush that sent exactly
-  // UpsertedIds (upserts) and DeletedIds (deletions). Removes ONLY those ids -- not a blanket
-  // clear -- so a mutation that re-dirtied a container (or dirtied a new one) while the request
-  // was in flight is not silently dropped. A failed send, a disconnect, or this component being
-  // destroyed before the ack arrives all leave the affected ids dirty, so the next flush retries
-  // them; dirty state is never cleared on build/send, only on confirmed persistence.
+  // SentUpserts (upserts) and SentDeletions (deletions), each paired with the GENERATION that was
+  // current for that id at send time. Removes an id ONLY IF its generation is still the one that
+  // was sent -- if MarkContainersDirty/MarkContainersDeleted bumped it again while the request was
+  // in flight, the id is left dirty (at its newer generation) so the next flush re-sends the
+  // newer record instead of the ack silently clearing away a write it never actually persisted.
+  // A failed send, a disconnect, or this component being destroyed before the ack arrives all
+  // leave the affected ids dirty, so the next flush retries them; dirty state is never cleared on
+  // build/send, only on confirmed persistence of the exact generation acknowledged.
   void AckContainersFlushed(
-    const TArray<FString> &UpsertedIds, const TArray<FString> &DeletedIds
+    const TArray<TPair<FString, uint64>> &SentUpserts,
+    const TArray<TPair<FString, uint64>> &SentDeletions
   ) {
-    for (const FString &Id : UpsertedIds) {
-      DirtyContainerIdSet.Remove(Id);
+    for (const TPair<FString, uint64> &Sent : SentUpserts) {
+      uint64 *CurrentGeneration = DirtyContainerGenerations.Find(Sent.Key);
+      if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
+        DirtyContainerGenerations.Remove(Sent.Key);
+      }
     }
-    for (const FString &Id : DeletedIds) {
-      PendingDeletedContainerIds.RemoveSingle(Id);
+    for (const TPair<FString, uint64> &Sent : SentDeletions) {
+      uint64 *CurrentGeneration = PendingDeletedContainerGenerations.Find(Sent.Key);
+      if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
+        PendingDeletedContainerGenerations.Remove(Sent.Key);
+      }
     }
   }
 
@@ -318,8 +333,8 @@ public:
     return bAbilitySystemDirty;
   }
 
-  // NOTE: deliberately does NOT touch the containers dirty state (DirtyContainerIdSet /
-  // PendingDeletedContainerIds) -- unlike every flag cleared below, containers ride their own
+  // NOTE: deliberately does NOT touch the containers dirty state (DirtyContainerGenerations /
+  // PendingDeletedContainerGenerations) -- unlike every flag cleared below, containers ride their own
   // acknowledged send (FlushContainersForCharacterComponent -> AckContainersFlushed), so clearing
   // them here (before the ack) would drop a flush that later fails or never arrives.
   void ClearDirtyFlags() {
@@ -373,6 +388,7 @@ private:
   bool bDataDirty = false;
   bool bAbilitySystemDirty = false;
 
-  TSet<FString> DirtyContainerIdSet;
-  TArray<FString> PendingDeletedContainerIds;
+  // Value is a per-id dirty GENERATION, not a plain membership flag -- see AckContainersFlushed.
+  TMap<FString, uint64> DirtyContainerGenerations;
+  TMap<FString, uint64> PendingDeletedContainerGenerations;
 };

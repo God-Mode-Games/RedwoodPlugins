@@ -1523,12 +1523,15 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
 
 // Sends CharacterComponent's currently-dirty container records (plus pending deletions) to
 // realm:characters:containers:upsert. Dirty state is cleared ONLY on ack (the Emit callback's
-// Error.IsEmpty() check below) -- and only for the exact ids this call actually sent, since more
-// mutations may have re-dirtied something while the request was in flight. A failed send, a
-// disconnect, or the component/actor being destroyed mid-flight all leave the dirty state
-// (wholly or partially) set, so the next flush retries it; nothing is ever lost to an
-// unacknowledged send. TWeakObjectPtr guards the async callback the same way
-// FlushContainersForCharacterComponent's sibling channels' load callbacks already do.
+// Error.IsEmpty() check below), and only for the exact (id, generation) pairs this call actually
+// sent -- if MarkContainersDirty/MarkContainersDeleted bumped an id's generation again while the
+// request was in flight, AckContainersFlushed leaves that id dirty at its newer generation
+// instead of clearing it, so the next flush cycle re-sends the newer record rather than a
+// mid-flight re-dirty being silently stranded. A failed send, a disconnect, or the
+// component/actor being destroyed mid-flight all leave the dirty state (wholly or partially) set,
+// so the next flush retries it; nothing is ever lost to an unacknowledged send. TWeakObjectPtr
+// guards the async callback the same way FlushContainersForCharacterComponent's sibling channels'
+// load callbacks already do.
 void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
   URedwoodPlayerStateComponent *PlayerStateComponent,
   URedwoodCharacterComponent *CharacterComponent
@@ -1546,15 +1549,21 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
     return;
   }
 
-  const TSet<FString> &DirtyIds = CharacterComponent->GetDirtyContainerIds();
-  const TArray<FString> &DeletedIds = CharacterComponent->GetPendingDeletedContainerIds();
+  // Generation counters, not plain ids -- lets AckContainersFlushed tell "the record I sent" apart
+  // from "the record as it stands after a re-dirty that arrived while this send was in flight".
+  const TMap<FString, uint64> &DirtyGenerations =
+    CharacterComponent->GetDirtyContainerGenerations();
+  const TMap<FString, uint64> &DeletedGenerations =
+    CharacterComponent->GetPendingDeletedContainerGenerations();
 
   TArray<TSharedPtr<FJsonValue>> ContainersJsonArray;
-  // The exact set of ids actually included in ContainersJsonArray below -- NOT simply DirtyIds,
-  // since a dirty id with no matching record (logged below) is never sent and must not be acked.
-  TArray<FString> SentUpsertIds;
+  // The exact (id, generation) pairs actually included in ContainersJsonArray below -- NOT simply
+  // DirtyGenerations, since a dirty id with no matching record (logged below) is never sent and
+  // must not be acked.
+  TArray<TPair<FString, uint64>> SentUpsertIds;
   for (const FRedwoodContainerRecord &Record : *RecordsArray) {
-    if (!DirtyIds.Contains(Record.ContainerId)) {
+    const uint64 *Generation = DirtyGenerations.Find(Record.ContainerId);
+    if (!Generation) {
       continue;
     }
 
@@ -1568,10 +1577,10 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
         : MakeShareable(new FJsonObject)
     );
     ContainersJsonArray.Add(MakeShareable(new FJsonValueObject(Item)));
-    SentUpsertIds.Add(Record.ContainerId);
+    SentUpsertIds.Add(TPair<FString, uint64>(Record.ContainerId, *Generation));
   }
 
-  if (ContainersJsonArray.Num() != DirtyIds.Num()) {
+  if (ContainersJsonArray.Num() != DirtyGenerations.Num()) {
     // A dirty ContainerId that isn't in RecordsArray at all -- the game marked it dirty but
     // never wrote a matching record into Containers before the flush ran. Not fatal (the
     // deletion, if any, still goes out), but worth surfacing since it means that record is
@@ -1583,14 +1592,16 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
       TEXT(
         "FlushContainersForCharacterComponent: %d dirty ContainerId(s) had no matching record in %s (skipped, left dirty)"
       ),
-      DirtyIds.Num() - ContainersJsonArray.Num(),
+      DirtyGenerations.Num() - ContainersJsonArray.Num(),
       *CharacterComponent->ContainersVariableName
     );
   }
 
   TArray<TSharedPtr<FJsonValue>> DeletedJsonArray;
-  for (const FString &Id : DeletedIds) {
-    DeletedJsonArray.Add(MakeShareable(new FJsonValueString(Id)));
+  TArray<TPair<FString, uint64>> SentDeletedIds;
+  for (const TPair<FString, uint64> &Deleted : DeletedGenerations) {
+    DeletedJsonArray.Add(MakeShareable(new FJsonValueString(Deleted.Key)));
+    SentDeletedIds.Add(Deleted);
   }
 
   if (ContainersJsonArray.Num() == 0 && DeletedJsonArray.Num() == 0) {
@@ -1605,11 +1616,10 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
   Payload->SetArrayField(TEXT("containers"), ContainersJsonArray);
   Payload->SetArrayField(TEXT("deletedContainerIds"), DeletedJsonArray);
 
+  // SentUpsertIds/SentDeletedIds above are already independent copies of the (id, generation)
+  // pairs sent in this payload -- not references into CharacterComponent's live maps, which may
+  // change again (a re-dirty bumping a generation, a new mark, etc.) before this ack arrives.
   TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = CharacterComponent;
-  // DeletedIds is a reference into CharacterComponent's live PendingDeletedContainerIds array --
-  // snapshot it by value now, since the live array (and the dirty upsert set) may change again
-  // before this ack arrives.
-  TArray<FString> SentDeletedIds = DeletedIds;
 
   Sidecar->Emit(
     TEXT("realm:characters:containers:upsert"),
