@@ -108,6 +108,20 @@ public:
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
   int32 LatestNonequippedInventorySchemaVersion = 0;
 
+  // Per-container persistence channel (Task 8's Container table). Unlike the channels above,
+  // this is not a single whole-blob field: ContainersVariableName names a
+  // TArray<FRedwoodContainerRecord> UPROPERTY on the owning actor, and only the DIRTY records
+  // (MarkContainersDirty) plus any pending deletions (MarkContainersDeleted) are sent to the
+  // realm:characters:containers:upsert sidecar route on flush -- so a change to one bag doesn't
+  // resend every other container. Load is a separate realm:characters:containers:load round trip
+  // (see OnRedwoodContainersLoaded), because container rows are not part of
+  // FRedwoodCharacterBackend / the realm:characters:set:server payload.
+  UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
+  bool bUseContainers = true;
+
+  UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
+  FString ContainersVariableName = TEXT("Containers");
+
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
   bool bUseProgress = false;
 
@@ -173,6 +187,31 @@ public:
     }
   }
 
+  // Records ContainerIds whose game-side record changed since the last flush. Dirty ids
+  // accumulate (a second call before a flush unions in, it doesn't replace) so nothing is lost
+  // if multiple mutations land in the same tick.
+  UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Redwood")
+  void MarkContainersDirty(const TArray<FString> &DirtyContainerIds) {
+    if (bUseContainers) {
+      for (const FString &Id : DirtyContainerIds) {
+        DirtyContainerIdSet.Add(Id);
+      }
+    }
+  }
+
+  // Records ContainerIds whose row should be DELETED on next flush (e.g. a bag that got
+  // discarded). A deleted id is dropped from the dirty-upsert set too -- there's no point
+  // upserting a row the same flush is about to delete.
+  UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Redwood")
+  void MarkContainersDeleted(const TArray<FString> &DeletedContainerIds) {
+    if (bUseContainers) {
+      for (const FString &Id : DeletedContainerIds) {
+        PendingDeletedContainerIds.AddUnique(Id);
+        DirtyContainerIdSet.Remove(Id);
+      }
+    }
+  }
+
   UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Redwood")
   void MarkProgressDirty() {
     if (bUseProgress) {
@@ -220,6 +259,37 @@ public:
   }
 
   UFUNCTION(BlueprintPure, Category = "Redwood")
+  bool IsContainersDirty() const {
+    return DirtyContainerIdSet.Num() > 0 || PendingDeletedContainerIds.Num() > 0;
+  }
+
+  // Drained by URedwoodServerGameSubsystem::FlushContainersForCharacterComponent when building
+  // the upsert payload; not BlueprintCallable (Blueprint has no TSet<FString> pin type).
+  const TSet<FString> &GetDirtyContainerIds() const {
+    return DirtyContainerIdSet;
+  }
+
+  const TArray<FString> &GetPendingDeletedContainerIds() const {
+    return PendingDeletedContainerIds;
+  }
+
+  void ClearContainersDirtyState() {
+    DirtyContainerIdSet.Empty();
+    PendingDeletedContainerIds.Empty();
+  }
+
+  // Broadcast once the realm:characters:containers:load round trip completes and
+  // ContainersVariableName has been populated on the owning actor. The load request is kicked
+  // off at the END of RedwoodPlayerStateCharacterUpdated (after the fixed-channel
+  // Deserialize*/OnRedwoodCharacterUpdated processing), so this ALWAYS fires strictly after
+  // OnRedwoodCharacterUpdated for the same login/re-sync -- game code that needs both the
+  // legacy dense inventory arrays AND Containers (e.g. AClient's load hook) should treat this as
+  // a second, later-arriving signal, not assume Containers is already populated inside an
+  // OnRedwoodCharacterUpdated handler.
+  UPROPERTY(BlueprintAssignable, Category = "Redwood")
+  FRedwoodDynamicDelegate OnRedwoodContainersLoaded;
+
+  UFUNCTION(BlueprintPure, Category = "Redwood")
   bool IsProgressDirty() const {
     return bProgressDirty;
   }
@@ -243,6 +313,7 @@ public:
     bProgressDirty = false;
     bDataDirty = false;
     bAbilitySystemDirty = false;
+    ClearContainersDirtyState();
   }
 
 private:
@@ -284,4 +355,7 @@ private:
   bool bProgressDirty = false;
   bool bDataDirty = false;
   bool bAbilitySystemDirty = false;
+
+  TSet<FString> DirtyContainerIdSet;
+  TArray<FString> PendingDeletedContainerIds;
 };

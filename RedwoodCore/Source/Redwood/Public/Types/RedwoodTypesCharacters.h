@@ -56,6 +56,28 @@ struct FRedwoodCharacterBackend {
   USIOJsonObject *RedwoodData = nullptr;
 };
 
+// One record of the per-container persistence channel (see URedwoodCharacterComponent's
+// bUseContainers/ContainersVariableName/MarkContainersDirty). Unlike the fixed
+// EquippedInventory/NonequippedInventory/etc. channels above (one whole-blob USTRUCT field,
+// always resent in full when dirty), containers are transported as an ARRAY of these records so a
+// flush can send only the ones that actually changed (plus a deletedContainerIds list) to the
+// realm:characters:containers:upsert/load sidecar routes. Contents is deliberately opaque here
+// (an arbitrary JSON object) -- its shape is owned entirely by the game layer, matching how the
+// USIOJsonObject* fields on FRedwoodCharacterBackend above work.
+USTRUCT(BlueprintType)
+struct FRedwoodContainerRecord {
+  GENERATED_BODY()
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString ContainerId;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  uint8 Kind = 0;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  USIOJsonObject *Contents = nullptr;
+};
+
 USTRUCT(BlueprintType)
 struct FRedwoodListCharactersOutput {
   GENERATED_BODY()

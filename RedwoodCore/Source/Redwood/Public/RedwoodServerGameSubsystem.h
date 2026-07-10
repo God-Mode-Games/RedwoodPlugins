@@ -19,6 +19,8 @@
 class AGameModeBase;
 class URedwoodSyncItemAsset;
 class URedwoodSyncComponent;
+class URedwoodCharacterComponent;
+class URedwoodPlayerStateComponent;
 
 UCLASS(BlueprintType)
 class REDWOOD_API URedwoodServerGameSubsystem : public UGameInstanceSubsystem {
@@ -117,6 +119,27 @@ public:
     APlayerState *PlayerState, bool bForce
   );
   void FlushZoneData();
+
+  // Per-container persistence channel (see URedwoodCharacterComponent::bUseContainers). Sends
+  // ONLY CharacterComponent's currently-dirty container records (plus pending deletions) to
+  // realm:characters:containers:upsert, and clears the dirty state on send (fire-and-forget,
+  // matching the fixed channels' ClearDirtyFlags-after-building-the-payload semantics -- a
+  // failed send is not retried until the next mutation re-dirties something). No-op when the
+  // backend isn't in use (offline/PIE-disk saves don't carry container rows; the game's legacy
+  // dense-array leg is the fallback there).
+  void FlushContainersForCharacterComponent(
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    URedwoodCharacterComponent *CharacterComponent
+  );
+
+  // Issues the realm:characters:containers:load round trip for CharacterComponent's character
+  // and, on response, populates ContainersVariableName on the owning actor before broadcasting
+  // CharacterComponent->OnRedwoodContainersLoaded. Off-backend (PIE-disk), broadcasts
+  // immediately with an empty array so game code isn't left waiting forever.
+  void LoadContainersForCharacterComponent(
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    URedwoodCharacterComponent *CharacterComponent
+  );
 
   void InitialDataLoad(FRedwoodDelegate OnComplete);
 

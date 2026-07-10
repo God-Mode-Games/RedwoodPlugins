@@ -12,6 +12,7 @@
 #include "RedwoodSettings.h"
 #include "RedwoodSyncComponent.h"
 #include "RedwoodSyncItemAsset.h"
+#include "Types/RedwoodTypesCharacters.h"
 #include "Types/RedwoodTypesSync.h"
 
 #if WITH_EDITOR
@@ -1320,7 +1321,8 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
               !CharacterComponent->IsNonequippedInventoryDirty() &&
               !CharacterComponent->IsProgressDirty() &&
               !CharacterComponent->IsDataDirty() &&
-              !CharacterComponent->IsAbilitySystemDirty()) {
+              !CharacterComponent->IsAbilitySystemDirty() &&
+              !CharacterComponent->IsContainersDirty()) {
           continue;
         }
 
@@ -1473,6 +1475,17 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           }
         }
 
+        // Containers are NOT folded into CharacterObject/realm:characters:set:server -- that
+        // payload's schema has no "containers" field (Task 8 gave containers their own Container
+        // table + sidecar routes, deliberately outside the single-row PlayerCharacter blob so a
+        // one-bag change doesn't rewrite every other container). Send them out on their own
+        // channel instead; this also clears the dirty state, mirroring ClearDirtyFlags below.
+        if (bUseBackend && CharacterComponent->IsContainersDirty()) {
+          FlushContainersForCharacterComponent(
+            PlayerStateComponent, CharacterComponent
+          );
+        }
+
         CharacterComponent->ClearDirtyFlags();
       }
     }
@@ -1501,6 +1514,226 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
     );
     return TSharedPtr<FJsonObject>();
   }
+}
+
+// Resolves ContainersVariableName to a TArray<FRedwoodContainerRecord> UPROPERTY on the
+// CharacterComponent's data-holding object (the owning actor, or the component itself when
+// bStoreDataInActor is false -- same choice every other channel above makes). Returns nullptr
+// (with an error logged) if the property is missing or isn't the expected array-of-struct shape.
+static TArray<FRedwoodContainerRecord> *ResolveContainersRecordsArray(
+  URedwoodCharacterComponent *CharacterComponent
+) {
+  AActor *ComponentOwner = CharacterComponent->GetOwner();
+  UObject *Target = CharacterComponent->bStoreDataInActor
+    ? (UObject *)ComponentOwner
+    : (UObject *)CharacterComponent;
+
+  if (!IsValid(Target)) {
+    return nullptr;
+  }
+
+  FProperty *Prop =
+    Target->GetClass()->FindPropertyByName(*CharacterComponent->ContainersVariableName);
+  FArrayProperty *ArrayProp = CastField<FArrayProperty>(Prop);
+  if (!ArrayProp) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("%s variable not found (or not an array) in %s"),
+      *CharacterComponent->ContainersVariableName,
+      *Target->GetName()
+    );
+    return nullptr;
+  }
+
+  FStructProperty *InnerStructProp = CastField<FStructProperty>(ArrayProp->Inner);
+  if (!InnerStructProp || InnerStructProp->Struct != FRedwoodContainerRecord::StaticStruct()) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("%s variable in %s is not a TArray<FRedwoodContainerRecord>"),
+      *CharacterComponent->ContainersVariableName,
+      *Target->GetName()
+    );
+    return nullptr;
+  }
+
+  return ArrayProp->ContainerPtrToValuePtr<TArray<FRedwoodContainerRecord>>(Target);
+}
+
+void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  URedwoodCharacterComponent *CharacterComponent
+) {
+  if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    UE_LOG(
+      LogRedwood, Error, TEXT("Sidecar is not connected; cannot flush containers")
+    );
+    return;
+  }
+
+  TArray<FRedwoodContainerRecord> *RecordsArray =
+    ResolveContainersRecordsArray(CharacterComponent);
+  if (!RecordsArray) {
+    return;
+  }
+
+  const TSet<FString> &DirtyIds = CharacterComponent->GetDirtyContainerIds();
+  const TArray<FString> &DeletedIds = CharacterComponent->GetPendingDeletedContainerIds();
+
+  TArray<TSharedPtr<FJsonValue>> ContainersJsonArray;
+  for (const FRedwoodContainerRecord &Record : *RecordsArray) {
+    if (!DirtyIds.Contains(Record.ContainerId)) {
+      continue;
+    }
+
+    TSharedPtr<FJsonObject> Item = MakeShareable(new FJsonObject);
+    Item->SetStringField(TEXT("containerId"), Record.ContainerId);
+    Item->SetNumberField(TEXT("kind"), Record.Kind);
+    Item->SetObjectField(
+      TEXT("contents"),
+      Record.Contents && Record.Contents->IsValid()
+        ? Record.Contents->GetRootObject()
+        : MakeShareable(new FJsonObject)
+    );
+    ContainersJsonArray.Add(MakeShareable(new FJsonValueObject(Item)));
+  }
+
+  if (ContainersJsonArray.Num() != DirtyIds.Num()) {
+    // A dirty ContainerId that isn't in RecordsArray at all -- the game marked it dirty but
+    // never wrote a matching record into Containers before the flush ran. Not fatal (the
+    // deletion, if any, still goes out), but worth surfacing since it means that record is
+    // silently skipped this flush.
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT(
+        "FlushContainersForCharacterComponent: %d dirty ContainerId(s) had no matching record in %s (skipped)"
+      ),
+      DirtyIds.Num() - ContainersJsonArray.Num(),
+      *CharacterComponent->ContainersVariableName
+    );
+  }
+
+  TArray<TSharedPtr<FJsonValue>> DeletedJsonArray;
+  for (const FString &Id : DeletedIds) {
+    DeletedJsonArray.Add(MakeShareable(new FJsonValueString(Id)));
+  }
+
+  if (ContainersJsonArray.Num() == 0 && DeletedJsonArray.Num() == 0) {
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetField(TEXT("id"), MakeShareable(new FJsonValueNull()));
+  Payload->SetStringField(
+    TEXT("characterId"), PlayerStateComponent->RedwoodCharacter.Id
+  );
+  Payload->SetArrayField(TEXT("containers"), ContainersJsonArray);
+  Payload->SetArrayField(TEXT("deletedContainerIds"), DeletedJsonArray);
+
+  Sidecar->Emit(
+    TEXT("realm:characters:containers:upsert"),
+    Payload,
+    [](auto Response) {
+      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
+      FString Error = MessageStruct->GetStringField(TEXT("error"));
+      if (!Error.IsEmpty()) {
+        UE_LOG(
+          LogRedwood, Error, TEXT("Failed to flush containers: %s"), *Error
+        );
+      }
+    }
+  );
+}
+
+void URedwoodServerGameSubsystem::LoadContainersForCharacterComponent(
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  URedwoodCharacterComponent *CharacterComponent
+) {
+  TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = CharacterComponent;
+
+  if (!URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    // Offline/PIE-disk saves don't carry container rows (the on-disk character JSON has no
+    // "containers" field) -- broadcast immediately with whatever Containers already holds
+    // (nothing, on a fresh load) so game code isn't left waiting on an event that will never
+    // fire, and the legacy dense-array leg stays the effective path there.
+    CharacterComponent->OnRedwoodContainersLoaded.Broadcast();
+    return;
+  }
+
+  if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    UE_LOG(
+      LogRedwood, Error, TEXT("Sidecar is not connected; cannot load containers")
+    );
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetField(TEXT("id"), MakeShareable(new FJsonValueNull()));
+  Payload->SetStringField(
+    TEXT("characterId"), PlayerStateComponent->RedwoodCharacter.Id
+  );
+
+  Sidecar->Emit(
+    TEXT("realm:characters:containers:load"),
+    Payload,
+    [WeakCharacterComponent](auto Response) {
+      URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
+      if (!IsValid(CharacterComponent)) {
+        // The player disconnected (or the pawn/PlayerState was destroyed) while this request
+        // was in flight -- nothing left to populate.
+        return;
+      }
+
+      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
+      FString Error = MessageStruct->GetStringField(TEXT("error"));
+      if (!Error.IsEmpty()) {
+        UE_LOG(
+          LogRedwood, Error, TEXT("Failed to load containers: %s"), *Error
+        );
+        CharacterComponent->OnRedwoodContainersLoaded.Broadcast();
+        return;
+      }
+
+      TArray<FRedwoodContainerRecord> *RecordsArray =
+        ResolveContainersRecordsArray(CharacterComponent);
+      if (!RecordsArray) {
+        CharacterComponent->OnRedwoodContainersLoaded.Broadcast();
+        return;
+      }
+
+      RecordsArray->Reset();
+
+      const TArray<TSharedPtr<FJsonValue>> *ContainersJsonArray = nullptr;
+      if (MessageStruct->TryGetArrayField(TEXT("containers"), ContainersJsonArray)) {
+        RecordsArray->Reserve(ContainersJsonArray->Num());
+        for (const TSharedPtr<FJsonValue> &Value : *ContainersJsonArray) {
+          TSharedPtr<FJsonObject> Row = Value->AsObject();
+          if (!Row.IsValid()) {
+            continue;
+          }
+
+          FRedwoodContainerRecord Record;
+          Row->TryGetStringField(TEXT("containerId"), Record.ContainerId);
+          int32 KindValue = 0;
+          Row->TryGetNumberField(TEXT("kind"), KindValue);
+          Record.Kind = static_cast<uint8>(KindValue);
+
+          USIOJsonObject *Contents = NewObject<USIOJsonObject>();
+          const TSharedPtr<FJsonObject> *ContentsObject = nullptr;
+          if (Row->TryGetObjectField(TEXT("contents"), ContentsObject)) {
+            Contents->SetRootObject(*ContentsObject);
+          }
+          Record.Contents = Contents;
+
+          RecordsArray->Add(MoveTemp(Record));
+        }
+      }
+
+      CharacterComponent->OnRedwoodContainersLoaded.Broadcast();
+    }
+  );
 }
 
 void URedwoodServerGameSubsystem::InitialDataLoad(FRedwoodDelegate OnComplete) {

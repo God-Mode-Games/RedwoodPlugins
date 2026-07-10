@@ -4,7 +4,9 @@
 #include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodModule.h"
 #include "RedwoodPlayerStateComponent.h"
+#include "RedwoodServerGameSubsystem.h"
 
+#include "Engine/GameInstance.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/GameSession.h"
 #include "GameFramework/PlayerState.h"
@@ -561,6 +563,19 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
     MARK_PROPERTY_DIRTY_FROM_NAME(
       URedwoodCharacterComponent, RedwoodCharacterUpdateCount, this
     );
+
+    // Containers ride a separate realm:characters:containers:load round trip (they are not part
+    // of FRedwoodCharacterBackend / the payload OnRedwoodCharacterUpdated above was just built
+    // from), so this always completes strictly AFTER OnRedwoodCharacterUpdated for the same
+    // login/re-sync -- see OnRedwoodContainersLoaded's doc comment.
+    if (bUseContainers) {
+      if (UGameInstance *GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr) {
+        if (URedwoodServerGameSubsystem *ServerSubsystem =
+              GameInstance->GetSubsystem<URedwoodServerGameSubsystem>()) {
+          ServerSubsystem->LoadContainersForCharacterComponent(PlayerStateComponent, this);
+        }
+      }
+    }
   }
 }
 
