@@ -51,8 +51,9 @@ public:
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
   float PostBeginPlayDelay = 0.2f;
 
-  // Games bind component hooks (e.g. ShouldRetainCharacterBinding) through
-  // this.
+  // FORK(hollowed-oath): fork-added accessor (upstream keeps the component
+  // private with no getter). Games bind component hooks
+  // (e.g. ShouldRetainCharacterBinding) through this.
   URedwoodGameModeComponent *GetGameModeComponent() const {
     return GameModeComponent;
   }

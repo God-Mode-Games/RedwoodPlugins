@@ -11,6 +11,11 @@
 
 class URedwoodServerGameSubsystem;
 
+// FORK(hollowed-oath): fork-added delegate, not in upstream Redwood. Part of
+// the linkdead pawn retention feature (HollowedOath#1365 binds it from
+// AHollowedOathGameMode; pairs with the retainBinding field RedwoodBackend#18
+// adds to the player-left schema). Keep across upstream merges.
+//
 // Return true when this exiting player's character remains in-world after
 // the connection (e.g. a retained linkdead body): the player-left is still
 // emitted immediately — presence (party/chat/director) clears exactly as
@@ -86,9 +91,10 @@ public:
   UFUNCTION(BlueprintCallable, Category = "Redwood|GameMode")
   void OnGameModeLogout(AGameModeBase *GameMode, AController *Controller);
 
-  // Optional gate a game can bind for players whose in-world presence
-  // outlives the connection (e.g. linkdead body retention). Unbound = stock
-  // behavior.
+  // FORK(hollowed-oath): fork-added member (see the delegate declaration
+  // above). Optional gate a game can bind for players whose in-world
+  // presence outlives the connection (e.g. linkdead body retention).
+  // Unbound = stock behavior.
   FRedwoodShouldRetainCharacterBinding ShouldRetainCharacterBinding;
 
   UFUNCTION()

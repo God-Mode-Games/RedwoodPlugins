@@ -118,6 +118,11 @@ public:
   );
   void FlushZoneData();
 
+  // FORK(hollowed-oath): fork-added API (with EmitPlayerLeft below), not in
+  // upstream Redwood. Part of linkdead pawn retention (HollowedOath#1365,
+  // called from ULinkdeadPawnManager::FlushAndEndPresence). Keep across
+  // upstream merges.
+  //
   // Persist a detached pawn's character data by explicit identity. For pawns
   // that outlive their player's logout (e.g. a retained "linkdead" body): the
   // normal flush only reaches a pawn through PlayerState->GetPawn(), which no
@@ -145,6 +150,9 @@ public:
     bool bReleaseBindingWhenSettled = false
   );
 
+  // FORK(hollowed-oath): fork-added API (see FlushDetachedCharacterData
+  // above). Keep across upstream merges.
+  //
   // Emit a (second) player-left that releases the backend's
   // character->instance write binding for a character whose logout-time
   // player-left carried retainBinding (URedwoodGameModeComponent's

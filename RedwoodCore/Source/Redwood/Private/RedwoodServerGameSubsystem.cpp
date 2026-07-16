@@ -1118,6 +1118,9 @@ void URedwoodServerGameSubsystem::FlushPlayerCharacterData(
   }
 }
 
+// FORK(hollowed-oath): fork-added function (with EmitPlayerLeft below), not
+// in upstream Redwood — linkdead pawn retention support. See the header for
+// the contract; keep both across upstream merges.
 void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
   APawn *Pawn,
   const FString &CharacterId,
@@ -1325,6 +1328,7 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
   );
 }
 
+// FORK(hollowed-oath): fork-added function — see FlushDetachedCharacterData.
 void URedwoodServerGameSubsystem::EmitPlayerLeft(
   const FString &PlayerId, const FString &CharacterId
 ) {

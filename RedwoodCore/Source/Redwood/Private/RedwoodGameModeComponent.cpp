@@ -175,6 +175,11 @@ void URedwoodGameModeComponent::OnGameModeLogout(
 
     if (URedwoodCommonGameSubsystem::ShouldUseBackend(GameMode->GetWorld())) {
       if (Sidecar.IsValid() && Sidecar->bIsConnected) {
+        // FORK(hollowed-oath): fork-added block inside the otherwise-stock
+        // logout emit (upstream emits the same player-left with no flag).
+        // On upstream merge, keep this evaluation + the conditional
+        // retainBinding field on the payload below.
+        //
         // A game whose character stays in-world past the connection (e.g.
         // linkdead body retention) asks the backend to keep the
         // character->instance write binding: releasing it now would revoke
