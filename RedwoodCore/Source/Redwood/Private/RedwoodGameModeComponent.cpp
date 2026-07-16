@@ -173,18 +173,19 @@ void URedwoodGameModeComponent::OnGameModeLogout(
       ServerSubsystem->FlushPlayerCharacterData(PlayerFlushArray, true);
     }
 
-    // A game whose character stays in-world past the connection (e.g.
-    // linkdead body retention) asks the backend to keep the
-    // character->instance write binding: releasing it now would revoke the
-    // character writes the game still owes (its final flush). Presence
-    // processing (party/chat/director) is unaffected — the player-left is
-    // always emitted here. The game releases the binding later via
-    // URedwoodServerGameSubsystem::EmitPlayerLeft.
-    const bool bRetainBinding = ShouldRetainCharacterBinding.IsBound() &&
-      ShouldRetainCharacterBinding.Execute(PlayerController);
-
     if (URedwoodCommonGameSubsystem::ShouldUseBackend(GameMode->GetWorld())) {
       if (Sidecar.IsValid() && Sidecar->bIsConnected) {
+        // A game whose character stays in-world past the connection (e.g.
+        // linkdead body retention) asks the backend to keep the
+        // character->instance write binding: releasing it now would revoke
+        // the character writes the game still owes (its final flush).
+        // Presence processing (party/chat/director) is unaffected — the
+        // player-left is always emitted here. The game releases the binding
+        // later via URedwoodServerGameSubsystem::EmitPlayerLeft. Evaluated
+        // only when a player-left will actually be emitted.
+        const bool bRetainBinding = ShouldRetainCharacterBinding.IsBound() &&
+          ShouldRetainCharacterBinding.Execute(PlayerController);
+
         TSharedPtr<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
         JsonObject->SetStringField(
           TEXT("playerId"), PlayerStateComponent->RedwoodCharacter.PlayerId

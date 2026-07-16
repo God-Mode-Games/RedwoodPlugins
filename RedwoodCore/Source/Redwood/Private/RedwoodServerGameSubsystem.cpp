@@ -1119,10 +1119,45 @@ void URedwoodServerGameSubsystem::FlushPlayerCharacterData(
 }
 
 void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
-  APawn *Pawn, const FString &CharacterId, const FString &PlayerId
+  APawn *Pawn,
+  const FString &CharacterId,
+  const FString &PlayerId,
+  bool bReleaseBindingWhenSettled
 ) {
   UWorld *World = GetWorld();
-  if (!IsValid(Pawn) || CharacterId.IsEmpty() || !IsValid(World)) {
+  if (!IsValid(World) || CharacterId.IsEmpty()) {
+    return;
+  }
+
+  bool bUseBackend = URedwoodCommonGameSubsystem::ShouldUseBackend(World);
+
+  // Without the sidecar nothing can be delivered — neither the flush nor the
+  // binding-releasing player-left. Bail before serializing anything and
+  // WITHOUT clearing dirty flags, so the unsent data stays flushable.
+  if (bUseBackend && (!Sidecar.IsValid() || !Sidecar->bIsConnected)) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT(
+        "FlushDetachedCharacterData: sidecar not connected; dropping flush%s for character %s"
+      ),
+      bReleaseBindingWhenSettled ? TEXT(" and binding release") : TEXT(""),
+      *CharacterId
+    );
+    return;
+  }
+
+  // Skip paths that put no write in flight have nothing to order the release
+  // behind, so the caller-requested binding release can go out immediately.
+  auto ReleaseBindingNow =
+    [this, &PlayerId, &CharacterId, bReleaseBindingWhenSettled]() {
+      if (bReleaseBindingWhenSettled) {
+        EmitPlayerLeft(PlayerId, CharacterId);
+      }
+    };
+
+  if (!IsValid(Pawn)) {
+    ReleaseBindingNow();
     return;
   }
 
@@ -1137,6 +1172,7 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
       ),
       *Pawn->GetName()
     );
+    ReleaseBindingNow();
     return;
   }
 
@@ -1153,10 +1189,9 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
       *CharacterComponent->RedwoodCharacterId,
       *CharacterId
     );
+    ReleaseBindingNow();
     return;
   }
-
-  bool bUseBackend = URedwoodCommonGameSubsystem::ShouldUseBackend(World);
 
   TSharedPtr<FJsonObject> CharacterObject = MakeShareable(new FJsonObject);
   CharacterObject->SetStringField(TEXT("playerId"), PlayerId);
@@ -1233,8 +1268,6 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
     TEXT("abilitySystem")
   );
 
-  CharacterComponent->ClearDirtyFlags();
-
   if (bUseBackend) {
     if (SerializedFieldCount == 0) {
       UE_LOG(
@@ -1245,17 +1278,7 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
         ),
         *CharacterId
       );
-      return;
-    }
-    if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
-      UE_LOG(
-        LogRedwood,
-        Error,
-        TEXT(
-          "FlushDetachedCharacterData: sidecar not connected; dropping flush for character %s"
-        ),
-        *CharacterId
-      );
+      ReleaseBindingNow();
       return;
     }
 
@@ -1264,10 +1287,34 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
     CharactersArray.Add(MakeShareable(new FJsonValueObject(CharacterObject)));
     Payload->SetArrayField(TEXT("characters"), CharactersArray);
     Payload->SetStringField(TEXT("id"), TEXT("game-server"));
-    Sidecar->Emit(TEXT("realm:characters:set:server"), Payload);
+    if (bReleaseBindingWhenSettled) {
+      // Same-socket emission order does NOT serialize the backend's async
+      // handlers, so a player-left emitted right after the flush could be
+      // processed first and release the binding the flush still needs.
+      // Chain the release on the flush acknowledgment instead — the sidecar
+      // only acks after the realm has fully processed the write.
+      TWeakObjectPtr<URedwoodServerGameSubsystem> WeakThis(this);
+      Sidecar->Emit(
+        TEXT("realm:characters:set:server"),
+        Payload,
+        [WeakThis, PlayerId, CharacterId](auto Response) {
+          if (WeakThis.IsValid()) {
+            WeakThis->EmitPlayerLeft(PlayerId, CharacterId);
+          }
+        }
+      );
+    } else {
+      Sidecar->Emit(TEXT("realm:characters:set:server"), Payload);
+    }
+    // Clear only once a write is actually in flight: clearing before a
+    // dropped emit would silently lose the data forever (nothing would ever
+    // look dirty again).
+    CharacterComponent->ClearDirtyFlags();
   } else {
     CharacterObject->SetStringField(TEXT("id"), CharacterId);
     URedwoodCommonGameSubsystem::SaveCharacterJsonToDisk(CharacterObject);
+    CharacterComponent->ClearDirtyFlags();
+    ReleaseBindingNow();
   }
 
   UE_LOG(

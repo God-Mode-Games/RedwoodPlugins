@@ -51,7 +51,8 @@ public:
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
   float PostBeginPlayDelay = 0.2f;
 
-  // Games bind component hooks (e.g. ShouldDeferPlayerLeft) through this.
+  // Games bind component hooks (e.g. ShouldRetainCharacterBinding) through
+  // this.
   URedwoodGameModeComponent *GetGameModeComponent() const {
     return GameModeComponent;
   }
