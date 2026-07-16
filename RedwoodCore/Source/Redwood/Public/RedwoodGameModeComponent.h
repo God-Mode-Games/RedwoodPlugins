@@ -11,12 +11,15 @@
 
 class URedwoodServerGameSubsystem;
 
-// Return true to suppress the automatic player-left notification for this
-// exiting player; the game then owns emitting it later (via
-// URedwoodServerGameSubsystem::EmitPlayerLeft) when the player's presence
-// actually ends. The character-data flush at logout is unaffected.
+// Return true when this exiting player's character remains in-world after
+// the connection (e.g. a retained linkdead body): the player-left is still
+// emitted immediately — presence (party/chat/director) clears exactly as
+// stock — but it carries retainBinding, so the backend keeps the
+// character->instance write binding alive for the game's final flush. The
+// game then calls URedwoodServerGameSubsystem::EmitPlayerLeft (no flag) when
+// the character actually leaves the world, releasing the binding.
 DECLARE_DELEGATE_RetVal_OneParam(
-  bool, FRedwoodShouldDeferPlayerLeft, APlayerController *
+  bool, FRedwoodShouldRetainCharacterBinding, APlayerController *
 );
 
 UCLASS()
@@ -83,10 +86,10 @@ public:
   UFUNCTION(BlueprintCallable, Category = "Redwood|GameMode")
   void OnGameModeLogout(AGameModeBase *GameMode, AController *Controller);
 
-  // Optional gate a game can bind to defer the player-left notification for
-  // players whose in-world presence outlives the connection (e.g. linkdead
-  // body retention). Unbound = stock behavior (emit at logout).
-  FRedwoodShouldDeferPlayerLeft ShouldDeferPlayerLeft;
+  // Optional gate a game can bind for players whose in-world presence
+  // outlives the connection (e.g. linkdead body retention). Unbound = stock
+  // behavior.
+  FRedwoodShouldRetainCharacterBinding ShouldRetainCharacterBinding;
 
   UFUNCTION()
   void FlushPersistence();

@@ -130,12 +130,13 @@ public:
     APawn *Pawn, const FString &CharacterId, const FString &PlayerId
   );
 
-  // Notify the backend that a character's presence on this server ended.
-  // URedwoodGameModeComponent emits this automatically on logout unless the
-  // game deferred it (ShouldDeferPlayerLeft); a deferring game calls this when
-  // the player's presence actually ends. Emitted on the same sidecar socket as
-  // FlushDetachedCharacterData so a final flush ordered before it is processed
-  // before the backend releases the character's write binding.
+  // Emit a (second) player-left that releases the backend's
+  // character->instance write binding for a character whose logout-time
+  // player-left carried retainBinding (URedwoodGameModeComponent's
+  // ShouldRetainCharacterBinding gate). Call when the character actually
+  // leaves the world. Emitted on the same sidecar socket as
+  // FlushDetachedCharacterData so a final flush ordered before it is
+  // processed before the binding is released.
   UFUNCTION(BlueprintCallable, Category = "Redwood")
   void EmitPlayerLeft(const FString &PlayerId, const FString &CharacterId);
 

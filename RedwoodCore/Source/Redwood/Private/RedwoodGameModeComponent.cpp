@@ -173,18 +173,17 @@ void URedwoodGameModeComponent::OnGameModeLogout(
       ServerSubsystem->FlushPlayerCharacterData(PlayerFlushArray, true);
     }
 
-    // A game that keeps the player's presence alive past the connection (e.g.
-    // linkdead body retention) defers this notification and emits it later via
-    // URedwoodServerGameSubsystem::EmitPlayerLeft; sending it now would
-    // release the backend's character->instance binding while the character is
-    // still on this server (and revoke its remaining character writes).
-    const bool bDeferPlayerLeft = ShouldDeferPlayerLeft.IsBound() &&
-      ShouldDeferPlayerLeft.Execute(PlayerController);
+    // A game whose character stays in-world past the connection (e.g.
+    // linkdead body retention) asks the backend to keep the
+    // character->instance write binding: releasing it now would revoke the
+    // character writes the game still owes (its final flush). Presence
+    // processing (party/chat/director) is unaffected — the player-left is
+    // always emitted here. The game releases the binding later via
+    // URedwoodServerGameSubsystem::EmitPlayerLeft.
+    const bool bRetainBinding = ShouldRetainCharacterBinding.IsBound() &&
+      ShouldRetainCharacterBinding.Execute(PlayerController);
 
-    if (
-      !bDeferPlayerLeft &&
-      URedwoodCommonGameSubsystem::ShouldUseBackend(GameMode->GetWorld())
-    ) {
+    if (URedwoodCommonGameSubsystem::ShouldUseBackend(GameMode->GetWorld())) {
       if (Sidecar.IsValid() && Sidecar->bIsConnected) {
         TSharedPtr<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
         JsonObject->SetStringField(
@@ -193,6 +192,9 @@ void URedwoodGameModeComponent::OnGameModeLogout(
         JsonObject->SetStringField(
           TEXT("characterId"), PlayerStateComponent->RedwoodCharacter.Id
         );
+        if (bRetainBinding) {
+          JsonObject->SetBoolField(TEXT("retainBinding"), true);
+        }
         Sidecar->Emit(
           TEXT("realm:servers:player-left:game-server-to-sidecar"), JsonObject
         );
