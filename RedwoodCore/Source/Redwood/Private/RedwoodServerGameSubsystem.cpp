@@ -1308,6 +1308,20 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
         );
       }
 
+      // This branch treats the PlayerState's own character snapshot as authoritative and skips
+      // the character components entirely, so offline it must carry the snapshot's containers
+      // across too -- the disk save is a whole-file rewrite, and omitting the key here would drop
+      // every container row the character had. The backend leg needs nothing: its rows live in
+      // the Container table, untouched by realm:characters:set:server.
+      if (!bUseBackend) {
+        CharacterObject->SetArrayField(
+          TEXT("containers"),
+          URedwoodCommonGameSubsystem::SerializeContainerRecords(
+            PlayerStateComponent->RedwoodCharacter.Containers
+          )
+        );
+      }
+
       PlayerStateComponent->OnRedwoodCharacterUpdated.Broadcast();
 
       bIsDirty = true;
@@ -1480,14 +1494,26 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           }
         }
 
-        // Containers are NOT folded into CharacterObject/realm:characters:set:server -- that
-        // payload's schema has no "containers" field (Task 8 gave containers their own Container
-        // table + sidecar routes, deliberately outside the single-row PlayerCharacter blob so a
-        // one-bag change doesn't rewrite every other container). Send them out on their own
-        // channel instead; this also clears the dirty state, mirroring ClearDirtyFlags below.
-        if (bUseBackend && CharacterComponent->IsContainersDirty()) {
-          FlushContainersForCharacterComponent(
-            PlayerStateComponent, CharacterComponent
+        // Containers are NOT folded into CharacterObject when it's headed for
+        // realm:characters:set:server -- that payload's schema has no "containers" field (Task 8
+        // gave containers their own Container table + sidecar routes, deliberately outside the
+        // single-row PlayerCharacter blob so a one-bag change doesn't rewrite every other
+        // container). Send them out on their own channel instead; this also clears the dirty
+        // state, mirroring ClearDirtyFlags below.
+        //
+        // Offline/PIE has neither that route nor a Container table: CharacterObject IS the
+        // character's JSON file (FlushPlayerCharacterData writes it straight to disk), so the
+        // rows go inline there instead. Without this the file would carry only the legacy flat
+        // nonequippedInventory blob and every load would degrade to the legacy split path.
+        if (bUseBackend) {
+          if (CharacterComponent->IsContainersDirty()) {
+            FlushContainersForCharacterComponent(
+              PlayerStateComponent, CharacterComponent
+            );
+          }
+        } else {
+          WriteOfflineContainersToCharacterObject(
+            CharacterObject, CharacterComponent
           );
         }
 
@@ -1567,16 +1593,9 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
       continue;
     }
 
-    TSharedPtr<FJsonObject> Item = MakeShareable(new FJsonObject);
-    Item->SetStringField(TEXT("containerId"), Record.ContainerId);
-    Item->SetNumberField(TEXT("kind"), Record.Kind);
-    Item->SetObjectField(
-      TEXT("contents"),
-      Record.Contents && Record.Contents->IsValid()
-        ? Record.Contents->GetRootObject()
-        : MakeShareable(new FJsonObject)
-    );
-    ContainersJsonArray.Add(MakeShareable(new FJsonValueObject(Item)));
+    ContainersJsonArray.Add(MakeShareable(new FJsonValueObject(
+      URedwoodCommonGameSubsystem::SerializeContainerRecord(Record)
+    )));
     SentUpsertIds.Add(TPair<FString, uint64>(Record.ContainerId, *Generation));
   }
 
@@ -1645,6 +1664,52 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
       CharacterComponent->AckContainersFlushed(SentUpsertIds, SentDeletedIds);
     }
   );
+}
+
+void URedwoodServerGameSubsystem::WriteOfflineContainersToCharacterObject(
+  TSharedPtr<FJsonObject> CharacterObject,
+  URedwoodCharacterComponent *CharacterComponent
+) {
+  if (!CharacterComponent->bUseContainers) {
+    return;
+  }
+
+  TArray<FRedwoodContainerRecord> *RecordsArray =
+    URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(CharacterComponent);
+  if (!RecordsArray) {
+    // The game's ContainersVariableName property is missing or the wrong type -- a hard
+    // misconfiguration that breaks the backend leg identically, already logged by
+    // ResolveContainersRecordsArray. There is no set of records to write, and nothing better to
+    // fall back to: SaveCharacterJsonToDisk rewrites the file wholesale, so the previous rows are
+    // gone either way.
+    return;
+  }
+
+  // Honor pending deletions even though game code is expected to have already removed the record
+  // from RecordsArray -- this leg writes the whole array verbatim, so a record left behind after
+  // its deletion was marked would silently resurrect the bag on the next load.
+  const TMap<FString, uint64> &DeletedGenerations =
+    CharacterComponent->GetPendingDeletedContainerGenerations();
+
+  TArray<FRedwoodContainerRecord> RecordsToWrite;
+  RecordsToWrite.Reserve(RecordsArray->Num());
+  for (const FRedwoodContainerRecord &Record : *RecordsArray) {
+    if (!DeletedGenerations.Contains(Record.ContainerId)) {
+      RecordsToWrite.Add(Record);
+    }
+  }
+
+  CharacterObject->SetArrayField(
+    TEXT("containers"),
+    URedwoodCommonGameSubsystem::SerializeContainerRecords(RecordsToWrite)
+  );
+
+  // Safe to clear outright, unlike the sidecar leg's generation-matched ack: the disk write is
+  // synchronous and unconditionally rewrites the complete set, so no id needs to stay marked for
+  // a later retry and no re-dirty can race an in-flight send. Without this, the dirty and
+  // pending-deletion maps would grow for the whole session (ClearDirtyFlags deliberately leaves
+  // container state alone) and a deleted id would suppress its own row forever.
+  CharacterComponent->ClearContainersDirtyState();
 }
 
 void URedwoodServerGameSubsystem::InitialDataLoad(FRedwoodDelegate OnComplete) {

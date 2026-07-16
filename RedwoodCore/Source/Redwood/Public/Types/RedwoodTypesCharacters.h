@@ -83,8 +83,10 @@ struct FRedwoodCharacterBackend {
   // realm:characters:containers:load call -- this is what lets
   // URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() populate
   // ContainersVariableName BEFORE broadcasting OnRedwoodCharacterUpdated, so game code never sees
-  // a character-updated event with containers still missing. Empty for offline/PIE-disk saves
-  // (the on-disk character JSON has no "containers" field).
+  // a character-updated event with containers still missing. Offline/PIE-disk saves populate this
+  // the same way, from the "containers" array the on-disk character JSON carries inline (there is
+  // no Container table to read there) -- see URedwoodCommonGameSubsystem::SaveCharacterToDisk and
+  // URedwoodServerGameSubsystem::WriteOfflineContainersToCharacterObject.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   TArray<FRedwoodContainerRecord> Containers;
 };

@@ -112,6 +112,20 @@ public:
     const TArray<TSharedPtr<FJsonValue>> &ContainersJsonArray
   );
 
+  // Serializes one record into that same wire {containerId, kind, contents} shape -- the exact
+  // inverse of ParseContainerRecords. Shared by the backend flush
+  // (realm:characters:containers:upsert) and the offline/PIE disk save so the two legs cannot
+  // drift: a character JSON written offline and a backend container row stay interchangeable.
+  static TSharedPtr<FJsonObject> SerializeContainerRecord(
+    const FRedwoodContainerRecord &Record
+  );
+
+  // Serializes a whole set of records into a wire "containers" array via
+  // SerializeContainerRecord.
+  static TArray<TSharedPtr<FJsonValue>> SerializeContainerRecords(
+    const TArray<FRedwoodContainerRecord> &Records
+  );
+
   // Resolves CharacterComponent->ContainersVariableName to a TArray<FRedwoodContainerRecord>
   // UPROPERTY on the component's data-holding object (the owning actor, or the component itself
   // when bStoreDataInActor is false -- same choice every other channel makes). Returns nullptr

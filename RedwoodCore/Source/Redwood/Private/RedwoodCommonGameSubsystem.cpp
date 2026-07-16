@@ -114,6 +114,14 @@ void URedwoodCommonGameSubsystem::SaveCharacterToDisk(
     );
   }
 
+  // Offline/PIE has no Container table, so the character JSON carries the rows itself. Written
+  // unconditionally (an empty array included) because this is a whole-file rewrite: omitting the
+  // key on a character whose containers were all removed would leave the previous file's rows to
+  // be re-parsed on the next load.
+  JsonObject->SetArrayField(
+    TEXT("containers"), SerializeContainerRecords(Character.Containers)
+  );
+
   SaveCharacterJsonToDisk(JsonObject);
 }
 
@@ -257,6 +265,17 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
     Character.RedwoodData->SetRootObject(*RedwoodData);
   }
 
+  // Containers live INSIDE the character object only for offline/PIE-disk saves, where the
+  // character JSON file is the whole persistence store (see SaveCharacterToDisk). The backend
+  // keeps container rows in their own table and delivers them as a SIBLING of "character" in the
+  // player-auth response, so this field is simply absent there and RunSidecarPlayerAuth assigns
+  // Character.Containers from that sibling array after calling us -- both legs land in the same
+  // place, parsed by the same code.
+  const TArray<TSharedPtr<FJsonValue>> *Containers = nullptr;
+  if (CharacterObj->TryGetArrayField(TEXT("containers"), Containers)) {
+    Character.Containers = ParseContainerRecords(*Containers);
+  }
+
   return Character;
 }
 
@@ -289,6 +308,40 @@ TArray<FRedwoodContainerRecord> URedwoodCommonGameSubsystem::ParseContainerRecor
   }
 
   return Records;
+}
+
+TSharedPtr<FJsonObject> URedwoodCommonGameSubsystem::SerializeContainerRecord(
+  const FRedwoodContainerRecord &Record
+) {
+  TSharedPtr<FJsonObject> Row = MakeShareable(new FJsonObject);
+  Row->SetStringField(TEXT("containerId"), Record.ContainerId);
+  Row->SetNumberField(TEXT("kind"), Record.Kind);
+  // A record with no contents still serializes an (empty) object rather than omitting the field,
+  // so ParseContainerRecords reads back a record that compares equal to the one written.
+  Row->SetObjectField(
+    TEXT("contents"),
+    Record.Contents && Record.Contents->IsValid()
+      ? Record.Contents->GetRootObject()
+      : MakeShareable(new FJsonObject)
+  );
+
+  return Row;
+}
+
+TArray<TSharedPtr<FJsonValue>>
+URedwoodCommonGameSubsystem::SerializeContainerRecords(
+  const TArray<FRedwoodContainerRecord> &Records
+) {
+  TArray<TSharedPtr<FJsonValue>> ContainersJsonArray;
+  ContainersJsonArray.Reserve(Records.Num());
+
+  for (const FRedwoodContainerRecord &Record : Records) {
+    ContainersJsonArray.Add(
+      MakeShareable(new FJsonValueObject(SerializeContainerRecord(Record)))
+    );
+  }
+
+  return ContainersJsonArray;
 }
 
 TArray<FRedwoodContainerRecord> *
