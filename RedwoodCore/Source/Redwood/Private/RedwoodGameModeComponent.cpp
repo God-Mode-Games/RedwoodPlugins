@@ -173,7 +173,18 @@ void URedwoodGameModeComponent::OnGameModeLogout(
       ServerSubsystem->FlushPlayerCharacterData(PlayerFlushArray, true);
     }
 
-    if (URedwoodCommonGameSubsystem::ShouldUseBackend(GameMode->GetWorld())) {
+    // A game that keeps the player's presence alive past the connection (e.g.
+    // linkdead body retention) defers this notification and emits it later via
+    // URedwoodServerGameSubsystem::EmitPlayerLeft; sending it now would
+    // release the backend's character->instance binding while the character is
+    // still on this server (and revoke its remaining character writes).
+    const bool bDeferPlayerLeft = ShouldDeferPlayerLeft.IsBound() &&
+      ShouldDeferPlayerLeft.Execute(PlayerController);
+
+    if (
+      !bDeferPlayerLeft &&
+      URedwoodCommonGameSubsystem::ShouldUseBackend(GameMode->GetWorld())
+    ) {
       if (Sidecar.IsValid() && Sidecar->bIsConnected) {
         TSharedPtr<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
         JsonObject->SetStringField(

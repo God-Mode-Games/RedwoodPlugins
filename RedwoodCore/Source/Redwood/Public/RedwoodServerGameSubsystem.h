@@ -118,6 +118,27 @@ public:
   );
   void FlushZoneData();
 
+  // Persist a detached pawn's character data by explicit identity. For pawns
+  // that outlive their player's logout (e.g. a retained "linkdead" body): the
+  // normal flush only reaches a pawn through PlayerState->GetPawn(), which no
+  // longer exists for these. Serializes every field group the pawn's
+  // URedwoodCharacterComponent has enabled and emits
+  // realm:characters:set:server (backend) or saves to disk (offline). The
+  // component's RedwoodCharacterId must match CharacterId or nothing is sent.
+  UFUNCTION(BlueprintCallable, Category = "Redwood")
+  void FlushDetachedCharacterData(
+    APawn *Pawn, const FString &CharacterId, const FString &PlayerId
+  );
+
+  // Notify the backend that a character's presence on this server ended.
+  // URedwoodGameModeComponent emits this automatically on logout unless the
+  // game deferred it (ShouldDeferPlayerLeft); a deferring game calls this when
+  // the player's presence actually ends. Emitted on the same sidecar socket as
+  // FlushDetachedCharacterData so a final flush ordered before it is processed
+  // before the backend releases the character's write binding.
+  UFUNCTION(BlueprintCallable, Category = "Redwood")
+  void EmitPlayerLeft(const FString &PlayerId, const FString &CharacterId);
+
   void InitialDataLoad(FRedwoodDelegate OnComplete);
 
   void RegisterSyncComponent(
