@@ -6,6 +6,10 @@
 
 #include "RedwoodTypesCharacters.generated.h"
 
+// FORK(hollowed-oath) BEGIN: FRedwoodContainerRecord, the transport type for HollowedOath's
+// per-bag inventory. Entirely fork-added; no upstream counterpart. Its field set defines the wire
+// {containerId, kind, contents} contract shared by the backend Container table and the offline JSON.
+// Must stay declared ABOVE FRedwoodCharacterBackend (its Containers array needs the complete type).
 // One record of the per-container persistence channel (see URedwoodCharacterComponent's
 // bUseContainers/ContainersVariableName/MarkContainersDirty). Unlike the fixed
 // EquippedInventory/NonequippedInventory/etc. channels below (one whole-blob USTRUCT field,
@@ -28,6 +32,7 @@ struct FRedwoodContainerRecord {
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   USIOJsonObject *Contents = nullptr;
 };
+// FORK(hollowed-oath) END
 
 USTRUCT(BlueprintType)
 struct FRedwoodCharacterBackend {
@@ -78,6 +83,9 @@ struct FRedwoodCharacterBackend {
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   USIOJsonObject *RedwoodData = nullptr;
 
+  // FORK(hollowed-oath) BEGIN: fork-added Containers field on the otherwise-upstream character
+  // struct. This is the load-leg carrier -- rows ride the character's own round trip, letting the
+  // component populate the game array before OnRedwoodCharacterUpdated. Preserve on merge.
   // Container rows for this character, delivered in the SAME round trip as the rest of this
   // struct (the player-auth / character-load response) rather than a separate later-arriving
   // realm:characters:containers:load call -- this is what lets
@@ -89,6 +97,7 @@ struct FRedwoodCharacterBackend {
   // URedwoodServerGameSubsystem::AppendOfflineContainerRows.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   TArray<FRedwoodContainerRecord> Containers;
+  // FORK(hollowed-oath) END
 };
 
 USTRUCT(BlueprintType)

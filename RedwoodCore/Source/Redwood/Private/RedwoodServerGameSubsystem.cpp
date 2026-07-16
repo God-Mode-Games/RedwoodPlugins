@@ -12,6 +12,8 @@
 #include "RedwoodSettings.h"
 #include "RedwoodSyncComponent.h"
 #include "RedwoodSyncItemAsset.h"
+// FORK(hollowed-oath): FRedwoodContainerRecord lives here; added for the container flush/offline
+// helpers below.
 #include "Types/RedwoodTypesCharacters.h"
 #include "Types/RedwoodTypesSync.h"
 
@@ -1308,6 +1310,10 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
         );
       }
 
+      // FORK(hollowed-oath) BEGIN: offline container carry-across in the "PlayerState snapshot is
+      // authoritative" branch (fork-added; this whole !bUseBackend inline-containers write has no
+      // upstream counterpart). Merge must keep it gated on !bUseBackend -- the backend leg's rows
+      // live in the Container table and must NOT be folded into realm:characters:set:server.
       // This branch treats the PlayerState's own character snapshot as authoritative and skips
       // the character components entirely, so offline it must carry the snapshot's containers
       // across too -- the disk save is a whole-file rewrite, and omitting the key here would drop
@@ -1321,11 +1327,15 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           )
         );
       }
+      // FORK(hollowed-oath) END
 
       PlayerStateComponent->OnRedwoodCharacterUpdated.Broadcast();
 
       bIsDirty = true;
     } else {
+      // FORK(hollowed-oath): offline-only accumulator for the union of every character component's
+      // container rows (written once after the loop, below). Fork-added -- the backend leg sends
+      // each component's rows on its own sidecar channel and needs no accumulator.
       // Offline only: the union of every character component's container rows, written to the
       // single "containers" field after the loop below (the backend leg sends each component's
       // rows on its own sidecar channel instead, so it needs no accumulator).
@@ -1342,6 +1352,8 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
               !CharacterComponent->IsProgressDirty() &&
               !CharacterComponent->IsDataDirty() &&
               !CharacterComponent->IsAbilitySystemDirty() &&
+              // FORK(hollowed-oath): containers added to the "nothing dirty, skip this component"
+              // guard so a container-only change still forces a flush. Keep in the AND-chain.
               !CharacterComponent->IsContainersDirty()) {
           continue;
         }
@@ -1364,6 +1376,9 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
             Pawn ? *Pawn->GetName() : TEXT("<none>")
           );
           CharacterComponent->ClearDirtyFlags();
+          // FORK(hollowed-oath): container dirty state is NOT touched by ClearDirtyFlags (it clears
+          // only on a send's ack), so the identity-mismatch skip path must clear it explicitly or
+          // this component's containers stay dirty forever. Fork-added; keep alongside the skip.
           // ClearDirtyFlags() deliberately leaves containers alone (they only clear on a
           // send's ack) -- but this component is never going to be flushed at all (it's
           // being skipped outright), so there is no in-flight send to race; clear its
@@ -1500,6 +1515,13 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           }
         }
 
+        // FORK(hollowed-oath) BEGIN: per-component container flush dispatch. Fork-added; upstream
+        // has neither branch. Backend leg routes dirty rows out on their OWN sidecar channel
+        // (FlushContainersForCharacterComponent) and deliberately does NOT fold "containers" into
+        // the realm:characters:set:server payload. Offline leg appends the rows into
+        // CharacterObject for the on-disk JSON. Merge must preserve the bUseBackend split and keep
+        // this BEFORE ClearDirtyFlags (which does not clear container state -- the flush's ack /
+        // the offline append do).
         // Containers are NOT folded into CharacterObject when it's headed for
         // realm:characters:set:server -- that payload's schema has no "containers" field (Task 8
         // gave containers their own Container table + sidecar routes, deliberately outside the
@@ -1522,10 +1544,13 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
                    )) {
           bHasOfflineContainerRows = true;
         }
+        // FORK(hollowed-oath) END
 
         CharacterComponent->ClearDirtyFlags();
       }
 
+      // FORK(hollowed-oath): write the accumulated offline container rows once (fork-added). Guarded
+      // so a game not using containers keeps the field absent rather than gaining an empty array.
       // One "containers" field, written once from every component's rows -- see
       // AppendOfflineContainerRows. Only written when a component actually owns containers, so a
       // game not using them keeps the field absent rather than gaining an empty array.
@@ -1562,6 +1587,17 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
   }
 }
 
+// FORK(hollowed-oath) BEGIN: container flush + offline-append helpers, entirely fork-added (no
+// upstream counterpart). FlushContainersForCharacterComponent is the per-bag persistence channel:
+// it sends ONLY dirty records + pending deletions to realm:characters:containers:upsert and clears
+// dirty state ONLY on a generation-matched ack (AckContainersFlushed), so a re-dirty mid-flight is
+// never stranded and a failed/lost send is always retried. AppendOfflineContainerRows is its
+// offline/PIE twin (whole-array write into the on-disk character JSON). Called from
+// CreatePlayerCharacterDataObject above; the game module (AClient) drives the dirty state via
+// URedwoodCharacterComponent::MarkContainersDirty/MarkContainersDeleted. Declarations sit under a
+// matching FORK marker in RedwoodServerGameSubsystem.h. Merge must preserve: the ack-only clear
+// contract, the (id, generation) send-set independence from the live maps, and the TWeakObjectPtr
+// guard on the async callback.
 // Sends CharacterComponent's currently-dirty container records (plus pending deletions) to
 // realm:characters:containers:upsert. Dirty state is cleared ONLY on ack (the Emit callback's
 // Error.IsEmpty() check below), and only for the exact (id, generation) pairs this call actually
@@ -1730,6 +1766,7 @@ bool URedwoodServerGameSubsystem::AppendOfflineContainerRows(
   CharacterComponent->ClearContainersDirtyState();
   return true;
 }
+// FORK(hollowed-oath) END
 
 void URedwoodServerGameSubsystem::InitialDataLoad(FRedwoodDelegate OnComplete) {
   InitialDataLoadCompleteDelegate = OnComplete;

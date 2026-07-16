@@ -1,6 +1,7 @@
 // Copyright Incanta Games. All rights reserved.
 
 #include "RedwoodClientExecCommand.h"
+// FORK(hollowed-oath): NetCore PushModel include for the push-model rep branch below.
 #include "Net/Core/PushModel/PushModel.h"
 #include "Net/UnrealNetwork.h"
 
@@ -19,6 +20,9 @@ void ARedwoodClientExecCommand::GetLifetimeReplicatedProps(
 ) const {
   Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
+  // FORK(hollowed-oath) BEGIN: push-model replication for Command (upstream is a bare
+  // DOREPLIFETIME). No dirty-mark is needed anywhere because Command never mutates after spawn
+  // (see note below) -- it rides initial replication. Merge must preserve both legs.
   // Command is set once at deferred spawn (before FinishSpawningActor), so its
   // value rides the initial replication; no MARK_PROPERTY_DIRTY is needed because
   // it never mutates after the actor begins replicating.
@@ -32,4 +36,5 @@ void ARedwoodClientExecCommand::GetLifetimeReplicatedProps(
   {
     DOREPLIFETIME(ARedwoodClientExecCommand, Command);
   }
+  // FORK(hollowed-oath) END
 }

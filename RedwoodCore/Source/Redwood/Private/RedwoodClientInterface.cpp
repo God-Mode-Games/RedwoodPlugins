@@ -168,6 +168,9 @@ void URedwoodClientInterface::InitializeDirectorConnection(
               TEXT("Could not reauthenticate connection with Director: %s"),
               *Update.Message
             );
+            // FORK(hollowed-oath): fire the fork-added OnDirectorAuthFailed delegate on reauth
+            // failure. Upstream only logs the failure; the fork surfaces it up to the client's
+            // disconnect/reconnect modal (via RedwoodClientGameSubsystem).
             OnDirectorAuthFailed.Broadcast(Update.Message);
           }
         }),
@@ -2325,6 +2328,8 @@ void URedwoodClientInterface::BeginRealmReauthentication() {
           TEXT("Could not reauthenticate connection with Realm: %s"),
           *Error
         );
+        // FORK(hollowed-oath): fire the fork-added OnRealmAuthFailed delegate on reauth failure
+        // (token-fetch leg). Upstream only logs. See OnDirectorAuthFailed above.
         OnRealmAuthFailed.Broadcast(Error);
         return;
       }
@@ -2349,6 +2354,8 @@ void URedwoodClientInterface::BeginRealmReauthentication() {
                 TEXT("Could not reauthenticate connection with Realm: %s"),
                 *Output.Error
               );
+              // FORK(hollowed-oath): fire the fork-added OnRealmAuthFailed delegate on reauth
+              // failure (handshake-finalize leg). Upstream only logs. See OnDirectorAuthFailed above.
               OnRealmAuthFailed.Broadcast(Output.Error);
             }
           }

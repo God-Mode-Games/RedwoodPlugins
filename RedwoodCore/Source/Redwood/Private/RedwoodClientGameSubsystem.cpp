@@ -39,6 +39,11 @@ void URedwoodClientGameSubsystem::Initialize(
       this,
       &URedwoodClientGameSubsystem::HandleOnDirectorConnectionReestablished
     );
+    // FORK(hollowed-oath): subscribe the two fork-added auth-failed delegates
+    // (OnDirectorAuthFailed / OnRealmAuthFailed). Upstream surfaces reauth failure only as a log
+    // line; the fork re-broadcasts it as a BlueprintAssignable event so the HollowedOath client
+    // can drive its disconnect/reconnect modal. Merge must keep these binds paired with the
+    // matching UPROPERTY delegates + UFUNCTION handlers in RedwoodClientGameSubsystem.h.
     ClientInterface->OnDirectorAuthFailed.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleOnDirectorAuthFailed
     );
@@ -1252,6 +1257,8 @@ void URedwoodClientGameSubsystem::HandleOnDirectorConnectionReestablished() {
   OnDirectorConnectionReestablished.Broadcast();
 }
 
+// FORK(hollowed-oath): re-broadcast handler for the fork-added OnDirectorAuthFailed delegate
+// (see the bind in Initialize). Whole function is fork-added.
 void URedwoodClientGameSubsystem::HandleOnDirectorAuthFailed(FString Message) {
   OnDirectorAuthFailed.Broadcast(Message);
 }
@@ -1260,6 +1267,8 @@ void URedwoodClientGameSubsystem::HandleOnRealmConnectionLost() {
   OnRealmConnectionLost.Broadcast();
 }
 
+// FORK(hollowed-oath): re-broadcast handler for the fork-added OnRealmAuthFailed delegate
+// (see the bind in Initialize). Whole function is fork-added.
 void URedwoodClientGameSubsystem::HandleOnRealmAuthFailed(FString Message) {
   OnRealmAuthFailed.Broadcast(Message);
 }

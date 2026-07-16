@@ -19,6 +19,7 @@
 class AGameModeBase;
 class URedwoodSyncItemAsset;
 class URedwoodSyncComponent;
+// FORK(hollowed-oath): forward decls for the container flush helpers' parameters (fork-added).
 class URedwoodCharacterComponent;
 class URedwoodPlayerStateComponent;
 
@@ -120,6 +121,9 @@ public:
   );
   void FlushZoneData();
 
+  // FORK(hollowed-oath) BEGIN: container flush helper declarations. Fork-added; definitions + full
+  // rationale under a matching FORK marker in RedwoodServerGameSubsystem.cpp. Called from
+  // CreatePlayerCharacterDataObject. Preserve signatures on merge.
   // Per-container persistence channel (see URedwoodCharacterComponent::bUseContainers). Sends
   // ONLY CharacterComponent's currently-dirty container records (plus pending deletions) to
   // realm:characters:containers:upsert, and clears the dirty state ONLY once the upsert is
@@ -152,6 +156,7 @@ public:
     TArray<TSharedPtr<FJsonValue>> &OutRows,
     URedwoodCharacterComponent *CharacterComponent
   );
+  // FORK(hollowed-oath) END
 
   void InitialDataLoad(FRedwoodDelegate OnComplete);
 

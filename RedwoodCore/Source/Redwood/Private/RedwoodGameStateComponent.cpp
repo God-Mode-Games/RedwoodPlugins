@@ -3,6 +3,8 @@
 #include "RedwoodGameStateComponent.h"
 #include "RedwoodServerGameSubsystem.h"
 
+// FORK(hollowed-oath): NetCore PushModel include for the push-model rep branch + the
+// MARK_PROPERTY_DIRTY_FROM_NAME in SetServerDetails below.
 #include "Net/Core/PushModel/PushModel.h"
 #include "Net/UnrealNetwork.h"
 
@@ -18,6 +20,8 @@ void URedwoodGameStateComponent::GetLifetimeReplicatedProps(
 ) const {
   Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
+  // FORK(hollowed-oath) BEGIN: push-model replication for ServerDetails (upstream is a bare
+  // DOREPLIFETIME). SetServerDetails below must now dirty-mark it. Preserve both legs.
 #if WITH_PUSH_MODEL
   if (IS_PUSH_MODEL_ENABLED()) {
     FDoRepLifetimeParams Params;
@@ -30,6 +34,7 @@ void URedwoodGameStateComponent::GetLifetimeReplicatedProps(
   {
     DOREPLIFETIME(URedwoodGameStateComponent, ServerDetails);
   }
+  // FORK(hollowed-oath) END
 }
 
 void URedwoodGameStateComponent::BeginPlay() {
@@ -75,6 +80,8 @@ void URedwoodGameStateComponent::SetServerDetails(
   Details.ZoneName = ZoneName;
   Details.ShardName = ShardName;
   ServerDetails = Details;
+  // FORK(hollowed-oath): dirty-mark paired with the push-model conversion of ServerDetails
+  // (see GetLifetimeReplicatedProps). Upstream mutates ServerDetails with no dirty-mark.
   MARK_PROPERTY_DIRTY_FROM_NAME(
     URedwoodGameStateComponent, ServerDetails, this
   );

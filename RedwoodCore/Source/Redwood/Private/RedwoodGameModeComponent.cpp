@@ -598,6 +598,13 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
             URedwoodCommonGameSubsystem::ParsePlayerData(Player)
           );
 
+          // FORK(hollowed-oath) BEGIN: backend container-load leg. Upstream trunk here is a
+          // single inline PlayerStateComponent->SetRedwoodCharacter(ParseCharacter(Character)).
+          // The fork hoists the parse into ParsedCharacter so it can graft the container rows --
+          // which the backend delivers as a SIBLING "containers" field of the player-auth response,
+          // NOT nested in "character" -- onto it BEFORE SetRedwoodCharacter fires
+          // OnRedwoodCharacterUpdated. Merge must preserve that ordering (rows attached before the
+          // set) so RedwoodPlayerStateCharacterUpdated has them in hand when it broadcasts.
           FRedwoodCharacterBackend ParsedCharacter =
             URedwoodCommonGameSubsystem::ParseCharacter(Character);
 
@@ -612,6 +619,7 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
           }
 
           PlayerStateComponent->SetRedwoodCharacter(ParsedCharacter);
+          // FORK(hollowed-oath) END
           PlayerStateComponent->SetServerReady();
 
           // The realm backend pushes party data to this server when the

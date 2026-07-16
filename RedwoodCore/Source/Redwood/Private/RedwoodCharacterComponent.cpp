@@ -10,6 +10,9 @@
 #include "GameFramework/GameSession.h"
 #include "GameFramework/PlayerState.h"
 #include "Kismet/GameplayStatics.h"
+// FORK(hollowed-oath): NetCore PushModel include for the push-model rep conversion + the
+// MARK_PROPERTY_DIRTY_FROM_NAME calls in the *Updated() handlers below (upstream trunk has
+// neither). Engine/GameInstance.h above is likewise fork-added for the same body of work.
 #include "Net/Core/PushModel/PushModel.h"
 #include "Net/UnrealNetwork.h"
 #include "SIOJConvert.h"
@@ -27,6 +30,13 @@ void URedwoodCharacterComponent::GetLifetimeReplicatedProps(
 ) const {
   Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
+  // FORK(hollowed-oath) BEGIN: push-model replication for every URedwoodCharacterComponent
+  // replicated property. Upstream trunk registers these with plain DOREPLIFETIME /
+  // DOREPLIFETIME_CONDITION (the else-branch below). The fork converts them to push-model, which
+  // makes each property inert until dirty-marked -- so the RedwoodPlayerStatePlayerUpdated() /
+  // RedwoodPlayerStateCharacterUpdated() handlers below MUST MARK_PROPERTY_DIRTY_FROM_NAME every
+  // field they mutate (they now do). An upstream merge must preserve: (a) BOTH legs here, (b) the
+  // exact OwnerOnly-vs-default condition split, and (c) the paired dirty-marks in those handlers.
 #if WITH_PUSH_MODEL
   if (IS_PUSH_MODEL_ENABLED()) {
     FDoRepLifetimeParams Params;
@@ -81,6 +91,7 @@ void URedwoodCharacterComponent::GetLifetimeReplicatedProps(
     DOREPLIFETIME(URedwoodCharacterComponent, RedwoodPlayerUpdateCount);
     DOREPLIFETIME(URedwoodCharacterComponent, RedwoodCharacterUpdateCount);
   }
+  // FORK(hollowed-oath) END
 }
 
 void URedwoodCharacterComponent::BeginPlay() {
@@ -188,6 +199,9 @@ void URedwoodCharacterComponent::RedwoodPlayerStatePlayerUpdated() {
     bSelectedGuildValid = PlayerData.bSelectedGuildValid;
     SelectedGuild = PlayerData.SelectedGuild;
 
+    // FORK(hollowed-oath) BEGIN: dirty-marks required by the push-model conversion of these
+    // properties (see GetLifetimeReplicatedProps above). Upstream mutates them with no dirty-mark
+    // because upstream rep is legacy always-poll. Merge must keep one mark per mutated field.
     MARK_PROPERTY_DIRTY_FROM_NAME(
       URedwoodCharacterComponent, RedwoodPlayerNickname, this
     );
@@ -200,6 +214,7 @@ void URedwoodCharacterComponent::RedwoodPlayerStatePlayerUpdated() {
     MARK_PROPERTY_DIRTY_FROM_NAME(
       URedwoodCharacterComponent, SelectedGuild, this
     );
+    // FORK(hollowed-oath) END
 
     if (bUsePlayerData) {
       bool bErrored = false;
@@ -289,6 +304,8 @@ void URedwoodCharacterComponent::RedwoodPlayerStatePlayerUpdated() {
     // notify fires on clients once the updated fields have been applied.
     OnRedwoodPlayerUpdated.Broadcast();
     RedwoodPlayerUpdateCount++;
+    // FORK(hollowed-oath): dirty-mark for the push-model counter that drives the client-side
+    // OnRep notify; without it the incremented count never replicates. See GetLifetimeReplicatedProps.
     MARK_PROPERTY_DIRTY_FROM_NAME(
       URedwoodCharacterComponent, RedwoodPlayerUpdateCount, this
     );
@@ -328,6 +345,8 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
     RedwoodCharacterId = RedwoodCharacterBackend.Id;
     RedwoodCharacterName = RedwoodCharacterBackend.Name;
 
+    // FORK(hollowed-oath) BEGIN: dirty-marks required by the push-model conversion of these
+    // properties (see GetLifetimeReplicatedProps above). Upstream mutates them with no dirty-mark.
     MARK_PROPERTY_DIRTY_FROM_NAME(
       URedwoodCharacterComponent, RedwoodPlayerId, this
     );
@@ -337,6 +356,7 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
     MARK_PROPERTY_DIRTY_FROM_NAME(
       URedwoodCharacterComponent, RedwoodCharacterName, this
     );
+    // FORK(hollowed-oath) END
 
     if (bUseCharacterCreatorData) {
       bool bErrored = false;
@@ -555,6 +575,11 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
       }
     }
 
+    // FORK(hollowed-oath) BEGIN: container LOAD leg of HollowedOath's per-bag inventory. Copies
+    // the persisted container rows into the game's ContainersVariableName array BEFORE the
+    // OnRedwoodCharacterUpdated broadcast, so game code (AClient / the per-bag inventory) sees
+    // the rows already present the moment it reacts. Entirely fork-added -- upstream has no
+    // container concept. Merge must preserve the ordering: this block runs before the broadcast.
     // Containers ride the SAME round trip as every field above (RedwoodCharacterBackend.Containers
     // -- populated by the player-auth / character-load response, not a separate
     // realm:characters:containers:load call), so this runs BEFORE the OnRedwoodCharacterUpdated
@@ -573,11 +598,14 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         *RecordsArray = RedwoodCharacterBackend.Containers;
       }
     }
+    // FORK(hollowed-oath) END
 
     // Broadcast locally on the server, then bump the replicated counter so the
     // notify fires on clients once the updated fields have been applied.
     OnRedwoodCharacterUpdated.Broadcast();
     RedwoodCharacterUpdateCount++;
+    // FORK(hollowed-oath): dirty-mark for the push-model counter that drives the client-side
+    // OnRep notify; upstream leaves it unmarked (legacy always-poll rep).
     MARK_PROPERTY_DIRTY_FROM_NAME(
       URedwoodCharacterComponent, RedwoodCharacterUpdateCount, this
     );

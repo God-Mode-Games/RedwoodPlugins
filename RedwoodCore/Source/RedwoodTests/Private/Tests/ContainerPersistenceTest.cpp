@@ -1,5 +1,13 @@
 // Copyright Incanta Games. All Rights Reserved.
 
+// FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart. Pins the container
+// wire-format contract for HollowedOath's per-container persistence channel (per-bag inventory):
+// SerializeContainerRecords/ParseContainerRecords round-trip and ParseCharacter's inline
+// "containers" reading (the offline/PIE leg) vs. its absence (the backend sidecar leg). WHY the
+// fork needs it: the backend Container table and the offline character JSON are only
+// interchangeable while they agree on the {containerId, kind, contents} shape these tests lock
+// down. An upstream merge must keep this file with the URedwoodCommonGameSubsystem container APIs
+// it exercises; if those APIs are renamed/removed upstream, update or drop this test in lockstep.
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"

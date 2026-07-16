@@ -11,6 +11,7 @@
 #include "RedwoodCommonGameSubsystem.generated.h"
 
 class USIOJsonObject;
+// FORK(hollowed-oath): forward decl for ResolveContainersRecordsArray's parameter (container helpers).
 class URedwoodCharacterComponent;
 
 UCLASS(BlueprintType)
@@ -103,6 +104,10 @@ public:
 
   static FRedwoodParty ParseParty(const TSharedPtr<FJsonObject> &PartyObj);
 
+  // FORK(hollowed-oath) BEGIN: container wire-format helper declarations. Fork-added; definitions +
+  // the full rationale live under a matching FORK marker in RedwoodCommonGameSubsystem.cpp. These
+  // are the shared serialize/parse/resolve surface both persistence legs (backend sidecar upsert
+  // and offline/PIE disk JSON) and the game module depend on -- preserve their signatures on merge.
   // Parses a wire "containers" JSON array (the {containerId, kind, contents} shape shared by the
   // player-auth response and the realm:characters:containers:load response) into
   // FRedwoodContainerRecord entries. Shared so both the character-arrival path
@@ -135,6 +140,7 @@ public:
   static TArray<FRedwoodContainerRecord> *ResolveContainersRecordsArray(
     URedwoodCharacterComponent *CharacterComponent
   );
+  // FORK(hollowed-oath) END
 
 private:
 };

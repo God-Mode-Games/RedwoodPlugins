@@ -108,6 +108,10 @@ public:
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
   int32 LatestNonequippedInventorySchemaVersion = 0;
 
+  // FORK(hollowed-oath) BEGIN: container-persistence config knobs. Fork-added; no upstream
+  // counterpart. bUseContainers gates the whole channel; ContainersVariableName names the game's
+  // TArray<FRedwoodContainerRecord> UPROPERTY that ResolveContainersRecordsArray reflects into.
+  // Merge must preserve both as EditAnywhere config (games override ContainersVariableName).
   // Per-container persistence channel (Task 8's Container table). Unlike the channels above,
   // this is not a single whole-blob field: ContainersVariableName names a
   // TArray<FRedwoodContainerRecord> UPROPERTY on the owning actor, and only the DIRTY records
@@ -123,6 +127,7 @@ public:
 
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
   FString ContainersVariableName = TEXT("Containers");
+  // FORK(hollowed-oath) END
 
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
   bool bUseProgress = false;
@@ -189,6 +194,11 @@ public:
     }
   }
 
+  // FORK(hollowed-oath) BEGIN: container dirty/delete-marking API. Fork-added; the game module
+  // (AClient / per-bag inventory) calls MarkContainersDirty / MarkContainersDeleted to drive the
+  // per-container persistence channel. Merge must preserve the delete-cancel-on-redirty behavior
+  // (a re-dirty removes a pending deletion, and vice versa) and the per-id GENERATION counter that
+  // AckContainersFlushed relies on -- these are the correctness core of the whole channel.
   // Records ContainerIds whose game-side record changed since the last flush. Dirty ids
   // accumulate (a second call before a flush unions in, it doesn't replace) so nothing is lost
   // if multiple mutations land in the same tick. Each id carries a GENERATION counter (bumped on
@@ -224,6 +234,7 @@ public:
       }
     }
   }
+  // FORK(hollowed-oath) END
 
   UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Redwood")
   void MarkProgressDirty() {
@@ -271,6 +282,12 @@ public:
     return bNonequippedInventoryDirty;
   }
 
+  // FORK(hollowed-oath) BEGIN: container dirty-state query, drain accessors, and the two clear
+  // paths. Fork-added. The critical invariant an upstream merge MUST keep: AckContainersFlushed
+  // clears an id only if its generation still matches what was sent (so a re-dirty racing an
+  // in-flight send is never silently dropped), whereas ClearContainersDirtyState is the
+  // unconditional clear reserved for paths with no in-flight send to race. Consumed by
+  // URedwoodServerGameSubsystem::FlushContainersForCharacterComponent / AppendOfflineContainerRows.
   UFUNCTION(BlueprintPure, Category = "Redwood")
   bool IsContainersDirty() const {
     return DirtyContainerGenerations.Num() > 0 || PendingDeletedContainerGenerations.Num() > 0;
@@ -324,6 +341,7 @@ public:
       }
     }
   }
+  // FORK(hollowed-oath) END
 
   UFUNCTION(BlueprintPure, Category = "Redwood")
   bool IsProgressDirty() const {
@@ -340,6 +358,9 @@ public:
     return bAbilitySystemDirty;
   }
 
+  // FORK(hollowed-oath): the container dirty-state carve-out below is a fork addition to an
+  // otherwise-upstream method. An upstream merge MUST keep ClearDirtyFlags from clearing
+  // DirtyContainerGenerations / PendingDeletedContainerGenerations -- those clear only on ack.
   // NOTE: deliberately does NOT touch the containers dirty state (DirtyContainerGenerations /
   // PendingDeletedContainerGenerations) -- unlike every flag cleared below, containers ride their own
   // acknowledged send (FlushContainersForCharacterComponent -> AckContainersFlushed), so clearing
@@ -395,6 +416,7 @@ private:
   bool bDataDirty = false;
   bool bAbilitySystemDirty = false;
 
+  // FORK(hollowed-oath): fork-added backing state for the per-container persistence channel.
   // Value is a per-id dirty GENERATION, not a plain membership flag -- see AckContainersFlushed.
   TMap<FString, uint64> DirtyContainerGenerations;
   TMap<FString, uint64> PendingDeletedContainerGenerations;

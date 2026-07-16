@@ -1,6 +1,9 @@
 // Copyright Incanta Games. All Rights Reserved.
 
 #include "RedwoodCommonGameSubsystem.h"
+// FORK(hollowed-oath): RedwoodCharacterComponent.h + RedwoodModule.h + UObject/UnrealType.h below
+// are added for the container-persistence helpers (ResolveContainersRecordsArray reflects into the
+// game's ContainersVariableName UPROPERTY via FArrayProperty; LogRedwood comes from RedwoodModule).
 #include "RedwoodCharacterComponent.h"
 #include "RedwoodModule.h"
 
@@ -114,6 +117,9 @@ void URedwoodCommonGameSubsystem::SaveCharacterToDisk(
     );
   }
 
+  // FORK(hollowed-oath) BEGIN: write the character's container rows inline into the offline/PIE
+  // character JSON. Entirely fork-added (upstream has no container concept). Merge must keep the
+  // unconditional SetArrayField -- see the comment; a conditional write would resurrect stale rows.
   // Offline/PIE has no Container table, so the character JSON carries the rows itself. Written
   // unconditionally (an empty array included) because this is a whole-file rewrite: omitting the
   // key on a character whose containers were all removed would leave the previous file's rows to
@@ -121,6 +127,7 @@ void URedwoodCommonGameSubsystem::SaveCharacterToDisk(
   JsonObject->SetArrayField(
     TEXT("containers"), SerializeContainerRecords(Character.Containers)
   );
+  // FORK(hollowed-oath) END
 
   SaveCharacterJsonToDisk(JsonObject);
 }
@@ -265,6 +272,9 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
     Character.RedwoodData->SetRootObject(*RedwoodData);
   }
 
+  // FORK(hollowed-oath) BEGIN: read inline container rows off the character object (offline/PIE
+  // leg). Fork-added; absent on the backend leg (rows arrive as a sibling of "character", assigned
+  // by RunSidecarPlayerAuth). Merge must keep this tolerant of the field being absent.
   // Containers live INSIDE the character object only for offline/PIE-disk saves, where the
   // character JSON file is the whole persistence store (see SaveCharacterToDisk). The backend
   // keeps container rows in their own table and delivers them as a SIBLING of "character" in the
@@ -275,10 +285,21 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
   if (CharacterObj->TryGetArrayField(TEXT("containers"), Containers)) {
     Character.Containers = ParseContainerRecords(*Containers);
   }
+  // FORK(hollowed-oath) END
 
   return Character;
 }
 
+// FORK(hollowed-oath) BEGIN: container-record wire helpers, entirely fork-added (no upstream
+// counterpart). ParseContainerRecords / SerializeContainerRecord(s) define the shared
+// {containerId, kind, contents} wire shape that MUST stay identical between the backend
+// realm:characters:containers:upsert payload and the offline/PIE character JSON, or the two
+// persistence legs stop being interchangeable. ResolveContainersRecordsArray reflects the game's
+// ContainersVariableName UPROPERTY (a TArray<FRedwoodContainerRecord>) on the component's
+// data-holding object. Consumers to preserve on merge: URedwoodServerGameSubsystem
+// (FlushContainersForCharacterComponent / AppendOfflineContainerRows),
+// URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated (load leg), and the game module
+// via those. Declarations live in RedwoodCommonGameSubsystem.h under a matching FORK marker.
 TArray<FRedwoodContainerRecord> URedwoodCommonGameSubsystem::ParseContainerRecords(
   const TArray<TSharedPtr<FJsonValue>> &ContainersJsonArray
 ) {
@@ -387,6 +408,7 @@ URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(
   return ArrayProp->ContainerPtrToValuePtr<TArray<FRedwoodContainerRecord>>(Target
   );
 }
+// FORK(hollowed-oath) END
 
 FRedwoodGameServerProxy URedwoodCommonGameSubsystem::ParseServerProxy(
   TSharedPtr<FJsonObject> ServerProxy
