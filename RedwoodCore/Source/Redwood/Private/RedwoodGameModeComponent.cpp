@@ -175,6 +175,22 @@ void URedwoodGameModeComponent::OnGameModeLogout(
 
     if (URedwoodCommonGameSubsystem::ShouldUseBackend(GameMode->GetWorld())) {
       if (Sidecar.IsValid() && Sidecar->bIsConnected) {
+        // FORK(hollowed-oath): fork-added block inside the otherwise-stock
+        // logout emit (upstream emits the same player-left with no flag).
+        // On upstream merge, keep this evaluation + the conditional
+        // retainBinding field on the payload below.
+        //
+        // A game whose character stays in-world past the connection (e.g.
+        // linkdead body retention) asks the backend to keep the
+        // character->instance write binding: releasing it now would revoke
+        // the character writes the game still owes (its final flush).
+        // Presence processing (party/chat/director) is unaffected — the
+        // player-left is always emitted here. The game releases the binding
+        // later via URedwoodServerGameSubsystem::EmitPlayerLeft. Evaluated
+        // only when a player-left will actually be emitted.
+        const bool bRetainBinding = ShouldRetainCharacterBinding.IsBound() &&
+          ShouldRetainCharacterBinding.Execute(PlayerController);
+
         TSharedPtr<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
         JsonObject->SetStringField(
           TEXT("playerId"), PlayerStateComponent->RedwoodCharacter.PlayerId
@@ -182,6 +198,9 @@ void URedwoodGameModeComponent::OnGameModeLogout(
         JsonObject->SetStringField(
           TEXT("characterId"), PlayerStateComponent->RedwoodCharacter.Id
         );
+        if (bRetainBinding) {
+          JsonObject->SetBoolField(TEXT("retainBinding"), true);
+        }
         Sidecar->Emit(
           TEXT("realm:servers:player-left:game-server-to-sidecar"), JsonObject
         );

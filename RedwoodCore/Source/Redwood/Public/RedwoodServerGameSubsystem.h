@@ -118,6 +118,53 @@ public:
   );
   void FlushZoneData();
 
+  // FORK(hollowed-oath): fork-added API (with EmitPlayerLeft below), not in
+  // upstream Redwood. Part of linkdead pawn retention (HollowedOath#1365,
+  // called from ULinkdeadPawnManager::FlushAndEndPresence). Keep across
+  // upstream merges.
+  //
+  // Persist a detached pawn's character data by explicit identity. For pawns
+  // that outlive their player's logout (e.g. a retained "linkdead" body): the
+  // normal flush only reaches a pawn through PlayerState->GetPawn(), which no
+  // longer exists for these. Backend mode serializes only the field groups
+  // dirtied since the last flush (per-field merge — never overwrites newer
+  // backend values with a stale whole object) and emits
+  // realm:characters:set:server; offline mode serializes every enabled group
+  // and saves the whole document to disk. The component's RedwoodCharacterId
+  // must match CharacterId or nothing is sent.
+  //
+  // bReleaseBindingWhenSettled additionally releases the character's
+  // retained write binding (see EmitPlayerLeft) once the flush has SETTLED:
+  // the player-left is emitted from the flush's sidecar acknowledgment —
+  // which the sidecar only sends after the realm has fully processed the
+  // write — so the release can never overtake the flush and revoke the
+  // binding it still needs. Every skip path that doesn't put a write in
+  // flight (no component, id mismatch, nothing dirty, offline) releases
+  // immediately; a disconnected sidecar drops BOTH (and keeps the dirty
+  // flags set) since neither message could be delivered anyway.
+  UFUNCTION(BlueprintCallable, Category = "Redwood")
+  void FlushDetachedCharacterData(
+    APawn *Pawn,
+    const FString &CharacterId,
+    const FString &PlayerId,
+    bool bReleaseBindingWhenSettled = false
+  );
+
+  // FORK(hollowed-oath): fork-added API (see FlushDetachedCharacterData
+  // above). Keep across upstream merges.
+  //
+  // Emit a (second) player-left that releases the backend's
+  // character->instance write binding for a character whose logout-time
+  // player-left carried retainBinding (URedwoodGameModeComponent's
+  // ShouldRetainCharacterBinding gate). Call when the character actually
+  // leaves the world. If a final flush must be processed first, do not
+  // sequence it by emission order — same-socket delivery order does not
+  // serialize the async backend handlers; use
+  // FlushDetachedCharacterData(..., bReleaseBindingWhenSettled) which chains
+  // this call on the flush acknowledgment.
+  UFUNCTION(BlueprintCallable, Category = "Redwood")
+  void EmitPlayerLeft(const FString &PlayerId, const FString &CharacterId);
+
   void InitialDataLoad(FRedwoodDelegate OnComplete);
 
   void RegisterSyncComponent(

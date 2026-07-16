@@ -1118,6 +1118,243 @@ void URedwoodServerGameSubsystem::FlushPlayerCharacterData(
   }
 }
 
+// FORK(hollowed-oath): fork-added function (with EmitPlayerLeft below), not
+// in upstream Redwood — linkdead pawn retention support. See the header for
+// the contract; keep both across upstream merges.
+void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
+  APawn *Pawn,
+  const FString &CharacterId,
+  const FString &PlayerId,
+  bool bReleaseBindingWhenSettled
+) {
+  UWorld *World = GetWorld();
+  if (!IsValid(World) || CharacterId.IsEmpty()) {
+    return;
+  }
+
+  bool bUseBackend = URedwoodCommonGameSubsystem::ShouldUseBackend(World);
+
+  // Without the sidecar nothing can be delivered — neither the flush nor the
+  // binding-releasing player-left. Bail before serializing anything and
+  // WITHOUT clearing dirty flags, so the unsent data stays flushable.
+  if (bUseBackend && (!Sidecar.IsValid() || !Sidecar->bIsConnected)) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT(
+        "FlushDetachedCharacterData: sidecar not connected; dropping flush%s for character %s"
+      ),
+      bReleaseBindingWhenSettled ? TEXT(" and binding release") : TEXT(""),
+      *CharacterId
+    );
+    return;
+  }
+
+  // Skip paths that put no write in flight have nothing to order the release
+  // behind, so the caller-requested binding release can go out immediately.
+  auto ReleaseBindingNow =
+    [this, &PlayerId, &CharacterId, bReleaseBindingWhenSettled]() {
+      if (bReleaseBindingWhenSettled) {
+        EmitPlayerLeft(PlayerId, CharacterId);
+      }
+    };
+
+  if (!IsValid(Pawn)) {
+    ReleaseBindingNow();
+    return;
+  }
+
+  URedwoodCharacterComponent *CharacterComponent =
+    Pawn->FindComponentByClass<URedwoodCharacterComponent>();
+  if (!IsValid(CharacterComponent)) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT(
+        "FlushDetachedCharacterData: pawn %s has no URedwoodCharacterComponent"
+      ),
+      *Pawn->GetName()
+    );
+    ReleaseBindingNow();
+    return;
+  }
+
+  // Same safety rail as the PlayerState flush: refuse to persist a component
+  // whose character identity doesn't match the id we're flushing for.
+  if (CharacterComponent->RedwoodCharacterId != CharacterId) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT(
+        "FlushDetachedCharacterData: pawn %s carries character id '%s', expected '%s'; skipping"
+      ),
+      *Pawn->GetName(),
+      *CharacterComponent->RedwoodCharacterId,
+      *CharacterId
+    );
+    ReleaseBindingNow();
+    return;
+  }
+
+  TSharedPtr<FJsonObject> CharacterObject = MakeShareable(new FJsonObject);
+  CharacterObject->SetStringField(TEXT("playerId"), PlayerId);
+  CharacterObject->SetStringField(TEXT("characterId"), CharacterId);
+
+  AActor *ComponentOwner = CharacterComponent->GetOwner();
+  int32 SerializedFieldCount = 0;
+  auto SerializeField = [&](
+                          bool bUseField,
+                          bool bFieldDirty,
+                          const FString &VariableName,
+                          const TCHAR *FieldName
+                        ) {
+    // Backend saves merge per-field, so send only groups gameplay actually
+    // dirtied since the last flush — a whole-object save could overwrite
+    // newer backend values written while the pawn was detached (e.g. the
+    // player editing their character through the frontend). Offline disk
+    // saves replace the whole document, so those serialize every enabled
+    // group (same split as FlushPlayerCharacterData).
+    if (!bUseField || (bUseBackend && !bFieldDirty)) {
+      return;
+    }
+    USIOJsonObject *Value = URedwoodCommonGameSubsystem::SerializeBackendData(
+      CharacterComponent->bStoreDataInActor ? (UObject *)ComponentOwner
+                                            : (UObject *)CharacterComponent,
+      VariableName
+    );
+    if (Value) {
+      CharacterObject->SetObjectField(FieldName, Value->GetRootObject());
+      SerializedFieldCount++;
+    }
+  };
+
+  SerializeField(
+    CharacterComponent->bUseCharacterCreatorData,
+    CharacterComponent->IsCharacterCreatorDataDirty(),
+    CharacterComponent->CharacterCreatorDataVariableName,
+    TEXT("characterCreatorData")
+  );
+  SerializeField(
+    CharacterComponent->bUseMetadata,
+    CharacterComponent->IsMetadataDirty(),
+    CharacterComponent->MetadataVariableName,
+    TEXT("metadata")
+  );
+  SerializeField(
+    CharacterComponent->bUseEquippedInventory,
+    CharacterComponent->IsEquippedInventoryDirty(),
+    CharacterComponent->EquippedInventoryVariableName,
+    TEXT("equippedInventory")
+  );
+  SerializeField(
+    CharacterComponent->bUseNonequippedInventory,
+    CharacterComponent->IsNonequippedInventoryDirty(),
+    CharacterComponent->NonequippedInventoryVariableName,
+    TEXT("nonequippedInventory")
+  );
+  SerializeField(
+    CharacterComponent->bUseProgress,
+    CharacterComponent->IsProgressDirty(),
+    CharacterComponent->ProgressVariableName,
+    TEXT("progress")
+  );
+  SerializeField(
+    CharacterComponent->bUseData,
+    CharacterComponent->IsDataDirty(),
+    CharacterComponent->DataVariableName,
+    TEXT("data")
+  );
+  SerializeField(
+    CharacterComponent->bUseAbilitySystem,
+    CharacterComponent->IsAbilitySystemDirty(),
+    CharacterComponent->AbilitySystemVariableName,
+    TEXT("abilitySystem")
+  );
+
+  if (bUseBackend) {
+    if (SerializedFieldCount == 0) {
+      UE_LOG(
+        LogRedwood,
+        Verbose,
+        TEXT(
+          "FlushDetachedCharacterData: nothing dirty for character %s; skipping"
+        ),
+        *CharacterId
+      );
+      ReleaseBindingNow();
+      return;
+    }
+
+    TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+    TArray<TSharedPtr<FJsonValue>> CharactersArray;
+    CharactersArray.Add(MakeShareable(new FJsonValueObject(CharacterObject)));
+    Payload->SetArrayField(TEXT("characters"), CharactersArray);
+    Payload->SetStringField(TEXT("id"), TEXT("game-server"));
+    if (bReleaseBindingWhenSettled) {
+      // Same-socket emission order does NOT serialize the backend's async
+      // handlers, so a player-left emitted right after the flush could be
+      // processed first and release the binding the flush still needs.
+      // Chain the release on the flush acknowledgment instead — the sidecar
+      // only acks after the realm has fully processed the write.
+      TWeakObjectPtr<URedwoodServerGameSubsystem> WeakThis(this);
+      Sidecar->Emit(
+        TEXT("realm:characters:set:server"),
+        Payload,
+        [WeakThis, PlayerId, CharacterId](auto Response) {
+          if (WeakThis.IsValid()) {
+            WeakThis->EmitPlayerLeft(PlayerId, CharacterId);
+          }
+        }
+      );
+    } else {
+      Sidecar->Emit(TEXT("realm:characters:set:server"), Payload);
+    }
+    // Clear only once a write is actually in flight: clearing before a
+    // dropped emit would silently lose the data forever (nothing would ever
+    // look dirty again).
+    CharacterComponent->ClearDirtyFlags();
+  } else {
+    CharacterObject->SetStringField(TEXT("id"), CharacterId);
+    URedwoodCommonGameSubsystem::SaveCharacterJsonToDisk(CharacterObject);
+    CharacterComponent->ClearDirtyFlags();
+    ReleaseBindingNow();
+  }
+
+  UE_LOG(
+    LogRedwood,
+    Log,
+    TEXT("Flushed detached character data for character %s"),
+    *CharacterId
+  );
+}
+
+// FORK(hollowed-oath): fork-added function — see FlushDetachedCharacterData.
+void URedwoodServerGameSubsystem::EmitPlayerLeft(
+  const FString &PlayerId, const FString &CharacterId
+) {
+  UWorld *World = GetWorld();
+  if (!IsValid(World) || !URedwoodCommonGameSubsystem::ShouldUseBackend(World)) {
+    return;
+  }
+
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("EmitPlayerLeft: sidecar not connected; dropping for character %s"),
+      *CharacterId
+    );
+    return;
+  }
+
+  TSharedPtr<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
+  JsonObject->SetStringField(TEXT("playerId"), PlayerId);
+  JsonObject->SetStringField(TEXT("characterId"), CharacterId);
+  Sidecar->Emit(
+    TEXT("realm:servers:player-left:game-server-to-sidecar"), JsonObject
+  );
+}
+
 TSharedPtr<FJsonObject>
 URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
   APlayerState *PlayerState, bool bForce
