@@ -1156,17 +1156,27 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
     return;
   }
 
+  bool bUseBackend = URedwoodCommonGameSubsystem::ShouldUseBackend(World);
+
   TSharedPtr<FJsonObject> CharacterObject = MakeShareable(new FJsonObject);
   CharacterObject->SetStringField(TEXT("playerId"), PlayerId);
   CharacterObject->SetStringField(TEXT("characterId"), CharacterId);
 
   AActor *ComponentOwner = CharacterComponent->GetOwner();
+  int32 SerializedFieldCount = 0;
   auto SerializeField = [&](
                           bool bUseField,
+                          bool bFieldDirty,
                           const FString &VariableName,
                           const TCHAR *FieldName
                         ) {
-    if (!bUseField) {
+    // Backend saves merge per-field, so send only groups gameplay actually
+    // dirtied since the last flush — a whole-object save could overwrite
+    // newer backend values written while the pawn was detached (e.g. the
+    // player editing their character through the frontend). Offline disk
+    // saves replace the whole document, so those serialize every enabled
+    // group (same split as FlushPlayerCharacterData).
+    if (!bUseField || (bUseBackend && !bFieldDirty)) {
       return;
     }
     USIOJsonObject *Value = URedwoodCommonGameSubsystem::SerializeBackendData(
@@ -1176,46 +1186,67 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
     );
     if (Value) {
       CharacterObject->SetObjectField(FieldName, Value->GetRootObject());
+      SerializedFieldCount++;
     }
   };
 
   SerializeField(
     CharacterComponent->bUseCharacterCreatorData,
+    CharacterComponent->IsCharacterCreatorDataDirty(),
     CharacterComponent->CharacterCreatorDataVariableName,
     TEXT("characterCreatorData")
   );
   SerializeField(
     CharacterComponent->bUseMetadata,
+    CharacterComponent->IsMetadataDirty(),
     CharacterComponent->MetadataVariableName,
     TEXT("metadata")
   );
   SerializeField(
     CharacterComponent->bUseEquippedInventory,
+    CharacterComponent->IsEquippedInventoryDirty(),
     CharacterComponent->EquippedInventoryVariableName,
     TEXT("equippedInventory")
   );
   SerializeField(
     CharacterComponent->bUseNonequippedInventory,
+    CharacterComponent->IsNonequippedInventoryDirty(),
     CharacterComponent->NonequippedInventoryVariableName,
     TEXT("nonequippedInventory")
   );
   SerializeField(
     CharacterComponent->bUseProgress,
+    CharacterComponent->IsProgressDirty(),
     CharacterComponent->ProgressVariableName,
     TEXT("progress")
   );
   SerializeField(
     CharacterComponent->bUseData,
+    CharacterComponent->IsDataDirty(),
     CharacterComponent->DataVariableName,
     TEXT("data")
   );
   SerializeField(
     CharacterComponent->bUseAbilitySystem,
+    CharacterComponent->IsAbilitySystemDirty(),
     CharacterComponent->AbilitySystemVariableName,
     TEXT("abilitySystem")
   );
 
-  if (URedwoodCommonGameSubsystem::ShouldUseBackend(World)) {
+  CharacterComponent->ClearDirtyFlags();
+
+  if (bUseBackend) {
+    if (SerializedFieldCount == 0) {
+      UE_LOG(
+        LogRedwood,
+        Verbose,
+        TEXT(
+          "FlushDetachedCharacterData: nothing dirty for character %s; skipping"
+        ),
+        *CharacterId
+      );
+      return;
+    }
     if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
       UE_LOG(
         LogRedwood,

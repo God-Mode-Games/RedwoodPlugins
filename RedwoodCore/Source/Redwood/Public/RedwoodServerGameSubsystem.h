@@ -121,10 +121,12 @@ public:
   // Persist a detached pawn's character data by explicit identity. For pawns
   // that outlive their player's logout (e.g. a retained "linkdead" body): the
   // normal flush only reaches a pawn through PlayerState->GetPawn(), which no
-  // longer exists for these. Serializes every field group the pawn's
-  // URedwoodCharacterComponent has enabled and emits
-  // realm:characters:set:server (backend) or saves to disk (offline). The
-  // component's RedwoodCharacterId must match CharacterId or nothing is sent.
+  // longer exists for these. Backend mode serializes only the field groups
+  // dirtied since the last flush (per-field merge — never overwrites newer
+  // backend values with a stale whole object) and emits
+  // realm:characters:set:server; offline mode serializes every enabled group
+  // and saves the whole document to disk. The component's RedwoodCharacterId
+  // must match CharacterId or nothing is sent.
   UFUNCTION(BlueprintCallable, Category = "Redwood")
   void FlushDetachedCharacterData(
     APawn *Pawn, const FString &CharacterId, const FString &PlayerId
