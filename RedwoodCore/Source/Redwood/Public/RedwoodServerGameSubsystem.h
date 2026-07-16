@@ -126,7 +126,7 @@ public:
   // acknowledged (see AckContainersFlushed) -- a failed or unacknowledged send leaves the dirty
   // state set so the next flush retries it. Backend-only: the offline/PIE leg has no sidecar to
   // send to and instead writes its rows into the character's own JSON file, see
-  // WriteOfflineContainersToCharacterObject.
+  // AppendOfflineContainerRows.
   //
   // Container LOADING no longer has a counterpart here: container rows now arrive in the SAME
   // round trip as the rest of the character (see FRedwoodCharacterBackend::Containers), populated
@@ -137,14 +137,19 @@ public:
     URedwoodCharacterComponent *CharacterComponent
   );
 
-  // Offline/PIE counterpart to FlushContainersForCharacterComponent: folds CharacterComponent's
-  // container records into CharacterObject under "containers", which FlushPlayerCharacterData
-  // then writes to the character's JSON file. Unlike the backend leg this writes EVERY record
-  // rather than only the dirty ones -- the disk save is a whole-file rewrite, so a dirty-only
-  // write would drop every untouched container -- and it therefore does not need the
-  // generation-tracked ack the sidecar round trip does.
-  void WriteOfflineContainersToCharacterObject(
-    TSharedPtr<FJsonObject> CharacterObject,
+  // Offline/PIE counterpart to FlushContainersForCharacterComponent: appends CharacterComponent's
+  // container records to OutRows, which the caller writes ONCE to CharacterObject's "containers"
+  // field for FlushPlayerCharacterData to put in the character's JSON file. Appends rather than
+  // writing the field itself because "containers" is a single field fed by potentially several
+  // character components -- writing per component would keep only the last one's rows. Returns
+  // whether this component contributed (false = no containers, or a misconfigured records array),
+  // so the caller can leave the field absent entirely when nothing owns containers.
+  //
+  // Unlike the backend leg this writes EVERY record rather than only the dirty ones -- the disk
+  // save is a whole-file rewrite, so a dirty-only write would drop every untouched container --
+  // and it therefore does not need the generation-tracked ack the sidecar round trip does.
+  bool AppendOfflineContainerRows(
+    TArray<TSharedPtr<FJsonValue>> &OutRows,
     URedwoodCharacterComponent *CharacterComponent
   );
 

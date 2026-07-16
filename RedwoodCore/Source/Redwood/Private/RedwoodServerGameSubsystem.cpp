@@ -1326,6 +1326,12 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
 
       bIsDirty = true;
     } else {
+      // Offline only: the union of every character component's container rows, written to the
+      // single "containers" field after the loop below (the backend leg sends each component's
+      // rows on its own sidecar channel instead, so it needs no accumulator).
+      TArray<TSharedPtr<FJsonValue>> OfflineContainerRows;
+      bool bHasOfflineContainerRows = false;
+
       for (URedwoodCharacterComponent *CharacterComponent :
            CharacterComponents) {
         if (bUseBackend && // always fill out if not using the backend
@@ -1511,13 +1517,22 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
               PlayerStateComponent, CharacterComponent
             );
           }
-        } else {
-          WriteOfflineContainersToCharacterObject(
-            CharacterObject, CharacterComponent
-          );
+        } else if (AppendOfflineContainerRows(
+                     OfflineContainerRows, CharacterComponent
+                   )) {
+          bHasOfflineContainerRows = true;
         }
 
         CharacterComponent->ClearDirtyFlags();
+      }
+
+      // One "containers" field, written once from every component's rows -- see
+      // AppendOfflineContainerRows. Only written when a component actually owns containers, so a
+      // game not using them keeps the field absent rather than gaining an empty array.
+      if (bHasOfflineContainerRows) {
+        CharacterObject->SetArrayField(
+          TEXT("containers"), OfflineContainerRows
+        );
       }
     }
 
@@ -1666,12 +1681,12 @@ void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
   );
 }
 
-void URedwoodServerGameSubsystem::WriteOfflineContainersToCharacterObject(
-  TSharedPtr<FJsonObject> CharacterObject,
+bool URedwoodServerGameSubsystem::AppendOfflineContainerRows(
+  TArray<TSharedPtr<FJsonValue>> &OutRows,
   URedwoodCharacterComponent *CharacterComponent
 ) {
   if (!CharacterComponent->bUseContainers) {
-    return;
+    return false;
   }
 
   TArray<FRedwoodContainerRecord> *RecordsArray =
@@ -1682,7 +1697,7 @@ void URedwoodServerGameSubsystem::WriteOfflineContainersToCharacterObject(
     // ResolveContainersRecordsArray. There is no set of records to write, and nothing better to
     // fall back to: SaveCharacterJsonToDisk rewrites the file wholesale, so the previous rows are
     // gone either way.
-    return;
+    return false;
   }
 
   // Honor pending deletions even though game code is expected to have already removed the record
@@ -1699,8 +1714,11 @@ void URedwoodServerGameSubsystem::WriteOfflineContainersToCharacterObject(
     }
   }
 
-  CharacterObject->SetArrayField(
-    TEXT("containers"),
+  // APPEND, never assign: "containers" is ONE field on the character object but every character
+  // component owning containers contributes rows to it, so the caller writes the field once from
+  // the union of all of them. Setting the field per component would leave only the last component's
+  // rows on disk and silently drop the rest.
+  OutRows.Append(
     URedwoodCommonGameSubsystem::SerializeContainerRecords(RecordsToWrite)
   );
 
@@ -1710,6 +1728,7 @@ void URedwoodServerGameSubsystem::WriteOfflineContainersToCharacterObject(
   // pending-deletion maps would grow for the whole session (ClearDirtyFlags deliberately leaves
   // container state alone) and a deleted id would suppress its own row forever.
   CharacterComponent->ClearContainersDirtyState();
+  return true;
 }
 
 void URedwoodServerGameSubsystem::InitialDataLoad(FRedwoodDelegate OnComplete) {

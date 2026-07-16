@@ -86,7 +86,7 @@ struct FRedwoodCharacterBackend {
   // a character-updated event with containers still missing. Offline/PIE-disk saves populate this
   // the same way, from the "containers" array the on-disk character JSON carries inline (there is
   // no Container table to read there) -- see URedwoodCommonGameSubsystem::SaveCharacterToDisk and
-  // URedwoodServerGameSubsystem::WriteOfflineContainersToCharacterObject.
+  // URedwoodServerGameSubsystem::AppendOfflineContainerRows.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   TArray<FRedwoodContainerRecord> Containers;
 };
