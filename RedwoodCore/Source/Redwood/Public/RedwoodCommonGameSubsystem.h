@@ -134,16 +134,14 @@ public:
     const TArray<FRedwoodItemRecord> &Records
   );
 
-  // Resolves CharacterComponent->ContainersVariableName to a TArray<FRedwoodItemRecord>
+  // Resolves CharacterComponent->ItemsVariableName to a TArray<FRedwoodItemRecord>
   // UPROPERTY on the component's data-holding object (the owning actor, or the component itself
   // when bStoreDataInActor is false -- same choice every other channel makes). Returns nullptr
   // (with an error logged) if the property is missing or isn't the expected array-of-struct
-  // shape. Shared by the flush path (FlushContainersForCharacterComponent) and the arrival path
+  // shape. Shared by the server item-flush path and the arrival path
   // (RedwoodPlayerStateCharacterUpdated), which both need to reach the same array.
-  // FORK(hollowed-oath): still reads ContainersVariableName -- the component property itself is
-  // renamed to ItemsVariableName in a later task (RedwoodPlugins plan Task 3). This task only
-  // swaps the reflected struct type; leave the property-name read alone so the diff stays minimal
-  // and compiling until that rename lands.
+  // FORK(hollowed-oath): reads ItemsVariableName (the component property was renamed from
+  // ContainersVariableName in RedwoodPlugins plan Task 3, landed alongside this reflection helper).
   static TArray<FRedwoodItemRecord> *ResolveItemsRecordsArray(
     URedwoodCharacterComponent *CharacterComponent
   );

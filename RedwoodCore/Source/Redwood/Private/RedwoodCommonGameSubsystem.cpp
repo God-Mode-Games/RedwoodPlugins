@@ -3,7 +3,7 @@
 #include "RedwoodCommonGameSubsystem.h"
 // FORK(hollowed-oath): RedwoodCharacterComponent.h + RedwoodModule.h + UObject/UnrealType.h below
 // are added for the item-persistence helpers (ResolveItemsRecordsArray reflects into the game's
-// ContainersVariableName UPROPERTY via FArrayProperty; LogRedwood comes from RedwoodModule).
+// ItemsVariableName UPROPERTY via FArrayProperty; LogRedwood comes from RedwoodModule).
 #include "RedwoodCharacterComponent.h"
 #include "RedwoodModule.h"
 
@@ -316,12 +316,12 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
 // attributes} wire shape that MUST stay identical between the backend
 // realm:characters:items:upsert payload and the offline/PIE character JSON, or the two
 // persistence legs stop being interchangeable. ResolveItemsRecordsArray reflects the game's
-// ContainersVariableName UPROPERTY (a TArray<FRedwoodItemRecord> as of this task; the property
-// itself is renamed to ItemsVariableName in RedwoodPlugins plan Task 3) on the component's
-// data-holding object. Consumers to preserve on merge: URedwoodServerGameSubsystem
-// (FlushContainersForCharacterComponent / AppendOfflineContainerRows),
-// URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated (load leg), and the game module
-// via those. Declarations live in RedwoodCommonGameSubsystem.h under a matching FORK marker.
+// ItemsVariableName UPROPERTY (a TArray<FRedwoodItemRecord>; the property was renamed from
+// ContainersVariableName in RedwoodPlugins plan Task 3, landed alongside this helper) on the
+// component's data-holding object. Consumers to preserve on merge: URedwoodServerGameSubsystem
+// (item flush / offline append), URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated
+// (load leg), and the game module via those. Declarations live in RedwoodCommonGameSubsystem.h
+// under a matching FORK marker.
 TArray<FRedwoodItemRecord> URedwoodCommonGameSubsystem::ParseItemRecords(
   const TArray<TSharedPtr<FJsonValue>> &ItemsJsonArray
 ) {
@@ -418,11 +418,11 @@ TArray<FRedwoodItemRecord> *URedwoodCommonGameSubsystem::ResolveItemsRecordsArra
     return nullptr;
   }
 
-  // FORK(hollowed-oath): still reads ContainersVariableName -- see the declaration-site FORK note
-  // in RedwoodCommonGameSubsystem.h. The property is renamed to ItemsVariableName in
-  // RedwoodPlugins plan Task 3; only the reflected struct type (below) changes in this task.
+  // FORK(hollowed-oath): reads ItemsVariableName (renamed from ContainersVariableName in
+  // RedwoodPlugins plan Task 3, landed alongside this helper) -- see the declaration-site FORK
+  // note in RedwoodCommonGameSubsystem.h.
   FProperty *Prop = Target->GetClass()->FindPropertyByName(
-    *CharacterComponent->ContainersVariableName
+    *CharacterComponent->ItemsVariableName
   );
   FArrayProperty *ArrayProp = CastField<FArrayProperty>(Prop);
   if (!ArrayProp) {
@@ -430,7 +430,7 @@ TArray<FRedwoodItemRecord> *URedwoodCommonGameSubsystem::ResolveItemsRecordsArra
       LogRedwood,
       Error,
       TEXT("%s variable not found (or not an array) in %s"),
-      *CharacterComponent->ContainersVariableName,
+      *CharacterComponent->ItemsVariableName,
       *Target->GetName()
     );
     return nullptr;
@@ -442,7 +442,7 @@ TArray<FRedwoodItemRecord> *URedwoodCommonGameSubsystem::ResolveItemsRecordsArra
       LogRedwood,
       Error,
       TEXT("%s variable in %s is not a TArray<FRedwoodItemRecord>"),
-      *CharacterComponent->ContainersVariableName,
+      *CharacterComponent->ItemsVariableName,
       *Target->GetName()
     );
     return nullptr;

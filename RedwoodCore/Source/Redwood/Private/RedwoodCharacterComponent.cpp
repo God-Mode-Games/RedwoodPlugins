@@ -575,28 +575,32 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
       }
     }
 
-    // FORK(hollowed-oath) BEGIN: container LOAD leg of HollowedOath's per-bag inventory. Copies
-    // the persisted container rows into the game's ContainersVariableName array BEFORE the
+    // FORK(hollowed-oath) BEGIN: item LOAD leg of HollowedOath's per-bag inventory. Copies
+    // the persisted item rows into the game's ItemsVariableName array BEFORE the
     // OnRedwoodCharacterUpdated broadcast, so game code (AClient / the per-bag inventory) sees
     // the rows already present the moment it reacts. Entirely fork-added -- upstream has no
-    // container concept. Merge must preserve the ordering: this block runs before the broadcast.
-    // Containers ride the SAME round trip as every field above (RedwoodCharacterBackend.Containers
+    // item-row concept. Merge must preserve the ordering: this block runs before the broadcast.
+    // Items ride the SAME round trip as every field above (RedwoodCharacterBackend.Items
     // -- populated by the player-auth / character-load response, not a separate
-    // realm:characters:containers:load call), so this runs BEFORE the OnRedwoodCharacterUpdated
+    // realm:characters:items:load call), so this runs BEFORE the OnRedwoodCharacterUpdated
     // broadcast below like every other channel: game code reacting to that broadcast can rely on
-    // ContainersVariableName already reflecting the persisted rows, with no later-arriving
-    // corrective pass required.
+    // ItemsVariableName already reflecting the persisted rows, with no later-arriving
+    // corrective pass required. SeedItemSeqFromCharacter primes the single-flight batchSeq state
+    // from the loaded InventorySeq so the first flush of the session continues the backend's
+    // sequence (see the state-member FORK block in the header) -- it must run here, before any
+    // flush can be triggered by game code reacting to the broadcast.
     // NOTE: RedwoodPlayerStateCharacterUpdated() re-runs on every OnControllerChanged, so this
-    // login snapshot re-applies RedwoodCharacterBackend.Containers to the wire array each time --
+    // login snapshot re-applies RedwoodCharacterBackend.Items to the wire array each time --
     // safe today because there is no mid-session repossession path (this is a single-shot game
     // load), but revisit once linkdead pawn retention (#1365) lands and a live pawn can be
     // re-possessed after mutations have already dirtied the wire array past the login snapshot.
-    if (bUseContainers) {
-      TArray<FRedwoodContainerRecord> *RecordsArray =
-        URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(this);
+    if (bUseItems) {
+      TArray<FRedwoodItemRecord> *RecordsArray =
+        URedwoodCommonGameSubsystem::ResolveItemsRecordsArray(this);
       if (RecordsArray) {
-        *RecordsArray = RedwoodCharacterBackend.Containers;
+        *RecordsArray = RedwoodCharacterBackend.Items;
       }
+      SeedItemSeqFromCharacter(RedwoodCharacterBackend.InventorySeq);
     }
     // FORK(hollowed-oath) END
 
@@ -615,3 +619,70 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
 void URedwoodCharacterComponent::OnRep_RedwoodCharacterUpdated() {
   OnRedwoodCharacterUpdated.Broadcast();
 }
+
+// FORK(hollowed-oath) BEGIN: protocol-v2 single-flight/batchSeq item-flush lifecycle. Fork-added;
+// no upstream counterpart. See the state-member rationale block in the header for WHY the item
+// channel is single-flight and sequence-fenced (the backend rejects seq gaps and no-ops replays,
+// so overlapping in-flight batches must be prevented).
+bool URedwoodCharacterComponent::TryBeginItemFlush(int64 &OutBatchSeq) {
+  if (bItemFlushInFlight) {
+    // A batch is already outstanding; the caller must not send a second, overlapping one.
+    return false;
+  }
+
+  bItemFlushInFlight = true;
+  InFlightBatchSeq = NextBatchSeq;
+  OutBatchSeq = NextBatchSeq;
+  return true;
+}
+
+void URedwoodCharacterComponent::CompleteItemFlush(
+  const FString &Error,
+  int64 CommittedSeq,
+  const TArray<TPair<FString, uint64>> &SentUpserts,
+  const TArray<TPair<FString, uint64>> &SentDeletes
+) {
+  // The seq the just-completed flush stamped on its payload (claimed in TryBeginItemFlush).
+  const int64 SentSeq = InFlightBatchSeq;
+
+  if (Error.IsEmpty()) {
+    // Success: clear only the ids whose generation still matches what was sent, exactly as the
+    // old container ack did -- if MarkItemsDirty/MarkItemsDeleted bumped an id again while the
+    // request was in flight, leave it dirty (at its newer generation) so the next flush re-sends
+    // the newer record instead of clearing away a write we never actually persisted.
+    for (const TPair<FString, uint64> &Sent : SentUpserts) {
+      uint64 *CurrentGeneration = DirtyItemGenerations.Find(Sent.Key);
+      if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
+        DirtyItemGenerations.Remove(Sent.Key);
+      }
+    }
+    for (const TPair<FString, uint64> &Sent : SentDeletes) {
+      uint64 *CurrentGeneration = PendingDeletedItemGenerations.Find(Sent.Key);
+      if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
+        PendingDeletedItemGenerations.Remove(Sent.Key);
+      }
+    }
+
+    LastCommittedItemSeq = CommittedSeq;
+    NextBatchSeq = CommittedSeq + 1;
+  } else {
+    // Error: leave dirt in place so the next tick re-sends. Normally we also leave NextBatchSeq
+    // alone so the retry re-uses the same seq -- EXCEPT when the backend reports it has already
+    // committed at or past the seq we sent (a replay it no-oped, or a fence ahead of us). In that
+    // case keeping our old NextBatchSeq would wedge every future flush behind a gap the backend
+    // keeps rejecting, so realign to the backend's committed fence.
+    if (CommittedSeq >= SentSeq) {
+      LastCommittedItemSeq = CommittedSeq;
+      NextBatchSeq = CommittedSeq + 1;
+    }
+  }
+
+  // Always release the flight slot, whatever the outcome.
+  bItemFlushInFlight = false;
+}
+
+void URedwoodCharacterComponent::SeedItemSeqFromCharacter(int64 InventorySeq) {
+  LastCommittedItemSeq = InventorySeq;
+  NextBatchSeq = InventorySeq + 1;
+}
+// FORK(hollowed-oath) END

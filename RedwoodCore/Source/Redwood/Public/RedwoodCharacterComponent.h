@@ -108,25 +108,25 @@ public:
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
   int32 LatestNonequippedInventorySchemaVersion = 0;
 
-  // FORK(hollowed-oath) BEGIN: container-persistence config knobs. Fork-added; no upstream
-  // counterpart. bUseContainers gates the whole channel; ContainersVariableName names the game's
-  // TArray<FRedwoodContainerRecord> UPROPERTY that ResolveContainersRecordsArray reflects into.
-  // Merge must preserve both as EditAnywhere config (games override ContainersVariableName).
-  // Per-container persistence channel (Task 8's Container table). Unlike the channels above,
-  // this is not a single whole-blob field: ContainersVariableName names a
-  // TArray<FRedwoodContainerRecord> UPROPERTY on the owning actor, and only the DIRTY records
-  // (MarkContainersDirty) plus any pending deletions (MarkContainersDeleted) are sent to the
-  // realm:characters:containers:upsert sidecar route on flush -- so a change to one bag doesn't
-  // resend every other container. LOADING, unlike flushing, rides the SAME round trip as the rest
-  // of the character (FRedwoodCharacterBackend::Containers, populated by the player-auth /
+  // FORK(hollowed-oath) BEGIN: per-item-persistence config knobs. Fork-added; no upstream
+  // counterpart. bUseItems gates the whole channel; ItemsVariableName names the game's
+  // TArray<FRedwoodItemRecord> UPROPERTY that ResolveItemsRecordsArray reflects into.
+  // Merge must preserve both as EditAnywhere config (games override ItemsVariableName).
+  // Per-item persistence channel (the backend Item table). Unlike the channels above,
+  // this is not a single whole-blob field: ItemsVariableName names a
+  // TArray<FRedwoodItemRecord> UPROPERTY on the owning actor, and only the DIRTY records
+  // (MarkItemsDirty) plus any pending deletions (MarkItemsDeleted) are sent to the
+  // realm:characters:items:upsert sidecar route on flush -- so a change to one item doesn't
+  // resend every other item. LOADING, unlike flushing, rides the SAME round trip as the rest
+  // of the character (FRedwoodCharacterBackend::Items, populated by the player-auth /
   // character-load response) rather than its own route -- see
-  // RedwoodPlayerStateCharacterUpdated(), which copies it into ContainersVariableName before
+  // RedwoodPlayerStateCharacterUpdated(), which copies it into ItemsVariableName before
   // broadcasting OnRedwoodCharacterUpdated.
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
-  bool bUseContainers = true;
+  bool bUseItems = true;
 
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
-  FString ContainersVariableName = TEXT("Containers");
+  FString ItemsVariableName = TEXT("Items");
   // FORK(hollowed-oath) END
 
   UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Redwood")
@@ -194,43 +194,43 @@ public:
     }
   }
 
-  // FORK(hollowed-oath) BEGIN: container dirty/delete-marking API. Fork-added; the game module
-  // (AClient / per-bag inventory) calls MarkContainersDirty / MarkContainersDeleted to drive the
-  // per-container persistence channel. Merge must preserve the delete-cancel-on-redirty behavior
+  // FORK(hollowed-oath) BEGIN: item dirty/delete-marking API. Fork-added; the game module
+  // (AClient / per-bag inventory) calls MarkItemsDirty / MarkItemsDeleted to drive the
+  // per-item persistence channel. Merge must preserve the delete-cancel-on-redirty behavior
   // (a re-dirty removes a pending deletion, and vice versa) and the per-id GENERATION counter that
-  // AckContainersFlushed relies on -- these are the correctness core of the whole channel.
-  // Records ContainerIds whose game-side record changed since the last flush. Dirty ids
+  // CompleteItemFlush relies on -- these are the correctness core of the whole channel.
+  // Records item ids whose game-side record changed since the last flush. Dirty ids
   // accumulate (a second call before a flush unions in, it doesn't replace) so nothing is lost
   // if multiple mutations land in the same tick. Each id carries a GENERATION counter (bumped on
-  // every mark) rather than a plain presence flag -- see AckContainersFlushed for why: it lets an
+  // every mark) rather than a plain presence flag -- see CompleteItemFlush for why: it lets an
   // ack tell "the id I sent" apart from "the id as it stands after a re-dirty that arrived while
   // that send was still in flight".
   UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Redwood")
-  void MarkContainersDirty(const TArray<FString> &DirtyContainerIds) {
-    if (bUseContainers) {
-      for (const FString &Id : DirtyContainerIds) {
-        ++DirtyContainerGenerations.FindOrAdd(Id);
+  void MarkItemsDirty(const TArray<FString> &DirtyItemIds) {
+    if (bUseItems) {
+      for (const FString &Id : DirtyItemIds) {
+        ++DirtyItemGenerations.FindOrAdd(Id);
         // A re-dirtied id cancels any pending deletion of the same row (delete-then-recreate,
-        // e.g. a bag unequipped then re-equipped inside one flush window). Without this, one
+        // e.g. an item removed then re-created inside one flush window). Without this, one
         // flush sends the id as BOTH upsert and delete, and the backend transaction deletes
         // last -- the recreated row is lost while both acks report success. Correct whether or
         // not a delete is already in flight: an in-flight delete's ack then no-ops on the
         // removed entry and the surviving dirty upsert recreates the row.
-        PendingDeletedContainerGenerations.Remove(Id);
+        PendingDeletedItemGenerations.Remove(Id);
       }
     }
   }
 
-  // Records ContainerIds whose row should be DELETED on next flush (e.g. a bag that got
-  // discarded). A deleted id is dropped from the dirty-upsert set too -- there's no point
+  // Records item ids whose row should be DELETED on next flush (e.g. an item that got
+  // consumed/discarded). A deleted id is dropped from the dirty-upsert set too -- there's no point
   // upserting a row the same flush is about to delete. Same generation-counter treatment as
-  // MarkContainersDirty, for the same reason.
+  // MarkItemsDirty, for the same reason.
   UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Redwood")
-  void MarkContainersDeleted(const TArray<FString> &DeletedContainerIds) {
-    if (bUseContainers) {
-      for (const FString &Id : DeletedContainerIds) {
-        ++PendingDeletedContainerGenerations.FindOrAdd(Id);
-        DirtyContainerGenerations.Remove(Id);
+  void MarkItemsDeleted(const TArray<FString> &DeletedItemIds) {
+    if (bUseItems) {
+      for (const FString &Id : DeletedItemIds) {
+        ++PendingDeletedItemGenerations.FindOrAdd(Id);
+        DirtyItemGenerations.Remove(Id);
       }
     }
   }
@@ -282,65 +282,75 @@ public:
     return bNonequippedInventoryDirty;
   }
 
-  // FORK(hollowed-oath) BEGIN: container dirty-state query, drain accessors, and the two clear
-  // paths. Fork-added. The critical invariant an upstream merge MUST keep: AckContainersFlushed
-  // clears an id only if its generation still matches what was sent (so a re-dirty racing an
-  // in-flight send is never silently dropped), whereas ClearContainersDirtyState is the
-  // unconditional clear reserved for paths with no in-flight send to race. Consumed by
-  // URedwoodServerGameSubsystem::FlushContainersForCharacterComponent / AppendOfflineContainerRows.
+  // FORK(hollowed-oath) BEGIN: item dirty-state query, drain accessors, the two clear paths, and
+  // the protocol-v2 single-flight/batchSeq API. Fork-added. The critical invariant an upstream
+  // merge MUST keep: CompleteItemFlush clears an id only if its generation still matches what was
+  // sent (so a re-dirty racing an in-flight send is never silently dropped), whereas
+  // ClearItemsDirtyState is the unconditional clear reserved for paths with no in-flight send to
+  // race. Consumed by URedwoodServerGameSubsystem's item flush / offline append paths.
   UFUNCTION(BlueprintPure, Category = "Redwood")
-  bool IsContainersDirty() const {
-    return DirtyContainerGenerations.Num() > 0 || PendingDeletedContainerGenerations.Num() > 0;
+  bool IsItemsDirty() const {
+    return DirtyItemGenerations.Num() > 0 || PendingDeletedItemGenerations.Num() > 0;
   }
 
-  // Drained by URedwoodServerGameSubsystem::FlushContainersForCharacterComponent when building
-  // the upsert payload; not BlueprintCallable (Blueprint has no TMap<FString, uint64> pin type).
-  // The value is the dirty GENERATION for that id -- see AckContainersFlushed.
-  const TMap<FString, uint64> &GetDirtyContainerGenerations() const {
-    return DirtyContainerGenerations;
+  // Drained by the server item-flush path when building the upsert payload; not BlueprintCallable
+  // (Blueprint has no TMap<FString, uint64> pin type). The value is the dirty GENERATION for that
+  // id -- see CompleteItemFlush.
+  const TMap<FString, uint64> &GetDirtyItemGenerations() const {
+    return DirtyItemGenerations;
   }
 
-  const TMap<FString, uint64> &GetPendingDeletedContainerGenerations() const {
-    return PendingDeletedContainerGenerations;
+  const TMap<FString, uint64> &GetPendingDeletedItemGenerations() const {
+    return PendingDeletedItemGenerations;
   }
 
   // Unconditional full clear -- used where there is genuinely nothing to retry (e.g. the
-  // identity-mismatch safety rail in CreatePlayerCharacterDataObject skips the flush entirely for
-  // a stale/un-hydrated component, so there is no in-flight send whose ack this would race).
-  // The normal flush path does NOT call this -- see AckContainersFlushed below, which clears only
-  // the specific ids a successfully-acknowledged flush actually sent.
-  void ClearContainersDirtyState() {
-    DirtyContainerGenerations.Empty();
-    PendingDeletedContainerGenerations.Empty();
+  // identity-mismatch safety rail that skips the flush entirely for a stale/un-hydrated component,
+  // so there is no in-flight send whose ack this would race). The normal flush path does NOT call
+  // this -- see CompleteItemFlush below, which clears only the specific ids a successfully-
+  // acknowledged flush actually sent.
+  void ClearItemsDirtyState() {
+    DirtyItemGenerations.Empty();
+    PendingDeletedItemGenerations.Empty();
   }
 
-  // Called by FlushContainersForCharacterComponent's Emit callback once
-  // realm:characters:containers:upsert acknowledges success for a flush that sent exactly
-  // SentUpserts (upserts) and SentDeletions (deletions), each paired with the GENERATION that was
-  // current for that id at send time. Removes an id ONLY IF its generation is still the one that
-  // was sent -- if MarkContainersDirty/MarkContainersDeleted bumped it again while the request was
-  // in flight, the id is left dirty (at its newer generation) so the next flush re-sends the
-  // newer record instead of the ack silently clearing away a write it never actually persisted.
-  // A failed send, a disconnect, or this component being destroyed before the ack arrives all
-  // leave the affected ids dirty, so the next flush retries them; dirty state is never cleared on
-  // build/send, only on confirmed persistence of the exact generation acknowledged.
-  void AckContainersFlushed(
-    const TArray<TPair<FString, uint64>> &SentUpserts,
-    const TArray<TPair<FString, uint64>> &SentDeletions
-  ) {
-    for (const TPair<FString, uint64> &Sent : SentUpserts) {
-      uint64 *CurrentGeneration = DirtyContainerGenerations.Find(Sent.Key);
-      if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
-        DirtyContainerGenerations.Remove(Sent.Key);
-      }
-    }
-    for (const TPair<FString, uint64> &Sent : SentDeletions) {
-      uint64 *CurrentGeneration = PendingDeletedContainerGenerations.Find(Sent.Key);
-      if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
-        PendingDeletedContainerGenerations.Remove(Sent.Key);
-      }
-    }
+  // Protocol-v2 single-flight/batchSeq accessors. See the FORK rationale block on the state
+  // members (bItemFlushInFlight / NextBatchSeq) for WHY the item channel is single-flight and
+  // sequence-fenced where the sibling channels are not.
+  bool IsItemFlushInFlight() const {
+    return bItemFlushInFlight;
   }
+
+  int64 GetLastCommittedItemSeq() const {
+    return LastCommittedItemSeq;
+  }
+
+  // Claims the single flight slot and the next batchSeq for a flush the server is about to send.
+  // Returns false (and leaves OutBatchSeq untouched) if a flush is already in flight -- the caller
+  // must not send a second, overlapping item batch (see the state-member FORK block). On success,
+  // OutBatchSeq is the NextBatchSeq value the flush must stamp on its payload, and that same value
+  // is remembered in InFlightBatchSeq so CompleteItemFlush can recognise a backend fence at or
+  // past the seq we sent without being handed it explicitly.
+  bool TryBeginItemFlush(int64 &OutBatchSeq);
+
+  // Ack handler for the in-flight item flush. On success (Error empty) clears the SENT generations
+  // (generation-matched, exactly as the old container ack did) and advances the committed seq. On
+  // error it normally leaves dirt in place so the next tick re-sends -- EXCEPT when the backend
+  // reports it has already committed at or past the seq we sent (replay/fence resync), in which
+  // case NextBatchSeq is realigned to CommittedSeq + 1 so future flushes aren't wedged behind a
+  // gap the backend will keep rejecting. ALWAYS releases the flight slot. SentUpserts/SentDeletes
+  // pair each sent id with the GENERATION current for it at send time.
+  void CompleteItemFlush(
+    const FString &Error,
+    int64 CommittedSeq,
+    const TArray<TPair<FString, uint64>> &SentUpserts,
+    const TArray<TPair<FString, uint64>> &SentDeletes
+  );
+
+  // Seeds the committed-seq/next-batchSeq state from a freshly-loaded character's InventorySeq.
+  // Called from the load-broadcast copy site (RedwoodPlayerStateCharacterUpdated) so the first
+  // flush of the session continues the backend's sequence instead of restarting at 1.
+  void SeedItemSeqFromCharacter(int64 InventorySeq);
   // FORK(hollowed-oath) END
 
   UFUNCTION(BlueprintPure, Category = "Redwood")
@@ -358,13 +368,13 @@ public:
     return bAbilitySystemDirty;
   }
 
-  // FORK(hollowed-oath): the container dirty-state carve-out below is a fork addition to an
+  // FORK(hollowed-oath): the item dirty-state carve-out below is a fork addition to an
   // otherwise-upstream method. An upstream merge MUST keep ClearDirtyFlags from clearing
-  // DirtyContainerGenerations / PendingDeletedContainerGenerations -- those clear only on ack.
-  // NOTE: deliberately does NOT touch the containers dirty state (DirtyContainerGenerations /
-  // PendingDeletedContainerGenerations) -- unlike every flag cleared below, containers ride their own
-  // acknowledged send (FlushContainersForCharacterComponent -> AckContainersFlushed), so clearing
-  // them here (before the ack) would drop a flush that later fails or never arrives.
+  // DirtyItemGenerations / PendingDeletedItemGenerations -- those clear only on ack.
+  // NOTE: deliberately does NOT touch the item dirty state (DirtyItemGenerations /
+  // PendingDeletedItemGenerations) -- unlike every flag cleared below, items ride their own
+  // acknowledged, sequence-fenced send (CompleteItemFlush), so clearing them here (before the ack)
+  // would drop a flush that later fails or never arrives.
   void ClearDirtyFlags() {
     bPlayerDataDirty = false;
     bCharacterCreatorDataDirty = false;
@@ -416,8 +426,27 @@ private:
   bool bDataDirty = false;
   bool bAbilitySystemDirty = false;
 
-  // FORK(hollowed-oath): fork-added backing state for the per-container persistence channel.
-  // Value is a per-id dirty GENERATION, not a plain membership flag -- see AckContainersFlushed.
-  TMap<FString, uint64> DirtyContainerGenerations;
-  TMap<FString, uint64> PendingDeletedContainerGenerations;
+  // FORK(hollowed-oath) BEGIN: fork-added backing state for the per-item persistence channel.
+  // Value is a per-id dirty GENERATION, not a plain membership flag -- see CompleteItemFlush.
+  TMap<FString, uint64> DirtyItemGenerations;
+  TMap<FString, uint64> PendingDeletedItemGenerations;
+
+  // Protocol-v2 single-flight + sequence-fence state. WHY single-flight exists: the item channel
+  // has no tombstones and the backend enforces strict ordering on the per-character mutation
+  // sequence -- it REJECTS a batch whose seq leaves a GAP (a seq ahead of what it has committed)
+  // and NO-OPS a replay (a seq at or below what it has already committed). If two flushes were in
+  // flight at once their acks could interleave and either wedge the channel behind a perceived gap
+  // or silently drop the later batch as a replay. So exactly one item flush may be outstanding:
+  // TryBeginItemFlush claims bItemFlushInFlight and stamps the batch with NextBatchSeq (remembered
+  // in InFlightBatchSeq), and CompleteItemFlush releases the slot, advancing the seq only on a
+  // confirmed commit or a backend-reported fence. LastCommittedItemSeq mirrors the backend's last
+  // committed seq (seeded from the loaded character's InventorySeq); NextBatchSeq is the seq the
+  // next flush will claim.
+  bool bItemFlushInFlight = false;
+  int64 LastCommittedItemSeq = 0;
+  int64 NextBatchSeq = 1;
+  // The batchSeq handed out by the current in-flight TryBeginItemFlush; lets CompleteItemFlush
+  // detect a backend fence at or past what we sent without the seq being passed back in.
+  int64 InFlightBatchSeq = 0;
+  // FORK(hollowed-oath) END
 };
