@@ -314,7 +314,7 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
 // persistence is per-item flat rows instead of opaque per-container blobs. ParseItemRecords /
 // SerializeItemRecord(s) define the shared {id, parentId, domain, slot, quantity, templateId,
 // attributes} wire shape that MUST stay identical between the backend
-// realm:characters:items:upsert payload and the offline/PIE character JSON, or the two
+// realm:characters:items:flush payload and the offline/PIE character JSON, or the two
 // persistence legs stop being interchangeable. ResolveItemsRecordsArray reflects the game's
 // ItemsVariableName UPROPERTY (a TArray<FRedwoodItemRecord>; the property was renamed from
 // ContainersVariableName in RedwoodPlugins plan Task 3, landed alongside this helper) on the

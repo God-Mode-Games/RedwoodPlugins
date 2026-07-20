@@ -14,12 +14,11 @@
 // feat/item-persistence line. Must stay declared ABOVE FRedwoodCharacterBackend (its Items array
 // needs the complete type).
 // One record of the per-item persistence channel (see URedwoodCharacterComponent's
-// bUseContainers/ContainersVariableName/MarkContainersDirty; those names describe the
-// container-era wiring and are retargeted to items in a later task). Unlike the fixed
+// bUseItems/ItemsVariableName/MarkItemsDirty). Unlike the fixed
 // EquippedInventory/NonequippedInventory/etc. channels below (one whole-blob USTRUCT field,
 // always resent in full when dirty), items are transported as an ARRAY of these records so a
-// flush can send only the ones that actually changed (plus a deletedItemIds list) to the
-// realm:characters:items:upsert sidecar route. ParentId establishes nesting (empty string = root
+// flush can send only the ones that actually changed (plus a deletes list) to the
+// realm:characters:items:flush sidecar route. ParentId establishes nesting (empty string = root
 // item, matching the wire's null) -- sockets and other contained items point at their owner via
 // this field instead of living inside an opaque container blob. Attributes is deliberately opaque
 // here (an arbitrary JSON object) -- its shape is owned entirely by the game layer, matching how
@@ -113,8 +112,8 @@ struct FRedwoodCharacterBackend {
   // character-updated event with items still missing. Offline/PIE-disk saves populate this the
   // same way, from the "items" array the on-disk character JSON carries inline (there is no Item
   // table to read there) -- see URedwoodCommonGameSubsystem::SaveCharacterToDisk and
-  // URedwoodServerGameSubsystem::AppendOfflineContainerRows (both retarget to items in a later
-  // task). InventoryRowsMigrated and InventorySeq are fork-added bookkeeping: the former counts
+  // URedwoodServerGameSubsystem::AppendOfflineItemRows. InventoryRowsMigrated and InventorySeq
+  // are fork-added bookkeeping: the former counts
   // legacy container rows folded into Items by the one-time migration, the latter is a
   // per-character mutation sequence counter used to detect stale/racing flushes. Backend
   // counterpart for all three fields lives on RedwoodBackend's feat/item-persistence line.

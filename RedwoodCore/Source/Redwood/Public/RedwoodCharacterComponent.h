@@ -116,7 +116,7 @@ public:
   // this is not a single whole-blob field: ItemsVariableName names a
   // TArray<FRedwoodItemRecord> UPROPERTY on the owning actor, and only the DIRTY records
   // (MarkItemsDirty) plus any pending deletions (MarkItemsDeleted) are sent to the
-  // realm:characters:items:upsert sidecar route on flush -- so a change to one item doesn't
+  // realm:characters:items:flush sidecar route on flush -- so a change to one item doesn't
   // resend every other item. LOADING, unlike flushing, rides the SAME round trip as the rest
   // of the character (FRedwoodCharacterBackend::Items, populated by the player-auth /
   // character-load response) rather than its own route -- see

@@ -122,7 +122,7 @@ public:
 
   // Serializes one record into that same wire {id, parentId, domain, slot, quantity, templateId,
   // attributes} shape -- the exact inverse of ParseItemRecords. Shared by the backend flush
-  // (realm:characters:items:upsert) and the offline/PIE disk save so the two legs cannot drift: a
+  // (realm:characters:items:flush) and the offline/PIE disk save so the two legs cannot drift: a
   // character JSON written offline and a backend item row stay interchangeable. Emits "parentId"
   // as JSON null when Record.ParentId is empty (root item), and "attributes" as an empty object
   // when Record.Attributes is null/invalid (mirrors the old container "contents" guard).

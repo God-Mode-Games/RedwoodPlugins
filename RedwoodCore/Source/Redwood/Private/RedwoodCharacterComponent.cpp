@@ -663,8 +663,32 @@ void URedwoodCharacterComponent::CompleteItemFlush(
       }
     }
 
-    LastCommittedItemSeq = CommittedSeq;
-    NextBatchSeq = CommittedSeq + 1;
+    // FORK(hollowed-oath): defensive guard against a malformed SUCCESS ack. We otherwise trust the
+    // backend to report committedSeq >= SentSeq on every success response -- that trust is the
+    // whole point of the seq fence. But FlushItemsForCharacterComponent's TryGetNumberField parses
+    // a missing/malformed "committedSeq" field to 0.0, and adopting that here would reset
+    // NextBatchSeq to 1, wedging the fence (every later flush would then stamp a seq the backend
+    // has already moved past). If the contract is ever violated like this, do NOT adopt the bogus
+    // seq: leave LastCommittedItemSeq/NextBatchSeq exactly as they were. The generations above are
+    // still cleared and the flight slot below is still released either way -- the send itself did
+    // succeed; only the seq bookkeeping in the ack is suspect.
+    if (CommittedSeq < SentSeq) {
+      UE_LOG(
+        LogRedwood,
+        Warning,
+        TEXT(
+          "CompleteItemFlush: success ack reported committedSeq %lld < sent batchSeq %lld "
+          "(contract violation -- missing/malformed committedSeq field?); ignoring the reported "
+          "seq and leaving NextBatchSeq at %lld"
+        ),
+        CommittedSeq,
+        SentSeq,
+        NextBatchSeq
+      );
+    } else {
+      LastCommittedItemSeq = CommittedSeq;
+      NextBatchSeq = CommittedSeq + 1;
+    }
   } else {
     // Error: leave dirt in place so the next tick re-sends. Normally we also leave NextBatchSeq
     // alone so the retry re-uses the same seq -- EXCEPT when the backend reports it has already

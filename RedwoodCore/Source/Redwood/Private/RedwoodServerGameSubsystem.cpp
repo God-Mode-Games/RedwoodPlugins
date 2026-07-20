@@ -1356,6 +1356,15 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
       }
     };
 
+  // FORK(hollowed-oath): stranding hazard at THIS release site, not just the park path it depends
+  // on. If FlushItemsForCharacterComponent finds a batch already in flight it PARKS this attempt
+  // (see the single-flight comment in that function) instead of sending it, and still calls
+  // SettleOne synchronously -- so the latch above can reach zero and EmitPlayerLeft can release the
+  // write binding while this pawn's dirty items never actually left the process. A live, still-
+  // ticking component would retry on its next flush; a detached pawn has none once the binding is
+  // released. This settled-latch does not close that gap -- it only orders the release behind an
+  // attempt SETTLING, not behind the items actually landing. #1365's flush-barrier work is what
+  // closes it (by keeping the pawn's binding alive until a real delivery, not just a settle).
   // Item flush leg. PlayerStateComponent is null here (a detached pawn has no live PlayerState), so
   // FlushItemsForCharacterComponent sources characterId from the component's RedwoodCharacterId,
   // already verified equal to CharacterId at the top of this function. Single-flight makes it safe
@@ -1976,8 +1985,11 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // Claim the single-flight slot + the batchSeq this batch must stamp. If a batch is already
   // outstanding, park this tick's flush -- the dirt stays marked and coalesces until the in-flight
   // batch's ack releases the slot. Settle so the detached barrier doesn't wait forever on a parked
-  // tick (the still-dirty rows retry on a later flush; the barrier is interim, not a delivery
-  // guarantee).
+  // tick. For a LIVE component the still-dirty rows retry on that component's next tick-flush; a
+  // DETACHED pawn has no next tick once FlushDetachedCharacterData's settled-latch reaches zero and
+  // releases the write binding, so a park here can strand those rows outright rather than merely
+  // delay them -- see the FORK note at that function's item-flush call site. The barrier is interim,
+  // not a delivery guarantee, until #1365's flush-barrier work closes this gap.
   int64 BatchSeq = 0;
   if (!CharacterComponent->TryBeginItemFlush(BatchSeq)) {
     Settle();
