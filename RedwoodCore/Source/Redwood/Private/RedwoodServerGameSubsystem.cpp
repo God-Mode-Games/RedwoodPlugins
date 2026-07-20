@@ -2246,14 +2246,15 @@ void URedwoodServerGameSubsystem::EmitItemsTrade(
   const FString &FromCharacterId,
   const FString &ToCharacterId,
   const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
-  TFunction<void(FString Error)> OnComplete
+  TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)>
+    OnComplete
 ) {
   if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
     UE_LOG(
       LogRedwood, Error, TEXT("Sidecar is not connected; cannot trade items")
     );
     if (OnComplete) {
-      OnComplete(TEXT("Sidecar is not connected"));
+      OnComplete(TEXT("Sidecar is not connected"), -1, -1);
     }
     return;
   }
@@ -2284,8 +2285,23 @@ void URedwoodServerGameSubsystem::EmitItemsTrade(
       if (!Error.IsEmpty()) {
         UE_LOG(LogRedwood, Error, TEXT("Failed to trade items: %s"), *Error);
       }
+      // FORK(hollowed-oath): post-trade InventorySeq fences (see the header doc-comment on
+      // EmitItemsTrade for the full delta-loss contract). -1 default covers error acks that omit
+      // the fields entirely, matching the sentinel the backend itself sends on error paths. Routed
+      // through a double intermediate the same way committedSeq is above -- JSON numbers land as
+      // doubles, and TryGetNumberField has no int64 overload here.
+      double FromCommittedSeqValue = -1.0;
+      double ToCommittedSeqValue = -1.0;
+      MessageStruct->TryGetNumberField(
+        TEXT("fromCommittedSeq"), FromCommittedSeqValue
+      );
+      MessageStruct->TryGetNumberField(
+        TEXT("toCommittedSeq"), ToCommittedSeqValue
+      );
+      int64 FromCommittedSeq = static_cast<int64>(FromCommittedSeqValue);
+      int64 ToCommittedSeq = static_cast<int64>(ToCommittedSeqValue);
       if (OnComplete) {
-        OnComplete(Error);
+        OnComplete(Error, FromCommittedSeq, ToCommittedSeq);
       }
     }
   );

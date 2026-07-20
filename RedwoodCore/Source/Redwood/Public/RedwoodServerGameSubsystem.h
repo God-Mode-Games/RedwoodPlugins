@@ -200,11 +200,25 @@ public:
   // in one transaction. After a successful trade the backend bumps BOTH characters' InventorySeq,
   // so each caller's next FlushItemsForCharacterComponent takes the seq-resync path (CommittedSeq
   // ahead of its sent seq) and realigns -- the trade itself does not flush either side here.
+  //
+  // FORK(hollowed-oath): FromCommittedSeq/ToCommittedSeq are the post-trade InventorySeq fences the
+  // backend returns on the ack (-1 on error paths; see RedwoodBackend feat/item-persistence trade
+  // handler). The backend bumps BOTH characters' seq server-side as part of the trade transaction,
+  // so each character's *next* flush arrives one seq behind what the server now expects -- without
+  // intervention that flush is silently treated as an idempotent replay (its batchSeq no longer
+  // matches CommittedSeq) even though the ack it receives is success-shaped, which clears the
+  // client's dirty state and DROPS the flush's contents. The CALLER (the game's trade task, which
+  // is the only place both characters' URedwoodCharacterComponent are reachable) MUST call
+  // SeedItemSeqFromCharacter on each trading character's component with the matching fence value
+  // BEFORE releasing that character's flush lane, or this loss reproduces on every trade. This
+  // function does not perform that re-seed itself -- the contract is documented here, on the
+  // signature, deliberately not wired in, because the components live outside RedwoodCore's reach
+  // from this call site.
   void EmitItemsTrade(
     const FString &FromCharacterId,
     const FString &ToCharacterId,
     const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
-    TFunction<void(FString Error)> OnComplete
+    TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete
   );
   // FORK(hollowed-oath) END
 
