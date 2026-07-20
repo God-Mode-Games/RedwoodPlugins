@@ -2,8 +2,8 @@
 
 #include "RedwoodCommonGameSubsystem.h"
 // FORK(hollowed-oath): RedwoodCharacterComponent.h + RedwoodModule.h + UObject/UnrealType.h below
-// are added for the container-persistence helpers (ResolveContainersRecordsArray reflects into the
-// game's ContainersVariableName UPROPERTY via FArrayProperty; LogRedwood comes from RedwoodModule).
+// are added for the item-persistence helpers (ResolveItemsRecordsArray reflects into the game's
+// ContainersVariableName UPROPERTY via FArrayProperty; LogRedwood comes from RedwoodModule).
 #include "RedwoodCharacterComponent.h"
 #include "RedwoodModule.h"
 
@@ -272,58 +272,87 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
     Character.RedwoodData->SetRootObject(*RedwoodData);
   }
 
-  // FORK(hollowed-oath) BEGIN: read inline container rows off the character object (offline/PIE
-  // leg). Fork-added; absent on the backend leg (rows arrive as a sibling of "character", assigned
-  // by RunSidecarPlayerAuth). Merge must keep this tolerant of the field being absent.
-  // Containers live INSIDE the character object only for offline/PIE-disk saves, where the
-  // character JSON file is the whole persistence store (see SaveCharacterToDisk). The backend
-  // keeps container rows in their own table and delivers them as a SIBLING of "character" in the
-  // player-auth response, so this field is simply absent there and RunSidecarPlayerAuth assigns
-  // Character.Containers from that sibling array after calling us -- both legs land in the same
-  // place, parsed by the same code.
-  const TArray<TSharedPtr<FJsonValue>> *Containers = nullptr;
-  if (CharacterObj->TryGetArrayField(TEXT("containers"), Containers)) {
-    Character.Containers = ParseContainerRecords(*Containers);
+  // FORK(hollowed-oath) BEGIN: read inline item rows off the character object (offline/PIE leg),
+  // plus the item-migration bookkeeping fields. Fork-added; absent on the backend leg (rows arrive
+  // as a sibling of "character", assigned by RunSidecarPlayerAuth). Merge must keep this tolerant
+  // of the fields being absent.
+  // Items live INSIDE the character object only for offline/PIE-disk saves, where the character
+  // JSON file is the whole persistence store (see SaveCharacterToDisk). The backend keeps item
+  // rows in their own table and delivers them as a SIBLING of "character" in the player-auth
+  // response, so this field is simply absent there and RunSidecarPlayerAuth assigns
+  // Character.Items from that sibling array after calling us -- both legs land in the same place,
+  // parsed by the same code. Replaces the earlier "containers" read (RedwoodPlugins#17).
+  const TArray<TSharedPtr<FJsonValue>> *Items = nullptr;
+  if (CharacterObj->TryGetArrayField(TEXT("items"), Items)) {
+    Character.Items = ParseItemRecords(*Items);
+  }
+
+  // inventoryRowsMigrated / inventorySeq ride on the character object on both legs (unlike Items,
+  // which is offline-only). GetNumberField returns a double; inventorySeq is a per-character
+  // mutation counter that will never approach 2^53 (the largest integer a double can represent
+  // exactly), so the narrowing cast below is safe in practice.
+  int32 InventoryRowsMigratedValue = 0;
+  if (CharacterObj->TryGetNumberField(
+        TEXT("inventoryRowsMigrated"), InventoryRowsMigratedValue
+      )) {
+    Character.InventoryRowsMigrated = InventoryRowsMigratedValue;
+  }
+
+  double InventorySeqValue = 0.0;
+  if (CharacterObj->TryGetNumberField(TEXT("inventorySeq"), InventorySeqValue)) {
+    Character.InventorySeq = static_cast<int64>(InventorySeqValue);
   }
   // FORK(hollowed-oath) END
 
   return Character;
 }
 
-// FORK(hollowed-oath) BEGIN: container-record wire helpers, entirely fork-added (no upstream
-// counterpart). ParseContainerRecords / SerializeContainerRecord(s) define the shared
-// {containerId, kind, contents} wire shape that MUST stay identical between the backend
-// realm:characters:containers:upsert payload and the offline/PIE character JSON, or the two
-// persistence legs stop being interchangeable. ResolveContainersRecordsArray reflects the game's
-// ContainersVariableName UPROPERTY (a TArray<FRedwoodContainerRecord>) on the component's
+// FORK(hollowed-oath) BEGIN: item-record wire helpers, entirely fork-added (no upstream
+// counterpart). Replaces the earlier per-container helpers (ParseContainerRecords /
+// SerializeContainerRecord(s) / ResolveContainersRecordsArray, RedwoodPlugins#17) now that
+// persistence is per-item flat rows instead of opaque per-container blobs. ParseItemRecords /
+// SerializeItemRecord(s) define the shared {id, parentId, domain, slot, quantity, templateId,
+// attributes} wire shape that MUST stay identical between the backend
+// realm:characters:items:upsert payload and the offline/PIE character JSON, or the two
+// persistence legs stop being interchangeable. ResolveItemsRecordsArray reflects the game's
+// ContainersVariableName UPROPERTY (a TArray<FRedwoodItemRecord> as of this task; the property
+// itself is renamed to ItemsVariableName in RedwoodPlugins plan Task 3) on the component's
 // data-holding object. Consumers to preserve on merge: URedwoodServerGameSubsystem
 // (FlushContainersForCharacterComponent / AppendOfflineContainerRows),
 // URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated (load leg), and the game module
 // via those. Declarations live in RedwoodCommonGameSubsystem.h under a matching FORK marker.
-TArray<FRedwoodContainerRecord> URedwoodCommonGameSubsystem::ParseContainerRecords(
-  const TArray<TSharedPtr<FJsonValue>> &ContainersJsonArray
+TArray<FRedwoodItemRecord> URedwoodCommonGameSubsystem::ParseItemRecords(
+  const TArray<TSharedPtr<FJsonValue>> &ItemsJsonArray
 ) {
-  TArray<FRedwoodContainerRecord> Records;
-  Records.Reserve(ContainersJsonArray.Num());
+  TArray<FRedwoodItemRecord> Records;
+  Records.Reserve(ItemsJsonArray.Num());
 
-  for (const TSharedPtr<FJsonValue> &Value : ContainersJsonArray) {
+  for (const TSharedPtr<FJsonValue> &Value : ItemsJsonArray) {
     TSharedPtr<FJsonObject> Row = Value->AsObject();
     if (!Row.IsValid()) {
       continue;
     }
 
-    FRedwoodContainerRecord Record;
-    Row->TryGetStringField(TEXT("containerId"), Record.ContainerId);
-    int32 KindValue = 0;
-    Row->TryGetNumberField(TEXT("kind"), KindValue);
-    Record.Kind = static_cast<uint8>(KindValue);
+    FRedwoodItemRecord Record;
+    Row->TryGetStringField(TEXT("id"), Record.Id);
 
-    USIOJsonObject *Contents = NewObject<USIOJsonObject>();
-    const TSharedPtr<FJsonObject> *ContentsObject = nullptr;
-    if (Row->TryGetObjectField(TEXT("contents"), ContentsObject)) {
-      Contents->SetRootObject(*ContentsObject);
+    // "parentId" is JSON null for a root item (see SerializeItemRecord). TryGetStringField
+    // fails (leaves ParentId untouched) both when the field is absent and when it's JSON null,
+    // so the default-constructed empty FString covers both cases -- exactly the "root item"
+    // meaning the wire contract expects.
+    Row->TryGetStringField(TEXT("parentId"), Record.ParentId);
+
+    Row->TryGetStringField(TEXT("domain"), Record.Domain);
+    Row->TryGetNumberField(TEXT("slot"), Record.Slot);
+    Row->TryGetNumberField(TEXT("quantity"), Record.Quantity);
+    Row->TryGetStringField(TEXT("templateId"), Record.TemplateId);
+
+    USIOJsonObject *Attributes = NewObject<USIOJsonObject>();
+    const TSharedPtr<FJsonObject> *AttributesObject = nullptr;
+    if (Row->TryGetObjectField(TEXT("attributes"), AttributesObject)) {
+      Attributes->SetRootObject(*AttributesObject);
     }
-    Record.Contents = Contents;
+    Record.Attributes = Attributes;
 
     Records.Add(MoveTemp(Record));
   }
@@ -331,42 +360,52 @@ TArray<FRedwoodContainerRecord> URedwoodCommonGameSubsystem::ParseContainerRecor
   return Records;
 }
 
-TSharedPtr<FJsonObject> URedwoodCommonGameSubsystem::SerializeContainerRecord(
-  const FRedwoodContainerRecord &Record
+TSharedPtr<FJsonObject> URedwoodCommonGameSubsystem::SerializeItemRecord(
+  const FRedwoodItemRecord &Record
 ) {
   TSharedPtr<FJsonObject> Row = MakeShareable(new FJsonObject);
-  Row->SetStringField(TEXT("containerId"), Record.ContainerId);
-  Row->SetNumberField(TEXT("kind"), Record.Kind);
-  // A record with no contents still serializes an (empty) object rather than omitting the field,
-  // so ParseContainerRecords reads back a record that compares equal to the one written.
+  Row->SetStringField(TEXT("id"), Record.Id);
+  // An empty ParentId means "root item" and serializes as JSON null (not an empty string), so
+  // ParseItemRecords reads back a record that compares equal to the one written and the backend
+  // schema's nullable parentId column round-trips cleanly.
+  if (Record.ParentId.IsEmpty()) {
+    Row->SetField(TEXT("parentId"), MakeShareable(new FJsonValueNull));
+  } else {
+    Row->SetStringField(TEXT("parentId"), Record.ParentId);
+  }
+  Row->SetStringField(TEXT("domain"), Record.Domain);
+  Row->SetNumberField(TEXT("slot"), Record.Slot);
+  Row->SetNumberField(TEXT("quantity"), Record.Quantity);
+  Row->SetStringField(TEXT("templateId"), Record.TemplateId);
+  // A record with no attributes still serializes an (empty) object rather than omitting the
+  // field, so ParseItemRecords reads back a record that compares equal to the one written
+  // (mirrors the old container "contents" guard).
   Row->SetObjectField(
-    TEXT("contents"),
-    Record.Contents && Record.Contents->IsValid()
-      ? Record.Contents->GetRootObject()
+    TEXT("attributes"),
+    Record.Attributes && Record.Attributes->IsValid()
+      ? Record.Attributes->GetRootObject()
       : MakeShareable(new FJsonObject)
   );
 
   return Row;
 }
 
-TArray<TSharedPtr<FJsonValue>>
-URedwoodCommonGameSubsystem::SerializeContainerRecords(
-  const TArray<FRedwoodContainerRecord> &Records
+TArray<TSharedPtr<FJsonValue>> URedwoodCommonGameSubsystem::SerializeItemRecords(
+  const TArray<FRedwoodItemRecord> &Records
 ) {
-  TArray<TSharedPtr<FJsonValue>> ContainersJsonArray;
-  ContainersJsonArray.Reserve(Records.Num());
+  TArray<TSharedPtr<FJsonValue>> ItemsJsonArray;
+  ItemsJsonArray.Reserve(Records.Num());
 
-  for (const FRedwoodContainerRecord &Record : Records) {
-    ContainersJsonArray.Add(
-      MakeShareable(new FJsonValueObject(SerializeContainerRecord(Record)))
+  for (const FRedwoodItemRecord &Record : Records) {
+    ItemsJsonArray.Add(
+      MakeShareable(new FJsonValueObject(SerializeItemRecord(Record)))
     );
   }
 
-  return ContainersJsonArray;
+  return ItemsJsonArray;
 }
 
-TArray<FRedwoodContainerRecord> *
-URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(
+TArray<FRedwoodItemRecord> *URedwoodCommonGameSubsystem::ResolveItemsRecordsArray(
   URedwoodCharacterComponent *CharacterComponent
 ) {
   AActor *ComponentOwner = CharacterComponent->GetOwner();
@@ -378,6 +417,9 @@ URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(
     return nullptr;
   }
 
+  // FORK(hollowed-oath): still reads ContainersVariableName -- see the declaration-site FORK note
+  // in RedwoodCommonGameSubsystem.h. The property is renamed to ItemsVariableName in
+  // RedwoodPlugins plan Task 3; only the reflected struct type (below) changes in this task.
   FProperty *Prop = Target->GetClass()->FindPropertyByName(
     *CharacterComponent->ContainersVariableName
   );
@@ -394,19 +436,18 @@ URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(
   }
 
   FStructProperty *InnerStructProp = CastField<FStructProperty>(ArrayProp->Inner);
-  if (!InnerStructProp || InnerStructProp->Struct != FRedwoodContainerRecord::StaticStruct()) {
+  if (!InnerStructProp || InnerStructProp->Struct != FRedwoodItemRecord::StaticStruct()) {
     UE_LOG(
       LogRedwood,
       Error,
-      TEXT("%s variable in %s is not a TArray<FRedwoodContainerRecord>"),
+      TEXT("%s variable in %s is not a TArray<FRedwoodItemRecord>"),
       *CharacterComponent->ContainersVariableName,
       *Target->GetName()
     );
     return nullptr;
   }
 
-  return ArrayProp->ContainerPtrToValuePtr<TArray<FRedwoodContainerRecord>>(Target
-  );
+  return ArrayProp->ContainerPtrToValuePtr<TArray<FRedwoodItemRecord>>(Target);
 }
 // FORK(hollowed-oath) END
 

@@ -11,7 +11,7 @@
 #include "RedwoodCommonGameSubsystem.generated.h"
 
 class USIOJsonObject;
-// FORK(hollowed-oath): forward decl for ResolveContainersRecordsArray's parameter (container helpers).
+// FORK(hollowed-oath): forward decl for ResolveItemsRecordsArray's parameter (item helpers).
 class URedwoodCharacterComponent;
 
 UCLASS(BlueprintType)
@@ -104,40 +104,47 @@ public:
 
   static FRedwoodParty ParseParty(const TSharedPtr<FJsonObject> &PartyObj);
 
-  // FORK(hollowed-oath) BEGIN: container wire-format helper declarations. Fork-added; definitions +
+  // FORK(hollowed-oath) BEGIN: item wire-format helper declarations. Fork-added; definitions +
   // the full rationale live under a matching FORK marker in RedwoodCommonGameSubsystem.cpp. These
   // are the shared serialize/parse/resolve surface both persistence legs (backend sidecar upsert
   // and offline/PIE disk JSON) and the game module depend on -- preserve their signatures on merge.
-  // Parses a wire "containers" JSON array (the {containerId, kind, contents} shape shared by the
-  // player-auth response and the realm:characters:containers:load response) into
-  // FRedwoodContainerRecord entries. Shared so both the character-arrival path
-  // (RedwoodGameModeComponent's RunSidecarPlayerAuth) and any other container-bearing response
-  // parse it identically.
-  static TArray<FRedwoodContainerRecord> ParseContainerRecords(
-    const TArray<TSharedPtr<FJsonValue>> &ContainersJsonArray
+  // Replaces the earlier per-container helpers (ParseContainerRecords / SerializeContainerRecord(s)
+  // / ResolveContainersRecordsArray, RedwoodPlugins#17) now that persistence is per-item flat rows
+  // instead of opaque per-container blobs; see FRedwoodItemRecord in RedwoodTypesCharacters.h.
+  // Parses a wire "items" JSON array (the {id, parentId, domain, slot, quantity, templateId,
+  // attributes} shape shared by the player-auth response and the realm:characters:items:load
+  // response) into FRedwoodItemRecord entries. Shared so both the character-arrival path
+  // (RedwoodGameModeComponent's RunSidecarPlayerAuth) and any other item-bearing response parse it
+  // identically. A JSON-null or missing "parentId" parses to an empty string (root item).
+  static TArray<FRedwoodItemRecord> ParseItemRecords(
+    const TArray<TSharedPtr<FJsonValue>> &ItemsJsonArray
   );
 
-  // Serializes one record into that same wire {containerId, kind, contents} shape -- the exact
-  // inverse of ParseContainerRecords. Shared by the backend flush
-  // (realm:characters:containers:upsert) and the offline/PIE disk save so the two legs cannot
-  // drift: a character JSON written offline and a backend container row stay interchangeable.
-  static TSharedPtr<FJsonObject> SerializeContainerRecord(
-    const FRedwoodContainerRecord &Record
+  // Serializes one record into that same wire {id, parentId, domain, slot, quantity, templateId,
+  // attributes} shape -- the exact inverse of ParseItemRecords. Shared by the backend flush
+  // (realm:characters:items:upsert) and the offline/PIE disk save so the two legs cannot drift: a
+  // character JSON written offline and a backend item row stay interchangeable. Emits "parentId"
+  // as JSON null when Record.ParentId is empty (root item), and "attributes" as an empty object
+  // when Record.Attributes is null/invalid (mirrors the old container "contents" guard).
+  static TSharedPtr<FJsonObject> SerializeItemRecord(const FRedwoodItemRecord &Record
   );
 
-  // Serializes a whole set of records into a wire "containers" array via
-  // SerializeContainerRecord.
-  static TArray<TSharedPtr<FJsonValue>> SerializeContainerRecords(
-    const TArray<FRedwoodContainerRecord> &Records
+  // Serializes a whole set of records into a wire "items" array via SerializeItemRecord.
+  static TArray<TSharedPtr<FJsonValue>> SerializeItemRecords(
+    const TArray<FRedwoodItemRecord> &Records
   );
 
-  // Resolves CharacterComponent->ContainersVariableName to a TArray<FRedwoodContainerRecord>
+  // Resolves CharacterComponent->ContainersVariableName to a TArray<FRedwoodItemRecord>
   // UPROPERTY on the component's data-holding object (the owning actor, or the component itself
   // when bStoreDataInActor is false -- same choice every other channel makes). Returns nullptr
   // (with an error logged) if the property is missing or isn't the expected array-of-struct
   // shape. Shared by the flush path (FlushContainersForCharacterComponent) and the arrival path
   // (RedwoodPlayerStateCharacterUpdated), which both need to reach the same array.
-  static TArray<FRedwoodContainerRecord> *ResolveContainersRecordsArray(
+  // FORK(hollowed-oath): still reads ContainersVariableName -- the component property itself is
+  // renamed to ItemsVariableName in a later task (RedwoodPlugins plan Task 3). This task only
+  // swaps the reflected struct type; leave the property-name read alone so the diff stays minimal
+  // and compiling until that rename lands.
+  static TArray<FRedwoodItemRecord> *ResolveItemsRecordsArray(
     URedwoodCharacterComponent *CharacterComponent
   );
   // FORK(hollowed-oath) END
