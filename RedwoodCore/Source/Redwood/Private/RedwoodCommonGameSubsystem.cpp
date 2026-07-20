@@ -117,16 +117,17 @@ void URedwoodCommonGameSubsystem::SaveCharacterToDisk(
     );
   }
 
-  // FORK(hollowed-oath) BEGIN: write the character's container rows inline into the offline/PIE
-  // character JSON. Entirely fork-added (upstream has no container concept). Merge must keep the
-  // unconditional SetArrayField -- see the comment; a conditional write would resurrect stale rows.
-  // Offline/PIE has no Container table, so the character JSON carries the rows itself. Written
+  // FORK(hollowed-oath) BEGIN: write the character's item rows inline into the offline/PIE
+  // character JSON. Entirely fork-added (upstream has no item/container concept). Merge must keep
+  // the unconditional SetArrayField -- see the comment; a conditional write would resurrect stale
+  // rows. Retargeted from the earlier per-container write (Character.Containers /
+  // SerializeContainerRecords, RedwoodPlugins#17) to match ParseCharacter's offline leg, which now
+  // reads "items" back out of this same key (see the FORK block in ParseCharacter above).
+  // Offline/PIE has no Item table, so the character JSON carries the rows itself. Written
   // unconditionally (an empty array included) because this is a whole-file rewrite: omitting the
-  // key on a character whose containers were all removed would leave the previous file's rows to
-  // be re-parsed on the next load.
-  JsonObject->SetArrayField(
-    TEXT("containers"), SerializeContainerRecords(Character.Containers)
-  );
+  // key on a character whose items were all removed would leave the previous file's rows to be
+  // re-parsed on the next load.
+  JsonObject->SetArrayField(TEXT("items"), SerializeItemRecords(Character.Items));
   // FORK(hollowed-oath) END
 
   SaveCharacterJsonToDisk(JsonObject);
