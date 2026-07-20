@@ -26,6 +26,19 @@
 // file-scope `using`: test .cpp files are concatenated into a shared translation unit by the
 // unity build, where an anonymous namespace would merge with another test's and a `using` would
 // leak into every file after this one in the blob.
+
+// FORK(hollowed-oath) BEGIN: QUARANTINED pending the item-model test port (RedwoodPlugins Plan B
+// Task 6 / game Plan C Task 11). The per-container wire this file pins (FRedwoodContainerRecord,
+// SerializeContainerRecords/ParseContainerRecords, and ParseCharacter's "containers" read) was
+// replaced by the flat per-item channel (FRedwoodItemRecord, SerializeItemRecords/ParseItemRecords,
+// ParseCharacter's "items" read) on this same feat/item-persistence line -- so every symbol below
+// no longer exists and the file cannot compile as-is. The seam rename (game Plan C Task 1) must
+// leave the editor build green, so the whole body is compiled out here rather than deleted: Task 11
+// must restore equivalent coverage against the item wire (round-trip, empty-contents, and the
+// ParseCharacter items-present / items-absent legs). WHY not delete: the assertions here are the
+// only record of the offline<->backend interchange contract, needed to re-derive the item-wire
+// equivalents. These tests register under "Redwood.Containers.*", NOT the "HollowedOath" suite.
+#if 0 // QUARANTINED pending plan C task 11 (row-model port)
 namespace RedwoodContainerPersistenceTest {
   const FString TestContainerId = TEXT("11111111-2222-3333-4444-555555555555");
   constexpr uint8 TestContainerKind = 2;
@@ -248,3 +261,5 @@ bool FRedwoodParseCharacterWithoutContainersTest::RunTest(
 
   return true;
 }
+#endif // QUARANTINED
+// FORK(hollowed-oath) END
