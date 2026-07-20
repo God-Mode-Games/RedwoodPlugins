@@ -195,7 +195,8 @@ public:
   );
 
   // Emit realm:characters:items:trade: atomically moves the given root items (each identified by a
-  // (Domain, Slot) placement) from one character to another on the backend. RootPlacements name
+  // (Domain, Slot) placement, optionally with a ParentId for a content-child destination -- see
+  // FRedwoodTradeRootPlacement) from one character to another on the backend. RootPlacements name
   // only the root rows being handed over; the backend re-parents each root and its nested children
   // in one transaction. After a successful trade the backend bumps BOTH characters' InventorySeq,
   // so each caller's next FlushItemsForCharacterComponent takes the seq-resync path (CommittedSeq

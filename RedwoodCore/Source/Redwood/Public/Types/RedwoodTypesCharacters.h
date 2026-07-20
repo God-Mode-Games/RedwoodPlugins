@@ -134,6 +134,14 @@ struct FRedwoodCharacterBackend {
 // added in a later task (RedwoodPlugins plan Task 4) resolves an FRedwoodItemRecord.Id to its
 // placement via (Domain, Slot) without needing the full item payload. Declared now, unused until
 // that task lands, to keep this header's item-model diff a single commit.
+//
+// ParentId widens this beyond pure root placements: production trades move items between bags,
+// i.e. content-child placements (an item socketed/nested inside a receiving-side bag item), not
+// just top-level slots. Zero-value FString (empty) still means "root placement" -- the struct is
+// shipped wire surface, so the empty-default reading is preserved rather than renaming the type
+// or adding a separate root/child struct pair. Domain is correspondingly no longer limited to
+// top-level inventory domains ("equipped", "nonequipped"); it also carries "content" for
+// container-item placements, matching FRedwoodItemRecord.Domain's existing "content" value.
 USTRUCT(BlueprintType)
 struct FRedwoodTradeRootPlacement {
   GENERATED_BODY()
@@ -146,6 +154,14 @@ struct FRedwoodTradeRootPlacement {
 
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   int32 Slot = 0;
+
+  // Empty = root placement (lands directly in the receiving character's top-level inventory).
+  // Non-empty = the receiver-side bag item's InstanceId this item is placed inside, for
+  // content-child (nested/socketed) placements. Mirrors FRedwoodItemRecord.ParentId's semantics;
+  // wire serialization mirrors its null convention too (see SerializeItemRecord / ParseItemRecords
+  // in RedwoodCommonGameSubsystem.cpp) -- empty here means JSON null on the wire, not "".
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString ParentId;
 };
 // FORK(hollowed-oath) END
 

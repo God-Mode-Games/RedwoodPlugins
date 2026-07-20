@@ -2239,9 +2239,13 @@ void URedwoodServerGameSubsystem::EmitItemsMigrate(
 }
 
 // One-shot trade emit: atomically re-parents the named root items from one character to another on
-// the backend. rootPlacements carries only each root row's (id, domain, slot); the backend moves
-// each root and its nested children in one transaction and bumps BOTH characters' InventorySeq, so
-// each side's next FlushItemsForCharacterComponent takes the seq-resync path (see the header).
+// the backend. rootPlacements carries only each root row's (id, domain, slot, parentId); the
+// backend moves each root and its nested children in one transaction and bumps BOTH characters'
+// InventorySeq, so each side's next FlushItemsForCharacterComponent takes the seq-resync path (see
+// the header). parentId is optional on the wire (absent/null = root placement into the receiving
+// character's top-level inventory); non-null names the receiver-side bag item's InstanceId a
+// content-child placement lands inside -- production trades move items between bags, so a
+// zero-value (root-only) placement can no longer represent every destination a trade needs.
 void URedwoodServerGameSubsystem::EmitItemsTrade(
   const FString &FromCharacterId,
   const FString &ToCharacterId,
@@ -2266,6 +2270,15 @@ void URedwoodServerGameSubsystem::EmitItemsTrade(
     PlacementObject->SetStringField(TEXT("id"), Placement.Id);
     PlacementObject->SetStringField(TEXT("domain"), Placement.Domain);
     PlacementObject->SetNumberField(TEXT("slot"), Placement.Slot);
+    // FORK(hollowed-oath): mirror SerializeItemRecord's null convention for ParentId (empty =
+    // JSON null, not ""), so the backend's trade route can treat a content-child destination
+    // (nested inside a receiving-side bag item) the same way it already treats item rows --
+    // production trades move items between bags, not just top-level slots.
+    if (Placement.ParentId.IsEmpty()) {
+      PlacementObject->SetField(TEXT("parentId"), MakeShareable(new FJsonValueNull));
+    } else {
+      PlacementObject->SetStringField(TEXT("parentId"), Placement.ParentId);
+    }
     RootPlacementsJsonArray.Add(
       MakeShareable(new FJsonValueObject(PlacementObject))
     );
