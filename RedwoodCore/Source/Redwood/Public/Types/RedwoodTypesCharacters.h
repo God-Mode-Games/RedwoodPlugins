@@ -6,31 +6,48 @@
 
 #include "RedwoodTypesCharacters.generated.h"
 
-// FORK(hollowed-oath) BEGIN: FRedwoodContainerRecord, the transport type for HollowedOath's
-// per-bag inventory. Entirely fork-added; no upstream counterpart. Its field set defines the wire
-// {containerId, kind, contents} contract shared by the backend Container table and the offline JSON.
-// Must stay declared ABOVE FRedwoodCharacterBackend (its Containers array needs the complete type).
-// One record of the per-container persistence channel (see URedwoodCharacterComponent's
-// bUseContainers/ContainersVariableName/MarkContainersDirty). Unlike the fixed
+// FORK(hollowed-oath) BEGIN: FRedwoodItemRecord, the transport type for HollowedOath's per-item
+// inventory. Entirely fork-added; no upstream counterpart. Replaces the earlier per-container
+// shape (FRedwoodContainerRecord, RedwoodPlugins#17) with a flat per-item record -- each row is
+// one item instance addressed by (Domain, Slot) instead of nesting inside an opaque
+// per-container Contents blob. Backend counterpart lives on RedwoodBackend's
+// feat/item-persistence line. Must stay declared ABOVE FRedwoodCharacterBackend (its Items array
+// needs the complete type).
+// One record of the per-item persistence channel (see URedwoodCharacterComponent's
+// bUseContainers/ContainersVariableName/MarkContainersDirty; those names describe the
+// container-era wiring and are retargeted to items in a later task). Unlike the fixed
 // EquippedInventory/NonequippedInventory/etc. channels below (one whole-blob USTRUCT field,
-// always resent in full when dirty), containers are transported as an ARRAY of these records so a
-// flush can send only the ones that actually changed (plus a deletedContainerIds list) to the
-// realm:characters:containers:upsert sidecar route. Contents is deliberately opaque here
-// (an arbitrary JSON object) -- its shape is owned entirely by the game layer, matching how the
-// USIOJsonObject* fields on FRedwoodCharacterBackend below work. Declared ABOVE
-// FRedwoodCharacterBackend because that struct's Containers array needs the complete type.
+// always resent in full when dirty), items are transported as an ARRAY of these records so a
+// flush can send only the ones that actually changed (plus a deletedItemIds list) to the
+// realm:characters:items:upsert sidecar route. ParentId establishes nesting (empty string = root
+// item, matching the wire's null) -- sockets and other contained items point at their owner via
+// this field instead of living inside an opaque container blob. Attributes is deliberately opaque
+// here (an arbitrary JSON object) -- its shape is owned entirely by the game layer, matching how
+// the USIOJsonObject* fields on FRedwoodCharacterBackend below work.
 USTRUCT(BlueprintType)
-struct FRedwoodContainerRecord {
+struct FRedwoodItemRecord {
   GENERATED_BODY()
 
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
-  FString ContainerId;
+  FString Id;
 
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
-  uint8 Kind = 0;
+  FString ParentId;
 
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
-  USIOJsonObject *Contents = nullptr;
+  FString Domain;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  int32 Slot = 0;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  int32 Quantity = 1;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString TemplateId;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  USIOJsonObject *Attributes = nullptr;
 };
 // FORK(hollowed-oath) END
 
@@ -83,22 +100,55 @@ struct FRedwoodCharacterBackend {
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   USIOJsonObject *RedwoodData = nullptr;
 
-  // FORK(hollowed-oath) BEGIN: fork-added Containers field on the otherwise-upstream character
-  // struct. This is the load-leg carrier -- rows ride the character's own round trip, letting the
-  // component populate the game array before OnRedwoodCharacterUpdated. Preserve on merge.
-  // Container rows for this character, delivered in the SAME round trip as the rest of this
-  // struct (the player-auth / character-load response) rather than a separate later-arriving
-  // realm:characters:containers:load call -- this is what lets
-  // URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() populate
-  // ContainersVariableName BEFORE broadcasting OnRedwoodCharacterUpdated, so game code never sees
-  // a character-updated event with containers still missing. Offline/PIE-disk saves populate this
-  // the same way, from the "containers" array the on-disk character JSON carries inline (there is
-  // no Container table to read there) -- see URedwoodCommonGameSubsystem::SaveCharacterToDisk and
-  // URedwoodServerGameSubsystem::AppendOfflineContainerRows.
+  // FORK(hollowed-oath) BEGIN: fork-added Items field on the otherwise-upstream character
+  // struct, replacing the earlier per-container Containers field (FRedwoodContainerRecord,
+  // RedwoodPlugins#17). This is the load-leg carrier -- rows ride the character's own round trip,
+  // letting the component populate the game array before OnRedwoodCharacterUpdated. Preserve on
+  // merge.
+  // Item rows for this character, delivered in the SAME round trip as the rest of this struct
+  // (the player-auth / character-load response) rather than a separate later-arriving
+  // realm:characters:items:load call -- this is what lets
+  // URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() populate the game-side
+  // inventory BEFORE broadcasting OnRedwoodCharacterUpdated, so game code never sees a
+  // character-updated event with items still missing. Offline/PIE-disk saves populate this the
+  // same way, from the "items" array the on-disk character JSON carries inline (there is no Item
+  // table to read there) -- see URedwoodCommonGameSubsystem::SaveCharacterToDisk and
+  // URedwoodServerGameSubsystem::AppendOfflineContainerRows (both retarget to items in a later
+  // task). InventoryRowsMigrated and InventorySeq are fork-added bookkeeping: the former counts
+  // legacy container rows folded into Items by the one-time migration, the latter is a
+  // per-character mutation sequence counter used to detect stale/racing flushes. Backend
+  // counterpart for all three fields lives on RedwoodBackend's feat/item-persistence line.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
-  TArray<FRedwoodContainerRecord> Containers;
+  TArray<FRedwoodItemRecord> Items;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  int32 InventoryRowsMigrated = 0;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  int64 InventorySeq = 0;
   // FORK(hollowed-oath) END
 };
+
+// FORK(hollowed-oath) BEGIN: FRedwoodTradeRootPlacement, forward-declared here alongside the item
+// wire types it composes with. Entirely fork-added; no upstream counterpart. Identifies where a
+// root item (ParentId empty on FRedwoodItemRecord) sits in a trade offer -- trade-window code
+// added in a later task (RedwoodPlugins plan Task 4) resolves an FRedwoodItemRecord.Id to its
+// placement via (Domain, Slot) without needing the full item payload. Declared now, unused until
+// that task lands, to keep this header's item-model diff a single commit.
+USTRUCT(BlueprintType)
+struct FRedwoodTradeRootPlacement {
+  GENERATED_BODY()
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString Id;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString Domain;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  int32 Slot = 0;
+};
+// FORK(hollowed-oath) END
 
 USTRUCT(BlueprintType)
 struct FRedwoodListCharactersOutput {
