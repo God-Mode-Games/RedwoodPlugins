@@ -128,6 +128,19 @@ void URedwoodCommonGameSubsystem::SaveCharacterToDisk(
   // key on a character whose items were all removed would leave the previous file's rows to be
   // re-parsed on the next load.
   JsonObject->SetArrayField(TEXT("items"), SerializeItemRecords(Character.Items));
+
+  // Write the item-migration bookkeeping alongside the rows. inventoryRowsMigrated is REQUIRED: the
+  // offline lifecycle now mirrors the backend one (OWNER RULING 2026-07-20) -- an offline character
+  // migrates its legacy blob to rows locally at load and stamps this marker to 1 on the parsed
+  // character struct, and the game's next load reads it back (ParseCharacter, above) to take the
+  // ROW-load path. Without persisting it here the marker would reset to 0 every save and the
+  // character would re-migrate from a frozen (stale) blob on every load. inventorySeq echoes the DB
+  // column for wire-shape parity with the backend leg; the seq FENCE is meaningless offline (there is
+  // no wire to gap-check against), so it simply rides through as whatever the struct holds (0 offline).
+  JsonObject->SetNumberField(
+    TEXT("inventoryRowsMigrated"), Character.InventoryRowsMigrated
+  );
+  JsonObject->SetNumberField(TEXT("inventorySeq"), Character.InventorySeq);
   // FORK(hollowed-oath) END
 
   SaveCharacterJsonToDisk(JsonObject);

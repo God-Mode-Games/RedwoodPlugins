@@ -1302,6 +1302,45 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
     if (AppendOfflineItemRows(DetachedOfflineItemRows, CharacterComponent)) {
       CharacterObject->SetArrayField(TEXT("items"), DetachedOfflineItemRows);
     }
+    // FORK(hollowed-oath) BEGIN: carry the item-migration marker across the detached offline write too,
+    // for the same reason CreatePlayerCharacterDataObject does -- this is also a whole-file rewrite, so
+    // omitting inventoryRowsMigrated would regress a locally-migrated character back to the frozen blob
+    // on its next load. The marker lives on the PlayerState's RedwoodCharacter, not the CharacterComponent;
+    // a detached (linkdead) pawn may have no live PlayerState, so resolve it best-effort through the pawn's
+    // controller. NOTE: offline linkdead retention is dormant today (EmitPlayerLeft short-circuits without
+    // a backend and the retention manager stays dormant until the zone game mode is reparented), so this
+    // path is not exercised in practice; when the PlayerState cannot be resolved the marker is left absent
+    // and the next load re-migrates from the blob -- logged loudly. Tracked as a follow-up if offline
+    // linkdead ever goes live.
+    APlayerState *DetachedPlayerState =
+      IsValid(Pawn) && IsValid(Pawn->GetController())
+      ? Pawn->GetController()->PlayerState
+      : nullptr;
+    URedwoodPlayerStateComponent *DetachedPSC =
+      IsValid(DetachedPlayerState)
+      ? DetachedPlayerState->FindComponentByClass<URedwoodPlayerStateComponent>()
+      : nullptr;
+    if (DetachedPSC) {
+      CharacterObject->SetNumberField(
+        TEXT("inventoryRowsMigrated"),
+        DetachedPSC->RedwoodCharacter.InventoryRowsMigrated
+      );
+      CharacterObject->SetNumberField(
+        TEXT("inventorySeq"), DetachedPSC->RedwoodCharacter.InventorySeq
+      );
+    } else {
+      UE_LOG(
+        LogRedwood,
+        Warning,
+        TEXT(
+          "FlushDetachedCharacterData (offline): no PlayerState for character %s; item-migration marker "
+          "not written (next load re-migrates from the blob). Offline linkdead is dormant, so this is "
+          "not expected to occur."
+        ),
+        *CharacterId
+      );
+    }
+    // FORK(hollowed-oath) END
     CharacterObject->SetStringField(TEXT("id"), CharacterId);
     URedwoodCommonGameSubsystem::SaveCharacterJsonToDisk(CharacterObject);
     CharacterComponent->ClearDirtyFlags();
@@ -1886,6 +1925,31 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
         }
       }
     }
+
+    // FORK(hollowed-oath) BEGIN: persist the item-migration bookkeeping into the offline character JSON
+    // (fork-added; upstream has no item-migration concept). This is the runtime offline write path
+    // (FlushPlayerCharacterData -> SaveCharacterJsonToDisk on the periodic timer and the forced logout
+    // flush), so the marker MUST be written HERE, not only in SaveCharacterToDisk (which handles just
+    // character creation): the OWNER RULING's offline lifecycle mirrors the backend one -- a character
+    // migrates its legacy blob to rows locally at load and stamps
+    // PlayerStateComponent->RedwoodCharacter.InventoryRowsMigrated = 1, and the next load must read that
+    // marker back to take the row-load path. Omitting it here would let the very next periodic save
+    // strip the marker (this is a whole-file rewrite offline) and re-migrate from a frozen blob forever.
+    // Gated on !bUseBackend for the same reason the item rows are: the backend leg keeps these on the
+    // Item table / character row and must not fold them into realm:characters:set:server. This does NOT
+    // set bIsDirty -- it is metadata riding an already-dirty save; if nothing else changed the previous
+    // file (already carrying the marker) is left untouched. inventorySeq echoes the DB column for wire
+    // parity; the fence is meaningless offline (0), see the SaveCharacterToDisk FORK note.
+    if (!bUseBackend) {
+      CharacterObject->SetNumberField(
+        TEXT("inventoryRowsMigrated"),
+        PlayerStateComponent->RedwoodCharacter.InventoryRowsMigrated
+      );
+      CharacterObject->SetNumberField(
+        TEXT("inventorySeq"), PlayerStateComponent->RedwoodCharacter.InventorySeq
+      );
+    }
+    // FORK(hollowed-oath) END
 
     if (!bIsDirty) {
       return TSharedPtr<FJsonObject>();
