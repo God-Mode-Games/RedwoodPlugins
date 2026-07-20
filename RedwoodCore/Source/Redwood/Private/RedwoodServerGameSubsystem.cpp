@@ -1274,82 +1274,122 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
     TEXT("abilitySystem")
   );
 
-  // FORK(hollowed-oath) BEGIN: detached-flush item leg. Closes the gap where a retained linkdead
-  // pawn's dirty item rows were SILENTLY DROPPED -- the container channel this replaced
-  // (RedwoodPlugins#17) was never wired into FlushDetachedCharacterData, so a pawn that outlived
-  // its player lost every inventory mutation made after the last live flush. Items must not.
+  // FORK(hollowed-oath) BEGIN: detached-flush item leg + settled-latch release barrier. Closes the
+  // gap where a retained linkdead pawn's dirty item rows were SILENTLY DROPPED -- the container
+  // channel this replaced (RedwoodPlugins#17) was never wired into FlushDetachedCharacterData, so a
+  // pawn that outlived its player lost every inventory mutation made after the last live flush.
+  // Items must not.
   //
-  // Placed AFTER the seven-field serialize and BEFORE the bUseBackend split (and thus before both
-  // ClearDirtyFlags calls) on purpose: it must NOT be gated by the SerializedFieldCount == 0 early
-  // return below, because a pawn whose only change was its inventory has zero dirty character-blob
-  // fields yet still carries dirty items. Backend leg sends dirty rows on the item sidecar channel
-  // -- PlayerStateComponent is null here (a detached pawn has no live PlayerState), so
-  // FlushItemsForCharacterComponent sources characterId from the component's RedwoodCharacterId,
-  // already verified equal to CharacterId at the top of this function. Single-flight makes that
-  // safe against a concurrent tick flush. Offline leg writes the rows inline into CharacterObject
-  // for the on-disk JSON, mirroring CreatePlayerCharacterDataObject's offline leg: a bare
-  // FlushItemsForCharacterComponent would no-op offline (no sidecar) and drop the very rows this
-  // fix protects.
-  if (bUseBackend) {
-    if (CharacterComponent->IsItemsDirty()) {
-      FlushItemsForCharacterComponent(nullptr, CharacterComponent);
-    }
-  } else {
+  // Placed AFTER the seven-field serialize (so it is NOT gated by the SerializedFieldCount == 0
+  // case below -- a pawn whose only change was its inventory has zero dirty character-blob fields
+  // yet still carries dirty items).
+  //
+  // ORDERING HAZARD (why the latch): in backend mode both the item flush and the set:server write
+  // are async sidecar round trips, and the backend's player-left (EmitPlayerLeft) tears down the
+  // character->instance write binding that each write's auth gate still needs -- immediately,
+  // deleting the online/bound state. This barrier is NEWLY reachable here: the old container
+  // channel never ran in this function, so the item leg is the first async write it fires, and an
+  // unchained release could land BEFORE realm:characters:items:flush is processed, making the auth
+  // gate reject the flush and drop the very detached rows this leg exists to save. So when a
+  // release is requested it MUST wait until BOTH pending writes have SETTLED. This settled-latch is
+  // the interim barrier until the full flush-barrier work lands (game Plan C / #1365 family).
+  if (!bUseBackend) {
+    // Offline: item rows go inline into the on-disk character JSON, mirroring
+    // CreatePlayerCharacterDataObject's offline leg (a bare FlushItemsForCharacterComponent would
+    // no-op with no sidecar and drop the rows). No barrier needed -- the disk write is synchronous
+    // and the binding release is a no-op offline (EmitPlayerLeft short-circuits without a backend).
     TArray<TSharedPtr<FJsonValue>> DetachedOfflineItemRows;
     if (AppendOfflineItemRows(DetachedOfflineItemRows, CharacterComponent)) {
       CharacterObject->SetArrayField(TEXT("items"), DetachedOfflineItemRows);
     }
+    CharacterObject->SetStringField(TEXT("id"), CharacterId);
+    URedwoodCommonGameSubsystem::SaveCharacterJsonToDisk(CharacterObject);
+    CharacterComponent->ClearDirtyFlags();
+    ReleaseBindingNow();
+    UE_LOG(
+      LogRedwood,
+      Log,
+      TEXT("Flushed detached character data for character %s"),
+      *CharacterId
+    );
+    return;
   }
-  // FORK(hollowed-oath) END
 
-  if (bUseBackend) {
-    if (SerializedFieldCount == 0) {
-      UE_LOG(
-        LogRedwood,
-        Verbose,
-        TEXT(
-          "FlushDetachedCharacterData: nothing dirty for character %s; skipping"
-        ),
-        *CharacterId
-      );
-      ReleaseBindingNow();
-      return;
-    }
+  // Backend mode. Count the async writes the binding release must wait behind.
+  const bool bItemsLegPending = CharacterComponent->IsItemsDirty();
+  const bool bSetServerPending = SerializedFieldCount > 0;
+  const int32 PendingSettles =
+    (bItemsLegPending ? 1 : 0) + (bSetServerPending ? 1 : 0);
 
+  if (PendingSettles == 0) {
+    // Nothing dirty at all (no items, no character-blob fields): no async write to order behind, so
+    // release immediately, exactly as before.
+    UE_LOG(
+      LogRedwood,
+      Verbose,
+      TEXT(
+        "FlushDetachedCharacterData: nothing dirty for character %s; skipping"
+      ),
+      *CharacterId
+    );
+    ReleaseBindingNow();
+    return;
+  }
+
+  // Settled-latch: each pending write decrements it by one; the last one to reach zero runs the
+  // release continuation. Shared by value into every async callback so it outlives this stack
+  // frame. "Settled" means the write attempt RESOLVED (success OR error), NOT that it committed --
+  // an errored write still can't be raced by the release, and the linkdead body must not be pinned
+  // forever waiting on a settle that will never upgrade to a commit.
+  TSharedRef<int32> SettleLatch = MakeShared<int32>(PendingSettles);
+  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakThis(this);
+  auto SettleOne =
+    [WeakThis, SettleLatch, PlayerId, CharacterId, bReleaseBindingWhenSettled]() {
+      if (--(*SettleLatch) > 0) {
+        return;
+      }
+      // Last pending write settled -- releasing the binding now can no longer beat a write's auth
+      // gate. Gated on the caller's request; when not requested this is a bare countdown that fires
+      // nothing.
+      if (bReleaseBindingWhenSettled && WeakThis.IsValid()) {
+        WeakThis->EmitPlayerLeft(PlayerId, CharacterId);
+      }
+    };
+
+  // Item flush leg. PlayerStateComponent is null here (a detached pawn has no live PlayerState), so
+  // FlushItemsForCharacterComponent sources characterId from the component's RedwoodCharacterId,
+  // already verified equal to CharacterId at the top of this function. Single-flight makes it safe
+  // against a concurrent tick flush. OnAckSettled decrements the latch when the flush settles (or
+  // synchronously if it sends nothing) -- guaranteed exactly once, so the latch can never wedge.
+  if (bItemsLegPending) {
+    FlushItemsForCharacterComponent(nullptr, CharacterComponent, SettleOne);
+  }
+
+  if (bSetServerPending) {
     TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
     TArray<TSharedPtr<FJsonValue>> CharactersArray;
     CharactersArray.Add(MakeShareable(new FJsonValueObject(CharacterObject)));
     Payload->SetArrayField(TEXT("characters"), CharactersArray);
     Payload->SetStringField(TEXT("id"), TEXT("game-server"));
-    if (bReleaseBindingWhenSettled) {
-      // Same-socket emission order does NOT serialize the backend's async
-      // handlers, so a player-left emitted right after the flush could be
-      // processed first and release the binding the flush still needs.
-      // Chain the release on the flush acknowledgment instead — the sidecar
-      // only acks after the realm has fully processed the write.
-      TWeakObjectPtr<URedwoodServerGameSubsystem> WeakThis(this);
-      Sidecar->Emit(
-        TEXT("realm:characters:set:server"),
-        Payload,
-        [WeakThis, PlayerId, CharacterId](auto Response) {
-          if (WeakThis.IsValid()) {
-            WeakThis->EmitPlayerLeft(PlayerId, CharacterId);
-          }
-        }
-      );
-    } else {
-      Sidecar->Emit(TEXT("realm:characters:set:server"), Payload);
-    }
-    // Clear only once a write is actually in flight: clearing before a
-    // dropped emit would silently lose the data forever (nothing would ever
-    // look dirty again).
+    // Route the set:server ack through the SAME latch. This preserves the prior "chain the release
+    // on the flush ack" intent -- same-socket emission order does NOT serialize the backend's async
+    // handlers, so a player-left emitted right after this write could be processed first and release
+    // the binding it still needs -- and now additionally waits behind the item flush. When no
+    // release is requested SettleOne is just a countdown. (Fire-and-forget error handling is
+    // unchanged: neither the old nor this callback inspects the ack beyond ordering.)
+    Sidecar->Emit(
+      TEXT("realm:characters:set:server"),
+      Payload,
+      [SettleOne](auto Response) {
+        SettleOne();
+      }
+    );
+    // Clear only once a write is actually in flight: clearing before a dropped emit would silently
+    // lose the data forever (nothing would ever look dirty again). Items ride their own ack
+    // (CompleteItemFlush), so ClearDirtyFlags deliberately doesn't touch item dirty state.
     CharacterComponent->ClearDirtyFlags();
-  } else {
-    CharacterObject->SetStringField(TEXT("id"), CharacterId);
-    URedwoodCommonGameSubsystem::SaveCharacterJsonToDisk(CharacterObject);
-    CharacterComponent->ClearDirtyFlags();
-    ReleaseBindingNow();
   }
+  // FORK(hollowed-oath) END
 
   UE_LOG(
     LogRedwood,
@@ -1893,11 +1933,25 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
 // authoritative id.
 void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   URedwoodPlayerStateComponent *PlayerStateComponent,
-  URedwoodCharacterComponent *CharacterComponent
+  URedwoodCharacterComponent *CharacterComponent,
+  TFunction<void()> OnAckSettled
 ) {
+  // OnAckSettled must fire EXACTLY ONCE on every path through this function -- the detached-flush
+  // release barrier (FlushDetachedCharacterData) counts on it to know this flush attempt has
+  // SETTLED before it releases the character's write binding. "Settled" = the in-flight attempt
+  // resolved (success OR error), NOT that it committed. Every early-return below settles
+  // synchronously via this helper; the sole sending path settles inside the async ack callback.
+  // Null for the ordinary tick-flush caller, where this is a no-op.
+  auto Settle = [&OnAckSettled]() {
+    if (OnAckSettled) {
+      OnAckSettled();
+    }
+  };
+
   // Early-out before claiming the flight slot: the detached-flush leg calls this without the
   // dispatch site's IsItemsDirty() pre-check, and a slot claimed here would never be released.
   if (!CharacterComponent->IsItemsDirty()) {
+    Settle();
     return;
   }
 
@@ -1905,6 +1959,7 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     UE_LOG(
       LogRedwood, Error, TEXT("Sidecar is not connected; cannot flush items")
     );
+    Settle();
     return;
   }
 
@@ -1914,14 +1969,18 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   TArray<FRedwoodItemRecord> *RecordsArray =
     URedwoodCommonGameSubsystem::ResolveItemsRecordsArray(CharacterComponent);
   if (!RecordsArray) {
+    Settle();
     return;
   }
 
   // Claim the single-flight slot + the batchSeq this batch must stamp. If a batch is already
   // outstanding, park this tick's flush -- the dirt stays marked and coalesces until the in-flight
-  // batch's ack releases the slot.
+  // batch's ack releases the slot. Settle so the detached barrier doesn't wait forever on a parked
+  // tick (the still-dirty rows retry on a later flush; the barrier is interim, not a delivery
+  // guarantee).
   int64 BatchSeq = 0;
   if (!CharacterComponent->TryBeginItemFlush(BatchSeq)) {
+    Settle();
     return;
   }
 
@@ -1976,10 +2035,12 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   if (UpsertsJsonArray.Num() == 0 && DeletesJsonArray.Num() == 0) {
     // Nothing actually sendable (e.g. every dirty id lacked a record). Release the flight slot we
     // just claimed via the ack path with no sent ids and the current committed seq, so the next
-    // flush isn't wedged behind a slot that never sent anything.
+    // flush isn't wedged behind a slot that never sent anything. Settle synchronously: no emit
+    // means no async callback will ever settle this attempt.
     CharacterComponent->CompleteItemFlush(
       TEXT(""), CharacterComponent->GetLastCommittedItemSeq(), {}, {}
     );
+    Settle();
     return;
   }
 
@@ -2002,13 +2063,16 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   Sidecar->Emit(
     TEXT("realm:characters:items:flush"),
     Payload,
-    [WeakCharacterComponent, SentUpserts, SentDeletes](auto Response) {
+    [WeakCharacterComponent, SentUpserts, SentDeletes, OnAckSettled](auto Response) {
       TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
       FString Error = MessageStruct->GetStringField(TEXT("error"));
-      // committedSeq rides both success and error (fence/replay) responses; absent -> 0, which the
-      // error path treats as "no fence ahead of us" and leaves NextBatchSeq alone.
-      int64 CommittedSeq =
-        static_cast<int64>(MessageStruct->GetNumberField(TEXT("committedSeq")));
+      // committedSeq rides both success and error (fence/replay) responses; TryGetNumberField
+      // leaves the 0 default when absent (e.g. some error responses), which the error path treats
+      // as "no fence ahead of us" and leaves NextBatchSeq alone -- and avoids a spurious missing-
+      // field warning that GetNumberField would log.
+      double CommittedSeqValue = 0.0;
+      MessageStruct->TryGetNumberField(TEXT("committedSeq"), CommittedSeqValue);
+      int64 CommittedSeq = static_cast<int64>(CommittedSeqValue);
 
       URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
       if (!IsValid(CharacterComponent)) {
@@ -2020,6 +2084,11 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
           UE_LOG(
             LogRedwood, Error, TEXT("Failed to flush items (component gone): %s"), *Error
           );
+        }
+        // Still settle: the detached release barrier must not stall forever just because the
+        // component died mid-flight -- the attempt HAS resolved.
+        if (OnAckSettled) {
+          OnAckSettled();
         }
         return;
       }
@@ -2035,6 +2104,12 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
       CharacterComponent->CompleteItemFlush(
         Error, CommittedSeq, SentUpserts, SentDeletes
       );
+
+      // Settle AFTER CompleteItemFlush, on both success and error: the release barrier's rule is
+      // "the attempt resolved", which is exactly here.
+      if (OnAckSettled) {
+        OnAckSettled();
+      }
     }
   );
 }
@@ -2098,6 +2173,22 @@ void URedwoodServerGameSubsystem::EmitItemsMigrate(
   const TArray<FRedwoodItemRecord> &Items,
   TFunction<void(FString Error, bool bAlreadyMigrated)> OnComplete
 ) {
+  // Null-PSC guard mirroring FlushItemsForCharacterComponent's tolerance -- except migrate has no
+  // CharacterComponent to fall back to for the characterId (the rows are handed in whole, not
+  // drained from a component), so a null PSC is unrecoverable: early-return with a warning rather
+  // than dereferencing it below.
+  if (!PlayerStateComponent) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("EmitItemsMigrate: null PlayerStateComponent; cannot resolve characterId")
+    );
+    if (OnComplete) {
+      OnComplete(TEXT("Null PlayerStateComponent"), false);
+    }
+    return;
+  }
+
   if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
     UE_LOG(
       LogRedwood, Error, TEXT("Sidecar is not connected; cannot migrate items")
