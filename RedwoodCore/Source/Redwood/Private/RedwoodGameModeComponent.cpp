@@ -617,24 +617,27 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
             URedwoodCommonGameSubsystem::ParsePlayerData(Player)
           );
 
-          // FORK(hollowed-oath) BEGIN: backend container-load leg. Upstream trunk here is a
+          // FORK(hollowed-oath) BEGIN: backend item-load leg. Upstream trunk here is a
           // single inline PlayerStateComponent->SetRedwoodCharacter(ParseCharacter(Character)).
-          // The fork hoists the parse into ParsedCharacter so it can graft the container rows --
-          // which the backend delivers as a SIBLING "containers" field of the player-auth response,
+          // The fork hoists the parse into ParsedCharacter so it can graft the item rows --
+          // which the backend delivers as a SIBLING "items" field of the player-auth response,
           // NOT nested in "character" -- onto it BEFORE SetRedwoodCharacter fires
           // OnRedwoodCharacterUpdated. Merge must preserve that ordering (rows attached before the
           // set) so RedwoodPlayerStateCharacterUpdated has them in hand when it broadcasts.
+          // (inventoryRowsMigrated/inventorySeq need no such graft: unlike Items, the backend puts
+          // those directly on the character object, so ParseCharacter above already picked them up.)
           FRedwoodCharacterBackend ParsedCharacter =
             URedwoodCommonGameSubsystem::ParseCharacter(Character);
 
-          // Container rows ride this SAME player-auth response (a sibling field to "character",
-          // not nested inside it -- see PlayerAuth.SidecarToRealm's IResponse), so they are
-          // present before SetRedwoodCharacter fires OnRedwoodCharacterUpdated below, instead of
-          // arriving later via a separate realm:characters:containers:load round trip.
-          const TArray<TSharedPtr<FJsonValue>> *ContainersJsonArray = nullptr;
-          if (MessageStruct->TryGetArrayField(TEXT("containers"), ContainersJsonArray)) {
-            ParsedCharacter.Containers =
-              URedwoodCommonGameSubsystem::ParseContainerRecords(*ContainersJsonArray);
+          // Item rows ride this SAME player-auth response (a sibling field to "character", not
+          // nested inside it -- see the backend's PlayerAuth.SidecarToRealm IResponse extension
+          // that added "items" alongside "character"/"player"), so they are present before
+          // SetRedwoodCharacter fires OnRedwoodCharacterUpdated below, instead of arriving later
+          // via a separate realm:characters:items:load round trip.
+          const TArray<TSharedPtr<FJsonValue>> *ItemsJsonArray = nullptr;
+          if (MessageStruct->TryGetArrayField(TEXT("items"), ItemsJsonArray)) {
+            ParsedCharacter.Items =
+              URedwoodCommonGameSubsystem::ParseItemRecords(*ItemsJsonArray);
           }
 
           PlayerStateComponent->SetRedwoodCharacter(ParsedCharacter);
