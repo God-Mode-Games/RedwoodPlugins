@@ -19,7 +19,8 @@
 class AGameModeBase;
 class URedwoodSyncItemAsset;
 class URedwoodSyncComponent;
-// FORK(hollowed-oath): forward decls for the container flush helpers' parameters (fork-added).
+// FORK(hollowed-oath): forward decls for the item flush / migrate / trade helpers' parameters
+// (fork-added).
 class URedwoodCharacterComponent;
 class URedwoodPlayerStateComponent;
 
@@ -121,40 +122,77 @@ public:
   );
   void FlushZoneData();
 
-  // FORK(hollowed-oath) BEGIN: container flush helper declarations. Fork-added; definitions + full
-  // rationale under a matching FORK marker in RedwoodServerGameSubsystem.cpp. Called from
-  // CreatePlayerCharacterDataObject. Preserve signatures on merge.
-  // Per-container persistence channel (see URedwoodCharacterComponent::bUseContainers). Sends
-  // ONLY CharacterComponent's currently-dirty container records (plus pending deletions) to
-  // realm:characters:containers:upsert, and clears the dirty state ONLY once the upsert is
-  // acknowledged (see AckContainersFlushed) -- a failed or unacknowledged send leaves the dirty
-  // state set so the next flush retries it. Backend-only: the offline/PIE leg has no sidecar to
-  // send to and instead writes its rows into the character's own JSON file, see
-  // AppendOfflineContainerRows.
+  // FORK(hollowed-oath) BEGIN: per-item persistence channel helper declarations. Fork-added;
+  // definitions + full rationale under a matching FORK marker in RedwoodServerGameSubsystem.cpp.
+  // Replaces the earlier per-container flush helpers (FlushContainersForCharacterComponent /
+  // AppendOfflineContainerRows, RedwoodPlugins#17) now that persistence is per-item flat rows
+  // instead of opaque per-container blobs. Backend counterpart lives on RedwoodBackend's
+  // feat/item-persistence line (realm:characters:items:{flush,migrate,trade} routes). Preserve
+  // signatures on merge.
   //
-  // Container LOADING no longer has a counterpart here: container rows now arrive in the SAME
-  // round trip as the rest of the character (see FRedwoodCharacterBackend::Containers), populated
-  // directly in RedwoodPlayerStateCharacterUpdated() before OnRedwoodCharacterUpdated broadcasts,
-  // instead of a separate later-arriving realm:characters:containers:load call.
-  void FlushContainersForCharacterComponent(
+  // What: FlushItemsForCharacterComponent sends CharacterComponent's currently-dirty item records
+  // (plus pending deletions) to realm:characters:items:flush under a single-flight, seq-fenced
+  // protocol-v2 envelope. Why v2: the backend rejects seq gaps and no-ops replays, so at most one
+  // batch may be outstanding -- TryBeginItemFlush claims the slot and a batchSeq, and the ack's
+  // CompleteItemFlush clears only the (id, generation) pairs actually sent and advances the
+  // committed seq. A failed / unacknowledged / component-destroyed send leaves the dirty state set
+  // so the next flush retries it; the parked-tick case (slot busy) simply coalesces more dirt.
+  // Preserve: the single-flight guard, the generation-matched ack, and the TWeakObjectPtr guard on
+  // the async callback.
+  //
+  // PlayerStateComponent supplies the payload's characterId (PlayerStateComponent->RedwoodCharacter
+  // .Id). It may be null on the detached-flush leg (a retained linkdead pawn has no live
+  // PlayerState); the characterId then comes from CharacterComponent->RedwoodCharacterId, which the
+  // dispatch site has already verified equal to the authoritative id.
+  //
+  // Item LOADING has no counterpart here: item rows arrive in the SAME round trip as the rest of
+  // the character (see FRedwoodCharacterBackend::Items), populated directly in
+  // RedwoodPlayerStateCharacterUpdated() before OnRedwoodCharacterUpdated broadcasts, instead of a
+  // separate later-arriving realm:characters:items:load call.
+  void FlushItemsForCharacterComponent(
     URedwoodPlayerStateComponent *PlayerStateComponent,
     URedwoodCharacterComponent *CharacterComponent
   );
 
-  // Offline/PIE counterpart to FlushContainersForCharacterComponent: appends CharacterComponent's
-  // container records to OutRows, which the caller writes ONCE to CharacterObject's "containers"
-  // field for FlushPlayerCharacterData to put in the character's JSON file. Appends rather than
-  // writing the field itself because "containers" is a single field fed by potentially several
-  // character components -- writing per component would keep only the last one's rows. Returns
-  // whether this component contributed (false = no containers, or a misconfigured records array),
-  // so the caller can leave the field absent entirely when nothing owns containers.
+  // Offline/PIE counterpart to FlushItemsForCharacterComponent: appends CharacterComponent's item
+  // records to OutRows, which the caller writes ONCE to CharacterObject's "items" field for
+  // FlushPlayerCharacterData to put in the character's JSON file. Appends rather than writing the
+  // field itself because "items" is a single field fed by potentially several character components
+  // -- writing per component would keep only the last one's rows. Returns whether this component
+  // contributed (false = items disabled, or a misconfigured records array), so the caller can
+  // leave the field absent entirely when nothing owns items.
   //
   // Unlike the backend leg this writes EVERY record rather than only the dirty ones -- the disk
-  // save is a whole-file rewrite, so a dirty-only write would drop every untouched container --
-  // and it therefore does not need the generation-tracked ack the sidecar round trip does.
-  bool AppendOfflineContainerRows(
+  // save is a whole-file rewrite, so a dirty-only write would drop every untouched item -- and it
+  // therefore does not need the generation-tracked ack the sidecar round trip does.
+  bool AppendOfflineItemRows(
     TArray<TSharedPtr<FJsonValue>> &OutRows,
     URedwoodCharacterComponent *CharacterComponent
+  );
+
+  // One-shot emit of realm:characters:items:migrate: hands the backend a whole set of item rows to
+  // fold into the Item table (the game's one-time legacy-inventory backfill, Plan C). Does NOT
+  // touch the component's dirty/flush state -- the rows are supplied whole by the caller, not
+  // drained from the dirty maps. OnComplete reports the backend's error string and whether the
+  // character was already migrated (alreadyMigrated true = a prior migrate already ran; the caller
+  // should treat that as success and not re-backfill).
+  void EmitItemsMigrate(
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    const TArray<FRedwoodItemRecord> &Items,
+    TFunction<void(FString Error, bool bAlreadyMigrated)> OnComplete
+  );
+
+  // Emit realm:characters:items:trade: atomically moves the given root items (each identified by a
+  // (Domain, Slot) placement) from one character to another on the backend. RootPlacements name
+  // only the root rows being handed over; the backend re-parents each root and its nested children
+  // in one transaction. After a successful trade the backend bumps BOTH characters' InventorySeq,
+  // so each caller's next FlushItemsForCharacterComponent takes the seq-resync path (CommittedSeq
+  // ahead of its sent seq) and realigns -- the trade itself does not flush either side here.
+  void EmitItemsTrade(
+    const FString &FromCharacterId,
+    const FString &ToCharacterId,
+    const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
+    TFunction<void(FString Error)> OnComplete
   );
   // FORK(hollowed-oath) END
 

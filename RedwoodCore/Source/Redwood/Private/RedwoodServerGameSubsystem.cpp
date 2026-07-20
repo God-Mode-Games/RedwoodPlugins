@@ -12,8 +12,8 @@
 #include "RedwoodSettings.h"
 #include "RedwoodSyncComponent.h"
 #include "RedwoodSyncItemAsset.h"
-// FORK(hollowed-oath): FRedwoodContainerRecord lives here; added for the container flush/offline
-// helpers below.
+// FORK(hollowed-oath): FRedwoodItemRecord + FRedwoodTradeRootPlacement live here; added for the
+// item flush / migrate / trade / offline helpers below.
 #include "Types/RedwoodTypesCharacters.h"
 #include "Types/RedwoodTypesSync.h"
 
@@ -1274,6 +1274,34 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
     TEXT("abilitySystem")
   );
 
+  // FORK(hollowed-oath) BEGIN: detached-flush item leg. Closes the gap where a retained linkdead
+  // pawn's dirty item rows were SILENTLY DROPPED -- the container channel this replaced
+  // (RedwoodPlugins#17) was never wired into FlushDetachedCharacterData, so a pawn that outlived
+  // its player lost every inventory mutation made after the last live flush. Items must not.
+  //
+  // Placed AFTER the seven-field serialize and BEFORE the bUseBackend split (and thus before both
+  // ClearDirtyFlags calls) on purpose: it must NOT be gated by the SerializedFieldCount == 0 early
+  // return below, because a pawn whose only change was its inventory has zero dirty character-blob
+  // fields yet still carries dirty items. Backend leg sends dirty rows on the item sidecar channel
+  // -- PlayerStateComponent is null here (a detached pawn has no live PlayerState), so
+  // FlushItemsForCharacterComponent sources characterId from the component's RedwoodCharacterId,
+  // already verified equal to CharacterId at the top of this function. Single-flight makes that
+  // safe against a concurrent tick flush. Offline leg writes the rows inline into CharacterObject
+  // for the on-disk JSON, mirroring CreatePlayerCharacterDataObject's offline leg: a bare
+  // FlushItemsForCharacterComponent would no-op offline (no sidecar) and drop the very rows this
+  // fix protects.
+  if (bUseBackend) {
+    if (CharacterComponent->IsItemsDirty()) {
+      FlushItemsForCharacterComponent(nullptr, CharacterComponent);
+    }
+  } else {
+    TArray<TSharedPtr<FJsonValue>> DetachedOfflineItemRows;
+    if (AppendOfflineItemRows(DetachedOfflineItemRows, CharacterComponent)) {
+      CharacterObject->SetArrayField(TEXT("items"), DetachedOfflineItemRows);
+    }
+  }
+  // FORK(hollowed-oath) END
+
   if (bUseBackend) {
     if (SerializedFieldCount == 0) {
       UE_LOG(
@@ -1547,20 +1575,22 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
         );
       }
 
-      // FORK(hollowed-oath) BEGIN: offline container carry-across in the "PlayerState snapshot is
-      // authoritative" branch (fork-added; this whole !bUseBackend inline-containers write has no
-      // upstream counterpart). Merge must keep it gated on !bUseBackend -- the backend leg's rows
-      // live in the Container table and must NOT be folded into realm:characters:set:server.
+      // FORK(hollowed-oath) BEGIN: offline item carry-across in the "PlayerState snapshot is
+      // authoritative" branch (fork-added; this whole !bUseBackend inline-items write has no
+      // upstream counterpart). Retargeted from the earlier per-container write
+      // (RedwoodCharacter.Containers / SerializeContainerRecords, RedwoodPlugins#17). Merge must
+      // keep it gated on !bUseBackend -- the backend leg's rows live in the Item table and must NOT
+      // be folded into realm:characters:set:server.
       // This branch treats the PlayerState's own character snapshot as authoritative and skips
-      // the character components entirely, so offline it must carry the snapshot's containers
+      // the character components entirely, so offline it must carry the snapshot's item rows
       // across too -- the disk save is a whole-file rewrite, and omitting the key here would drop
-      // every container row the character had. The backend leg needs nothing: its rows live in
-      // the Container table, untouched by realm:characters:set:server.
+      // every item row the character had. The backend leg needs nothing: its rows live in
+      // the Item table, untouched by realm:characters:set:server.
       if (!bUseBackend) {
         CharacterObject->SetArrayField(
-          TEXT("containers"),
-          URedwoodCommonGameSubsystem::SerializeContainerRecords(
-            PlayerStateComponent->RedwoodCharacter.Containers
+          TEXT("items"),
+          URedwoodCommonGameSubsystem::SerializeItemRecords(
+            PlayerStateComponent->RedwoodCharacter.Items
           )
         );
       }
@@ -1571,13 +1601,13 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
       bIsDirty = true;
     } else {
       // FORK(hollowed-oath): offline-only accumulator for the union of every character component's
-      // container rows (written once after the loop, below). Fork-added -- the backend leg sends
+      // item rows (written once after the loop, below). Fork-added -- the backend leg sends
       // each component's rows on its own sidecar channel and needs no accumulator.
-      // Offline only: the union of every character component's container rows, written to the
-      // single "containers" field after the loop below (the backend leg sends each component's
+      // Offline only: the union of every character component's item rows, written to the
+      // single "items" field after the loop below (the backend leg sends each component's
       // rows on its own sidecar channel instead, so it needs no accumulator).
-      TArray<TSharedPtr<FJsonValue>> OfflineContainerRows;
-      bool bHasOfflineContainerRows = false;
+      TArray<TSharedPtr<FJsonValue>> OfflineItemRows;
+      bool bHasOfflineItemRows = false;
 
       for (URedwoodCharacterComponent *CharacterComponent :
            CharacterComponents) {
@@ -1589,9 +1619,9 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
               !CharacterComponent->IsProgressDirty() &&
               !CharacterComponent->IsDataDirty() &&
               !CharacterComponent->IsAbilitySystemDirty() &&
-              // FORK(hollowed-oath): containers added to the "nothing dirty, skip this component"
-              // guard so a container-only change still forces a flush. Keep in the AND-chain.
-              !CharacterComponent->IsContainersDirty()) {
+              // FORK(hollowed-oath): items added to the "nothing dirty, skip this component"
+              // guard so an item-only change still forces a flush. Keep in the AND-chain.
+              !CharacterComponent->IsItemsDirty()) {
           continue;
         }
 
@@ -1613,14 +1643,14 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
             Pawn ? *Pawn->GetName() : TEXT("<none>")
           );
           CharacterComponent->ClearDirtyFlags();
-          // FORK(hollowed-oath): container dirty state is NOT touched by ClearDirtyFlags (it clears
+          // FORK(hollowed-oath): item dirty state is NOT touched by ClearDirtyFlags (it clears
           // only on a send's ack), so the identity-mismatch skip path must clear it explicitly or
-          // this component's containers stay dirty forever. Fork-added; keep alongside the skip.
-          // ClearDirtyFlags() deliberately leaves containers alone (they only clear on a
+          // this component's items stay dirty forever. Fork-added; keep alongside the skip.
+          // ClearDirtyFlags() deliberately leaves items alone (they only clear on a
           // send's ack) -- but this component is never going to be flushed at all (it's
           // being skipped outright), so there is no in-flight send to race; clear its
-          // container dirty state directly instead of leaving it stuck forever.
-          CharacterComponent->ClearContainersDirtyState();
+          // item dirty state directly instead of leaving it stuck forever.
+          CharacterComponent->ClearItemsDirtyState();
           continue;
         }
 
@@ -1752,48 +1782,47 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           }
         }
 
-        // FORK(hollowed-oath) BEGIN: per-component container flush dispatch. Fork-added; upstream
+        // FORK(hollowed-oath) BEGIN: per-component item flush dispatch. Fork-added; upstream
         // has neither branch. Backend leg routes dirty rows out on their OWN sidecar channel
-        // (FlushContainersForCharacterComponent) and deliberately does NOT fold "containers" into
+        // (FlushItemsForCharacterComponent) and deliberately does NOT fold "items" into
         // the realm:characters:set:server payload. Offline leg appends the rows into
         // CharacterObject for the on-disk JSON. Merge must preserve the bUseBackend split and keep
-        // this BEFORE ClearDirtyFlags (which does not clear container state -- the flush's ack /
+        // this BEFORE ClearDirtyFlags (which does not clear item state -- the flush's ack /
         // the offline append do).
-        // Containers are NOT folded into CharacterObject when it's headed for
-        // realm:characters:set:server -- that payload's schema has no "containers" field (Task 8
-        // gave containers their own Container table + sidecar routes, deliberately outside the
-        // single-row PlayerCharacter blob so a one-bag change doesn't rewrite every other
-        // container). Send them out on their own channel instead; this also clears the dirty
-        // state, mirroring ClearDirtyFlags below.
+        // Items are NOT folded into CharacterObject when it's headed for
+        // realm:characters:set:server -- that payload's schema has no "items" field: items live in
+        // their own Item table + sidecar routes, deliberately outside the single-row PlayerCharacter
+        // blob so a one-item change doesn't rewrite every other item. Send them out on their own
+        // channel instead; the flush's ack clears the dirty state.
         //
-        // Offline/PIE has neither that route nor a Container table: CharacterObject IS the
+        // Offline/PIE has neither that route nor an Item table: CharacterObject IS the
         // character's JSON file (FlushPlayerCharacterData writes it straight to disk), so the
         // rows go inline there instead. Without this the file would carry only the legacy flat
         // nonequippedInventory blob and every load would degrade to the legacy split path.
         if (bUseBackend) {
-          if (CharacterComponent->IsContainersDirty()) {
-            FlushContainersForCharacterComponent(
+          if (CharacterComponent->IsItemsDirty()) {
+            FlushItemsForCharacterComponent(
               PlayerStateComponent, CharacterComponent
             );
           }
-        } else if (AppendOfflineContainerRows(
-                     OfflineContainerRows, CharacterComponent
+        } else if (AppendOfflineItemRows(
+                     OfflineItemRows, CharacterComponent
                    )) {
-          bHasOfflineContainerRows = true;
+          bHasOfflineItemRows = true;
         }
         // FORK(hollowed-oath) END
 
         CharacterComponent->ClearDirtyFlags();
       }
 
-      // FORK(hollowed-oath): write the accumulated offline container rows once (fork-added). Guarded
-      // so a game not using containers keeps the field absent rather than gaining an empty array.
-      // One "containers" field, written once from every component's rows -- see
-      // AppendOfflineContainerRows. Only written when a component actually owns containers, so a
+      // FORK(hollowed-oath): write the accumulated offline item rows once (fork-added). Guarded
+      // so a game not using items keeps the field absent rather than gaining an empty array.
+      // One "items" field, written once from every component's rows -- see
+      // AppendOfflineItemRows. Only written when a component actually owns items, so a
       // game not using them keeps the field absent rather than gaining an empty array.
-      if (bHasOfflineContainerRows) {
+      if (bHasOfflineItemRows) {
         CharacterObject->SetArrayField(
-          TEXT("containers"), OfflineContainerRows
+          TEXT("items"), OfflineItemRows
         );
       }
     }
@@ -1824,150 +1853,206 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
   }
 }
 
-// FORK(hollowed-oath) BEGIN: container flush + offline-append helpers, entirely fork-added (no
-// upstream counterpart). FlushContainersForCharacterComponent is the per-bag persistence channel:
-// it sends ONLY dirty records + pending deletions to realm:characters:containers:upsert and clears
-// dirty state ONLY on a generation-matched ack (AckContainersFlushed), so a re-dirty mid-flight is
-// never stranded and a failed/lost send is always retried. AppendOfflineContainerRows is its
-// offline/PIE twin (whole-array write into the on-disk character JSON). Called from
-// CreatePlayerCharacterDataObject above; the game module (AClient) drives the dirty state via
-// URedwoodCharacterComponent::MarkContainersDirty/MarkContainersDeleted. Declarations sit under a
-// matching FORK marker in RedwoodServerGameSubsystem.h. Merge must preserve: the ack-only clear
-// contract, the (id, generation) send-set independence from the live maps, and the TWeakObjectPtr
-// guard on the async callback.
-// Sends CharacterComponent's currently-dirty container records (plus pending deletions) to
-// realm:characters:containers:upsert. Dirty state is cleared ONLY on ack (the Emit callback's
-// Error.IsEmpty() check below), and only for the exact (id, generation) pairs this call actually
-// sent -- if MarkContainersDirty/MarkContainersDeleted bumped an id's generation again while the
-// request was in flight, AckContainersFlushed leaves that id dirty at its newer generation
-// instead of clearing it, so the next flush cycle re-sends the newer record rather than a
-// mid-flight re-dirty being silently stranded. A failed send, a disconnect, or the
-// component/actor being destroyed mid-flight all leave the dirty state (wholly or partially) set,
-// so the next flush retries it; nothing is ever lost to an unacknowledged send. TWeakObjectPtr
-// guards the async callback the same way FlushContainersForCharacterComponent's sibling channels'
-// load callbacks already do.
-void URedwoodServerGameSubsystem::FlushContainersForCharacterComponent(
+// FORK(hollowed-oath) BEGIN: item flush + migrate + trade + offline-append helpers, entirely
+// fork-added (no upstream counterpart). Replaces the earlier per-container flush helpers
+// (FlushContainersForCharacterComponent / AppendOfflineContainerRows, RedwoodPlugins#17) now that
+// persistence is per-item flat rows instead of opaque per-container blobs. Backend counterpart:
+// RedwoodBackend feat/item-persistence (realm:characters:items:{flush,migrate,trade} routes).
+//
+// FlushItemsForCharacterComponent is the per-item persistence channel, protocol v2: single-flight
+// + seq-fenced. It sends ONLY currently-dirty item records (plus pending deletions) to
+// realm:characters:items:flush under a batchSeq claimed by TryBeginItemFlush, and clears dirty
+// state ONLY on a generation-matched ack inside CompleteItemFlush, so a re-dirty mid-flight is
+// never stranded and a failed/lost/component-destroyed send is always retried. At most one batch
+// is outstanding: while one is in flight TryBeginItemFlush returns false and this tick's flush is
+// parked (dirt keeps coalescing). AppendOfflineItemRows is its offline/PIE twin (whole-array write
+// into the on-disk character JSON). EmitItemsMigrate / EmitItemsTrade are one-shot backend ops
+// with no dirty-state interaction. Called from CreatePlayerCharacterDataObject /
+// FlushDetachedCharacterData above; the game module (AClient / per-bag inventory) drives the dirty
+// state via URedwoodCharacterComponent::MarkItemsDirty/MarkItemsDeleted and calls the migrate/trade
+// emits from Plan C. Declarations sit under a matching FORK marker in RedwoodServerGameSubsystem.h.
+// Merge must preserve: the single-flight/seq-fence contract, the generation-matched ack, the
+// (id, generation) send-set independence from the live maps, and the TWeakObjectPtr guard on every
+// async callback.
+//
+// Sends CharacterComponent's currently-dirty item records (plus pending deletions) to
+// realm:characters:items:flush under a claimed batchSeq. Dirty state is cleared ONLY on the ack
+// inside CompleteItemFlush (below), and only for the exact (id, generation) pairs this call
+// actually sent -- if MarkItemsDirty/MarkItemsDeleted bumped an id's generation again while the
+// request was in flight, CompleteItemFlush leaves that id dirty at its newer generation instead of
+// clearing it, so the next flush cycle re-sends the newer record rather than a mid-flight re-dirty
+// being silently stranded. A failed send leaves the dirty state set (CompleteItemFlush releases
+// the single-flight slot but retains the dirt); a component/actor destroyed mid-flight strands
+// nothing recoverable and just returns. CompleteItemFlush ALWAYS runs on a live component (success
+// or error) so the flight slot is released and the next flush can proceed. TWeakObjectPtr guards
+// the async callback the same way the sibling channels' callbacks do.
+//
+// PlayerStateComponent supplies the payload's characterId; it may be null on the detached-flush leg
+// (a retained linkdead pawn has no live PlayerState), in which case the id comes from the
+// component's own RedwoodCharacterId, which the dispatch site already verified equal to the
+// authoritative id.
+void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   URedwoodPlayerStateComponent *PlayerStateComponent,
   URedwoodCharacterComponent *CharacterComponent
 ) {
+  // Early-out before claiming the flight slot: the detached-flush leg calls this without the
+  // dispatch site's IsItemsDirty() pre-check, and a slot claimed here would never be released.
+  if (!CharacterComponent->IsItemsDirty()) {
+    return;
+  }
+
   if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
     UE_LOG(
-      LogRedwood, Error, TEXT("Sidecar is not connected; cannot flush containers")
+      LogRedwood, Error, TEXT("Sidecar is not connected; cannot flush items")
     );
     return;
   }
 
-  TArray<FRedwoodContainerRecord> *RecordsArray =
-    URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(CharacterComponent);
+  // Resolve the records array BEFORE claiming the single-flight slot: a misconfigured
+  // ItemsVariableName returns null here, and bailing after TryBeginItemFlush would strand the slot
+  // forever (nothing would release bItemFlushInFlight).
+  TArray<FRedwoodItemRecord> *RecordsArray =
+    URedwoodCommonGameSubsystem::ResolveItemsRecordsArray(CharacterComponent);
   if (!RecordsArray) {
     return;
   }
 
-  // Generation counters, not plain ids -- lets AckContainersFlushed tell "the record I sent" apart
+  // Claim the single-flight slot + the batchSeq this batch must stamp. If a batch is already
+  // outstanding, park this tick's flush -- the dirt stays marked and coalesces until the in-flight
+  // batch's ack releases the slot.
+  int64 BatchSeq = 0;
+  if (!CharacterComponent->TryBeginItemFlush(BatchSeq)) {
+    return;
+  }
+
+  // Generation counters, not plain ids -- lets CompleteItemFlush tell "the record I sent" apart
   // from "the record as it stands after a re-dirty that arrived while this send was in flight".
   const TMap<FString, uint64> &DirtyGenerations =
-    CharacterComponent->GetDirtyContainerGenerations();
+    CharacterComponent->GetDirtyItemGenerations();
   const TMap<FString, uint64> &DeletedGenerations =
-    CharacterComponent->GetPendingDeletedContainerGenerations();
+    CharacterComponent->GetPendingDeletedItemGenerations();
 
-  TArray<TSharedPtr<FJsonValue>> ContainersJsonArray;
-  // The exact (id, generation) pairs actually included in ContainersJsonArray below -- NOT simply
+  TArray<TSharedPtr<FJsonValue>> UpsertsJsonArray;
+  // The exact (id, generation) pairs actually included in UpsertsJsonArray below -- NOT simply
   // DirtyGenerations, since a dirty id with no matching record (logged below) is never sent and
   // must not be acked.
-  TArray<TPair<FString, uint64>> SentUpsertIds;
-  for (const FRedwoodContainerRecord &Record : *RecordsArray) {
-    const uint64 *Generation = DirtyGenerations.Find(Record.ContainerId);
+  TArray<TPair<FString, uint64>> SentUpserts;
+  for (const FRedwoodItemRecord &Record : *RecordsArray) {
+    const uint64 *Generation = DirtyGenerations.Find(Record.Id);
     if (!Generation) {
       continue;
     }
 
-    ContainersJsonArray.Add(MakeShareable(new FJsonValueObject(
-      URedwoodCommonGameSubsystem::SerializeContainerRecord(Record)
+    UpsertsJsonArray.Add(MakeShareable(new FJsonValueObject(
+      URedwoodCommonGameSubsystem::SerializeItemRecord(Record)
     )));
-    SentUpsertIds.Add(TPair<FString, uint64>(Record.ContainerId, *Generation));
+    SentUpserts.Add(TPair<FString, uint64>(Record.Id, *Generation));
   }
 
-  if (ContainersJsonArray.Num() != DirtyGenerations.Num()) {
-    // A dirty ContainerId that isn't in RecordsArray at all -- the game marked it dirty but
-    // never wrote a matching record into Containers before the flush ran. Not fatal (the
-    // deletion, if any, still goes out), but worth surfacing since it means that record is
-    // silently skipped this flush. It stays dirty (not in SentUpsertIds) so a later flush,
-    // once a matching record exists, retries it.
+  if (UpsertsJsonArray.Num() != DirtyGenerations.Num()) {
+    // A dirty item id that isn't in RecordsArray at all -- the game marked it dirty but never
+    // wrote a matching record into the items array before the flush ran. Not fatal (the deletion,
+    // if any, still goes out), but worth surfacing since that record is silently skipped this
+    // flush. It stays dirty (not in SentUpserts) so a later flush, once a matching record exists,
+    // retries it.
     UE_LOG(
       LogRedwood,
       Warning,
       TEXT(
-        "FlushContainersForCharacterComponent: %d dirty ContainerId(s) had no matching record in %s (skipped, left dirty)"
+        "FlushItemsForCharacterComponent: %d dirty item id(s) had no matching record in %s (skipped, left dirty)"
       ),
-      DirtyGenerations.Num() - ContainersJsonArray.Num(),
-      *CharacterComponent->ContainersVariableName
+      DirtyGenerations.Num() - UpsertsJsonArray.Num(),
+      *CharacterComponent->ItemsVariableName
     );
   }
 
-  TArray<TSharedPtr<FJsonValue>> DeletedJsonArray;
-  TArray<TPair<FString, uint64>> SentDeletedIds;
+  TArray<TSharedPtr<FJsonValue>> DeletesJsonArray;
+  TArray<TPair<FString, uint64>> SentDeletes;
   for (const TPair<FString, uint64> &Deleted : DeletedGenerations) {
-    DeletedJsonArray.Add(MakeShareable(new FJsonValueString(Deleted.Key)));
-    SentDeletedIds.Add(Deleted);
+    DeletesJsonArray.Add(MakeShareable(new FJsonValueString(Deleted.Key)));
+    SentDeletes.Add(Deleted);
   }
 
-  if (ContainersJsonArray.Num() == 0 && DeletedJsonArray.Num() == 0) {
+  if (UpsertsJsonArray.Num() == 0 && DeletesJsonArray.Num() == 0) {
+    // Nothing actually sendable (e.g. every dirty id lacked a record). Release the flight slot we
+    // just claimed via the ack path with no sent ids and the current committed seq, so the next
+    // flush isn't wedged behind a slot that never sent anything.
+    CharacterComponent->CompleteItemFlush(
+      TEXT(""), CharacterComponent->GetLastCommittedItemSeq(), {}, {}
+    );
     return;
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetField(TEXT("id"), MakeShareable(new FJsonValueNull()));
   Payload->SetStringField(
-    TEXT("characterId"), PlayerStateComponent->RedwoodCharacter.Id
+    TEXT("characterId"),
+    PlayerStateComponent ? PlayerStateComponent->RedwoodCharacter.Id
+                         : CharacterComponent->RedwoodCharacterId
   );
-  Payload->SetArrayField(TEXT("containers"), ContainersJsonArray);
-  Payload->SetArrayField(TEXT("deletedContainerIds"), DeletedJsonArray);
+  Payload->SetNumberField(TEXT("batchSeq"), static_cast<double>(BatchSeq));
+  Payload->SetArrayField(TEXT("upserts"), UpsertsJsonArray);
+  Payload->SetArrayField(TEXT("deletes"), DeletesJsonArray);
 
-  // SentUpsertIds/SentDeletedIds above are already independent copies of the (id, generation)
-  // pairs sent in this payload -- not references into CharacterComponent's live maps, which may
-  // change again (a re-dirty bumping a generation, a new mark, etc.) before this ack arrives.
+  // SentUpserts/SentDeletes above are already independent copies of the (id, generation) pairs
+  // sent in this payload -- not references into CharacterComponent's live maps, which may change
+  // again (a re-dirty bumping a generation, a new mark, etc.) before this ack arrives.
   TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = CharacterComponent;
 
   Sidecar->Emit(
-    TEXT("realm:characters:containers:upsert"),
+    TEXT("realm:characters:items:flush"),
     Payload,
-    [WeakCharacterComponent, SentUpsertIds, SentDeletedIds](auto Response) {
+    [WeakCharacterComponent, SentUpserts, SentDeletes](auto Response) {
       TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
       FString Error = MessageStruct->GetStringField(TEXT("error"));
-      if (!Error.IsEmpty()) {
-        UE_LOG(
-          LogRedwood, Error, TEXT("Failed to flush containers: %s"), *Error
-        );
-        // Leave the dirty/pending-deletion state as-is -- the next flush retries these ids.
-        return;
-      }
+      // committedSeq rides both success and error (fence/replay) responses; absent -> 0, which the
+      // error path treats as "no fence ahead of us" and leaves NextBatchSeq alone.
+      int64 CommittedSeq =
+        static_cast<int64>(MessageStruct->GetNumberField(TEXT("committedSeq")));
 
       URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
       if (!IsValid(CharacterComponent)) {
         // The player disconnected (or the pawn/PlayerState was destroyed) while this request was
-        // in flight -- nothing left to clear dirty state on.
+        // in flight -- the single-flight slot lives on that now-dead component, so there is
+        // nothing to release or clear. (Inherited exposure: the flush barrier that bounds a
+        // detached pawn's lifetime keeps this from leaking a live component's slot.)
+        if (!Error.IsEmpty()) {
+          UE_LOG(
+            LogRedwood, Error, TEXT("Failed to flush items (component gone): %s"), *Error
+          );
+        }
         return;
       }
 
-      CharacterComponent->AckContainersFlushed(SentUpsertIds, SentDeletedIds);
+      if (!Error.IsEmpty()) {
+        UE_LOG(LogRedwood, Error, TEXT("Failed to flush items: %s"), *Error);
+      }
+
+      // ALWAYS complete (success or error): CompleteItemFlush releases the single-flight slot and,
+      // on success, clears only the generation-matched sent ids and advances the committed seq; on
+      // error it leaves the dirt for the next flush (realigning NextBatchSeq only if the backend
+      // reports a fence at/past the seq we sent).
+      CharacterComponent->CompleteItemFlush(
+        Error, CommittedSeq, SentUpserts, SentDeletes
+      );
     }
   );
 }
 
-bool URedwoodServerGameSubsystem::AppendOfflineContainerRows(
+bool URedwoodServerGameSubsystem::AppendOfflineItemRows(
   TArray<TSharedPtr<FJsonValue>> &OutRows,
   URedwoodCharacterComponent *CharacterComponent
 ) {
-  if (!CharacterComponent->bUseContainers) {
+  if (!CharacterComponent->bUseItems) {
     return false;
   }
 
-  TArray<FRedwoodContainerRecord> *RecordsArray =
-    URedwoodCommonGameSubsystem::ResolveContainersRecordsArray(CharacterComponent);
+  TArray<FRedwoodItemRecord> *RecordsArray =
+    URedwoodCommonGameSubsystem::ResolveItemsRecordsArray(CharacterComponent);
   if (!RecordsArray) {
-    // The game's ContainersVariableName property is missing or the wrong type -- a hard
+    // The game's ItemsVariableName property is missing or the wrong type -- a hard
     // misconfiguration that breaks the backend leg identically, already logged by
-    // ResolveContainersRecordsArray. There is no set of records to write, and nothing better to
+    // ResolveItemsRecordsArray. There is no set of records to write, and nothing better to
     // fall back to: SaveCharacterJsonToDisk rewrites the file wholesale, so the previous rows are
     // gone either way.
     return false;
@@ -1975,33 +2060,132 @@ bool URedwoodServerGameSubsystem::AppendOfflineContainerRows(
 
   // Honor pending deletions even though game code is expected to have already removed the record
   // from RecordsArray -- this leg writes the whole array verbatim, so a record left behind after
-  // its deletion was marked would silently resurrect the bag on the next load.
+  // its deletion was marked would silently resurrect the item on the next load.
   const TMap<FString, uint64> &DeletedGenerations =
-    CharacterComponent->GetPendingDeletedContainerGenerations();
+    CharacterComponent->GetPendingDeletedItemGenerations();
 
-  TArray<FRedwoodContainerRecord> RecordsToWrite;
+  TArray<FRedwoodItemRecord> RecordsToWrite;
   RecordsToWrite.Reserve(RecordsArray->Num());
-  for (const FRedwoodContainerRecord &Record : *RecordsArray) {
-    if (!DeletedGenerations.Contains(Record.ContainerId)) {
+  for (const FRedwoodItemRecord &Record : *RecordsArray) {
+    if (!DeletedGenerations.Contains(Record.Id)) {
       RecordsToWrite.Add(Record);
     }
   }
 
-  // APPEND, never assign: "containers" is ONE field on the character object but every character
-  // component owning containers contributes rows to it, so the caller writes the field once from
+  // APPEND, never assign: "items" is ONE field on the character object but every character
+  // component owning items contributes rows to it, so the caller writes the field once from
   // the union of all of them. Setting the field per component would leave only the last component's
   // rows on disk and silently drop the rest.
   OutRows.Append(
-    URedwoodCommonGameSubsystem::SerializeContainerRecords(RecordsToWrite)
+    URedwoodCommonGameSubsystem::SerializeItemRecords(RecordsToWrite)
   );
 
   // Safe to clear outright, unlike the sidecar leg's generation-matched ack: the disk write is
   // synchronous and unconditionally rewrites the complete set, so no id needs to stay marked for
   // a later retry and no re-dirty can race an in-flight send. Without this, the dirty and
   // pending-deletion maps would grow for the whole session (ClearDirtyFlags deliberately leaves
-  // container state alone) and a deleted id would suppress its own row forever.
-  CharacterComponent->ClearContainersDirtyState();
+  // item state alone) and a deleted id would suppress its own row forever.
+  CharacterComponent->ClearItemsDirtyState();
   return true;
+}
+
+// One-shot migrate emit (Plan C's legacy-inventory backfill). Hands the backend a whole set of
+// item rows to fold into the Item table; does NOT touch the component's dirty/flush state -- the
+// rows are supplied whole by the caller, not drained from the dirty maps. See the header for the
+// alreadyMigrated contract.
+void URedwoodServerGameSubsystem::EmitItemsMigrate(
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  const TArray<FRedwoodItemRecord> &Items,
+  TFunction<void(FString Error, bool bAlreadyMigrated)> OnComplete
+) {
+  if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    UE_LOG(
+      LogRedwood, Error, TEXT("Sidecar is not connected; cannot migrate items")
+    );
+    if (OnComplete) {
+      OnComplete(TEXT("Sidecar is not connected"), false);
+    }
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(
+    TEXT("characterId"), PlayerStateComponent->RedwoodCharacter.Id
+  );
+  Payload->SetArrayField(
+    TEXT("items"), URedwoodCommonGameSubsystem::SerializeItemRecords(Items)
+  );
+
+  Sidecar->Emit(
+    TEXT("realm:characters:items:migrate"),
+    Payload,
+    [OnComplete](auto Response) {
+      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
+      FString Error = MessageStruct->GetStringField(TEXT("error"));
+      // Absent -> false: an error response may omit alreadyMigrated entirely.
+      bool bAlreadyMigrated = false;
+      MessageStruct->TryGetBoolField(TEXT("alreadyMigrated"), bAlreadyMigrated);
+      if (!Error.IsEmpty()) {
+        UE_LOG(LogRedwood, Error, TEXT("Failed to migrate items: %s"), *Error);
+      }
+      if (OnComplete) {
+        OnComplete(Error, bAlreadyMigrated);
+      }
+    }
+  );
+}
+
+// One-shot trade emit: atomically re-parents the named root items from one character to another on
+// the backend. rootPlacements carries only each root row's (id, domain, slot); the backend moves
+// each root and its nested children in one transaction and bumps BOTH characters' InventorySeq, so
+// each side's next FlushItemsForCharacterComponent takes the seq-resync path (see the header).
+void URedwoodServerGameSubsystem::EmitItemsTrade(
+  const FString &FromCharacterId,
+  const FString &ToCharacterId,
+  const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
+  TFunction<void(FString Error)> OnComplete
+) {
+  if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    UE_LOG(
+      LogRedwood, Error, TEXT("Sidecar is not connected; cannot trade items")
+    );
+    if (OnComplete) {
+      OnComplete(TEXT("Sidecar is not connected"));
+    }
+    return;
+  }
+
+  TArray<TSharedPtr<FJsonValue>> RootPlacementsJsonArray;
+  RootPlacementsJsonArray.Reserve(RootPlacements.Num());
+  for (const FRedwoodTradeRootPlacement &Placement : RootPlacements) {
+    TSharedPtr<FJsonObject> PlacementObject = MakeShareable(new FJsonObject);
+    PlacementObject->SetStringField(TEXT("id"), Placement.Id);
+    PlacementObject->SetStringField(TEXT("domain"), Placement.Domain);
+    PlacementObject->SetNumberField(TEXT("slot"), Placement.Slot);
+    RootPlacementsJsonArray.Add(
+      MakeShareable(new FJsonValueObject(PlacementObject))
+    );
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("fromCharacterId"), FromCharacterId);
+  Payload->SetStringField(TEXT("toCharacterId"), ToCharacterId);
+  Payload->SetArrayField(TEXT("rootPlacements"), RootPlacementsJsonArray);
+
+  Sidecar->Emit(
+    TEXT("realm:characters:items:trade"),
+    Payload,
+    [OnComplete](auto Response) {
+      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
+      FString Error = MessageStruct->GetStringField(TEXT("error"));
+      if (!Error.IsEmpty()) {
+        UE_LOG(LogRedwood, Error, TEXT("Failed to trade items: %s"), *Error);
+      }
+      if (OnComplete) {
+        OnComplete(Error);
+      }
+    }
+  );
 }
 // FORK(hollowed-oath) END
 
