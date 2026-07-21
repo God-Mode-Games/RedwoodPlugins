@@ -221,6 +221,29 @@ public:
     const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
     TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete
   );
+
+  // Static payload builders for the three item emits above, split out so ItemPersistenceTest can
+  // pin the wire envelope without a live sidecar connection. The sidecar validates each request
+  // against its full schema BEFORE stamping its own instanceId over "id" (mirroring
+  // realm:characters:set:server), so every envelope MUST carry a placeholder id -- omitting it (or
+  // sending JSON null) fails that pre-stamp validation and the message never reaches the realm;
+  // this was live-broken for all three routes on the first deployed channel ("id is a required
+  // field") because no test covered the envelope layer. Emit sites MUST build their payloads
+  // through these.
+  static TSharedPtr<FJsonObject> BuildItemsFlushPayload(
+    const FString &CharacterId,
+    int64 BatchSeq,
+    const TArray<TSharedPtr<FJsonValue>> &Upserts,
+    const TArray<TSharedPtr<FJsonValue>> &Deletes
+  );
+  static TSharedPtr<FJsonObject> BuildItemsMigratePayload(
+    const FString &CharacterId, const TArray<FRedwoodItemRecord> &Items
+  );
+  static TSharedPtr<FJsonObject> BuildItemsTradePayload(
+    const FString &FromCharacterId,
+    const FString &ToCharacterId,
+    const TArray<FRedwoodTradeRootPlacement> &RootPlacements
+  );
   // FORK(hollowed-oath) END
 
   // FORK(hollowed-oath): fork-added API (with EmitPlayerLeft below), not in

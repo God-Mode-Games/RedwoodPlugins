@@ -2004,6 +2004,76 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
 // (a retained linkdead pawn has no live PlayerState), in which case the id comes from the
 // component's own RedwoodCharacterId, which the dispatch site already verified equal to the
 // authoritative id.
+// The shared envelope contract for the three item emits below (see the header FORK block): every
+// payload carries the "game-server" placeholder id because the sidecar validates the FULL request
+// schema (id: string().required()) BEFORE stamping its own instanceId over the field -- identical
+// to the realm:characters:set:server payload above. A null or absent id fails that pre-stamp
+// validation ("id is a required field") and the message never reaches the realm; ItemPersistenceTest
+// pins these builders so the envelope layer can no longer regress untested.
+// file-local (static, not an anonymous namespace -- those merge across unity-build blobs)
+static const TCHAR *ItemsEnvelopePlaceholderId = TEXT("game-server");
+
+TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsFlushPayload(
+  const FString &CharacterId,
+  int64 BatchSeq,
+  const TArray<TSharedPtr<FJsonValue>> &Upserts,
+  const TArray<TSharedPtr<FJsonValue>> &Deletes
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("id"), ItemsEnvelopePlaceholderId);
+  Payload->SetStringField(TEXT("characterId"), CharacterId);
+  Payload->SetNumberField(TEXT("batchSeq"), static_cast<double>(BatchSeq));
+  Payload->SetArrayField(TEXT("upserts"), Upserts);
+  Payload->SetArrayField(TEXT("deletes"), Deletes);
+  return Payload;
+}
+
+TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsMigratePayload(
+  const FString &CharacterId, const TArray<FRedwoodItemRecord> &Items
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("id"), ItemsEnvelopePlaceholderId);
+  Payload->SetStringField(TEXT("characterId"), CharacterId);
+  Payload->SetArrayField(
+    TEXT("items"), URedwoodCommonGameSubsystem::SerializeItemRecords(Items)
+  );
+  return Payload;
+}
+
+TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsTradePayload(
+  const FString &FromCharacterId,
+  const FString &ToCharacterId,
+  const TArray<FRedwoodTradeRootPlacement> &RootPlacements
+) {
+  TArray<TSharedPtr<FJsonValue>> RootPlacementsJsonArray;
+  RootPlacementsJsonArray.Reserve(RootPlacements.Num());
+  for (const FRedwoodTradeRootPlacement &Placement : RootPlacements) {
+    TSharedPtr<FJsonObject> PlacementObject = MakeShareable(new FJsonObject);
+    PlacementObject->SetStringField(TEXT("id"), Placement.Id);
+    PlacementObject->SetStringField(TEXT("domain"), Placement.Domain);
+    PlacementObject->SetNumberField(TEXT("slot"), Placement.Slot);
+    // FORK(hollowed-oath): mirror SerializeItemRecord's null convention for ParentId (empty =
+    // JSON null, not ""), so the backend's trade route can treat a content-child destination
+    // (nested inside a receiving-side bag item) the same way it already treats item rows --
+    // production trades move items between bags, not just top-level slots.
+    if (Placement.ParentId.IsEmpty()) {
+      PlacementObject->SetField(TEXT("parentId"), MakeShareable(new FJsonValueNull));
+    } else {
+      PlacementObject->SetStringField(TEXT("parentId"), Placement.ParentId);
+    }
+    RootPlacementsJsonArray.Add(
+      MakeShareable(new FJsonValueObject(PlacementObject))
+    );
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("id"), ItemsEnvelopePlaceholderId);
+  Payload->SetStringField(TEXT("fromCharacterId"), FromCharacterId);
+  Payload->SetStringField(TEXT("toCharacterId"), ToCharacterId);
+  Payload->SetArrayField(TEXT("rootPlacements"), RootPlacementsJsonArray);
+  return Payload;
+}
+
 void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   URedwoodPlayerStateComponent *PlayerStateComponent,
   URedwoodCharacterComponent *CharacterComponent,
@@ -2120,16 +2190,13 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     return;
   }
 
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetField(TEXT("id"), MakeShareable(new FJsonValueNull()));
-  Payload->SetStringField(
-    TEXT("characterId"),
+  TSharedPtr<FJsonObject> Payload = BuildItemsFlushPayload(
     PlayerStateComponent ? PlayerStateComponent->RedwoodCharacter.Id
-                         : CharacterComponent->RedwoodCharacterId
+                         : CharacterComponent->RedwoodCharacterId,
+    BatchSeq,
+    UpsertsJsonArray,
+    DeletesJsonArray
   );
-  Payload->SetNumberField(TEXT("batchSeq"), static_cast<double>(BatchSeq));
-  Payload->SetArrayField(TEXT("upserts"), UpsertsJsonArray);
-  Payload->SetArrayField(TEXT("deletes"), DeletesJsonArray);
 
   // SentUpserts/SentDeletes above are already independent copies of the (id, generation) pairs
   // sent in this payload -- not references into CharacterComponent's live maps, which may change
@@ -2275,13 +2342,8 @@ void URedwoodServerGameSubsystem::EmitItemsMigrate(
     return;
   }
 
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(
-    TEXT("characterId"), PlayerStateComponent->RedwoodCharacter.Id
-  );
-  Payload->SetArrayField(
-    TEXT("items"), URedwoodCommonGameSubsystem::SerializeItemRecords(Items)
-  );
+  TSharedPtr<FJsonObject> Payload =
+    BuildItemsMigratePayload(PlayerStateComponent->RedwoodCharacter.Id, Items);
 
   Sidecar->Emit(
     TEXT("realm:characters:items:migrate"),
@@ -2327,31 +2389,8 @@ void URedwoodServerGameSubsystem::EmitItemsTrade(
     return;
   }
 
-  TArray<TSharedPtr<FJsonValue>> RootPlacementsJsonArray;
-  RootPlacementsJsonArray.Reserve(RootPlacements.Num());
-  for (const FRedwoodTradeRootPlacement &Placement : RootPlacements) {
-    TSharedPtr<FJsonObject> PlacementObject = MakeShareable(new FJsonObject);
-    PlacementObject->SetStringField(TEXT("id"), Placement.Id);
-    PlacementObject->SetStringField(TEXT("domain"), Placement.Domain);
-    PlacementObject->SetNumberField(TEXT("slot"), Placement.Slot);
-    // FORK(hollowed-oath): mirror SerializeItemRecord's null convention for ParentId (empty =
-    // JSON null, not ""), so the backend's trade route can treat a content-child destination
-    // (nested inside a receiving-side bag item) the same way it already treats item rows --
-    // production trades move items between bags, not just top-level slots.
-    if (Placement.ParentId.IsEmpty()) {
-      PlacementObject->SetField(TEXT("parentId"), MakeShareable(new FJsonValueNull));
-    } else {
-      PlacementObject->SetStringField(TEXT("parentId"), Placement.ParentId);
-    }
-    RootPlacementsJsonArray.Add(
-      MakeShareable(new FJsonValueObject(PlacementObject))
-    );
-  }
-
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("fromCharacterId"), FromCharacterId);
-  Payload->SetStringField(TEXT("toCharacterId"), ToCharacterId);
-  Payload->SetArrayField(TEXT("rootPlacements"), RootPlacementsJsonArray);
+  TSharedPtr<FJsonObject> Payload =
+    BuildItemsTradePayload(FromCharacterId, ToCharacterId, RootPlacements);
 
   Sidecar->Emit(
     TEXT("realm:characters:items:trade"),

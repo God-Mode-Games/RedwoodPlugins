@@ -19,6 +19,7 @@
 #include "Misc/AutomationTest.h"
 #include "RedwoodCharacterComponent.h"
 #include "RedwoodCommonGameSubsystem.h"
+#include "RedwoodServerGameSubsystem.h"
 #include "SIOJsonObject.h"
 #include "Types/RedwoodTypesCharacters.h"
 
@@ -439,6 +440,160 @@ bool FRedwoodItemRecordRoundTripNullFieldsTest::RunTest(const FString &Parameter
       TEXT("Null Attributes round-trips to a non-null empty object"),
       Parsed[0].Attributes != nullptr && Parsed[0].Attributes->IsValid()
     );
+  }
+
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodItemEmitEnvelopeTest,
+  "Redwood.Items.EmitEnvelopes",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// Pins the wire ENVELOPE of the three item emits (flush / migrate / trade). The sidecar validates
+// each request against its full schema -- including id: string().required(), the field the sidecar
+// itself stamps -- BEFORE stamping, so an envelope without a placeholder id never reaches the
+// realm ("id is a required field"). This layer shipped untested once and was live-broken for all
+// three routes on the first deployed channel; these assertions make that unrepresentable.
+bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
+  const FString CharacterId = TEXT("character-1");
+
+  // A payload id must be a present, non-empty STRING (JSON null also fails the sidecar's schema).
+  auto TestEnvelopeId = [this](
+                          const TCHAR *Label, const TSharedPtr<FJsonObject> &Payload
+                        ) {
+    FString EnvelopeId;
+    TestTrue(
+      FString::Printf(TEXT("%s: envelope has a string id"), Label),
+      Payload->TryGetStringField(TEXT("id"), EnvelopeId)
+    );
+    TestFalse(
+      FString::Printf(TEXT("%s: envelope id is non-empty"), Label),
+      EnvelopeId.IsEmpty()
+    );
+  };
+
+  // --- flush ---
+  {
+    TArray<TSharedPtr<FJsonValue>> Upserts;
+    Upserts.Add(MakeShareable(new FJsonValueObject(
+      URedwoodCommonGameSubsystem::SerializeItemRecord(
+        RedwoodItemPersistenceTest::MakeTestRecord()
+      )
+    )));
+    TArray<TSharedPtr<FJsonValue>> Deletes;
+
+    TSharedPtr<FJsonObject> Payload =
+      URedwoodServerGameSubsystem::BuildItemsFlushPayload(
+        CharacterId, 7, Upserts, Deletes
+      );
+    TestEnvelopeId(TEXT("flush"), Payload);
+    TestEqual(
+      TEXT("flush: characterId"),
+      Payload->GetStringField(TEXT("characterId")),
+      CharacterId
+    );
+    TestEqual(
+      TEXT("flush: batchSeq"), Payload->GetNumberField(TEXT("batchSeq")), 7.0
+    );
+    TestTrue(
+      TEXT("flush: upserts array present"),
+      Payload->HasTypedField<EJson::Array>(TEXT("upserts"))
+    );
+    TestTrue(
+      TEXT("flush: deletes array present"),
+      Payload->HasTypedField<EJson::Array>(TEXT("deletes"))
+    );
+  }
+
+  // --- migrate ---
+  {
+    TArray<FRedwoodItemRecord> Items;
+    Items.Add(RedwoodItemPersistenceTest::MakeTestRecord());
+
+    TSharedPtr<FJsonObject> Payload =
+      URedwoodServerGameSubsystem::BuildItemsMigratePayload(CharacterId, Items);
+    TestEnvelopeId(TEXT("migrate"), Payload);
+    TestEqual(
+      TEXT("migrate: characterId"),
+      Payload->GetStringField(TEXT("characterId")),
+      CharacterId
+    );
+    const TArray<TSharedPtr<FJsonValue>> *ItemsArray = nullptr;
+    TestTrue(
+      TEXT("migrate: items array present"),
+      Payload->TryGetArrayField(TEXT("items"), ItemsArray)
+    );
+    if (ItemsArray) {
+      TestEqual(TEXT("migrate: one row serialized"), ItemsArray->Num(), 1);
+      const TSharedPtr<FJsonObject> *Row = nullptr;
+      if (ItemsArray->Num() == 1 && (*ItemsArray)[0]->TryGetObject(Row)) {
+        TestEqual(
+          TEXT("migrate: row id survives serialization"),
+          (*Row)->GetStringField(TEXT("id")),
+          RedwoodItemPersistenceTest::TestItemIdA
+        );
+      }
+    }
+  }
+
+  // --- trade ---
+  {
+    FRedwoodTradeRootPlacement RootPlacement;
+    RootPlacement.Id = RedwoodItemPersistenceTest::TestItemIdA;
+    RootPlacement.Domain = TEXT("general");
+    RootPlacement.Slot = 3;
+    // Empty ParentId: must serialize as JSON null (root placement), not "".
+    FRedwoodTradeRootPlacement ChildPlacement;
+    ChildPlacement.Id = RedwoodItemPersistenceTest::TestItemIdB;
+    ChildPlacement.Domain = TEXT("content");
+    ChildPlacement.Slot = 0;
+    ChildPlacement.ParentId = RedwoodItemPersistenceTest::TestParentId;
+
+    TSharedPtr<FJsonObject> Payload =
+      URedwoodServerGameSubsystem::BuildItemsTradePayload(
+        TEXT("character-from"), TEXT("character-to"), {RootPlacement, ChildPlacement}
+      );
+    TestEnvelopeId(TEXT("trade"), Payload);
+    TestEqual(
+      TEXT("trade: fromCharacterId"),
+      Payload->GetStringField(TEXT("fromCharacterId")),
+      FString(TEXT("character-from"))
+    );
+    TestEqual(
+      TEXT("trade: toCharacterId"),
+      Payload->GetStringField(TEXT("toCharacterId")),
+      FString(TEXT("character-to"))
+    );
+    const TArray<TSharedPtr<FJsonValue>> *Placements = nullptr;
+    TestTrue(
+      TEXT("trade: rootPlacements present"),
+      Payload->TryGetArrayField(TEXT("rootPlacements"), Placements)
+    );
+    if (Placements && Placements->Num() == 2) {
+      const TSharedPtr<FJsonObject> *Root = nullptr;
+      const TSharedPtr<FJsonObject> *Child = nullptr;
+      if ((*Placements)[0]->TryGetObject(Root) &&
+          (*Placements)[1]->TryGetObject(Child)) {
+        TSharedPtr<FJsonValue> RootParent = (*Root)->TryGetField(TEXT("parentId"));
+        TestTrue(
+          TEXT("trade: empty ParentId serializes as JSON null"),
+          RootParent.IsValid() && RootParent->IsNull()
+        );
+        TestEqual(
+          TEXT("trade: content-child ParentId survives"),
+          (*Child)->GetStringField(TEXT("parentId")),
+          RedwoodItemPersistenceTest::TestParentId
+        );
+      }
+    } else {
+      TestEqual(
+        TEXT("trade: both placements serialized"),
+        Placements ? Placements->Num() : 0,
+        2
+      );
+    }
   }
 
   return true;
