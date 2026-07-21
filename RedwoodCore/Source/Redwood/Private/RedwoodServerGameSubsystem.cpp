@@ -1981,7 +1981,8 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
 // (a retained linkdead pawn has no live PlayerState), in which case the id comes from the
 // component's own RedwoodCharacterId, which the dispatch site already verified equal to the
 // authoritative id.
-// The shared envelope contract for the three item emits below (see the header FORK block): every
+// The shared envelope contract for the two item emits below, flush and trade (see the header FORK
+// block): every
 // payload carries the "game-server" placeholder id because the sidecar validates the FULL request
 // schema (id: string().required()) BEFORE stamping its own instanceId over the field -- identical
 // to the realm:characters:set:server payload above. A null or absent id fails that pre-stamp

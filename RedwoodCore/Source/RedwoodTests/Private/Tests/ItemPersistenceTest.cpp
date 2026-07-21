@@ -451,11 +451,12 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// Pins the wire ENVELOPE of the three item emits (flush / migrate / trade). The sidecar validates
-// each request against its full schema -- including id: string().required(), the field the sidecar
+// Pins the wire ENVELOPE of the two item emits (flush / trade). The sidecar validates each
+// request against its full schema -- including id: string().required(), the field the sidecar
 // itself stamps -- BEFORE stamping, so an envelope without a placeholder id never reaches the
-// realm ("id is a required field"). This layer shipped untested once and was live-broken for all
-// three routes on the first deployed channel; these assertions make that unrepresentable.
+// realm ("id is a required field"). This layer shipped untested once and was live-broken on the
+// first deployed channel; these assertions make that unrepresentable. (The migrate emit shared
+// the same contract until the native-model pivot deleted the route entirely.)
 bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
   const FString CharacterId = TEXT("character-1");
 
