@@ -182,18 +182,6 @@ public:
     URedwoodCharacterComponent *CharacterComponent
   );
 
-  // One-shot emit of realm:characters:items:migrate: hands the backend a whole set of item rows to
-  // fold into the Item table (the game's one-time legacy-inventory backfill, Plan C). Does NOT
-  // touch the component's dirty/flush state -- the rows are supplied whole by the caller, not
-  // drained from the dirty maps. OnComplete reports the backend's error string and whether the
-  // character was already migrated (alreadyMigrated true = a prior migrate already ran; the caller
-  // should treat that as success and not re-backfill).
-  void EmitItemsMigrate(
-    URedwoodPlayerStateComponent *PlayerStateComponent,
-    const TArray<FRedwoodItemRecord> &Items,
-    TFunction<void(FString Error, bool bAlreadyMigrated)> OnComplete
-  );
-
   // Emit realm:characters:items:trade: atomically moves the given root items (each identified by a
   // (Domain, Slot) placement, optionally with a ParentId for a content-child destination -- see
   // FRedwoodTradeRootPlacement) from one character to another on the backend. RootPlacements name
@@ -222,22 +210,19 @@ public:
     TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete
   );
 
-  // Static payload builders for the three item emits above, split out so ItemPersistenceTest can
-  // pin the wire envelope without a live sidecar connection. The sidecar validates each request
-  // against its full schema BEFORE stamping its own instanceId over "id" (mirroring
-  // realm:characters:set:server), so every envelope MUST carry a placeholder id -- omitting it (or
-  // sending JSON null) fails that pre-stamp validation and the message never reaches the realm;
-  // this was live-broken for all three routes on the first deployed channel ("id is a required
-  // field") because no test covered the envelope layer. Emit sites MUST build their payloads
-  // through these.
+  // Static payload builders for the two item emits above (flush + trade), split out so
+  // ItemPersistenceTest can pin the wire envelope without a live sidecar connection. The sidecar
+  // validates each request against its full schema BEFORE stamping its own instanceId over "id"
+  // (mirroring realm:characters:set:server), so every envelope MUST carry a placeholder id --
+  // omitting it (or sending JSON null) fails that pre-stamp validation and the message never
+  // reaches the realm; this was live-broken for both routes on the first deployed channel ("id is
+  // a required field") because no test covered the envelope layer. Emit sites MUST build their
+  // payloads through these.
   static TSharedPtr<FJsonObject> BuildItemsFlushPayload(
     const FString &CharacterId,
     int64 BatchSeq,
     const TArray<TSharedPtr<FJsonValue>> &Upserts,
     const TArray<TSharedPtr<FJsonValue>> &Deletes
-  );
-  static TSharedPtr<FJsonObject> BuildItemsMigratePayload(
-    const FString &CharacterId, const TArray<FRedwoodItemRecord> &Items
   );
   static TSharedPtr<FJsonObject> BuildItemsTradePayload(
     const FString &FromCharacterId,

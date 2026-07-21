@@ -1302,16 +1302,15 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
     if (AppendOfflineItemRows(DetachedOfflineItemRows, CharacterComponent)) {
       CharacterObject->SetArrayField(TEXT("items"), DetachedOfflineItemRows);
     }
-    // FORK(hollowed-oath) BEGIN: carry the item-migration marker across the detached offline write too,
-    // for the same reason CreatePlayerCharacterDataObject does -- this is also a whole-file rewrite, so
-    // omitting inventoryRowsMigrated would regress a locally-migrated character back to the frozen blob
-    // on its next load. The marker lives on the PlayerState's RedwoodCharacter, not the CharacterComponent;
-    // a detached (linkdead) pawn may have no live PlayerState, so resolve it best-effort through the pawn's
-    // controller. NOTE: offline linkdead retention is dormant today (EmitPlayerLeft short-circuits without
-    // a backend and the retention manager stays dormant until the zone game mode is reparented), so this
-    // path is not exercised in practice; when the PlayerState cannot be resolved the marker is left absent
-    // and the next load re-migrates from the blob -- logged loudly. Tracked as a follow-up if offline
-    // linkdead ever goes live.
+    // FORK(hollowed-oath) BEGIN: carry the InventorySeq fence across the detached offline write too,
+    // for the same reason CreatePlayerCharacterDataObject does -- this is a whole-file rewrite, so the
+    // seq must ride through as whatever the struct holds. The fence lives on the PlayerState's
+    // RedwoodCharacter, not the CharacterComponent; a detached (linkdead) pawn may have no live
+    // PlayerState, so resolve it best-effort through the pawn's controller. NOTE: offline linkdead
+    // retention is dormant today (EmitPlayerLeft short-circuits without a backend and the retention
+    // manager stays dormant until the zone game mode is reparented), so this path is not exercised in
+    // practice; the seq fence is meaningless offline (0) anyway. Row-per-item is the native model now,
+    // so there is no migration marker to carry -- deleted with the migrate route.
     APlayerState *DetachedPlayerState =
       IsValid(Pawn) && IsValid(Pawn->GetController())
       ? Pawn->GetController()->PlayerState
@@ -1322,22 +1321,7 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
       : nullptr;
     if (DetachedPSC) {
       CharacterObject->SetNumberField(
-        TEXT("inventoryRowsMigrated"),
-        DetachedPSC->RedwoodCharacter.InventoryRowsMigrated
-      );
-      CharacterObject->SetNumberField(
         TEXT("inventorySeq"), DetachedPSC->RedwoodCharacter.InventorySeq
-      );
-    } else {
-      UE_LOG(
-        LogRedwood,
-        Warning,
-        TEXT(
-          "FlushDetachedCharacterData (offline): no PlayerState for character %s; item-migration marker "
-          "not written (next load re-migrates from the blob). Offline linkdead is dormant, so this is "
-          "not expected to occur."
-        ),
-        *CharacterId
       );
     }
     // FORK(hollowed-oath) END
@@ -1926,25 +1910,16 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
       }
     }
 
-    // FORK(hollowed-oath) BEGIN: persist the item-migration bookkeeping into the offline character JSON
-    // (fork-added; upstream has no item-migration concept). This is the runtime offline write path
+    // FORK(hollowed-oath) BEGIN: persist the InventorySeq fence into the offline character JSON
+    // (fork-added; upstream has no item-persistence concept). This is the runtime offline write path
     // (FlushPlayerCharacterData -> SaveCharacterJsonToDisk on the periodic timer and the forced logout
-    // flush), so the marker MUST be written HERE, not only in SaveCharacterToDisk (which handles just
-    // character creation): the OWNER RULING's offline lifecycle mirrors the backend one -- a character
-    // migrates its legacy blob to rows locally at load and stamps
-    // PlayerStateComponent->RedwoodCharacter.InventoryRowsMigrated = 1, and the next load must read that
-    // marker back to take the row-load path. Omitting it here would let the very next periodic save
-    // strip the marker (this is a whole-file rewrite offline) and re-migrate from a frozen blob forever.
-    // Gated on !bUseBackend for the same reason the item rows are: the backend leg keeps these on the
-    // Item table / character row and must not fold them into realm:characters:set:server. This does NOT
-    // set bIsDirty -- it is metadata riding an already-dirty save; if nothing else changed the previous
-    // file (already carrying the marker) is left untouched. inventorySeq echoes the DB column for wire
-    // parity; the fence is meaningless offline (0), see the SaveCharacterToDisk FORK note.
+    // flush), mirroring SaveCharacterToDisk (which handles character creation). Gated on !bUseBackend
+    // for the same reason the item rows are: the backend leg keeps the seq on the character row and
+    // must not fold it into realm:characters:set:server. This does NOT set bIsDirty -- it is metadata
+    // riding an already-dirty save. inventorySeq echoes the DB column for wire parity; the fence is
+    // meaningless offline (0), see the SaveCharacterToDisk FORK note. Row-per-item is the native model
+    // now, so there is no migration marker to write here -- deleted with the migrate route.
     if (!bUseBackend) {
-      CharacterObject->SetNumberField(
-        TEXT("inventoryRowsMigrated"),
-        PlayerStateComponent->RedwoodCharacter.InventoryRowsMigrated
-      );
       CharacterObject->SetNumberField(
         TEXT("inventorySeq"), PlayerStateComponent->RedwoodCharacter.InventorySeq
       );
@@ -1966,11 +1941,13 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
   }
 }
 
-// FORK(hollowed-oath) BEGIN: item flush + migrate + trade + offline-append helpers, entirely
+// FORK(hollowed-oath) BEGIN: item flush + trade + offline-append helpers, entirely
 // fork-added (no upstream counterpart). Replaces the earlier per-container flush helpers
 // (FlushContainersForCharacterComponent / AppendOfflineContainerRows, RedwoodPlugins#17) now that
 // persistence is per-item flat rows instead of opaque per-container blobs. Backend counterpart:
-// RedwoodBackend feat/item-persistence (realm:characters:items:{flush,migrate,trade} routes).
+// RedwoodBackend feat/item-persistence (realm:characters:items:{flush,trade} routes). Row-per-item
+// is the native model now, so there is no blob->row migration route/helper -- the earlier
+// EmitItemsMigrate / BuildItemsMigratePayload / realm:characters:items:migrate surface is deleted.
 //
 // FlushItemsForCharacterComponent is the per-item persistence channel, protocol v2: single-flight
 // + seq-fenced. It sends ONLY currently-dirty item records (plus pending deletions) to
@@ -1979,11 +1956,11 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
 // never stranded and a failed/lost/component-destroyed send is always retried. At most one batch
 // is outstanding: while one is in flight TryBeginItemFlush returns false and this tick's flush is
 // parked (dirt keeps coalescing). AppendOfflineItemRows is its offline/PIE twin (whole-array write
-// into the on-disk character JSON). EmitItemsMigrate / EmitItemsTrade are one-shot backend ops
+// into the on-disk character JSON). EmitItemsTrade is a one-shot backend op
 // with no dirty-state interaction. Called from CreatePlayerCharacterDataObject /
 // FlushDetachedCharacterData above; the game module (AClient / per-bag inventory) drives the dirty
-// state via URedwoodCharacterComponent::MarkItemsDirty/MarkItemsDeleted and calls the migrate/trade
-// emits from Plan C. Declarations sit under a matching FORK marker in RedwoodServerGameSubsystem.h.
+// state via URedwoodCharacterComponent::MarkItemsDirty/MarkItemsDeleted and calls the trade
+// emit. Declarations sit under a matching FORK marker in RedwoodServerGameSubsystem.h.
 // Merge must preserve: the single-flight/seq-fence contract, the generation-matched ack, the
 // (id, generation) send-set independence from the live maps, and the TWeakObjectPtr guard on every
 // async callback.
@@ -2025,18 +2002,6 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsFlushPayload(
   Payload->SetNumberField(TEXT("batchSeq"), static_cast<double>(BatchSeq));
   Payload->SetArrayField(TEXT("upserts"), Upserts);
   Payload->SetArrayField(TEXT("deletes"), Deletes);
-  return Payload;
-}
-
-TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsMigratePayload(
-  const FString &CharacterId, const TArray<FRedwoodItemRecord> &Items
-) {
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("id"), ItemsEnvelopePlaceholderId);
-  Payload->SetStringField(TEXT("characterId"), CharacterId);
-  Payload->SetArrayField(
-    TEXT("items"), URedwoodCommonGameSubsystem::SerializeItemRecords(Items)
-  );
   return Payload;
 }
 
@@ -2305,63 +2270,6 @@ bool URedwoodServerGameSubsystem::AppendOfflineItemRows(
   // item state alone) and a deleted id would suppress its own row forever.
   CharacterComponent->ClearItemsDirtyState();
   return true;
-}
-
-// One-shot migrate emit (Plan C's legacy-inventory backfill). Hands the backend a whole set of
-// item rows to fold into the Item table; does NOT touch the component's dirty/flush state -- the
-// rows are supplied whole by the caller, not drained from the dirty maps. See the header for the
-// alreadyMigrated contract.
-void URedwoodServerGameSubsystem::EmitItemsMigrate(
-  URedwoodPlayerStateComponent *PlayerStateComponent,
-  const TArray<FRedwoodItemRecord> &Items,
-  TFunction<void(FString Error, bool bAlreadyMigrated)> OnComplete
-) {
-  // Null-PSC guard mirroring FlushItemsForCharacterComponent's tolerance -- except migrate has no
-  // CharacterComponent to fall back to for the characterId (the rows are handed in whole, not
-  // drained from a component), so a null PSC is unrecoverable: early-return with a warning rather
-  // than dereferencing it below.
-  if (!PlayerStateComponent) {
-    UE_LOG(
-      LogRedwood,
-      Warning,
-      TEXT("EmitItemsMigrate: null PlayerStateComponent; cannot resolve characterId")
-    );
-    if (OnComplete) {
-      OnComplete(TEXT("Null PlayerStateComponent"), false);
-    }
-    return;
-  }
-
-  if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
-    UE_LOG(
-      LogRedwood, Error, TEXT("Sidecar is not connected; cannot migrate items")
-    );
-    if (OnComplete) {
-      OnComplete(TEXT("Sidecar is not connected"), false);
-    }
-    return;
-  }
-
-  TSharedPtr<FJsonObject> Payload =
-    BuildItemsMigratePayload(PlayerStateComponent->RedwoodCharacter.Id, Items);
-
-  Sidecar->Emit(
-    TEXT("realm:characters:items:migrate"),
-    Payload,
-    [OnComplete](auto Response) {
-      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
-      FString Error = MessageStruct->GetStringField(TEXT("error"));
-      // Absent -> false: an error response may omit alreadyMigrated entirely.
-      bool bAlreadyMigrated = false;
-      MessageStruct->TryGetBoolField(TEXT("alreadyMigrated"), bAlreadyMigrated);
-      if (!Error.IsEmpty()) {
-        UE_LOG(LogRedwood, Error, TEXT("Failed to migrate items: %s"), *Error);
-      }
-      if (OnComplete) {
-        OnComplete(Error, bAlreadyMigrated);
-      }
-    }
-  );
 }
 
 // One-shot trade emit: atomically re-parents the named root items from one character to another on

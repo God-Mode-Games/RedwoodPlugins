@@ -112,16 +112,16 @@ struct FRedwoodCharacterBackend {
   // character-updated event with items still missing. Offline/PIE-disk saves populate this the
   // same way, from the "items" array the on-disk character JSON carries inline (there is no Item
   // table to read there) -- see URedwoodCommonGameSubsystem::SaveCharacterToDisk and
-  // URedwoodServerGameSubsystem::AppendOfflineItemRows. InventoryRowsMigrated and InventorySeq
-  // are fork-added bookkeeping: the former counts
-  // legacy container rows folded into Items by the one-time migration, the latter is a
-  // per-character mutation sequence counter used to detect stale/racing flushes. Backend
-  // counterpart for all three fields lives on RedwoodBackend's feat/item-persistence line.
+  // URedwoodServerGameSubsystem::AppendOfflineItemRows. The backend's character-LIST response also
+  // carries this array inline on each character object (equipment/cosmetic/socket rows) for the
+  // character-select preview; ParseCharacter reads it off the object the same way the offline leg
+  // does. InventorySeq is fork-added bookkeeping: a per-character mutation sequence counter used to
+  // detect stale/racing flushes (the live flush fence). Row-per-item is now the NATIVE persistence
+  // model, so the former one-time blob->row migration marker (InventoryRowsMigrated) is deleted --
+  // there is nothing to migrate from. Backend counterpart for both remaining fields lives on
+  // RedwoodBackend's feat/item-persistence line.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   TArray<FRedwoodItemRecord> Items;
-
-  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
-  int32 InventoryRowsMigrated = 0;
 
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   int64 InventorySeq = 0;

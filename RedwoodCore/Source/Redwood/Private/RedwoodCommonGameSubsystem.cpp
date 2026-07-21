@@ -129,17 +129,11 @@ void URedwoodCommonGameSubsystem::SaveCharacterToDisk(
   // re-parsed on the next load.
   JsonObject->SetArrayField(TEXT("items"), SerializeItemRecords(Character.Items));
 
-  // Write the item-migration bookkeeping alongside the rows. inventoryRowsMigrated is REQUIRED: the
-  // offline lifecycle now mirrors the backend one (OWNER RULING 2026-07-20) -- an offline character
-  // migrates its legacy blob to rows locally at load and stamps this marker to 1 on the parsed
-  // character struct, and the game's next load reads it back (ParseCharacter, above) to take the
-  // ROW-load path. Without persisting it here the marker would reset to 0 every save and the
-  // character would re-migrate from a frozen (stale) blob on every load. inventorySeq echoes the DB
-  // column for wire-shape parity with the backend leg; the seq FENCE is meaningless offline (there is
-  // no wire to gap-check against), so it simply rides through as whatever the struct holds (0 offline).
-  JsonObject->SetNumberField(
-    TEXT("inventoryRowsMigrated"), Character.InventoryRowsMigrated
-  );
+  // Write the InventorySeq fence alongside the rows. inventorySeq echoes the DB column for
+  // wire-shape parity with the backend leg; the seq FENCE is meaningless offline (there is no wire to
+  // gap-check against), so it simply rides through as whatever the struct holds (0 offline). Row-per-
+  // item is the native persistence model now, so there is no blob->row migration marker to write --
+  // the former inventoryRowsMigrated field is deleted with the migrate route.
   JsonObject->SetNumberField(TEXT("inventorySeq"), Character.InventorySeq);
   // FORK(hollowed-oath) END
 
@@ -286,32 +280,35 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
     Character.RedwoodData->SetRootObject(*RedwoodData);
   }
 
-  // FORK(hollowed-oath) BEGIN: read inline item rows off the character object (offline/PIE leg),
-  // plus the item-migration bookkeeping fields. Fork-added; absent on the backend leg (rows arrive
-  // as a sibling of "character", assigned by RunSidecarPlayerAuth). Merge must keep this tolerant
-  // of the fields being absent.
-  // Items live INSIDE the character object only for offline/PIE-disk saves, where the character
-  // JSON file is the whole persistence store (see SaveCharacterToDisk). The backend keeps item
-  // rows in their own table and delivers them as a SIBLING of "character" in the player-auth
-  // response, so this field is simply absent there and RunSidecarPlayerAuth assigns
-  // Character.Items from that sibling array after calling us -- both legs land in the same place,
-  // parsed by the same code. Replaces the earlier "containers" read (RedwoodPlugins#17).
+  // FORK(hollowed-oath) BEGIN: read an INLINE item-row array off the character object, plus the
+  // InventorySeq fence. Fork-added; merge must keep this tolerant of both fields being absent.
+  //
+  // Item-array contract -- there are exactly two on-the-wire placements for a character's item rows,
+  // and this function handles the INLINE one:
+  //   1. INLINE on the character object ("items" field, read here). Used by (a) offline/PIE-disk
+  //      saves, where the character JSON file is the whole persistence store (see
+  //      SaveCharacterToDisk), and (b) the backend character-LIST response, which now carries an
+  //      inline "items" array on each character object (equipment/cosmetic/socket rows, same record
+  //      wire shape) for the character-select preview.
+  //   2. SIBLING of "character" in the player-AUTH response. The backend keeps item rows in their
+  //      own table and delivers them alongside "character"/"player", NOT nested in it, so on that
+  //      leg this inline read is simply a no-op (the field is absent) and
+  //      RunSidecarPlayerAuth's graft in RedwoodGameModeComponent assigns Character.Items from that
+  //      sibling array AFTER calling us.
+  // The two placements are mutually exclusive per payload, so the inline read here never fights or
+  // double-parses the auth-path sibling graft: whichever payload is in hand carries "items" in only
+  // one of the two locations. Both legs ultimately land in Character.Items, parsed by the same
+  // ParseItemRecords. Replaces the earlier "containers" read (RedwoodPlugins#17).
   const TArray<TSharedPtr<FJsonValue>> *Items = nullptr;
   if (CharacterObj->TryGetArrayField(TEXT("items"), Items)) {
     Character.Items = ParseItemRecords(*Items);
   }
 
-  // inventoryRowsMigrated / inventorySeq ride on the character object on both legs (unlike Items,
-  // which is offline-only). GetNumberField returns a double; inventorySeq is a per-character
-  // mutation counter that will never approach 2^53 (the largest integer a double can represent
-  // exactly), so the narrowing cast below is safe in practice.
-  int32 InventoryRowsMigratedValue = 0;
-  if (CharacterObj->TryGetNumberField(
-        TEXT("inventoryRowsMigrated"), InventoryRowsMigratedValue
-      )) {
-    Character.InventoryRowsMigrated = InventoryRowsMigratedValue;
-  }
-
+  // inventorySeq rides on the character object on the offline and backend legs alike (the live flush
+  // fence). GetNumberField returns a double; inventorySeq is a per-character mutation counter that
+  // will never approach 2^53 (the largest integer a double can represent exactly), so the narrowing
+  // cast below is safe in practice. (Row-per-item is the native model now, so there is no
+  // inventoryRowsMigrated marker to parse -- deleted with the migrate route.)
   double InventorySeqValue = 0.0;
   if (CharacterObj->TryGetNumberField(TEXT("inventorySeq"), InventorySeqValue)) {
     Character.InventorySeq = static_cast<int64>(InventorySeqValue);

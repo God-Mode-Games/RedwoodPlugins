@@ -507,36 +507,8 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     );
   }
 
-  // --- migrate ---
-  {
-    TArray<FRedwoodItemRecord> Items;
-    Items.Add(RedwoodItemPersistenceTest::MakeTestRecord());
-
-    TSharedPtr<FJsonObject> Payload =
-      URedwoodServerGameSubsystem::BuildItemsMigratePayload(CharacterId, Items);
-    TestEnvelopeId(TEXT("migrate"), Payload);
-    TestEqual(
-      TEXT("migrate: characterId"),
-      Payload->GetStringField(TEXT("characterId")),
-      CharacterId
-    );
-    const TArray<TSharedPtr<FJsonValue>> *ItemsArray = nullptr;
-    TestTrue(
-      TEXT("migrate: items array present"),
-      Payload->TryGetArrayField(TEXT("items"), ItemsArray)
-    );
-    if (ItemsArray) {
-      TestEqual(TEXT("migrate: one row serialized"), ItemsArray->Num(), 1);
-      const TSharedPtr<FJsonObject> *Row = nullptr;
-      if (ItemsArray->Num() == 1 && (*ItemsArray)[0]->TryGetObject(Row)) {
-        TestEqual(
-          TEXT("migrate: row id survives serialization"),
-          (*Row)->GetStringField(TEXT("id")),
-          RedwoodItemPersistenceTest::TestItemIdA
-        );
-      }
-    }
-  }
+  // (The blob->row migrate envelope was deleted -- row-per-item is the native model now, so there
+  // is no migrate builder to pin.)
 
   // --- trade ---
   {
@@ -595,6 +567,72 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
       );
     }
   }
+
+  return true;
+}
+
+// Pins that ParseCharacter reads an INLINE "items" array off the character object -- the placement
+// the offline/PIE-disk save uses AND the one the backend character-LIST response now uses for the
+// character-select preview (equipment/cosmetic/socket rows). The player-AUTH leg instead delivers
+// items as a sibling of "character" grafted on in RedwoodGameModeComponent; that path is exercised
+// live, but this inline read is the one both offline saves and the list preview depend on. See the
+// item-array contract comment in ParseCharacter.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodParseCharacterInlineItemsTest,
+  "Redwood.Items.ParseCharacterInlineItems",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodParseCharacterInlineItemsTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodItemPersistenceTest;
+
+  TSharedPtr<FJsonObject> CharacterObj = MakeShareable(new FJsonObject);
+  CharacterObj->SetStringField(TEXT("id"), TEXT("character-1"));
+  CharacterObj->SetStringField(TEXT("playerId"), TEXT("player-1"));
+  CharacterObj->SetStringField(TEXT("name"), TEXT("Test Character"));
+  CharacterObj->SetStringField(TEXT("createdAt"), TEXT("2026-07-20T00:00:00.000Z"));
+  CharacterObj->SetStringField(TEXT("updatedAt"), TEXT("2026-07-20T00:00:00.000Z"));
+
+  // Inline "items" array, exactly the shape the backend character-LIST response carries.
+  TArray<FRedwoodItemRecord> Records;
+  Records.Add(Fixture::MakeTestRecord());
+  CharacterObj->SetArrayField(
+    TEXT("items"), URedwoodCommonGameSubsystem::SerializeItemRecords(Records)
+  );
+  CharacterObj->SetNumberField(TEXT("inventorySeq"), 5);
+
+  FRedwoodCharacterBackend Parsed =
+    URedwoodCommonGameSubsystem::ParseCharacter(CharacterObj);
+
+  TestEqual(TEXT("Inline items parsed onto the struct"), Parsed.Items.Num(), 1);
+  if (Parsed.Items.Num() == 1) {
+    TestEqual(
+      TEXT("Inline item id survives"), Parsed.Items[0].Id, Fixture::TestItemIdA
+    );
+    TestEqual(
+      TEXT("Inline item templateId survives"),
+      Parsed.Items[0].TemplateId,
+      Fixture::TestTemplateId
+    );
+  }
+  TestEqual(
+    TEXT("InventorySeq fence parsed"), Parsed.InventorySeq, (int64)5
+  );
+
+  // A character object with NO "items" field must leave Items empty (auth-leg / no-inline-rows
+  // tolerance -- the field is simply absent there).
+  TSharedPtr<FJsonObject> NoItemsObj = MakeShareable(new FJsonObject);
+  NoItemsObj->SetStringField(TEXT("id"), TEXT("character-2"));
+  NoItemsObj->SetStringField(TEXT("playerId"), TEXT("player-1"));
+  NoItemsObj->SetStringField(TEXT("name"), TEXT("No Items"));
+  NoItemsObj->SetStringField(TEXT("createdAt"), TEXT("2026-07-20T00:00:00.000Z"));
+  NoItemsObj->SetStringField(TEXT("updatedAt"), TEXT("2026-07-20T00:00:00.000Z"));
+
+  FRedwoodCharacterBackend ParsedNoItems =
+    URedwoodCommonGameSubsystem::ParseCharacter(NoItemsObj);
+  TestEqual(
+    TEXT("Absent items field leaves Items empty"), ParsedNoItems.Items.Num(), 0
+  );
 
   return true;
 }

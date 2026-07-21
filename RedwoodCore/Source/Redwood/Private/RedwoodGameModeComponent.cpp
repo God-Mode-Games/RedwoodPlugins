@@ -624,8 +624,12 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
           // NOT nested in "character" -- onto it BEFORE SetRedwoodCharacter fires
           // OnRedwoodCharacterUpdated. Merge must preserve that ordering (rows attached before the
           // set) so RedwoodPlayerStateCharacterUpdated has them in hand when it broadcasts.
-          // (inventoryRowsMigrated/inventorySeq need no such graft: unlike Items, the backend puts
-          // those directly on the character object, so ParseCharacter above already picked them up.)
+          // (inventorySeq needs no such graft: unlike Items on THIS auth leg, the backend puts the
+          // seq directly on the character object, so ParseCharacter above already picked it up. Note
+          // ParseCharacter ALSO reads an inline "items" array, but only the backend character-LIST
+          // response and offline saves place items there; the auth response nests nothing in
+          // "character", so that inline read is a no-op here and this sibling graft is the only path
+          // that populates Items on this leg. See the item-array contract in ParseCharacter.)
           FRedwoodCharacterBackend ParsedCharacter =
             URedwoodCommonGameSubsystem::ParseCharacter(Character);
 
