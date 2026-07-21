@@ -903,6 +903,27 @@ bool URedwoodCommonGameSubsystem::DeserializeBackendData(
                   // Clean up
                   FMemory::Free(Params);
                 }
+              } else {
+                // FORK(hollowed-oath): a stored schemaVersion below Latest with NO migration
+                // function used to be skipped in total silence -- the stored payload's fields are
+                // simply dropped on the (possibly empty) current struct, and the next whole-file
+                // flush rewrites the group, making the loss permanent. That is sometimes
+                // intentional (the native row-per-item pivot deliberately retired the
+                // equipped/nonequipped inventory blob migrations -- pre-pivot offline characters
+                // load those groups empty and must be recreated), but it must never be silent:
+                // without this warning a deleted-migration data drop is indistinguishable from a
+                // clean load.
+                UE_LOG(
+                  LogRedwood,
+                  Warning,
+                  TEXT(
+                    "No migration function %s on %s for stored schemaVersion %d < latest %d; the stored payload for this group is DROPPED and will be overwritten on the next save."
+                  ),
+                  *MigrationFunctionName,
+                  *TargetObject->GetName(),
+                  SchemaVersion,
+                  LatestSchemaVersion
+                );
               }
 
               SchemaVersion++;
