@@ -2234,11 +2234,14 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // sent in this payload -- not references into CharacterComponent's live maps, which may change
   // again (a re-dirty bumping a generation, a new mark, etc.) before this ack arrives.
   TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = CharacterComponent;
+  // FORK(hollowed-oath): carried into the ack so a committed seq can be written back onto the
+  // PlayerState snapshot -- see the write-back at the ack site for why a stale snapshot loses items.
+  TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerStateComponent = PlayerStateComponent;
 
   Sidecar->Emit(
     TEXT("realm:characters:items:flush"),
     Payload,
-    [WeakCharacterComponent, SentUpserts, SentDeletes, OnAckSettled](auto Response) {
+    [WeakCharacterComponent, WeakPlayerStateComponent, SentUpserts, SentDeletes, OnAckSettled](auto Response) {
       TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
       FString Error = MessageStruct->GetStringField(TEXT("error"));
       // committedSeq rides both success and error (fence/replay) responses; TryGetNumberField
@@ -2279,6 +2282,23 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
       CharacterComponent->CompleteItemFlush(
         Error, CommittedSeq, SentUpserts, SentDeletes
       );
+
+      // FORK(hollowed-oath): write the committed fence back onto the PlayerState snapshot.
+      // Only the COMPONENT's seq state advanced above; PlayerStateComponent->RedwoodCharacter
+      // .InventorySeq stayed at its login value. A character component recreated later in the
+      // session -- a respawn re-creating a pawn-owned component is the ordinary case -- seeds
+      // itself from that snapshot (SeedItemSeqFromCharacter), so it would send an ALREADY USED
+      // batchSeq. The backend no-ops that batch as a replay, and the no-op's success ack then
+      // clears the new component's dirty rows: the mutation is lost with every side reporting
+      // success. Keeping the snapshot current means a recreated component starts where the
+      // channel actually is.
+      if (Error.IsEmpty() && CommittedSeq > 0) {
+        if (URedwoodPlayerStateComponent *StateComponent = WeakPlayerStateComponent.Get()) {
+          if (StateComponent->RedwoodCharacter.InventorySeq < CommittedSeq) {
+            StateComponent->RedwoodCharacter.InventorySeq = CommittedSeq;
+          }
+        }
+      }
 
       // Settle AFTER CompleteItemFlush, on both success and error: the release barrier's rule is
       // "the attempt resolved", which is exactly here.
@@ -2383,12 +2403,26 @@ void URedwoodServerGameSubsystem::EmitItemsTrade(
       // doubles, and TryGetNumberField has no int64 overload here.
       double FromCommittedSeqValue = -1.0;
       double ToCommittedSeqValue = -1.0;
-      MessageStruct->TryGetNumberField(
+      const bool bHasFromSeq = MessageStruct->TryGetNumberField(
         TEXT("fromCommittedSeq"), FromCommittedSeqValue
       );
-      MessageStruct->TryGetNumberField(
+      const bool bHasToSeq = MessageStruct->TryGetNumberField(
         TEXT("toCommittedSeq"), ToCommittedSeqValue
       );
+      // -1 is the ERROR sentinel, so a success-shaped ack that omits either fence would hand the
+      // caller a sentinel it is contractually required to reseed from -- silently corrupting the
+      // seq lane on what looks like a clean trade. Say so loudly; the caller still sees -1 and its
+      // own contract (reseed only from a valid fence) keeps it from adopting the sentinel.
+      if (Error.IsEmpty() && (!bHasFromSeq || !bHasToSeq)) {
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT("EmitItemsTrade: success ack omitted %s%s%s -- seq resync cannot proceed from it"),
+          !bHasFromSeq ? TEXT("fromCommittedSeq") : TEXT(""),
+          (!bHasFromSeq && !bHasToSeq) ? TEXT(" and ") : TEXT(""),
+          !bHasToSeq ? TEXT("toCommittedSeq") : TEXT("")
+        );
+      }
       int64 FromCommittedSeq = static_cast<int64>(FromCommittedSeqValue);
       int64 ToCommittedSeq = static_cast<int64>(ToCommittedSeqValue);
       if (OnComplete) {

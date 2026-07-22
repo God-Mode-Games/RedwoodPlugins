@@ -659,16 +659,26 @@ void URedwoodCharacterComponent::CompleteItemFlush(
     // old container ack did -- if MarkItemsDirty/MarkItemsDeleted bumped an id again while the
     // request was in flight, leave it dirty (at its newer generation) so the next flush re-sends
     // the newer record instead of clearing away a write we never actually persisted.
-    for (const TPair<FString, uint64> &Sent : SentUpserts) {
-      uint64 *CurrentGeneration = DirtyItemGenerations.Find(Sent.Key);
-      if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
-        DirtyItemGenerations.Remove(Sent.Key);
+    // FORK(hollowed-oath): a malformed success ack leaves the rows DIRTY. Clearing them while
+    // refusing to adopt the reported seq (below) was the worst of both worlds: NextBatchSeq stayed
+    // where it was, so the NEXT flush re-sent the same batchSeq, the backend no-oped it as a replay
+    // of a seq it had already committed, and that no-op's success ack then cleared the NEW
+    // mutation -- silently losing it. Retaining the generations makes the replay self-healing
+    // instead: the same rows go out again at the same seq, the backend answers with a fence at or
+    // past it, and THAT ack (which passes the check below) clears them properly.
+    const bool bSeqTrustworthy = CommittedSeq >= SentSeq;
+    if (bSeqTrustworthy) {
+      for (const TPair<FString, uint64> &Sent : SentUpserts) {
+        uint64 *CurrentGeneration = DirtyItemGenerations.Find(Sent.Key);
+        if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
+          DirtyItemGenerations.Remove(Sent.Key);
+        }
       }
-    }
-    for (const TPair<FString, uint64> &Sent : SentDeletes) {
-      uint64 *CurrentGeneration = PendingDeletedItemGenerations.Find(Sent.Key);
-      if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
-        PendingDeletedItemGenerations.Remove(Sent.Key);
+      for (const TPair<FString, uint64> &Sent : SentDeletes) {
+        uint64 *CurrentGeneration = PendingDeletedItemGenerations.Find(Sent.Key);
+        if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
+          PendingDeletedItemGenerations.Remove(Sent.Key);
+        }
       }
     }
 
@@ -681,14 +691,15 @@ void URedwoodCharacterComponent::CompleteItemFlush(
     // seq: leave LastCommittedItemSeq/NextBatchSeq exactly as they were. The generations above are
     // still cleared and the flight slot below is still released either way -- the send itself did
     // succeed; only the seq bookkeeping in the ack is suspect.
-    if (CommittedSeq < SentSeq) {
+    if (!bSeqTrustworthy) {
       UE_LOG(
         LogRedwood,
         Warning,
         TEXT(
           "CompleteItemFlush: success ack reported committedSeq %lld < sent batchSeq %lld "
           "(contract violation -- missing/malformed committedSeq field?); ignoring the reported "
-          "seq and leaving NextBatchSeq at %lld"
+          "seq, KEEPING the sent rows dirty for a self-healing replay, and leaving NextBatchSeq "
+          "at %lld"
         ),
         CommittedSeq,
         SentSeq,

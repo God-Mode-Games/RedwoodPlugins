@@ -209,7 +209,14 @@ public:
   void MarkItemsDirty(const TArray<FString> &DirtyItemIds) {
     if (bUseItems) {
       for (const FString &Id : DirtyItemIds) {
-        ++DirtyItemGenerations.FindOrAdd(Id);
+        // Stamp from ONE monotonic counter, never a per-id ++ on FindOrAdd. A per-id counter
+        // restarts at 1 whenever the id's entry has been removed -- which is exactly what a
+        // remove-then-recreate does (MarkItemsDeleted drops the dirty entry, this call re-adds
+        // it). An upsert ack still in flight from before that cycle carries generation 1 too, so
+        // it matched the RECREATED entry and cleared it: the recreation was never flushed and the
+        // backend kept the stale pre-removal row. A shared counter makes a new stamp strictly
+        // greater than anything ever sent, so a stale ack can never match it.
+        DirtyItemGenerations.Add(Id, ++NextItemGeneration);
         // A re-dirtied id cancels any pending deletion of the same row (delete-then-recreate,
         // e.g. an item removed then re-created inside one flush window). Without this, one
         // flush sends the id as BOTH upsert and delete, and the backend transaction deletes
@@ -229,7 +236,9 @@ public:
   void MarkItemsDeleted(const TArray<FString> &DeletedItemIds) {
     if (bUseItems) {
       for (const FString &Id : DeletedItemIds) {
-        ++PendingDeletedItemGenerations.FindOrAdd(Id);
+        // Same shared monotonic counter as MarkItemsDirty, and for the same reason -- generations
+        // must not restart when an id moves between the dirty and pending-delete maps.
+        PendingDeletedItemGenerations.Add(Id, ++NextItemGeneration);
         DirtyItemGenerations.Remove(Id);
       }
     }
@@ -430,6 +439,11 @@ private:
   // Value is a per-id dirty GENERATION, not a plain membership flag -- see CompleteItemFlush.
   TMap<FString, uint64> DirtyItemGenerations;
   TMap<FString, uint64> PendingDeletedItemGenerations;
+
+  // ONE monotonic source for every generation stamp in both maps above. Deliberately not per-id:
+  // a per-id counter restarts whenever its entry is removed, which lets a stale in-flight ack
+  // match a freshly recreated entry and clear a mutation that was never persisted.
+  uint64 NextItemGeneration = 0;
 
   // Protocol-v2 single-flight + sequence-fence state. WHY single-flight exists: the item channel
   // has no tombstones and the backend enforces strict ordering on the per-character mutation
