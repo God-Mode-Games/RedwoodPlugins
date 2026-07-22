@@ -56,6 +56,9 @@ public:
 
   FRedwoodDynamicDelegate OnDirectorConnectionLost;
   FRedwoodDynamicDelegate OnDirectorConnectionReestablished;
+  // FORK(hollowed-oath): the two On*AuthFailed delegates are fork-added; upstream has no
+  // auth-failure surface (it only logs reauth failures). Broadcast from RedwoodClientInterface.cpp,
+  // relayed to the game by RedwoodClientGameSubsystem.
   FRedwoodConnectionAuthFailedDynamicDelegate OnDirectorAuthFailed;
   FRedwoodDynamicDelegate OnRealmConnectionLost;
   FRedwoodDynamicDelegate OnRealmConnectionReestablished;

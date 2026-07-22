@@ -34,6 +34,8 @@ public class Redwood : ModuleRules {
         "CoreUObject",
         "CoreOnline",
         "Engine",
+        // FORK(hollowed-oath): NetCore added for the push-model replication conversion
+        // (MARK_PROPERTY_DIRTY / DOREPLIFETIME_WITH_PARAMS_FAST). Upstream does not depend on it.
         // Push-model replication (MARK_PROPERTY_DIRTY) lives in NetCore.
         "NetCore",
         "LatencyChecker",

@@ -1,6 +1,11 @@
 // Copyright Incanta Games. All Rights Reserved.
 
 #include "RedwoodCommonGameSubsystem.h"
+// FORK(hollowed-oath): RedwoodCharacterComponent.h + RedwoodModule.h + UObject/UnrealType.h below
+// are added for the item-persistence helpers (ResolveItemsRecordsArray reflects into the game's
+// ItemsVariableName UPROPERTY via FArrayProperty; LogRedwood comes from RedwoodModule).
+#include "RedwoodCharacterComponent.h"
+#include "RedwoodModule.h"
 
 #if WITH_EDITOR
   #include "RedwoodEditorSettings.h"
@@ -8,6 +13,7 @@
 
 #include "SIOJConvert.h"
 #include "SIOJsonObject.h"
+#include "UObject/UnrealType.h"
 
 void URedwoodCommonGameSubsystem::Initialize(
   FSubsystemCollectionBase &Collection
@@ -110,6 +116,26 @@ void URedwoodCommonGameSubsystem::SaveCharacterToDisk(
       TEXT("abilitySystem"), Character.AbilitySystem->GetRootObject()
     );
   }
+
+  // FORK(hollowed-oath) BEGIN: write the character's item rows inline into the offline/PIE
+  // character JSON. Entirely fork-added (upstream has no item/container concept). Merge must keep
+  // the unconditional SetArrayField -- see the comment; a conditional write would resurrect stale
+  // rows. Retargeted from the earlier per-container write (Character.Containers /
+  // SerializeContainerRecords, RedwoodPlugins#17) to match ParseCharacter's offline leg, which now
+  // reads "items" back out of this same key (see the FORK block in ParseCharacter above).
+  // Offline/PIE has no Item table, so the character JSON carries the rows itself. Written
+  // unconditionally (an empty array included) because this is a whole-file rewrite: omitting the
+  // key on a character whose items were all removed would leave the previous file's rows to be
+  // re-parsed on the next load.
+  JsonObject->SetArrayField(TEXT("items"), SerializeItemRecords(Character.Items));
+
+  // Write the InventorySeq fence alongside the rows. inventorySeq echoes the DB column for
+  // wire-shape parity with the backend leg; the seq FENCE is meaningless offline (there is no wire to
+  // gap-check against), so it simply rides through as whatever the struct holds (0 offline). Row-per-
+  // item is the native persistence model now, so there is no blob->row migration marker to write --
+  // the former inventoryRowsMigrated field is deleted with the migrate route.
+  JsonObject->SetNumberField(TEXT("inventorySeq"), Character.InventorySeq);
+  // FORK(hollowed-oath) END
 
   SaveCharacterJsonToDisk(JsonObject);
 }
@@ -254,8 +280,187 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
     Character.RedwoodData->SetRootObject(*RedwoodData);
   }
 
+  // FORK(hollowed-oath) BEGIN: read an INLINE item-row array off the character object, plus the
+  // InventorySeq fence. Fork-added; merge must keep this tolerant of both fields being absent.
+  //
+  // Item-array contract -- there are exactly two on-the-wire placements for a character's item rows,
+  // and this function handles the INLINE one:
+  //   1. INLINE on the character object ("items" field, read here). Used by (a) offline/PIE-disk
+  //      saves, where the character JSON file is the whole persistence store (see
+  //      SaveCharacterToDisk), and (b) the backend character-LIST response, which now carries an
+  //      inline "items" array on each character object (equipment/cosmetic/socket rows, same record
+  //      wire shape) for the character-select preview.
+  //   2. SIBLING of "character" in the player-AUTH response. The backend keeps item rows in their
+  //      own table and delivers them alongside "character"/"player", NOT nested in it, so on that
+  //      leg this inline read is simply a no-op (the field is absent) and
+  //      RunSidecarPlayerAuth's graft in RedwoodGameModeComponent assigns Character.Items from that
+  //      sibling array AFTER calling us.
+  // The two placements are mutually exclusive per payload, so the inline read here never fights or
+  // double-parses the auth-path sibling graft: whichever payload is in hand carries "items" in only
+  // one of the two locations. Both legs ultimately land in Character.Items, parsed by the same
+  // ParseItemRecords. Replaces the earlier "containers" read (RedwoodPlugins#17).
+  const TArray<TSharedPtr<FJsonValue>> *Items = nullptr;
+  if (CharacterObj->TryGetArrayField(TEXT("items"), Items)) {
+    Character.Items = ParseItemRecords(*Items);
+  }
+
+  // inventorySeq rides on the character object on the offline and backend legs alike (the live flush
+  // fence). GetNumberField returns a double; inventorySeq is a per-character mutation counter that
+  // will never approach 2^53 (the largest integer a double can represent exactly), so the narrowing
+  // cast below is safe in practice. (Row-per-item is the native model now, so there is no
+  // inventoryRowsMigrated marker to parse -- deleted with the migrate route.)
+  double InventorySeqValue = 0.0;
+  if (CharacterObj->TryGetNumberField(TEXT("inventorySeq"), InventorySeqValue)) {
+    Character.InventorySeq = static_cast<int64>(InventorySeqValue);
+  }
+  // FORK(hollowed-oath) END
+
   return Character;
 }
+
+// FORK(hollowed-oath) BEGIN: item-record wire helpers, entirely fork-added (no upstream
+// counterpart). Replaces the earlier per-container helpers (ParseContainerRecords /
+// SerializeContainerRecord(s) / ResolveContainersRecordsArray, RedwoodPlugins#17) now that
+// persistence is per-item flat rows instead of opaque per-container blobs. ParseItemRecords /
+// SerializeItemRecord(s) define the shared {id, parentId, domain, slot, quantity, templateId,
+// attributes} wire shape that MUST stay identical between the backend
+// realm:characters:items:flush payload and the offline/PIE character JSON, or the two
+// persistence legs stop being interchangeable. ResolveItemsRecordsArray reflects the game's
+// ItemsVariableName UPROPERTY (a TArray<FRedwoodItemRecord>; the property was renamed from
+// ContainersVariableName in RedwoodPlugins plan Task 3, landed alongside this helper) on the
+// component's data-holding object. Consumers to preserve on merge: URedwoodServerGameSubsystem
+// (item flush / offline append), URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated
+// (load leg), and the game module via those. Declarations live in RedwoodCommonGameSubsystem.h
+// under a matching FORK marker.
+TArray<FRedwoodItemRecord> URedwoodCommonGameSubsystem::ParseItemRecords(
+  const TArray<TSharedPtr<FJsonValue>> &ItemsJsonArray
+) {
+  TArray<FRedwoodItemRecord> Records;
+  Records.Reserve(ItemsJsonArray.Num());
+
+  for (const TSharedPtr<FJsonValue> &Value : ItemsJsonArray) {
+    TSharedPtr<FJsonObject> Row = Value->AsObject();
+    if (!Row.IsValid()) {
+      continue;
+    }
+
+    FRedwoodItemRecord Record;
+    Row->TryGetStringField(TEXT("id"), Record.Id);
+
+    // "parentId" is JSON null for a root item (see SerializeItemRecord). TryGetStringField
+    // fails (leaves ParentId untouched) both when the field is absent and when it's JSON null,
+    // so the default-constructed empty FString covers both cases -- exactly the "root item"
+    // meaning the wire contract expects.
+    Row->TryGetStringField(TEXT("parentId"), Record.ParentId);
+
+    Row->TryGetStringField(TEXT("domain"), Record.Domain);
+    Row->TryGetNumberField(TEXT("slot"), Record.Slot);
+    Row->TryGetNumberField(TEXT("quantity"), Record.Quantity);
+    Row->TryGetStringField(TEXT("templateId"), Record.TemplateId);
+
+    USIOJsonObject *Attributes = NewObject<USIOJsonObject>();
+    const TSharedPtr<FJsonObject> *AttributesObject = nullptr;
+    if (Row->TryGetObjectField(TEXT("attributes"), AttributesObject)) {
+      Attributes->SetRootObject(*AttributesObject);
+    }
+    Record.Attributes = Attributes;
+
+    Records.Add(MoveTemp(Record));
+  }
+
+  return Records;
+}
+
+TSharedPtr<FJsonObject> URedwoodCommonGameSubsystem::SerializeItemRecord(
+  const FRedwoodItemRecord &Record
+) {
+  TSharedPtr<FJsonObject> Row = MakeShareable(new FJsonObject);
+  Row->SetStringField(TEXT("id"), Record.Id);
+  // An empty ParentId means "root item" and serializes as JSON null (not an empty string), so
+  // ParseItemRecords reads back a record that compares equal to the one written and the backend
+  // schema's nullable parentId column round-trips cleanly.
+  if (Record.ParentId.IsEmpty()) {
+    Row->SetField(TEXT("parentId"), MakeShareable(new FJsonValueNull));
+  } else {
+    Row->SetStringField(TEXT("parentId"), Record.ParentId);
+  }
+  Row->SetStringField(TEXT("domain"), Record.Domain);
+  Row->SetNumberField(TEXT("slot"), Record.Slot);
+  Row->SetNumberField(TEXT("quantity"), Record.Quantity);
+  Row->SetStringField(TEXT("templateId"), Record.TemplateId);
+  // A record with no attributes still serializes an (empty) object rather than omitting the
+  // field, so ParseItemRecords reads back a record that compares equal to the one written
+  // (mirrors the old container "contents" guard).
+  Row->SetObjectField(
+    TEXT("attributes"),
+    Record.Attributes && Record.Attributes->IsValid()
+      ? Record.Attributes->GetRootObject()
+      : MakeShareable(new FJsonObject)
+  );
+
+  return Row;
+}
+
+TArray<TSharedPtr<FJsonValue>> URedwoodCommonGameSubsystem::SerializeItemRecords(
+  const TArray<FRedwoodItemRecord> &Records
+) {
+  TArray<TSharedPtr<FJsonValue>> ItemsJsonArray;
+  ItemsJsonArray.Reserve(Records.Num());
+
+  for (const FRedwoodItemRecord &Record : Records) {
+    ItemsJsonArray.Add(
+      MakeShareable(new FJsonValueObject(SerializeItemRecord(Record)))
+    );
+  }
+
+  return ItemsJsonArray;
+}
+
+TArray<FRedwoodItemRecord> *URedwoodCommonGameSubsystem::ResolveItemsRecordsArray(
+  URedwoodCharacterComponent *CharacterComponent
+) {
+  AActor *ComponentOwner = CharacterComponent->GetOwner();
+  UObject *Target = CharacterComponent->bStoreDataInActor
+    ? (UObject *)ComponentOwner
+    : (UObject *)CharacterComponent;
+
+  if (!IsValid(Target)) {
+    return nullptr;
+  }
+
+  // FORK(hollowed-oath): reads ItemsVariableName (renamed from ContainersVariableName in
+  // RedwoodPlugins plan Task 3, landed alongside this helper) -- see the declaration-site FORK
+  // note in RedwoodCommonGameSubsystem.h.
+  FProperty *Prop = Target->GetClass()->FindPropertyByName(
+    *CharacterComponent->ItemsVariableName
+  );
+  FArrayProperty *ArrayProp = CastField<FArrayProperty>(Prop);
+  if (!ArrayProp) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("%s variable not found (or not an array) in %s"),
+      *CharacterComponent->ItemsVariableName,
+      *Target->GetName()
+    );
+    return nullptr;
+  }
+
+  FStructProperty *InnerStructProp = CastField<FStructProperty>(ArrayProp->Inner);
+  if (!InnerStructProp || InnerStructProp->Struct != FRedwoodItemRecord::StaticStruct()) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("%s variable in %s is not a TArray<FRedwoodItemRecord>"),
+      *CharacterComponent->ItemsVariableName,
+      *Target->GetName()
+    );
+    return nullptr;
+  }
+
+  return ArrayProp->ContainerPtrToValuePtr<TArray<FRedwoodItemRecord>>(Target);
+}
+// FORK(hollowed-oath) END
 
 FRedwoodGameServerProxy URedwoodCommonGameSubsystem::ParseServerProxy(
   TSharedPtr<FJsonObject> ServerProxy
@@ -698,6 +903,27 @@ bool URedwoodCommonGameSubsystem::DeserializeBackendData(
                   // Clean up
                   FMemory::Free(Params);
                 }
+              } else {
+                // FORK(hollowed-oath): a stored schemaVersion below Latest with NO migration
+                // function used to be skipped in total silence -- the stored payload's fields are
+                // simply dropped on the (possibly empty) current struct, and the next whole-file
+                // flush rewrites the group, making the loss permanent. That is sometimes
+                // intentional (the native row-per-item pivot deliberately retired the
+                // equipped/nonequipped inventory blob migrations -- pre-pivot offline characters
+                // load those groups empty and must be recreated), but it must never be silent:
+                // without this warning a deleted-migration data drop is indistinguishable from a
+                // clean load.
+                UE_LOG(
+                  LogRedwood,
+                  Warning,
+                  TEXT(
+                    "No migration function %s on %s for stored schemaVersion %d < latest %d; the stored payload for this group is DROPPED and will be overwritten on the next save."
+                  ),
+                  *MigrationFunctionName,
+                  *TargetObject->GetName(),
+                  SchemaVersion,
+                  LatestSchemaVersion
+                );
               }
 
               SchemaVersion++;

@@ -616,9 +616,36 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
           PlayerStateComponent->SetRedwoodPlayer(
             URedwoodCommonGameSubsystem::ParsePlayerData(Player)
           );
-          PlayerStateComponent->SetRedwoodCharacter(
-            URedwoodCommonGameSubsystem::ParseCharacter(Character)
-          );
+
+          // FORK(hollowed-oath) BEGIN: backend item-load leg. Upstream trunk here is a
+          // single inline PlayerStateComponent->SetRedwoodCharacter(ParseCharacter(Character)).
+          // The fork hoists the parse into ParsedCharacter so it can graft the item rows --
+          // which the backend delivers as a SIBLING "items" field of the player-auth response,
+          // NOT nested in "character" -- onto it BEFORE SetRedwoodCharacter fires
+          // OnRedwoodCharacterUpdated. Merge must preserve that ordering (rows attached before the
+          // set) so RedwoodPlayerStateCharacterUpdated has them in hand when it broadcasts.
+          // (inventorySeq needs no such graft: unlike Items on THIS auth leg, the backend puts the
+          // seq directly on the character object, so ParseCharacter above already picked it up. Note
+          // ParseCharacter ALSO reads an inline "items" array, but only the backend character-LIST
+          // response and offline saves place items there; the auth response nests nothing in
+          // "character", so that inline read is a no-op here and this sibling graft is the only path
+          // that populates Items on this leg. See the item-array contract in ParseCharacter.)
+          FRedwoodCharacterBackend ParsedCharacter =
+            URedwoodCommonGameSubsystem::ParseCharacter(Character);
+
+          // Item rows ride this SAME player-auth response (a sibling field to "character", not
+          // nested inside it -- see the backend's PlayerAuth.SidecarToRealm IResponse extension
+          // that added "items" alongside "character"/"player"), so they are present before
+          // SetRedwoodCharacter fires OnRedwoodCharacterUpdated below, instead of arriving later
+          // via a separate realm:characters:items:load round trip.
+          const TArray<TSharedPtr<FJsonValue>> *ItemsJsonArray = nullptr;
+          if (MessageStruct->TryGetArrayField(TEXT("items"), ItemsJsonArray)) {
+            ParsedCharacter.Items =
+              URedwoodCommonGameSubsystem::ParseItemRecords(*ItemsJsonArray);
+          }
+
+          PlayerStateComponent->SetRedwoodCharacter(ParsedCharacter);
+          // FORK(hollowed-oath) END
           PlayerStateComponent->SetServerReady();
 
           // The realm backend pushes party data to this server when the

@@ -19,6 +19,10 @@
 class AGameModeBase;
 class URedwoodSyncItemAsset;
 class URedwoodSyncComponent;
+// FORK(hollowed-oath): forward decls for the item flush / trade helpers' parameters
+// (fork-added).
+class URedwoodCharacterComponent;
+class URedwoodPlayerStateComponent;
 
 UCLASS(BlueprintType)
 class REDWOOD_API URedwoodServerGameSubsystem : public UGameInstanceSubsystem {
@@ -117,6 +121,116 @@ public:
     APlayerState *PlayerState, bool bForce
   );
   void FlushZoneData();
+
+  // FORK(hollowed-oath) BEGIN: per-item persistence channel helper declarations. Fork-added;
+  // definitions + full rationale under a matching FORK marker in RedwoodServerGameSubsystem.cpp.
+  // Replaces the earlier per-container flush helpers (FlushContainersForCharacterComponent /
+  // AppendOfflineContainerRows, RedwoodPlugins#17) now that persistence is per-item flat rows
+  // instead of opaque per-container blobs. Backend counterpart lives on RedwoodBackend's
+  // feat/item-persistence line (realm:characters:items:{flush,trade} routes; the one-shot
+  // blob->rows migrate route was deleted with the native-model pivot). Preserve
+  // signatures on merge.
+  //
+  // What: FlushItemsForCharacterComponent sends CharacterComponent's currently-dirty item records
+  // (plus pending deletions) to realm:characters:items:flush under a single-flight, seq-fenced
+  // protocol-v2 envelope. Why v2: the backend rejects seq gaps and no-ops replays, so at most one
+  // batch may be outstanding -- TryBeginItemFlush claims the slot and a batchSeq, and the ack's
+  // CompleteItemFlush clears only the (id, generation) pairs actually sent and advances the
+  // committed seq. A failed / unacknowledged / component-destroyed send leaves the dirty state set
+  // so the next flush retries it; the parked-tick case (slot busy) simply coalesces more dirt.
+  // Preserve: the single-flight guard, the generation-matched ack, and the TWeakObjectPtr guard on
+  // the async callback.
+  //
+  // PlayerStateComponent supplies the payload's characterId (PlayerStateComponent->RedwoodCharacter
+  // .Id). It may be null on the detached-flush leg (a retained linkdead pawn has no live
+  // PlayerState); the characterId then comes from CharacterComponent->RedwoodCharacterId, which the
+  // dispatch site has already verified equal to the authoritative id.
+  //
+  // OnAckSettled (optional) fires EXACTLY ONCE per call, when this flush attempt has SETTLED --
+  // meaning the in-flight attempt resolved (success OR error), NOT that it committed. It runs after
+  // CompleteItemFlush in the async ack callback (both success and error), and synchronously on
+  // every early-return path that sends nothing (not dirty, sidecar down, unresolved records array,
+  // single-flight slot busy, empty build), so a caller can always count on receiving it. The
+  // detached-flush release barrier relies on this to order the binding-releasing player-left behind
+  // the item write (see FlushDetachedCharacterData): the backend's player-left tears down the
+  // character->instance binding this flush's auth gate needs, so the release must not fire until the
+  // flush has settled. Null (the default) for the ordinary tick-flush caller, which needs no
+  // completion signal.
+  //
+  // Item LOADING has no counterpart here: item rows arrive in the SAME round trip as the rest of
+  // the character (see FRedwoodCharacterBackend::Items), populated directly in
+  // RedwoodPlayerStateCharacterUpdated() before OnRedwoodCharacterUpdated broadcasts, instead of a
+  // separate later-arriving realm:characters:items:load call.
+  void FlushItemsForCharacterComponent(
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    URedwoodCharacterComponent *CharacterComponent,
+    TFunction<void()> OnAckSettled = nullptr
+  );
+
+  // Offline/PIE counterpart to FlushItemsForCharacterComponent: appends CharacterComponent's item
+  // records to OutRows, which the caller writes ONCE to CharacterObject's "items" field for
+  // FlushPlayerCharacterData to put in the character's JSON file. Appends rather than writing the
+  // field itself because "items" is a single field fed by potentially several character components
+  // -- writing per component would keep only the last one's rows. Returns whether this component
+  // contributed (false = items disabled, or a misconfigured records array), so the caller can
+  // leave the field absent entirely when nothing owns items.
+  //
+  // Unlike the backend leg this writes EVERY record rather than only the dirty ones -- the disk
+  // save is a whole-file rewrite, so a dirty-only write would drop every untouched item -- and it
+  // therefore does not need the generation-tracked ack the sidecar round trip does.
+  bool AppendOfflineItemRows(
+    TArray<TSharedPtr<FJsonValue>> &OutRows,
+    URedwoodCharacterComponent *CharacterComponent
+  );
+
+  // Emit realm:characters:items:trade: atomically moves the given root items (each identified by a
+  // (Domain, Slot) placement, optionally with a ParentId for a content-child destination -- see
+  // FRedwoodTradeRootPlacement) from one character to another on the backend. RootPlacements name
+  // only the root rows being handed over; the backend re-parents each root and its nested children
+  // in one transaction. After a successful trade the backend bumps BOTH characters' InventorySeq,
+  // so each caller's next FlushItemsForCharacterComponent takes the seq-resync path (CommittedSeq
+  // ahead of its sent seq) and realigns -- the trade itself does not flush either side here.
+  //
+  // FORK(hollowed-oath): FromCommittedSeq/ToCommittedSeq are the post-trade InventorySeq fences the
+  // backend returns on the ack (-1 on error paths; see RedwoodBackend feat/item-persistence trade
+  // handler). The backend bumps BOTH characters' seq server-side as part of the trade transaction,
+  // so each character's *next* flush arrives one seq behind what the server now expects -- without
+  // intervention that flush is silently treated as an idempotent replay (its batchSeq no longer
+  // matches CommittedSeq) even though the ack it receives is success-shaped, which clears the
+  // client's dirty state and DROPS the flush's contents. The CALLER (the game's trade task, which
+  // is the only place both characters' URedwoodCharacterComponent are reachable) MUST call
+  // SeedItemSeqFromCharacter on each trading character's component with the matching fence value
+  // BEFORE releasing that character's flush lane, or this loss reproduces on every trade. This
+  // function does not perform that re-seed itself -- the contract is documented here, on the
+  // signature, deliberately not wired in, because the components live outside RedwoodCore's reach
+  // from this call site.
+  void EmitItemsTrade(
+    const FString &FromCharacterId,
+    const FString &ToCharacterId,
+    const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
+    TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete
+  );
+
+  // Static payload builders for the two item emits above (flush + trade), split out so
+  // ItemPersistenceTest can pin the wire envelope without a live sidecar connection. The sidecar
+  // validates each request against its full schema BEFORE stamping its own instanceId over "id"
+  // (mirroring realm:characters:set:server), so every envelope MUST carry a placeholder id --
+  // omitting it (or sending JSON null) fails that pre-stamp validation and the message never
+  // reaches the realm; this was live-broken for both routes on the first deployed channel ("id is
+  // a required field") because no test covered the envelope layer. Emit sites MUST build their
+  // payloads through these.
+  static TSharedPtr<FJsonObject> BuildItemsFlushPayload(
+    const FString &CharacterId,
+    int64 BatchSeq,
+    const TArray<TSharedPtr<FJsonValue>> &Upserts,
+    const TArray<TSharedPtr<FJsonValue>> &Deletes
+  );
+  static TSharedPtr<FJsonObject> BuildItemsTradePayload(
+    const FString &FromCharacterId,
+    const FString &ToCharacterId,
+    const TArray<FRedwoodTradeRootPlacement> &RootPlacements
+  );
+  // FORK(hollowed-oath) END
 
   // FORK(hollowed-oath): fork-added API (with EmitPlayerLeft below), not in
   // upstream Redwood. Part of linkdead pawn retention (HollowedOath#1365,

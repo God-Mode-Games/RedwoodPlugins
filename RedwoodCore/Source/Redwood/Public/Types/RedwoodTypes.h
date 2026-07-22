@@ -45,6 +45,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
   FRedwoodErrorOutputDynamicDelegate, FString, Error
 );
 
+// FORK(hollowed-oath): delegate type carrying the reauth-failure message, used by the fork-added
+// On*AuthFailed events on RedwoodClientInterface / RedwoodClientGameSubsystem. Fork-added.
 UDELEGATE()
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
   FRedwoodConnectionAuthFailedDynamicDelegate, FString, Message

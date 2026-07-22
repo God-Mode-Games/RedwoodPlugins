@@ -42,6 +42,8 @@ public:
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodDynamicDelegate OnDirectorConnectionReestablished;
 
+  // FORK(hollowed-oath): BlueprintAssignable event surfacing director reauth failure to the game
+  // (the HollowedOath disconnect/reconnect modal subscribes). Fork-added; upstream only logs.
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodConnectionAuthFailedDynamicDelegate OnDirectorAuthFailed;
 
@@ -50,6 +52,8 @@ public:
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodDynamicDelegate OnRealmConnectionLost;
 
+  // FORK(hollowed-oath): BlueprintAssignable event surfacing realm reauth failure. Fork-added;
+  // upstream only logs. Pairs with the handler + bind in RedwoodClientGameSubsystem.cpp.
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodConnectionAuthFailedDynamicDelegate OnRealmAuthFailed;
 
@@ -414,6 +418,8 @@ private:
   UFUNCTION()
   void HandleOnDirectorConnectionReestablished();
 
+  // FORK(hollowed-oath): handlers for the two fork-added auth-failed delegates; bound in
+  // Initialize, re-broadcast to the BlueprintAssignable events above.
   UFUNCTION()
   void HandleOnDirectorAuthFailed(FString Message);
 
