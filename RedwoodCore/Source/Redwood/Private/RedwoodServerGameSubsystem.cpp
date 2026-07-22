@@ -2158,6 +2158,21 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // DETACHED pawn has no next tick, so a parked attempt is DEFERRED rather than settled: it re-runs
   // from CompleteItemFlush once this batch's ack frees the slot, carrying the detached barrier's
   // settle with it, so the write binding cannot release before the rows land (#1534).
+  // FORK(hollowed-oath): catch this component up to the character's committed fence before it
+  // claims a seq. The fence is per-CHARACTER but NextBatchSeq is per-COMPONENT, so a component that
+  // did not send the last batch -- the one deferred by the one-flush-per-character rule, or one
+  // created after another had already flushed -- still holds its login-time value. Sending that
+  // stale seq makes the backend answer "replay", and the success-shaped ack then clears rows that
+  // were never persisted. The PlayerState snapshot carries the latest committed fence (written back
+  // on every successful ack), so trust it when it is ahead. Only ever forward: seeding backwards
+  // would re-wedge the lane behind a seq the backend has already passed.
+  if (PlayerStateComponent) {
+    const int64 AuthoritativeSeq = PlayerStateComponent->RedwoodCharacter.InventorySeq;
+    if (AuthoritativeSeq > CharacterComponent->GetLastCommittedItemSeq()) {
+      CharacterComponent->SeedItemSeqFromCharacter(AuthoritativeSeq);
+    }
+  }
+
   int64 BatchSeq = 0;
   if (!CharacterComponent->TryBeginItemFlush(BatchSeq)) {
     // PARK, don't settle. A live component would retry on its next tick, but a DETACHED pawn has no
