@@ -1574,6 +1574,15 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
       }
     }
 
+    // FORK(hollowed-oath): at most ONE item flush per CHARACTER per save pass. The single-flight
+    // slot and the batchSeq counter live on the COMPONENT, but the sequence they fence is
+    // per-CHARACTER on the backend. With both a PlayerState-owned and a pawn-owned component
+    // carrying items for the same character, each would claim the same seq: the backend commits one
+    // and no-ops the other as a replay, and that second component then clears its rows on the
+    // success-shaped ack -- losing them. Rows are re-derived from live storage on the next flush, so
+    // deferring the second component costs nothing.
+    TSet<FString> ItemFlushedCharacterIds;
+
     // If the PlayerStateComponent's dirty flag is set, use that data
     // instead of the character component and broadcast the data changed
     // so character components will sync with the new data
@@ -1674,6 +1683,21 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
 
       PlayerStateComponent->OnRedwoodCharacterUpdated.Broadcast();
 
+      // FORK(hollowed-oath): the item channel must run on THIS branch too. Items never travel in the
+      // character payload -- they go out on their own sidecar route -- so taking the snapshot branch
+      // skipped them entirely. On a logout save (bForce) with a PlayerState override pending, the
+      // component was then destroyed with its dirty rows never sent. The per-component loop in the
+      // else-branch is the only other place the item flush happens, and it is not reached from here.
+      if (bUseBackend) {
+        for (URedwoodCharacterComponent *ItemComponent : CharacterComponents) {
+          if (IsValid(ItemComponent) && ItemComponent->IsItemsDirty()
+              && !ItemFlushedCharacterIds.Contains(ItemComponent->RedwoodCharacterId)) {
+            ItemFlushedCharacterIds.Add(ItemComponent->RedwoodCharacterId);
+            FlushItemsForCharacterComponent(PlayerStateComponent, ItemComponent);
+          }
+        }
+      }
+
       // FORK(hollowed-oath) BEGIN: hand the override off to the character components, then consume it.
       // What: clear bCharacterDataDirty here (ClearDirtyFlags existed but had NO caller anywhere).
       // Why: the flag is LATCHING. Anything that sets it -- the game's linkdead-reclaim path in
@@ -1698,10 +1722,16 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
         if (!IsValid(CharacterComponent)) {
           continue;
         }
+        // EVERY component-backed group the snapshot can override, not just the four obvious ones:
+        // a lost emit must be retriable for all of them, and same-schema deserialization during the
+        // broadcast above does not mark the omitted ones dirty by itself.
         CharacterComponent->MarkCharacterCreatorDataDirty();
         CharacterComponent->MarkMetadataDirty();
+        CharacterComponent->MarkEquippedInventoryDirty();
+        CharacterComponent->MarkNonequippedInventoryDirty();
         CharacterComponent->MarkProgressDirty();
         CharacterComponent->MarkDataDirty();
+        CharacterComponent->MarkAbilitySystemDirty();
       }
       PlayerStateComponent->ClearDirtyFlags();
       // FORK(hollowed-oath) END
@@ -1908,7 +1938,10 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
         // rows go inline there instead. Without this the file would carry only the legacy flat
         // nonequippedInventory blob and every load would degrade to the legacy split path.
         if (bUseBackend) {
-          if (CharacterComponent->IsItemsDirty()) {
+          // One flush per character per pass -- see ItemFlushedCharacterIds above.
+          if (CharacterComponent->IsItemsDirty()
+              && !ItemFlushedCharacterIds.Contains(CharacterComponent->RedwoodCharacterId)) {
+            ItemFlushedCharacterIds.Add(CharacterComponent->RedwoodCharacterId);
             FlushItemsForCharacterComponent(
               PlayerStateComponent, CharacterComponent
             );
