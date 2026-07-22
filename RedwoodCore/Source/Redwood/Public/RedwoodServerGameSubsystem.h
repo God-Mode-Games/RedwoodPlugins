@@ -19,7 +19,7 @@
 class AGameModeBase;
 class URedwoodSyncItemAsset;
 class URedwoodSyncComponent;
-// FORK(hollowed-oath): forward decls for the item flush / migrate / trade helpers' parameters
+// FORK(hollowed-oath): forward decls for the item flush / trade helpers' parameters
 // (fork-added).
 class URedwoodCharacterComponent;
 class URedwoodPlayerStateComponent;
@@ -127,7 +127,8 @@ public:
   // Replaces the earlier per-container flush helpers (FlushContainersForCharacterComponent /
   // AppendOfflineContainerRows, RedwoodPlugins#17) now that persistence is per-item flat rows
   // instead of opaque per-container blobs. Backend counterpart lives on RedwoodBackend's
-  // feat/item-persistence line (realm:characters:items:{flush,migrate,trade} routes). Preserve
+  // feat/item-persistence line (realm:characters:items:{flush,trade} routes; the one-shot
+  // blob->rows migrate route was deleted with the native-model pivot). Preserve
   // signatures on merge.
   //
   // What: FlushItemsForCharacterComponent sends CharacterComponent's currently-dirty item records

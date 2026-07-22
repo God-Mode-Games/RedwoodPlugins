@@ -13,7 +13,7 @@
 #include "RedwoodSyncComponent.h"
 #include "RedwoodSyncItemAsset.h"
 // FORK(hollowed-oath): FRedwoodItemRecord + FRedwoodTradeRootPlacement live here; added for the
-// item flush / migrate / trade / offline helpers below.
+// item flush / trade / offline helpers below.
 #include "Types/RedwoodTypesCharacters.h"
 #include "Types/RedwoodTypesSync.h"
 
