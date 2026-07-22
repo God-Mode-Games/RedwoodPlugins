@@ -1293,7 +1293,8 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
   // gate reject the flush and drop the very detached rows this leg exists to save. So when a
   // release is requested it MUST wait until BOTH pending writes have SETTLED. This settled-latch is
   // the interim barrier until the full flush-barrier work lands (game Plan C / #1365 family).
-  // #TODO(#1534): that work is NOT done -- #1365 merged without closing this; #1534 tracks it.
+  // The delivery guarantee that note asked for now exists: a parked flush re-runs on the in-flight
+  // batch's ack and carries the barrier's settle with it (#1534).
   if (!bUseBackend) {
     // Offline: item rows go inline into the on-disk character JSON, mirroring
     // CreatePlayerCharacterDataObject's offline leg (a bare FlushItemsForCharacterComponent would
@@ -1380,15 +1381,17 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
       }
     };
 
-  // FORK(hollowed-oath): stranding hazard at THIS release site, not just the park path it depends
-  // on. If FlushItemsForCharacterComponent finds a batch already in flight it PARKS this attempt
-  // (see the single-flight comment in that function) instead of sending it, and still calls
-  // SettleOne synchronously -- so the latch above can reach zero and EmitPlayerLeft can release the
-  // write binding while this pawn's dirty items never actually left the process. A live, still-
-  // ticking component would retry on its next flush; a detached pawn has none once the binding is
-  // released. This settled-latch does not close that gap -- it only orders the release behind an
-  // attempt SETTLING, not behind the items actually landing. Closing it means keeping the pawn's
-  // binding alive until a real DELIVERY, not just a settle -- #TODO(#1534).
+  // FORK(hollowed-oath): the settled-latch now orders the binding release behind a real DELIVERY.
+  // A flush attempt that finds a batch already in flight no longer settles on the spot: it parks
+  // itself on the component and re-runs when that batch's ack frees the slot (see the single-flight
+  // branch in FlushItemsForCharacterComponent, and CompleteItemFlush which runs the parked attempt),
+  // carrying THIS latch's settle with it. So EmitPlayerLeft can no longer release the write binding
+  // while a detached pawn's dirty rows are still sitting in the process (#1534).
+  //
+  // What remains outside this guarantee, deliberately: a backend REJECTION. The ack settles the
+  // latch whatever the outcome, because the alternative is a detached pawn whose binding never
+  // releases at all. A rejected batch leaves its dirt marked and is reconciled from the backend rows
+  // on the next login -- the same recovery every error path here relies on.
   // Item flush leg. PlayerStateComponent is null here (a detached pawn has no live PlayerState), so
   // FlushItemsForCharacterComponent sources characterId from the component's RedwoodCharacterId,
   // already verified equal to CharacterId at the top of this function. Single-flight makes it safe
@@ -2119,13 +2122,42 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // outstanding, park this tick's flush -- the dirt stays marked and coalesces until the in-flight
   // batch's ack releases the slot. Settle so the detached barrier doesn't wait forever on a parked
   // tick. For a LIVE component the still-dirty rows retry on that component's next tick-flush; a
-  // DETACHED pawn has no next tick once FlushDetachedCharacterData's settled-latch reaches zero and
-  // releases the write binding, so a park here can strand those rows outright rather than merely
-  // delay them -- see the FORK note at that function's item-flush call site. The barrier is interim,
-  // not a delivery guarantee -- #TODO(#1534) tracks closing it (the settled-latch must wait on the
-  // batch ack, and a parked batch must still be delivered before the binding is released).
+  // DETACHED pawn has no next tick, so a parked attempt is DEFERRED rather than settled: it re-runs
+  // from CompleteItemFlush once this batch's ack frees the slot, carrying the detached barrier's
+  // settle with it, so the write binding cannot release before the rows land (#1534).
   int64 BatchSeq = 0;
   if (!CharacterComponent->TryBeginItemFlush(BatchSeq)) {
+    // PARK, don't settle. A live component would retry on its next tick, but a DETACHED pawn has no
+    // next tick: settling here let the release barrier reach zero and drop the write binding while
+    // these rows had never left the process (#1534). Defer the whole attempt — including its settle
+    // — until the in-flight batch's ack frees the slot; CompleteItemFlush runs it. The barrier then
+    // waits on a real DELIVERY rather than on an attempt.
+    //
+    // Only one attempt is parked. A second one settles immediately as before: that is the old
+    // interim behaviour, and it is strictly better than growing an unbounded retry chain on a
+    // component that may be about to be destroyed.
+    if (!CharacterComponent->HasPendingItemFlushRetry()) {
+      TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
+      TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerState(PlayerStateComponent);
+      TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacter(CharacterComponent);
+      TFunction<void()> DeferredSettle = OnAckSettled;
+      CharacterComponent->SetPendingItemFlushRetry(
+        [WeakSubsystem, WeakPlayerState, WeakCharacter, DeferredSettle]() {
+          if (!WeakSubsystem.IsValid() || !WeakCharacter.IsValid()) {
+            // The component or subsystem went away before the slot freed; settle so a barrier
+            // waiting on this attempt can never wedge.
+            if (DeferredSettle) {
+              DeferredSettle();
+            }
+            return;
+          }
+          WeakSubsystem->FlushItemsForCharacterComponent(
+            WeakPlayerState.Get(), WeakCharacter.Get(), DeferredSettle
+          );
+        }
+      );
+      return;
+    }
     Settle();
     return;
   }

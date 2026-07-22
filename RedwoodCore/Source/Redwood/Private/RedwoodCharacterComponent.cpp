@@ -712,6 +712,19 @@ void URedwoodCharacterComponent::CompleteItemFlush(
 
   // Always release the flight slot, whatever the outcome.
   bItemFlushInFlight = false;
+
+  // A flush attempt that arrived while this batch was outstanding PARKED itself here rather than
+  // settling — see FlushItemsForCharacterComponent's single-flight branch. The slot is free again
+  // now, so run it. This is what makes a DETACHED pawn's barrier a delivery guarantee instead of an
+  // attempt guarantee: a detached component has no next tick to retry on, so without this the parked
+  // rows were stranded the moment the binding released (#1534). Move the continuation out BEFORE
+  // invoking it: the retry re-enters this function on its own ack, and must find an empty slot
+  // rather than re-running itself.
+  if (PendingItemFlushRetry) {
+    TFunction<void()> Retry = MoveTemp(PendingItemFlushRetry);
+    PendingItemFlushRetry = nullptr;
+    Retry();
+  }
 }
 
 void URedwoodCharacterComponent::SeedItemSeqFromCharacter(int64 InventorySeq) {

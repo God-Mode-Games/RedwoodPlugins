@@ -457,5 +457,19 @@ private:
   // hydration; compared against the incoming character id so a genuinely different character (a
   // component reused across characters) still hydrates.
   FString HydratedItemsCharacterId;
+
+  // A flush attempt deferred because a batch was already in flight. CompleteItemFlush runs it once
+  // the slot frees. Exactly one is held: the detached barrier makes a single attempt, and chaining
+  // an unbounded queue here would be a worse failure than the interim settle it replaces (#1534).
+  TFunction<void()> PendingItemFlushRetry;
   // FORK(hollowed-oath) END
+
+public:
+  /** Whether a flush attempt is already parked waiting for the in-flight batch's ack (#1534). */
+  bool HasPendingItemFlushRetry() const { return static_cast<bool>(PendingItemFlushRetry); }
+  /** Park a flush attempt to run when the in-flight batch completes. Overwrites nothing: callers
+   *  check HasPendingItemFlushRetry first and settle immediately rather than displacing one. */
+  void SetPendingItemFlushRetry(TFunction<void()> Retry) {
+    PendingItemFlushRetry = MoveTemp(Retry);
+  }
 };
