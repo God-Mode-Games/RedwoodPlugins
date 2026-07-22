@@ -589,18 +589,27 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
     // from the loaded InventorySeq so the first flush of the session continues the backend's
     // sequence (see the state-member FORK block in the header) -- it must run here, before any
     // flush can be triggered by game code reacting to the broadcast.
-    // NOTE: RedwoodPlayerStateCharacterUpdated() re-runs on every OnControllerChanged, so this
-    // login snapshot re-applies RedwoodCharacterBackend.Items to the wire array each time --
-    // safe today because there is no mid-session repossession path (this is a single-shot game
-    // load), but revisit once linkdead pawn retention (#1365) lands and a live pawn can be
-    // re-possessed after mutations have already dirtied the wire array past the login snapshot.
+    // INITIAL-LOAD-ONLY. RedwoodPlayerStateCharacterUpdated() re-runs on every OnControllerChanged,
+    // and the note that used to live here said this was safe "until linkdead pawn retention (#1365)
+    // lands and a live pawn can be re-possessed after mutations have already dirtied the wire array
+    // past the login snapshot". #1365 HAS landed, and the same re-broadcast also fires when the
+    // PlayerState save branch publishes its data — so re-applying the login snapshot would overwrite
+    // live staging: moves and quantity changes revert on relog, and ids dirtied since login are left
+    // with no matching row to send. Hydrate once per character instead; a component genuinely reused
+    // for a DIFFERENT character still hydrates, because the guard is keyed on the character id.
     if (bUseItems) {
-      TArray<FRedwoodItemRecord> *RecordsArray =
-        URedwoodCommonGameSubsystem::ResolveItemsRecordsArray(this);
-      if (RecordsArray) {
-        *RecordsArray = RedwoodCharacterBackend.Items;
+      const FString &IncomingCharacterId = RedwoodCharacterBackend.Id;
+      if (HydratedItemsCharacterId != IncomingCharacterId) {
+        TArray<FRedwoodItemRecord> *RecordsArray =
+          URedwoodCommonGameSubsystem::ResolveItemsRecordsArray(this);
+        if (RecordsArray) {
+          *RecordsArray = RedwoodCharacterBackend.Items;
+        }
+        // Seeded alongside the snapshot for the same reason: re-seeding mid-session from the stale
+        // login InventorySeq would rewind the fence behind flushes that have already committed.
+        SeedItemSeqFromCharacter(RedwoodCharacterBackend.InventorySeq);
+        HydratedItemsCharacterId = IncomingCharacterId;
       }
-      SeedItemSeqFromCharacter(RedwoodCharacterBackend.InventorySeq);
     }
     // FORK(hollowed-oath) END
 

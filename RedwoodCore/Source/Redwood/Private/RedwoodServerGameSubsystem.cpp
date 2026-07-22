@@ -1293,6 +1293,7 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
   // gate reject the flush and drop the very detached rows this leg exists to save. So when a
   // release is requested it MUST wait until BOTH pending writes have SETTLED. This settled-latch is
   // the interim barrier until the full flush-barrier work lands (game Plan C / #1365 family).
+  // #TODO(#1534): that work is NOT done -- #1365 merged without closing this; #1534 tracks it.
   if (!bUseBackend) {
     // Offline: item rows go inline into the on-disk character JSON, mirroring
     // CreatePlayerCharacterDataObject's offline leg (a bare FlushItemsForCharacterComponent would
@@ -1386,8 +1387,8 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
   // write binding while this pawn's dirty items never actually left the process. A live, still-
   // ticking component would retry on its next flush; a detached pawn has none once the binding is
   // released. This settled-latch does not close that gap -- it only orders the release behind an
-  // attempt SETTLING, not behind the items actually landing. #1365's flush-barrier work is what
-  // closes it (by keeping the pawn's binding alive until a real delivery, not just a settle).
+  // attempt SETTLING, not behind the items actually landing. Closing it means keeping the pawn's
+  // binding alive until a real DELIVERY, not just a settle -- #TODO(#1534).
   // Item flush leg. PlayerStateComponent is null here (a detached pawn has no live PlayerState), so
   // FlushItemsForCharacterComponent sources characterId from the component's RedwoodCharacterId,
   // already verified equal to CharacterId at the top of this function. Single-flight makes it safe
@@ -1669,6 +1670,38 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
       // FORK(hollowed-oath) END
 
       PlayerStateComponent->OnRedwoodCharacterUpdated.Broadcast();
+
+      // FORK(hollowed-oath) BEGIN: hand the override off to the character components, then consume it.
+      // What: clear bCharacterDataDirty here (ClearDirtyFlags existed but had NO caller anywhere).
+      // Why: the flag is LATCHING. Anything that sets it -- the game's linkdead-reclaim path in
+      //   AHollowedOathGameMode calls MarkCharacterDataDirty() when it folds a retained body's
+      //   metadata back in -- made EVERY subsequent save for that player take this branch forever.
+      //   The per-component else-branch below is where the fork's item flush lives, so the character
+      //   would never persist another item mutation: loot taken after a reclaim vanished on relog,
+      //   and consumed items came back. The broadcast immediately above is what makes clearing safe
+      //   -- it exists precisely so the character components sync to this data, after which they are
+      //   the correct source for the next save.
+      // Preserve on upstream merge: upstream has no item flush and so never noticed the missing
+      //   clear; keep this call (or upstream's equivalent) alive.
+      //
+      // Clearing here is only safe because the data does NOT rest on this save succeeding. The
+      // backend write below is a fire-and-forget Emit with no ack, so if the batch were lost and the
+      // latch were simply dropped, the overridden groups (a retained body's metadata — health taken
+      // before the first save after a reclaim) would have no retry path: same-schema deserialization
+      // does not re-dirty them. So TRANSFER the override into the components' own dirty flags first.
+      // They have just synced to this data via the broadcast above, so they now carry it, and the
+      // next save re-sends it through the ordinary per-component path until it lands.
+      for (URedwoodCharacterComponent *CharacterComponent : CharacterComponents) {
+        if (!IsValid(CharacterComponent)) {
+          continue;
+        }
+        CharacterComponent->MarkCharacterCreatorDataDirty();
+        CharacterComponent->MarkMetadataDirty();
+        CharacterComponent->MarkProgressDirty();
+        CharacterComponent->MarkDataDirty();
+      }
+      PlayerStateComponent->ClearDirtyFlags();
+      // FORK(hollowed-oath) END
 
       bIsDirty = true;
     } else {
@@ -2089,7 +2122,8 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // DETACHED pawn has no next tick once FlushDetachedCharacterData's settled-latch reaches zero and
   // releases the write binding, so a park here can strand those rows outright rather than merely
   // delay them -- see the FORK note at that function's item-flush call site. The barrier is interim,
-  // not a delivery guarantee, until #1365's flush-barrier work closes this gap.
+  // not a delivery guarantee -- #TODO(#1534) tracks closing it (the settled-latch must wait on the
+  // batch ack, and a parked batch must still be delivered before the binding is released).
   int64 BatchSeq = 0;
   if (!CharacterComponent->TryBeginItemFlush(BatchSeq)) {
     Settle();

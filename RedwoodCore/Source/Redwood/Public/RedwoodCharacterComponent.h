@@ -448,5 +448,14 @@ private:
   // The batchSeq handed out by the current in-flight TryBeginItemFlush; lets CompleteItemFlush
   // detect a backend fence at or past what we sent without the seq being passed back in.
   int64 InFlightBatchSeq = 0;
+
+  // The character whose login snapshot has already been hydrated into the game's item array. The
+  // hydration is INITIAL-LOAD-ONLY: RedwoodPlayerStateCharacterUpdated re-runs on every
+  // OnControllerChanged, and with linkdead pawn retention (#1365) a LIVE pawn can be re-possessed
+  // after mutations have already advanced the wire array past that snapshot — re-applying it there
+  // reverts moves/quantities and can strand dirty ids with no matching row. Empty until the first
+  // hydration; compared against the incoming character id so a genuinely different character (a
+  // component reused across characters) still hydrates.
+  FString HydratedItemsCharacterId;
   // FORK(hollowed-oath) END
 };
