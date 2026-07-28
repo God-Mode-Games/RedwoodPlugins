@@ -1260,9 +1260,33 @@ FRedwoodPlayerData URedwoodCommonGameSubsystem::ParsePlayerData(
   // GetNumberField -- the latter logs an error on every call when the key is
   // absent, which an unforked backend would turn into a per-message log flood.
   // Matches the TryGet* posture the selectedGuild read below already uses.
+  //
+  // The narrowing is range-checked rather than a bare static_cast. JSON numbers
+  // arrive as double, and per ISO C++ a double -> int32 conversion is UNDEFINED
+  // behaviour when the truncated value falls outside int32's range -- it is not
+  // a guaranteed INT_MIN. This value feeds a privilege check, so it must not
+  // rest on the MSVC/x64 happenstance that cvttsd2si yields 0x80000000; a
+  // different target could just as legally produce something that clears the GM
+  // threshold. Both bounds are exactly representable as double, so the
+  // comparison is exact, and writing the guard as an inclusive range also
+  // rejects NaN and +/-inf for free (every comparison against NaN is false).
+  // Anything unrepresentable falls back to 0 -- no privilege, fail closed by
+  // language rule rather than by platform.
   double RoleValue = 0.0;
   if (PlayerDataObj->TryGetNumberField(TEXT("role"), RoleValue)) {
-    PlayerData.Role = static_cast<int32>(RoleValue);
+    if (RoleValue >= static_cast<double>(MIN_int32) &&
+        RoleValue <= static_cast<double>(MAX_int32)) {
+      PlayerData.Role = static_cast<int32>(RoleValue);
+    } else {
+      PlayerData.Role = 0;
+      UE_LOG(
+        LogRedwood,
+        Warning,
+        TEXT("Player role %f is not representable as int32; treating as 0 (no "
+             "privilege)"),
+        RoleValue
+      );
+    }
   }
   // FORK(hollowed-oath) END
 
