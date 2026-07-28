@@ -1256,6 +1256,16 @@ FRedwoodPlayerData URedwoodCommonGameSubsystem::ParsePlayerData(
   PlayerData.Id = PlayerDataObj->GetStringField(TEXT("id"));
   PlayerData.Nickname = PlayerDataObj->GetStringField(TEXT("nickname"));
 
+  // FORK(hollowed-oath) BEGIN: role for #1157. TryGetNumberField, not
+  // GetNumberField -- the latter logs an error on every call when the key is
+  // absent, which an unforked backend would turn into a per-message log flood.
+  // Matches the TryGet* posture the selectedGuild read below already uses.
+  double RoleValue = 0.0;
+  if (PlayerDataObj->TryGetNumberField(TEXT("role"), RoleValue)) {
+    PlayerData.Role = static_cast<int32>(RoleValue);
+  }
+  // FORK(hollowed-oath) END
+
   const TSharedPtr<FJsonObject> *SelectedGuildObj;
   PlayerData.bSelectedGuildValid =
     PlayerDataObj->TryGetObjectField(TEXT("selectedGuild"), SelectedGuildObj);
