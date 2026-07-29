@@ -122,33 +122,42 @@ bool FRedwoodPlayerDataRoleMissingOrWrongTypeTest::RunTest(
     0
   );
 
-  // Wrong-typed values are asserted against the security invariant rather than
-  // an exact number: TryGetNumberField's coercion rules for strings and bools
-  // are the engine's business, but none of them may reach the GameMaster tier.
-  const int32 GameMasterThreshold = 75;
-
+  // A non-numeric string and an object both make TryGetNumber return false --
+  // TJsonValueString gates on IsNumeric(), and FJsonValueObject inherits the
+  // base that always fails. Role is then never assigned and keeps its `= 0`
+  // member initialiser, so these two are the same no-privilege fallback the
+  // absent-field case above asserts, and are pinned exactly.
   TSharedPtr<FJsonObject> StringObj = MakePlayerDataObj();
   StringObj->SetStringField(TEXT("role"), TEXT("admin"));
-  TestTrue(
-    TEXT("Non-numeric string role does not reach GameMaster"),
-    URedwoodCommonGameSubsystem::ParsePlayerData(StringObj).Role
-      < GameMasterThreshold
-  );
-
-  TSharedPtr<FJsonObject> BoolObj = MakePlayerDataObj();
-  BoolObj->SetBoolField(TEXT("role"), true);
-  TestTrue(
-    TEXT("Boolean role does not reach GameMaster"),
-    URedwoodCommonGameSubsystem::ParsePlayerData(BoolObj).Role
-      < GameMasterThreshold
+  TestEqual(
+    TEXT("Non-numeric string role yields no privilege"),
+    URedwoodCommonGameSubsystem::ParsePlayerData(StringObj).Role,
+    0
   );
 
   TSharedPtr<FJsonObject> ObjectObj = MakePlayerDataObj();
   ObjectObj->SetObjectField(TEXT("role"), MakeShared<FJsonObject>());
+  TestEqual(
+    TEXT("Object role yields no privilege"),
+    URedwoodCommonGameSubsystem::ParsePlayerData(ObjectObj).Role,
+    0
+  );
+
+  // A bool is the exception, and does NOT reach that fallback:
+  // FJsonValueBoolean::TryGetNumber overrides the base and coerces, so `true`
+  // succeeds as 1.0 and lands in Role as 1 (measured, not inferred). That 1 is
+  // the engine's coercion rule rather than anything this fork promises, so it
+  // is asserted against the invariant that actually matters -- no wrong-typed
+  // value may reach a privileged tier -- instead of being pinned to 1 and
+  // turning a future engine change into a spurious security-test failure.
+  const int32 LowestPrivilegedTier = 50; // PlayerRole.Moderator
+
+  TSharedPtr<FJsonObject> BoolObj = MakePlayerDataObj();
+  BoolObj->SetBoolField(TEXT("role"), true);
   TestTrue(
-    TEXT("Object role does not reach GameMaster"),
-    URedwoodCommonGameSubsystem::ParsePlayerData(ObjectObj).Role
-      < GameMasterThreshold
+    TEXT("Boolean role stays below every privileged tier"),
+    URedwoodCommonGameSubsystem::ParsePlayerData(BoolObj).Role
+      < LowestPrivilegedTier
   );
 
   return true;
