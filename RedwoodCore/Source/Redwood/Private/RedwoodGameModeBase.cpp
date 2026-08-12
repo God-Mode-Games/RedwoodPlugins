@@ -148,9 +148,20 @@ APawn *REDWOOD_GAME_MODE_TYPE::SpawnDefaultPawnAtTransform_Implementation(
     FTransform NewSpawnTransform =
       GameModeComponent->PickPawnSpawnTransform(NewPlayer, SpawnTransform);
 
-    return Super::SpawnDefaultPawnAtTransform_Implementation(
+    APawn *Pawn = Super::SpawnDefaultPawnAtTransform_Implementation(
       NewPlayer, NewSpawnTransform
     );
+
+    // FORK(hollowed-oath): upstream passes a null spawn through, leaving the
+    // player a pawnless spectator. Retry lifted, then fall back to the
+    // PlayerStart. See RetryFailedPawnSpawn's rationale block.
+    if (!IsValid(Pawn)) {
+      Pawn = GameModeComponent->RetryFailedPawnSpawn(
+        this, NewPlayer, NewSpawnTransform
+      );
+    }
+
+    return Pawn;
   } else {
     return Super::SpawnDefaultPawnAtTransform_Implementation(
       NewPlayer, SpawnTransform

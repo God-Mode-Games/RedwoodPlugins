@@ -786,6 +786,12 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
       Error,
       TEXT("Sidecar is not connected; cannot travel player to new zone")
     );
+    // FORK(hollowed-oath): InitTransferring ran above, so this failed path
+    // must roll the flag back or the player stays latched as transferring
+    // for the rest of the session. See AbortTransferring's rationale block.
+    if (PlayerStateComponent) {
+      PlayerStateComponent->AbortTransferring();
+    }
     return;
   }
 
@@ -812,6 +818,17 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
           TEXT("Failed to transfer player to new zone, kicking them now: %s"),
           *Error
         );
+        // FORK(hollowed-oath): roll the transferring flag back BEFORE the
+        // kick, so the kick's Logout runs with normal (non-transferring)
+        // teardown — linkdead retention and lastLocation persistence stay
+        // intact. See AbortTransferring's rationale block.
+        if (IsValid(PlayerController) && PlayerController->PlayerState) {
+          if (URedwoodPlayerStateComponent *StateComponent =
+                PlayerController->PlayerState
+                  ->FindComponentByClass<URedwoodPlayerStateComponent>()) {
+            StateComponent->AbortTransferring();
+          }
+        }
         GetGameInstance()
           ->GetWorld()
           ->GetAuthGameMode()
@@ -895,6 +912,12 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
       Error,
       TEXT("Sidecar is not connected; cannot travel player to new zone")
     );
+    // FORK(hollowed-oath): InitTransferring ran above, so this failed path
+    // must roll the flag back or the player stays latched as transferring
+    // for the rest of the session. See AbortTransferring's rationale block.
+    if (PlayerStateComponent) {
+      PlayerStateComponent->AbortTransferring();
+    }
     return;
   }
 
@@ -921,6 +944,17 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
           TEXT("Failed to transfer player to new zone, kicking them now: %s"),
           *Error
         );
+        // FORK(hollowed-oath): roll the transferring flag back BEFORE the
+        // kick, so the kick's Logout runs with normal (non-transferring)
+        // teardown — linkdead retention and lastLocation persistence stay
+        // intact. See AbortTransferring's rationale block.
+        if (IsValid(PlayerController) && PlayerController->PlayerState) {
+          if (URedwoodPlayerStateComponent *StateComponent =
+                PlayerController->PlayerState
+                  ->FindComponentByClass<URedwoodPlayerStateComponent>()) {
+            StateComponent->AbortTransferring();
+          }
+        }
         GetGameInstance()
           ->GetWorld()
           ->GetAuthGameMode()

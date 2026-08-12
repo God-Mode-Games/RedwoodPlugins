@@ -13,6 +13,9 @@
 #endif
 
 #include "Dom/JsonObject.h"
+// FORK(hollowed-oath): Character + CapsuleComponent for RetryFailedPawnSpawn.
+#include "Components/CapsuleComponent.h"
+#include "GameFramework/Character.h"
 #include "GameFramework/GameSession.h"
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/Pawn.h"
@@ -534,6 +537,73 @@ FTransform URedwoodGameModeComponent::PickPawnSpawnTransform(
   );
 
   return SpawnTransform;
+}
+
+// FORK(hollowed-oath): recovery for a failed default-pawn spawn. See the
+// rationale on the header declaration.
+APawn *URedwoodGameModeComponent::RetryFailedPawnSpawn(
+  AGameModeBase *GameMode,
+  AController *NewPlayer,
+  const FTransform &FailedTransform
+) {
+  UWorld *World = GetWorld();
+  UClass *PawnClass = GameMode
+    ? GameMode->GetDefaultPawnClassForController(NewPlayer)
+    : nullptr;
+  if (!IsValid(World) || !PawnClass) {
+    return nullptr;
+  }
+
+  FActorSpawnParameters SpawnInfo;
+  SpawnInfo.Instigator = GameMode->GetInstigator();
+  SpawnInfo.ObjectFlags |= RF_Transient;
+
+  // Attempt 1: the same spot lifted by the capsule half-height — the
+  // observed failure is a ground-trace hit that left the capsule in the
+  // floor, so headroom is the most likely cure.
+  const ACharacter *PawnDefault = Cast<ACharacter>(PawnClass->GetDefaultObject());
+  const float Lift = (PawnDefault && PawnDefault->GetCapsuleComponent())
+    ? PawnDefault->GetCapsuleComponent()->GetScaledCapsuleHalfHeight()
+    : ARedwoodZoneSpawn::LegacySpawnGroundClearance;
+  FTransform LiftedTransform = FailedTransform;
+  LiftedTransform.SetLocation(
+    FailedTransform.GetLocation() + FVector(0.0f, 0.0f, Lift)
+  );
+  SpawnInfo.SpawnCollisionHandlingOverride =
+    ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButDontSpawnIfColliding;
+  if (APawn *Pawn =
+        World->SpawnActor<APawn>(PawnClass, LiftedTransform, SpawnInfo)) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT(
+        "Default pawn spawn failed at (%s); recovered %.0f units higher."
+      ),
+      *FailedTransform.GetLocation().ToCompactString(),
+      Lift
+    );
+    return Pawn;
+  }
+
+  // Attempt 2: the map's PlayerStart, force-spawned so the player always
+  // gets a pawn instead of staying a pawnless spectator.
+  FTransform StartTransform = LiftedTransform;
+  if (AActor *PlayerStart = GameMode->FindPlayerStart(NewPlayer)) {
+    StartTransform = FTransform(
+      PlayerStart->GetActorRotation(), PlayerStart->GetActorLocation()
+    );
+  }
+  SpawnInfo.SpawnCollisionHandlingOverride =
+    ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+  APawn *Pawn = World->SpawnActor<APawn>(PawnClass, StartTransform, SpawnInfo);
+  UE_LOG(
+    LogRedwood,
+    Warning,
+    TEXT("Default pawn spawn failed at (%s); PlayerStart fallback %s."),
+    *FailedTransform.GetLocation().ToCompactString(),
+    IsValid(Pawn) ? TEXT("succeeded") : TEXT("also failed")
+  );
+  return Pawn;
 }
 
 // ---------------------------------------------------------------------------

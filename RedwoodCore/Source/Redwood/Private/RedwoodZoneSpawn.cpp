@@ -3,6 +3,25 @@
 #include "RedwoodZoneSpawn.h"
 #include "Components/ArrowComponent.h"
 #include "Components/BillboardComponent.h"
+// FORK(hollowed-oath): for the capsule-aware ground clearance in
+// GetSpawnTransform.
+#include "Components/CapsuleComponent.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/GameModeBase.h"
+
+// FORK(hollowed-oath): see the rationale on the header declaration.
+float ARedwoodZoneSpawn::GetSpawnGroundClearance() const {
+  if (const AGameModeBase *GameMode = GetWorld()->GetAuthGameMode()) {
+    const ACharacter *PawnDefault = GameMode->DefaultPawnClass
+      ? Cast<ACharacter>(GameMode->DefaultPawnClass->GetDefaultObject())
+      : nullptr;
+    if (PawnDefault && PawnDefault->GetCapsuleComponent()) {
+      return PawnDefault->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() +
+        SpawnClearanceMargin;
+    }
+  }
+  return LegacySpawnGroundClearance;
+}
 
 ARedwoodZoneSpawn::ARedwoodZoneSpawn(const FObjectInitializer &ObjectInitializer
 ) :
@@ -60,9 +79,14 @@ FTransform ARedwoodZoneSpawn::GetSpawnTransform() {
     Location = HitResult.Location;
   }
 
-  Location += FVector(
-    0.0f, 0.0f, 100.0f
-  ); // TODO: make sure they're above the ground for now
+  // FORK(hollowed-oath): the upstream fixed 100-unit lift gives a
+  // taller-than-88 capsule almost no clearance, and a trace hit on a bevel
+  // seam or grating puts the capsule into the floor — the engine then
+  // refuses the pawn spawn and the player arrives pawnless. Lift by the
+  // default pawn's capsule half-height plus a margin when the game mode
+  // exposes a Character pawn; keep the upstream lift otherwise. An upstream
+  // merge must keep GetSpawnGroundClearance (the automation test pins it).
+  Location += FVector(0.0f, 0.0f, GetSpawnGroundClearance());
 
   Transform.SetLocation(Location);
 

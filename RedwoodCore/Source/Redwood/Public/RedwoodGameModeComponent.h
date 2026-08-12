@@ -80,6 +80,25 @@ public:
   FTransform PickPawnSpawnTransform(
     AController *NewPlayer, const FTransform &SpawnTransform
   );
+
+  /**
+   * FORK(hollowed-oath): recovery for a failed default-pawn spawn. Upstream
+   * passes a null return from SpawnDefaultPawnAtTransform through unchanged,
+   * which leaves the arriving player a pawnless spectator with no retry and
+   * no feedback (observed live: a zone-spawn trace hit on a bevel seam put
+   * the capsule into the floor and the engine refused the spawn). Two
+   * attempts, in order:
+   *   1. The same transform lifted by the pawn capsule's half-height.
+   *   2. The map's PlayerStart (FindPlayerStart), force-spawned with
+   *      AdjustIfPossibleButAlwaysSpawn so the player always gets a pawn.
+   * Both game mode variants call this when Super returns null. An upstream
+   * merge must keep those call sites.
+   */
+  APawn *RetryFailedPawnSpawn(
+    AGameModeBase *GameMode,
+    AController *NewPlayer,
+    const FTransform &FailedTransform
+  );
   //~End of AGameModeBase interface
 
   UFUNCTION()
