@@ -142,6 +142,23 @@ public:
   UPROPERTY(BlueprintAssignable, Category = "Events")
   FOnRedwoodPlayerTransferring OnTransferring;
 
+  // FORK(hollowed-oath): rollback for a transfer that never left the game
+  // server. InitTransferring runs BEFORE the TravelPlayerToZone* functions
+  // test the sidecar, and upstream has no path that clears the flag when
+  // that test fails — the player stays marked as transferring for the rest
+  // of the session, which also disables linkdead pawn retention and
+  // lastLocation persistence in the game project. Called ONLY on the
+  // sidecar-down early returns, where the request never left this server;
+  // the sidecar ERROR path keeps the flag on purpose (the realm may have
+  // begun the transfer, and the kick's Logout must run the transferring
+  // teardown). No client notification: nothing consumes one today, and the
+  // fork policy keeps unconsumed surface out. An upstream merge must keep
+  // AbortTransferring on the sidecar-down paths of
+  // TravelPlayerToZoneTransform / TravelPlayerToZoneSpawnName.
+
+  /** FORK(hollowed-oath): Server-only. Clears bTransferring. */
+  void AbortTransferring();
+
   void ClearDirtyFlags() {
     bCharacterDataDirty = false;
   }

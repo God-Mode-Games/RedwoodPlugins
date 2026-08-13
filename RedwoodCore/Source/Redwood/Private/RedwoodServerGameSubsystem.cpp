@@ -786,6 +786,12 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
       Error,
       TEXT("Sidecar is not connected; cannot travel player to new zone")
     );
+    // FORK(hollowed-oath): InitTransferring ran above, so this failed path
+    // must roll the flag back or the player stays latched as transferring
+    // for the rest of the session. See AbortTransferring's rationale block.
+    if (PlayerStateComponent) {
+      PlayerStateComponent->AbortTransferring();
+    }
     return;
   }
 
@@ -806,6 +812,14 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
 
       if (!Error.IsEmpty()) {
         // kick the player
+        //
+        // FORK(hollowed-oath): the transferring flag is deliberately NOT
+        // rolled back on this path. A sidecar error does not prove the realm
+        // did not begin the transfer, and the kick's Logout must run the
+        // transferring teardown (no linkdead retention — a retained body
+        // could duplicate a character the realm already re-homed). The flag
+        // rollback belongs only to the sidecar-down early return above,
+        // where the request never left this server.
         UE_LOG(
           LogRedwood,
           Error,
@@ -895,6 +909,12 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
       Error,
       TEXT("Sidecar is not connected; cannot travel player to new zone")
     );
+    // FORK(hollowed-oath): InitTransferring ran above, so this failed path
+    // must roll the flag back or the player stays latched as transferring
+    // for the rest of the session. See AbortTransferring's rationale block.
+    if (PlayerStateComponent) {
+      PlayerStateComponent->AbortTransferring();
+    }
     return;
   }
 
@@ -915,6 +935,14 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
 
       if (!Error.IsEmpty()) {
         // kick the player
+        //
+        // FORK(hollowed-oath): the transferring flag is deliberately NOT
+        // rolled back on this path. A sidecar error does not prove the realm
+        // did not begin the transfer, and the kick's Logout must run the
+        // transferring teardown (no linkdead retention — a retained body
+        // could duplicate a character the realm already re-homed). The flag
+        // rollback belongs only to the sidecar-down early return above,
+        // where the request never left this server.
         UE_LOG(
           LogRedwood,
           Error,

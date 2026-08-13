@@ -110,6 +110,12 @@ void URedwoodPlayerStateComponent::Client_OnTransferring_Implementation() {
   OnTransferring.Broadcast();
 }
 
+// FORK(hollowed-oath): rollback for a transfer that never left the game
+// server. See the rationale block in the header.
+void URedwoodPlayerStateComponent::AbortTransferring() {
+  bTransferring = false;
+}
+
 void URedwoodPlayerStateComponent::SetRedwoodPlayer(
   FRedwoodPlayerData InRedwoodPlayer
 ) {
