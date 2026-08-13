@@ -1,17 +1,20 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
 // FORK(hollowed-oath): entire file is fork-added — no upstream counterpart.
-// Pins the three zone-travel hardening contracts (HollowedOath#1752 items
-// 4, 7, 8):
-//   1. URedwoodPlayerStateComponent::AbortTransferring rolls back the
+// Pins the zone-travel hardening contracts (HollowedOath#1752 items 4, 7, 8):
+//   1. URedwoodPlayerStateComponent::AbortTransferring clears the
 //      bTransferring latch that InitTransferring sets before the
 //      TravelPlayerToZone* sidecar checks.
 //   2. ARedwoodZoneSpawn::GetSpawnGroundClearance lifts by the default
-//      pawn's capsule half-height (plus margin) when the game mode exposes
-//      an ACharacter pawn, and keeps the upstream 100 units otherwise.
+//      pawn's capsule half-height plus a margin when the game mode exposes
+//      an ACharacter pawn — never below the upstream 100 units — and keeps
+//      the upstream 100 units otherwise.
 //   3. URedwoodGameModeComponent::RetryFailedPawnSpawn recovers a failed
 //      default-pawn spawn instead of leaving the player a pawnless
 //      spectator.
+//   4. URedwoodGameModeComponent::ResolveFallbackArrivalTransform refuses a
+//      map with no arrival point — never the world-origin AWorldSettings
+//      actor that a bare FindPlayerStart returns.
 // An upstream merge must keep these APIs or update this file in lockstep.
 
 #include "CoreMinimal.h"
@@ -21,6 +24,7 @@
 #include "GameFramework/Character.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/PlayerStart.h"
 #include "GameFramework/PlayerState.h"
 #include "Misc/AutomationTest.h"
 #include "RedwoodGameModeComponent.h"
@@ -112,9 +116,11 @@ bool FRedwoodZoneTravelSpawnClearanceTest::RunTest(const FString &Parameters) {
     ARedwoodZoneSpawn::LegacySpawnGroundClearance
   );
 
-  // With a Character default pawn: capsule half-height plus the margin.
-  // SetGameMode is the only public way to give a bare world an
-  // AuthorityGameMode; override its pawn class to the one under test.
+  // With a Character default pawn: capsule half-height plus the margin,
+  // never below the upstream lift. SetGameMode is the only public way to
+  // give a world an AuthorityGameMode (UWorld::AuthorityGameMode is
+  // private); WHICH game mode class the host project's ini resolves does
+  // not matter, because the pawn class is overridden right after.
   Scoped.World->SetGameMode(FURL());
   AGameModeBase *GameMode = Scoped.World->GetAuthGameMode();
   if (!TestNotNull(TEXT("world game mode set"), GameMode)) {
@@ -124,9 +130,11 @@ bool FRedwoodZoneTravelSpawnClearanceTest::RunTest(const FString &Parameters) {
 
   const ACharacter *PawnDefault =
     Cast<ACharacter>(ACharacter::StaticClass()->GetDefaultObject());
-  const float Expected =
+  const float Expected = FMath::Max(
     PawnDefault->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() +
-    ARedwoodZoneSpawn::SpawnClearanceMargin;
+      ARedwoodZoneSpawn::SpawnClearanceMargin,
+    ARedwoodZoneSpawn::LegacySpawnGroundClearance
+  );
   TestEqual(
     TEXT("capsule-aware clearance with a Character pawn"),
     Spawn->GetSpawnGroundClearance(),
@@ -196,6 +204,76 @@ bool FRedwoodZoneTravelPawnSpawnRecoveryTest::RunTest(
   TestNull(
     TEXT("no pawn class returns null"),
     Component->RetryFailedPawnSpawn(GameMode, Controller, FailedTransform)
+  );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodZoneTravelFallbackArrivalTest,
+  "Redwood.ZoneTravel.FallbackArrivalNeverUsesTheWorldOrigin",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodZoneTravelFallbackArrivalTest::RunTest(const FString &Parameters) {
+  // FindPlayerStart never returns null: with no APlayerStart it returns the
+  // AWorldSettings actor at the world origin. A force-spawn there writes
+  // (0,0,0) into lastLocation and corrupts every later login, so the
+  // fallback resolution must refuse it.
+  RedwoodZoneTravelTest::FScopedWorld Scoped;
+
+  AGameModeBase *GameMode = Scoped.World->SpawnActor<AGameModeBase>();
+  AController *Controller = Scoped.World->SpawnActor<APlayerController>();
+  if (!TestNotNull(TEXT("game mode spawned"), GameMode) ||
+      !TestNotNull(TEXT("controller spawned"), Controller)) {
+    return false;
+  }
+  URedwoodGameModeComponent *Component =
+    NewObject<URedwoodGameModeComponent>(GameMode);
+  Component->RegisterComponent();
+
+  // No PlayerStart, no zone spawn: refuse, never the origin.
+  FTransform Fallback;
+  TestFalse(
+    TEXT("a map with no arrival point resolves nothing"),
+    Component->ResolveFallbackArrivalTransform(GameMode, Controller, Fallback)
+  );
+
+  // A zone spawn is an arrival point.
+  const FVector ZoneSpawnLocation(1000.0f, 2000.0f, 300.0f);
+  ARedwoodZoneSpawn *ZoneSpawn = Scoped.World->SpawnActor<ARedwoodZoneSpawn>(
+    ARedwoodZoneSpawn::StaticClass(), ZoneSpawnLocation, FRotator::ZeroRotator
+  );
+  if (!TestNotNull(TEXT("zone spawn spawned"), ZoneSpawn)) {
+    return false;
+  }
+  TestTrue(
+    TEXT("the zone spawn resolves"),
+    Component->ResolveFallbackArrivalTransform(GameMode, Controller, Fallback)
+  );
+  TestEqual(
+    TEXT("the fallback is the zone spawn, not the origin (x)"),
+    static_cast<float>(Fallback.GetLocation().X),
+    static_cast<float>(ZoneSpawnLocation.X),
+    1.0f
+  );
+
+  // A real APlayerStart outranks the zone spawn.
+  const FVector StartLocation(-500.0f, 0.0f, 100.0f);
+  APlayerStart *PlayerStart = Scoped.World->SpawnActor<APlayerStart>(
+    APlayerStart::StaticClass(), StartLocation, FRotator::ZeroRotator
+  );
+  if (!TestNotNull(TEXT("player start spawned"), PlayerStart)) {
+    return false;
+  }
+  TestTrue(
+    TEXT("the player start resolves"),
+    Component->ResolveFallbackArrivalTransform(GameMode, Controller, Fallback)
+  );
+  TestEqual(
+    TEXT("the player start wins (x)"),
+    static_cast<float>(Fallback.GetLocation().X),
+    static_cast<float>(StartLocation.X),
+    1.0f
   );
   return true;
 }

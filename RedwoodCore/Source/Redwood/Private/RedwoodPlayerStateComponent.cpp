@@ -114,11 +114,6 @@ void URedwoodPlayerStateComponent::Client_OnTransferring_Implementation() {
 // server. See the rationale block in the header.
 void URedwoodPlayerStateComponent::AbortTransferring() {
   bTransferring = false;
-  Client_OnTransferAborted();
-}
-
-void URedwoodPlayerStateComponent::Client_OnTransferAborted_Implementation() {
-  OnTransferAborted.Broadcast();
 }
 
 void URedwoodPlayerStateComponent::SetRedwoodPlayer(

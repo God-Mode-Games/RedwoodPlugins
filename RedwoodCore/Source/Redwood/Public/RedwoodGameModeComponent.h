@@ -83,21 +83,39 @@ public:
 
   /**
    * FORK(hollowed-oath): recovery for a failed default-pawn spawn. Upstream
-   * passes a null return from SpawnDefaultPawnAtTransform through unchanged,
-   * which leaves the arriving player a pawnless spectator with no retry and
-   * no feedback (observed live: a zone-spawn trace hit on a bevel seam put
-   * the capsule into the floor and the engine refused the spawn). Two
-   * attempts, in order:
-   *   1. The same transform lifted by the pawn capsule's half-height.
-   *   2. The map's PlayerStart (FindPlayerStart), force-spawned with
-   *      AdjustIfPossibleButAlwaysSpawn so the player always gets a pawn.
-   * Both game mode variants call this when Super returns null. An upstream
-   * merge must keep those call sites.
+   * gives a null return from SpawnDefaultPawnAtTransform no retry and no
+   * feedback: the arriving player stays a pawnless spectator (observed
+   * live: a zone-spawn trace hit on a bevel seam put the capsule into the
+   * floor and the engine refused the spawn). Two attempts, in order:
+   *   1. The same transform lifted by the pawn capsule's half-height,
+   *      adjust-or-fail.
+   *   2. A designed arrival point — a real APlayerStart if the map has one,
+   *      otherwise this zone's ARedwoodZoneSpawn — force-spawned with
+   *      AdjustIfPossibleButAlwaysSpawn. Never the bare FindPlayerStart
+   *      result: with no APlayerStart that is the world-origin
+   *      AWorldSettings actor, and a pawn there corrupts lastLocation.
+   * Returns null when the map has no arrival point at all. Both game mode
+   * variants call this when Super returns null. An upstream merge must keep
+   * those call sites.
    */
   APawn *RetryFailedPawnSpawn(
     AGameModeBase *GameMode,
     AController *NewPlayer,
     const FTransform &FailedTransform
+  );
+
+  /**
+   * FORK(hollowed-oath): the arrival point RetryFailedPawnSpawn falls back
+   * to — a real APlayerStart if the map has one, otherwise this zone's
+   * ARedwoodZoneSpawn. False when the map has neither; never the
+   * world-origin AWorldSettings actor that a bare FindPlayerStart returns
+   * on a PlayerStart-less map (the automation test pins that). Public so
+   * the test reaches it without forcing a real spawn failure.
+   */
+  bool ResolveFallbackArrivalTransform(
+    AGameModeBase *GameMode,
+    AController *NewPlayer,
+    FTransform &OutTransform
   );
   //~End of AGameModeBase interface
 

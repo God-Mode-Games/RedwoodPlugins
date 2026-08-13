@@ -812,23 +812,20 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
 
       if (!Error.IsEmpty()) {
         // kick the player
+        //
+        // FORK(hollowed-oath): the transferring flag is deliberately NOT
+        // rolled back on this path. A sidecar error does not prove the realm
+        // did not begin the transfer, and the kick's Logout must run the
+        // transferring teardown (no linkdead retention — a retained body
+        // could duplicate a character the realm already re-homed). The flag
+        // rollback belongs only to the sidecar-down early return above,
+        // where the request never left this server.
         UE_LOG(
           LogRedwood,
           Error,
           TEXT("Failed to transfer player to new zone, kicking them now: %s"),
           *Error
         );
-        // FORK(hollowed-oath): roll the transferring flag back BEFORE the
-        // kick, so the kick's Logout runs with normal (non-transferring)
-        // teardown — linkdead retention and lastLocation persistence stay
-        // intact. See AbortTransferring's rationale block.
-        if (IsValid(PlayerController) && PlayerController->PlayerState) {
-          if (URedwoodPlayerStateComponent *StateComponent =
-                PlayerController->PlayerState
-                  ->FindComponentByClass<URedwoodPlayerStateComponent>()) {
-            StateComponent->AbortTransferring();
-          }
-        }
         GetGameInstance()
           ->GetWorld()
           ->GetAuthGameMode()
@@ -938,23 +935,20 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
 
       if (!Error.IsEmpty()) {
         // kick the player
+        //
+        // FORK(hollowed-oath): the transferring flag is deliberately NOT
+        // rolled back on this path. A sidecar error does not prove the realm
+        // did not begin the transfer, and the kick's Logout must run the
+        // transferring teardown (no linkdead retention — a retained body
+        // could duplicate a character the realm already re-homed). The flag
+        // rollback belongs only to the sidecar-down early return above,
+        // where the request never left this server.
         UE_LOG(
           LogRedwood,
           Error,
           TEXT("Failed to transfer player to new zone, kicking them now: %s"),
           *Error
         );
-        // FORK(hollowed-oath): roll the transferring flag back BEFORE the
-        // kick, so the kick's Logout runs with normal (non-transferring)
-        // teardown — linkdead retention and lastLocation persistence stay
-        // intact. See AbortTransferring's rationale block.
-        if (IsValid(PlayerController) && PlayerController->PlayerState) {
-          if (URedwoodPlayerStateComponent *StateComponent =
-                PlayerController->PlayerState
-                  ->FindComponentByClass<URedwoodPlayerStateComponent>()) {
-            StateComponent->AbortTransferring();
-          }
-        }
         GetGameInstance()
           ->GetWorld()
           ->GetAuthGameMode()

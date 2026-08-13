@@ -19,6 +19,7 @@
 #include "GameFramework/GameSession.h"
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerStart.h"
 #include "Kismet/GameplayStatics.h"
 #include "Misc/Guid.h"
 #include "Net/OnlineEngineInterface.h"
@@ -539,6 +540,59 @@ FTransform URedwoodGameModeComponent::PickPawnSpawnTransform(
   return SpawnTransform;
 }
 
+// FORK(hollowed-oath): see the rationale on the header declaration.
+// FindPlayerStart alone is NOT safe as a fallback: with no APlayerStart in
+// the map it returns the AWorldSettings actor at the world origin, and a
+// force-spawn there writes (0,0,0) into lastLocation at the next flush,
+// corrupting every later login for the character.
+bool URedwoodGameModeComponent::ResolveFallbackArrivalTransform(
+  AGameModeBase *GameMode, AController *NewPlayer, FTransform &OutTransform
+) {
+  UWorld *World = GetWorld();
+  if (!IsValid(World) || !GameMode) {
+    return false;
+  }
+
+  if (const APlayerStart *PlayerStart =
+        Cast<APlayerStart>(GameMode->FindPlayerStart(NewPlayer))) {
+    OutTransform = FTransform(
+      PlayerStart->GetActorRotation(), PlayerStart->GetActorLocation()
+    );
+    return true;
+  }
+
+  // Redwood maps place zone spawns, not PlayerStarts. Prefer this zone's
+  // "default" spawn; take any zone spawn over none.
+  URedwoodServerGameSubsystem *Subsystem =
+    World->GetGameInstance()
+      ? World->GetGameInstance()->GetSubsystem<URedwoodServerGameSubsystem>()
+      : nullptr;
+  const FString CurrentZoneName = Subsystem ? Subsystem->ZoneName : FString();
+  TArray<AActor *> ZoneSpawnActors;
+  UGameplayStatics::GetAllActorsOfClass(
+    World, ARedwoodZoneSpawn::StaticClass(), ZoneSpawnActors
+  );
+  ARedwoodZoneSpawn *BestZoneSpawn = nullptr;
+  for (AActor *Actor : ZoneSpawnActors) {
+    ARedwoodZoneSpawn *ZoneSpawn = Cast<ARedwoodZoneSpawn>(Actor);
+    if (!IsValid(ZoneSpawn)) {
+      continue;
+    }
+    if (!CurrentZoneName.IsEmpty() && ZoneSpawn->ZoneName != CurrentZoneName) {
+      continue;
+    }
+    BestZoneSpawn = ZoneSpawn;
+    if (ZoneSpawn->SpawnName == TEXT("default")) {
+      break;
+    }
+  }
+  if (BestZoneSpawn) {
+    OutTransform = BestZoneSpawn->GetSpawnTransform();
+    return true;
+  }
+  return false;
+}
+
 // FORK(hollowed-oath): recovery for a failed default-pawn spawn. See the
 // rationale on the header declaration.
 APawn *URedwoodGameModeComponent::RetryFailedPawnSpawn(
@@ -560,7 +614,12 @@ APawn *URedwoodGameModeComponent::RetryFailedPawnSpawn(
 
   // Attempt 1: the same spot lifted by the capsule half-height — the
   // observed failure is a ground-trace hit that left the capsule in the
-  // floor, so headroom is the most likely cure.
+  // floor, so headroom is the most likely cure. The lift can push the spot
+  // into a ceiling in a low room; attempt 2 covers that. The collision
+  // policy is DELIBERATELY adjust-or-fail (stricter than a class default of
+  // AlwaysSpawn): an embedded pawn is the failure this function exists to
+  // avoid, so a spot the engine cannot adjust must fall through to the
+  // designed arrival point below, never force-spawn here.
   const ACharacter *PawnDefault = Cast<ACharacter>(PawnClass->GetDefaultObject());
   const float Lift = (PawnDefault && PawnDefault->GetCapsuleComponent())
     ? PawnDefault->GetCapsuleComponent()->GetScaledCapsuleHalfHeight()
@@ -585,22 +644,31 @@ APawn *URedwoodGameModeComponent::RetryFailedPawnSpawn(
     return Pawn;
   }
 
-  // Attempt 2: the map's PlayerStart, force-spawned so the player always
-  // gets a pawn instead of staying a pawnless spectator.
-  FTransform StartTransform = LiftedTransform;
-  if (AActor *PlayerStart = GameMode->FindPlayerStart(NewPlayer)) {
-    StartTransform = FTransform(
-      PlayerStart->GetActorRotation(), PlayerStart->GetActorLocation()
+  // Attempt 2: a designed arrival point; null when the map has none — a
+  // pawnless spectator beats a corrupted character record.
+  FTransform FallbackTransform;
+  if (!ResolveFallbackArrivalTransform(GameMode, NewPlayer, FallbackTransform)) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT(
+        "Default pawn spawn failed at (%s) and the map has no PlayerStart or zone spawn to fall back to."
+      ),
+      *FailedTransform.GetLocation().ToCompactString()
     );
+    return nullptr;
   }
+
   SpawnInfo.SpawnCollisionHandlingOverride =
     ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
-  APawn *Pawn = World->SpawnActor<APawn>(PawnClass, StartTransform, SpawnInfo);
+  APawn *Pawn =
+    World->SpawnActor<APawn>(PawnClass, FallbackTransform, SpawnInfo);
   UE_LOG(
     LogRedwood,
     Warning,
-    TEXT("Default pawn spawn failed at (%s); PlayerStart fallback %s."),
+    TEXT("Default pawn spawn failed at (%s); arrival-point fallback at (%s) %s."),
     *FailedTransform.GetLocation().ToCompactString(),
+    *FallbackTransform.GetLocation().ToCompactString(),
     IsValid(Pawn) ? TEXT("succeeded") : TEXT("also failed")
   );
   return Pawn;

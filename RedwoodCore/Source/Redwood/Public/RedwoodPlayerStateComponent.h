@@ -145,30 +145,19 @@ public:
   // FORK(hollowed-oath): rollback for a transfer that never left the game
   // server. InitTransferring runs BEFORE the TravelPlayerToZone* functions
   // test the sidecar, and upstream has no path that clears the flag when
-  // that test (or the sidecar's own answer) fails — the player stays marked
-  // as transferring for the rest of the session, which also disables
-  // linkdead pawn retention and lastLocation persistence in the game
-  // project. An upstream merge must keep AbortTransferring called on every
-  // failed path of TravelPlayerToZoneTransform/TravelPlayerToZoneSpawnName.
+  // that test fails — the player stays marked as transferring for the rest
+  // of the session, which also disables linkdead pawn retention and
+  // lastLocation persistence in the game project. Called ONLY on the
+  // sidecar-down early returns, where the request never left this server;
+  // the sidecar ERROR path keeps the flag on purpose (the realm may have
+  // begun the transfer, and the kick's Logout must run the transferring
+  // teardown). No client notification: nothing consumes one today, and the
+  // fork policy keeps unconsumed surface out. An upstream merge must keep
+  // AbortTransferring on the sidecar-down paths of
+  // TravelPlayerToZoneTransform / TravelPlayerToZoneSpawnName.
 
-  /**
-   * FORK(hollowed-oath): Server-only. Clears bTransferring and notifies the
-   * owning client via Client_OnTransferAborted, so client-side transfer UI
-   * (bound to OnTransferring) can stand down.
-   */
+  /** FORK(hollowed-oath): Server-only. Clears bTransferring. */
   void AbortTransferring();
-
-  /**
-   * FORK(hollowed-oath): Reliable RPC to the owning client. Broadcasts
-   * OnTransferAborted, the counterpart of OnTransferring.
-   */
-  UFUNCTION(Client, Reliable, Category = "Redwood|PlayerState")
-  void Client_OnTransferAborted();
-
-  // FORK(hollowed-oath): broadcast on the owning client when a transfer is
-  // rolled back before it left the server. Pairs with OnTransferring.
-  UPROPERTY(BlueprintAssignable, Category = "Events")
-  FOnRedwoodPlayerTransferring OnTransferAborted;
 
   void ClearDirtyFlags() {
     bCharacterDataDirty = false;
