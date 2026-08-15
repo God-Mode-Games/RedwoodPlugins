@@ -146,6 +146,8 @@ void URedwoodPlayerStateComponent::AbortTransferring(
   Client_OnTransferAborted(Error, Reason);
 }
 
+// FORK(hollowed-oath): fork-added, the counterpart of the upstream
+// Client_OnTransferring_Implementation above.
 void URedwoodPlayerStateComponent::Client_OnTransferAborted_Implementation(
   const FString &Error, const FString &Reason
 ) {
