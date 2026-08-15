@@ -105,7 +105,12 @@ void URedwoodPlayerStateComponent::InitTransferring() {
   // other), and a second travel can start before the first answer arrives.
   // A kept id then makes MatchesActiveTransfer drop the failure report of
   // THIS transfer, and the player stays latched as transferring.
+  //
+  // The generation names this transfer for its own answer. Clearing the id
+  // alone is not enough: the answer of the earlier transfer can land AFTER
+  // this start and write its id over the empty slot.
   ActiveTransferId.Empty();
+  ++TransferGeneration;
 
   // Notify the owning client. The Client RPC routes through the
   // PlayerState's owning controller's net connection, so only the

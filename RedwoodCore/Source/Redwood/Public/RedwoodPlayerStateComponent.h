@@ -4,6 +4,8 @@
 
 #include "Components/ActorComponent.h"
 #include "CoreMinimal.h"
+// FORK(hollowed-oath): for the transfer answer timeout handle below.
+#include "Engine/TimerHandle.h"
 
 #include "Types/RedwoodTypes.h"
 
@@ -137,6 +139,20 @@ public:
   // keep the name of an earlier one.
   FString ActiveTransferId;
 
+  // FORK(hollowed-oath): waits for the sidecar's answer to the transfer that
+  // runs now. URedwoodServerGameSubsystem sets it beside the emit and clears
+  // it when the answer arrives; see HandleTransferAnswerTimeout there. One
+  // player transfers once at a time, so one handle is enough.
+  FTimerHandle TransferAnswerTimeout;
+
+  // FORK(hollowed-oath): counts the transfers this component has started.
+  // InitTransferring adds one, so each emit can remember which transfer it
+  // belongs to and the answer of a transfer that is over can be told from
+  // the answer of the transfer that runs now. Server-only, never
+  // replicated. See HandleTransferZoneResponse for the two orderings this
+  // closes.
+  int64 TransferGeneration = 0;
+
   /**
    * FORK(hollowed-oath): True when a failure report that names TransferId
    * belongs to the transfer in flight. An empty id on EITHER side counts as
@@ -144,6 +160,13 @@ public:
    * this server before the answer that carries the id. Only two different
    * non-empty ids are a mismatch. The bTransferring latch stays the real
    * guard; this only drops a report for an earlier transfer.
+   *
+   * Known and accepted: while the id is still empty, a report from the
+   * transfer before this one also matches, and rolls this transfer back with
+   * the earlier failure. The realm sends each report once, so this needs a
+   * report that arrives late AND a new transfer inside the short wait for
+   * the answer. The player stays in this zone and can travel again, which is
+   * much better than a player who stays latched as transferring.
    */
   bool MatchesActiveTransfer(const FString &TransferId) const {
     return TransferId.IsEmpty() || ActiveTransferId.IsEmpty() ||
@@ -156,8 +179,8 @@ public:
    * via Client_OnTransferring, which broadcasts OnTransferring locally.
    * Called from URedwoodServerGameSubsystem's TravelPlayerToZone* paths
    * in place of setting bTransferring directly.
-   * FORK(hollowed-oath): also clears ActiveTransferId and broadcasts
-   * OnTransferringStartedServer.
+   * FORK(hollowed-oath): also clears ActiveTransferId, adds one to
+   * TransferGeneration, and broadcasts OnTransferringStartedServer.
    */
   void InitTransferring();
 

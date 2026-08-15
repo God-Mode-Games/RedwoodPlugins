@@ -116,9 +116,13 @@ public:
   // function and kicks the player on every error; this decides between a
   // kick and a rollback. Full rationale on the definition in the .cpp.
   // Public only so ZoneTravelHardeningTest can drive it without a sidecar.
+  // EmitGeneration is the player state component's TransferGeneration at the
+  // time of the emit; the answer is only acted on while that transfer is
+  // still the one in flight.
   void HandleTransferZoneResponse(
     const TSharedPtr<FJsonObject> &Response,
-    TWeakObjectPtr<APlayerController> WeakPlayerController
+    TWeakObjectPtr<APlayerController> WeakPlayerController,
+    int64 EmitGeneration
   );
 
   // FORK(hollowed-oath): wire name of the fork-added transfer-failed
@@ -146,6 +150,26 @@ public:
   // there. Full rationale on the definition in the .cpp. Public for the
   // same reason as HandleTransferZoneResponse above.
   void HandleTransferFailedEvent(const TSharedPtr<FJsonObject> &Payload);
+
+  // FORK(hollowed-oath): how long a transfer waits for the sidecar's answer
+  // before the player is taken out. The answer itself is quick: the route
+  // answers when the ticket goes in the queue, and the wait for a zone that
+  // starts on demand happens AFTER the answer. This is therefore only a
+  // guard for a sidecar that dies or stops answering, so it can be generous.
+  static constexpr float TransferAnswerTimeoutSeconds = 30.f;
+
+  // FORK(hollowed-oath): runs when a transfer got no answer in
+  // TransferAnswerTimeoutSeconds. Upstream has nothing here: a sidecar that
+  // dies after the connection test above gives no answer and no failure
+  // event, and the player then keeps the transferring latch for the rest of
+  // the session, with no linkdead retention and no lastLocation. An answer
+  // that never came is ambiguous by this plugin's own rule — the realm may
+  // hold the character already — so this kicks, exactly like an ambiguous
+  // answer. Full rationale on the definition in the .cpp. Public for the
+  // same reason as HandleTransferZoneResponse above.
+  void HandleTransferAnswerTimeout(
+    TWeakObjectPtr<APlayerController> WeakPlayerController, int64 EmitGeneration
+  );
 
   void FlushSync();
   void FlushPersistence();
@@ -389,6 +413,23 @@ private:
 
   void InitializeSidecar();
   void SendUpdateToSidecar();
+
+  // FORK(hollowed-oath): the one kick that a failed transfer uses, shared by
+  // the ambiguous answer and the answer that never came. Says so in the log
+  // when this server has no game session to kick with, because then the
+  // player stays here and stays marked as transferring.
+  void KickPlayerAfterFailedTransfer(
+    APlayerController *PlayerController, const FString &Error
+  );
+
+  // FORK(hollowed-oath): starts the wait for the sidecar's answer, beside
+  // both TravelPlayerToZone* emits. See TransferAnswerTimeoutSeconds and
+  // HandleTransferAnswerTimeout above.
+  void StartTransferAnswerTimeout(
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    TWeakObjectPtr<APlayerController> WeakPlayerController,
+    int64 EmitGeneration
+  );
 
   void GetParty(
     const FString &PartyId,
