@@ -19,7 +19,9 @@
 //   5. URedwoodServerGameSubsystem::HandleTransferZoneResponse rolls the
 //      transfer back ONLY when the sidecar marks the error "ambiguous":
 //      false, and only while the player is still transferring. An ambiguous
-//      error, or an answer with no such field (an older sidecar), kicks.
+//      error, or an answer with no such field (an older sidecar), kicks
+//      instead — a probe game session counts the kicks, because the upstream
+//      one does nothing for a player with no network connection.
 //   6. URedwoodPlayerStateComponent::MatchesActiveTransfer drops a failure
 //      report that names a different transfer, but accepts one when either
 //      side has no id (an older backend, or a report that overtakes the
@@ -28,6 +30,13 @@
 //   7. URedwoodServerGameSubsystem::HandleTransferFailedEvent rolls the
 //      transfer back for the character the realm names, and only when that
 //      player is still transferring and the ids agree.
+//   8. An answer that belongs to a transfer that is over changes nothing:
+//      URedwoodPlayerStateComponent::TransferGeneration names each transfer,
+//      and HandleTransferZoneResponse keeps the id and rolls back only for
+//      the generation that asked. The kick stays unconditional.
+//   9. URedwoodServerGameSubsystem::HandleTransferAnswerTimeout takes the
+//      player out when no answer comes, and does nothing for a transfer that
+//      is over or for a wait that belongs to an earlier transfer.
 // An upstream merge must keep these APIs or update this file in lockstep.
 
 #include "CoreMinimal.h"
@@ -172,7 +181,8 @@ bool FRedwoodZoneTravelAbortTransferringTest::RunTest(
   TestEqual(TEXT("a second abort broadcasts nothing"), Listener->ServerCount, 1);
   TestEqual(TEXT("the client hears nothing either"), Listener->ClientCount, 1);
 
-  // A repeated start still fires its events; that is upstream behaviour.
+  // Nothing stops a second travel request, so a repeated start fires its
+  // event again. Only the abort is idempotent.
   Component->InitTransferring();
   Component->InitTransferring();
   TestEqual(TEXT("every start is announced"), StartCount, 3);
@@ -218,39 +228,70 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
   }
   PlayerController->PlayerState = PlayerState;
 
+  // The kick goes through the authority game mode's game session, and a bare
+  // test world has neither. SetGameMode is the only public way to give the
+  // world an authority game mode; the probe session then counts the kicks,
+  // which the upstream one cannot do for a player with no connection.
+  Scoped.World->SetGameMode(FURL());
+  AGameModeBase *GameMode = Scoped.World->GetAuthGameMode();
+  ARedwoodKickProbeGameSession *KickProbe =
+    Scoped.World->SpawnActor<ARedwoodKickProbeGameSession>();
+  if (!TestNotNull(TEXT("world game mode set"), GameMode) ||
+      !TestNotNull(TEXT("kick probe spawned"), KickProbe)) {
+    return false;
+  }
+  GameMode->GameSession = KickProbe;
+
   TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
 
   Component->InitTransferring();
+  // The name of the transfer that asks; every answer below belongs to it.
+  const int64 EmitGeneration = Component->TransferGeneration;
 
   // No error at all: the transfer goes on.
   TSharedPtr<FJsonObject> Success = MakeShareable(new FJsonObject);
   Success->SetStringField(TEXT("error"), TEXT(""));
   Success->SetStringField(TEXT("transferId"), TEXT("transfer-1"));
-  Subsystem->HandleTransferZoneResponse(Success, WeakPlayerController);
+  Subsystem->HandleTransferZoneResponse(
+    Success, WeakPlayerController, EmitGeneration
+  );
   TestTrue(TEXT("no error keeps the transfer"), Component->bTransferring);
   TestEqual(
     TEXT("the answer's transfer id is kept"),
     Component->ActiveTransferId,
     TEXT("transfer-1")
   );
+  TestEqual(TEXT("a good answer kicks nobody"), KickProbe->KickCount, 0);
 
   // Ambiguous: the realm can hold the character already, so the flag stays
-  // and the player is kicked instead (this world has no GameSession, so the
-  // kick itself is a no-op here).
+  // and the player is kicked instead.
   TSharedPtr<FJsonObject> Ambiguous = MakeShareable(new FJsonObject);
   Ambiguous->SetStringField(TEXT("error"), TEXT("realm timed out"));
   Ambiguous->SetBoolField(TEXT("ambiguous"), true);
-  Subsystem->HandleTransferZoneResponse(Ambiguous, WeakPlayerController);
+  Subsystem->HandleTransferZoneResponse(
+    Ambiguous, WeakPlayerController, EmitGeneration
+  );
   TestTrue(TEXT("an ambiguous error keeps the flag"), Component->bTransferring);
+  TestEqual(TEXT("an ambiguous error kicks"), KickProbe->KickCount, 1);
+  TestEqual(
+    TEXT("the kick says why"),
+    KickProbe->LastKickReason,
+    TEXT("realm timed out")
+  );
 
   // No "ambiguous" field at all: an old sidecar that does not send it. This
   // must behave as ambiguous, or a game server that runs against an older
   // backend can roll a transfer back that the realm already committed.
   TSharedPtr<FJsonObject> NoField = MakeShareable(new FJsonObject);
   NoField->SetStringField(TEXT("error"), TEXT("realm timed out"));
-  Subsystem->HandleTransferZoneResponse(NoField, WeakPlayerController);
+  Subsystem->HandleTransferZoneResponse(
+    NoField, WeakPlayerController, EmitGeneration
+  );
   TestTrue(
     TEXT("a missing ambiguous field keeps the flag"), Component->bTransferring
+  );
+  TestEqual(
+    TEXT("a missing ambiguous field kicks too"), KickProbe->KickCount, 2
   );
 
   // An explicit false proves the transfer never started: roll back, do not
@@ -263,7 +304,9 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
   TSharedPtr<FJsonObject> Safe = MakeShareable(new FJsonObject);
   Safe->SetStringField(TEXT("error"), TEXT("zone is full"));
   Safe->SetBoolField(TEXT("ambiguous"), false);
-  Subsystem->HandleTransferZoneResponse(Safe, WeakPlayerController);
+  Subsystem->HandleTransferZoneResponse(
+    Safe, WeakPlayerController, EmitGeneration
+  );
   TestFalse(
     TEXT("an explicit false rolls the flag back"), Component->bTransferring
   );
@@ -283,12 +326,175 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
     Component->ActiveTransferId,
     FString()
   );
+  // The other half of the rule: a rollback keeps the player here.
+  TestEqual(TEXT("a rollback kicks nobody"), KickProbe->KickCount, 2);
 
   // The same answer again, with the player no longer transferring: a stale
   // answer must not fire the rollback events a second time.
-  Subsystem->HandleTransferZoneResponse(Safe, WeakPlayerController);
+  Subsystem->HandleTransferZoneResponse(
+    Safe, WeakPlayerController, EmitGeneration
+  );
   TestEqual(
     TEXT("a stale answer does not roll back again"), Listener->ServerCount, 1
+  );
+  TestEqual(
+    TEXT("a stale answer still kicks nobody"), KickProbe->KickCount, 2
+  );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodZoneTravelStaleAnswerTest,
+  "Redwood.ZoneTravel.TheAnswerOfAnEarlierTransferCannotTouchTheNextOne",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodZoneTravelStaleAnswerTest::RunTest(const FString &Parameters) {
+  // The realm can report a failure before it answers the transfer route: it
+  // sends the refusal of one character while it still handles the request.
+  // The report then rolls the transfer back, the player asks for another
+  // zone, and only THEN the first answer lands. It must touch nothing.
+  AddExpectedError(
+    TEXT("a transfer that is over"), EAutomationExpectedErrorFlags::Contains, 0
+  );
+  AddExpectedError(
+    TEXT("Failed to transfer player to new zone"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+
+  RedwoodZoneTravelTest::FScopedWorld Scoped;
+
+  URedwoodServerGameSubsystem *Subsystem =
+    Scoped.GameInstance->GetSubsystem<URedwoodServerGameSubsystem>();
+  APlayerController *PlayerController =
+    Scoped.World->SpawnActor<APlayerController>();
+  if (!TestNotNull(TEXT("subsystem available"), Subsystem) ||
+      !TestNotNull(TEXT("controller spawned"), PlayerController)) {
+    return false;
+  }
+
+  APlayerState *PlayerState = nullptr;
+  URedwoodPlayerStateComponent *Component =
+    Scoped.SpawnPlayerStateComponent(PlayerState);
+  if (!TestNotNull(TEXT("player state component spawned"), Component)) {
+    return false;
+  }
+  PlayerController->PlayerState = PlayerState;
+
+  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
+
+  // Transfer A starts, and the realm's report rolls it back before its
+  // answer arrives.
+  Component->InitTransferring();
+  const int64 GenerationA = Component->TransferGeneration;
+  Component->AbortTransferring(
+    TEXT("the zone did not start"), TEXT("zone-start-timeout")
+  );
+
+  // Transfer B starts.
+  Component->InitTransferring();
+  TestTrue(
+    TEXT("every start gets a name of its own"),
+    Component->TransferGeneration != GenerationA
+  );
+
+  // A's late SUCCESS answer must not name B's transfer, or B's own report
+  // would no longer match and B would stay latched for ever.
+  TSharedPtr<FJsonObject> LateSuccess = MakeShareable(new FJsonObject);
+  LateSuccess->SetStringField(TEXT("error"), TEXT(""));
+  LateSuccess->SetStringField(TEXT("transferId"), TEXT("transfer-a"));
+  Subsystem->HandleTransferZoneResponse(
+    LateSuccess, WeakPlayerController, GenerationA
+  );
+  TestEqual(
+    TEXT("the late answer does not name the new transfer"),
+    Component->ActiveTransferId,
+    FString()
+  );
+  TestTrue(
+    TEXT("the new transfer still matches its own report"),
+    Component->MatchesActiveTransfer(TEXT("transfer-b"))
+  );
+
+  // A's late ERROR answer must not roll B back either.
+  TSharedPtr<FJsonObject> LateError = MakeShareable(new FJsonObject);
+  LateError->SetStringField(TEXT("error"), TEXT("zone is full"));
+  LateError->SetBoolField(TEXT("ambiguous"), false);
+  Subsystem->HandleTransferZoneResponse(
+    LateError, WeakPlayerController, GenerationA
+  );
+  TestTrue(
+    TEXT("the new transfer is still in flight"), Component->bTransferring
+  );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodZoneTravelAnswerTimeoutTest,
+  "Redwood.ZoneTravel.ATransferWithNoAnswerTakesThePlayerOut",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodZoneTravelAnswerTimeoutTest::RunTest(const FString &Parameters) {
+  // Only the wait that runs out logs; the two that do nothing stay quiet.
+  AddExpectedError(
+    TEXT("got no answer"), EAutomationExpectedErrorFlags::Contains, 1
+  );
+
+  RedwoodZoneTravelTest::FScopedWorld Scoped;
+
+  URedwoodServerGameSubsystem *Subsystem =
+    Scoped.GameInstance->GetSubsystem<URedwoodServerGameSubsystem>();
+  APlayerController *PlayerController =
+    Scoped.World->SpawnActor<APlayerController>();
+  if (!TestNotNull(TEXT("subsystem available"), Subsystem) ||
+      !TestNotNull(TEXT("controller spawned"), PlayerController)) {
+    return false;
+  }
+
+  APlayerState *PlayerState = nullptr;
+  URedwoodPlayerStateComponent *Component =
+    Scoped.SpawnPlayerStateComponent(PlayerState);
+  if (!TestNotNull(TEXT("player state component spawned"), Component)) {
+    return false;
+  }
+  PlayerController->PlayerState = PlayerState;
+
+  Scoped.World->SetGameMode(FURL());
+  AGameModeBase *GameMode = Scoped.World->GetAuthGameMode();
+  ARedwoodKickProbeGameSession *KickProbe =
+    Scoped.World->SpawnActor<ARedwoodKickProbeGameSession>();
+  if (!TestNotNull(TEXT("world game mode set"), GameMode) ||
+      !TestNotNull(TEXT("kick probe spawned"), KickProbe)) {
+    return false;
+  }
+  GameMode->GameSession = KickProbe;
+
+  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
+
+  Component->InitTransferring();
+  const int64 EmitGeneration = Component->TransferGeneration;
+
+  // A wait left over from an earlier transfer must not touch this one.
+  Subsystem->HandleTransferAnswerTimeout(
+    WeakPlayerController, EmitGeneration - 1
+  );
+  TestEqual(
+    TEXT("a wait for an earlier transfer kicks nobody"), KickProbe->KickCount, 0
+  );
+  TestTrue(TEXT("and the transfer goes on"), Component->bTransferring);
+
+  // No answer for the transfer in flight: the realm may hold the character
+  // already, so the player goes out, exactly as an ambiguous answer does.
+  Subsystem->HandleTransferAnswerTimeout(WeakPlayerController, EmitGeneration);
+  TestEqual(TEXT("no answer takes the player out"), KickProbe->KickCount, 1);
+
+  // A transfer that is over does not need a kick.
+  Component->AbortTransferring(TEXT("zone is full"), TEXT("realm-rejected"));
+  Subsystem->HandleTransferAnswerTimeout(WeakPlayerController, EmitGeneration);
+  TestEqual(
+    TEXT("a transfer that is over kicks nobody"), KickProbe->KickCount, 1
   );
   return true;
 }
