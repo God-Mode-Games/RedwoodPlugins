@@ -884,6 +884,13 @@ void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
     // the name, so a later transfer-failed report can be matched to this
     // transfer. The field is absent on an older backend, and
     // TryGetStringField then leaves the id as it is (empty).
+    //
+    // A failure report can legally arrive BEFORE this answer: the report
+    // comes on the realm socket and the answer on the request path, and
+    // the two do not keep an order. That report is still safe, because
+    // InitTransferring latched bTransferring before the emit, and an empty
+    // id matches every report. The id only makes the match tighter once
+    // this answer lands.
     if (IsValid(PlayerStateComponent)) {
       Response->TryGetStringField(
         TEXT("transferId"), PlayerStateComponent->ActiveTransferId
