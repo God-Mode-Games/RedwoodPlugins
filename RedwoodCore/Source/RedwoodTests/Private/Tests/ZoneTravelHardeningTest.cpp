@@ -4,7 +4,11 @@
 // Pins the zone-travel hardening contracts (HollowedOath#1752 items 4, 7, 8):
 //   1. URedwoodPlayerStateComponent::AbortTransferring clears the
 //      bTransferring latch that InitTransferring sets before the
-//      TravelPlayerToZone* sidecar checks.
+//      TravelPlayerToZone* sidecar checks, and both tell the server through
+//      OnTransferringStartedServer / OnTransferAbortedServer.
+//   5. URedwoodServerGameSubsystem::HandleTransferZoneResponse kicks the
+//      player ONLY when the sidecar marks the error ambiguous; any other
+//      error rolls the transfer back and keeps the player in this zone.
 //   2. ARedwoodZoneSpawn::GetSpawnGroundClearance lifts by the default
 //      pawn's capsule half-height plus a margin when the game mode exposes
 //      an ACharacter pawn — never below the upstream 100 units — and keeps
@@ -19,6 +23,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/CapsuleComponent.h"
+#include "Dom/JsonObject.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
@@ -29,6 +34,7 @@
 #include "Misc/AutomationTest.h"
 #include "RedwoodGameModeComponent.h"
 #include "RedwoodPlayerStateComponent.h"
+#include "RedwoodServerGameSubsystem.h"
 #include "RedwoodZoneSpawn.h"
 
 #if WITH_AUTOMATION_WORKER
@@ -80,18 +86,110 @@ bool FRedwoodZoneTravelAbortTransferringTest::RunTest(
     NewObject<URedwoodPlayerStateComponent>(PlayerState);
   Component->RegisterComponent();
 
+  // The server-side events the game binds to put a loading screen up and
+  // take it down again.
+  int32 StartCount = 0;
+  int32 AbortCount = 0;
+  FString AbortError;
+  Component->OnTransferringStartedServer.AddLambda([&StartCount]() {
+    ++StartCount;
+  });
+  Component->OnTransferAbortedServer.AddLambda(
+    [&AbortCount, &AbortError](const FString &Error) {
+      ++AbortCount;
+      AbortError = Error;
+    }
+  );
+
   TestFalse(TEXT("not transferring initially"), Component->bTransferring);
   Component->InitTransferring();
   TestTrue(TEXT("InitTransferring latches the flag"), Component->bTransferring);
-  Component->AbortTransferring();
+  TestEqual(TEXT("the server hears the transfer start"), StartCount, 1);
+
+  Component->AbortTransferring(TEXT("zone is full"));
   TestFalse(
     TEXT("AbortTransferring rolls the flag back"), Component->bTransferring
+  );
+  TestEqual(TEXT("the server hears the abort"), AbortCount, 1);
+  TestEqual(
+    TEXT("the abort carries the error"), AbortError, TEXT("zone is full")
   );
 
   // Idempotent on an already-clear flag: the async error path can race a
   // second failed call.
-  Component->AbortTransferring();
+  Component->AbortTransferring(TEXT("zone is full"));
   TestFalse(TEXT("a second abort stays clear"), Component->bTransferring);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodZoneTravelTransferErrorTest,
+  "Redwood.ZoneTravel.OnlyAnAmbiguousTransferErrorKicks",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
+  // Both failure branches log at Error level on purpose.
+  AddExpectedError(
+    TEXT("Failed to transfer player to new zone"),
+    EAutomationExpectedErrorFlags::Contains,
+    2
+  );
+
+  RedwoodZoneTravelTest::FScopedWorld Scoped;
+
+  URedwoodServerGameSubsystem *Subsystem =
+    Scoped.GameInstance->GetSubsystem<URedwoodServerGameSubsystem>();
+  APlayerController *PlayerController =
+    Scoped.World->SpawnActor<APlayerController>();
+  if (!TestNotNull(TEXT("subsystem available"), Subsystem) ||
+      !TestNotNull(TEXT("controller spawned"), PlayerController)) {
+    return false;
+  }
+
+  APlayerState *PlayerState = Scoped.World->SpawnActor<APlayerState>();
+  if (!TestNotNull(TEXT("player state spawned"), PlayerState)) {
+    return false;
+  }
+  PlayerController->PlayerState = PlayerState;
+
+  URedwoodPlayerStateComponent *Component =
+    NewObject<URedwoodPlayerStateComponent>(PlayerState);
+  Component->RegisterComponent();
+
+  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
+
+  Component->InitTransferring();
+
+  // No error at all: the transfer goes on.
+  TSharedPtr<FJsonObject> Success = MakeShareable(new FJsonObject);
+  Success->SetStringField(TEXT("error"), TEXT(""));
+  Subsystem->HandleTransferZoneResponse(Success, WeakPlayerController);
+  TestTrue(TEXT("no error keeps the transfer"), Component->bTransferring);
+
+  // Ambiguous: the realm can hold the character already, so the flag stays
+  // and the player is kicked instead (this world has no GameSession, so the
+  // kick itself is a no-op here).
+  TSharedPtr<FJsonObject> Ambiguous = MakeShareable(new FJsonObject);
+  Ambiguous->SetStringField(TEXT("error"), TEXT("realm timed out"));
+  Ambiguous->SetBoolField(TEXT("ambiguous"), true);
+  Subsystem->HandleTransferZoneResponse(Ambiguous, WeakPlayerController);
+  TestTrue(TEXT("an ambiguous error keeps the flag"), Component->bTransferring);
+
+  // A plain error proves the transfer never started: roll back, do not kick.
+  FString AbortError;
+  Component->OnTransferAbortedServer.AddLambda(
+    [&AbortError](const FString &Error) { AbortError = Error; }
+  );
+  TSharedPtr<FJsonObject> Plain = MakeShareable(new FJsonObject);
+  Plain->SetStringField(TEXT("error"), TEXT("zone is full"));
+  Subsystem->HandleTransferZoneResponse(Plain, WeakPlayerController);
+  TestFalse(
+    TEXT("a plain error rolls the flag back"), Component->bTransferring
+  );
+  TestEqual(
+    TEXT("the rollback carries the error"), AbortError, TEXT("zone is full")
+  );
   return true;
 }
 

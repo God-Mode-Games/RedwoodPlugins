@@ -12,6 +12,16 @@
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnRedwoodPlayerStateUpdated);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnRedwoodPlayerTransferring);
 
+// FORK(hollowed-oath): transfer-abort notifications, plus the server-side
+// counterparts of the two client events. See AbortTransferring below.
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+  FOnRedwoodPlayerTransferAborted, FString, Error
+);
+DECLARE_MULTICAST_DELEGATE(FOnRedwoodPlayerTransferringServer);
+DECLARE_MULTICAST_DELEGATE_OneParam(
+  FOnRedwoodPlayerTransferAbortedServer, const FString & /* Error */
+);
+
 UCLASS(
   BlueprintType,
   Blueprintable,
@@ -124,6 +134,7 @@ public:
    * via Client_OnTransferring, which broadcasts OnTransferring locally.
    * Called from URedwoodServerGameSubsystem's TravelPlayerToZone* paths
    * in place of setting bTransferring directly.
+   * FORK(hollowed-oath): also broadcasts OnTransferringStartedServer.
    */
   void InitTransferring();
 
@@ -142,22 +153,55 @@ public:
   UPROPERTY(BlueprintAssignable, Category = "Events")
   FOnRedwoodPlayerTransferring OnTransferring;
 
-  // FORK(hollowed-oath): rollback for a transfer that never left the game
-  // server. InitTransferring runs BEFORE the TravelPlayerToZone* functions
-  // test the sidecar, and upstream has no path that clears the flag when
-  // that test fails — the player stays marked as transferring for the rest
-  // of the session, which also disables linkdead pawn retention and
-  // lastLocation persistence in the game project. Called ONLY on the
-  // sidecar-down early returns, where the request never left this server;
-  // the sidecar ERROR path keeps the flag on purpose (the realm may have
-  // begun the transfer, and the kick's Logout must run the transferring
-  // teardown). No client notification: nothing consumes one today, and the
-  // fork policy keeps unconsumed surface out. An upstream merge must keep
-  // AbortTransferring on the sidecar-down paths of
-  // TravelPlayerToZoneTransform / TravelPlayerToZoneSpawnName.
+  /**
+   * FORK(hollowed-oath): Reliable RPC delivered only to this PlayerState's
+   * owning client. Broadcasts OnTransferAborted so the client can remove
+   * the loading screen that Client_OnTransferring put up.
+   */
+  UFUNCTION(Client, Reliable, Category = "Redwood|PlayerState")
+  void Client_OnTransferAborted(const FString &Error);
 
-  /** FORK(hollowed-oath): Server-only. Clears bTransferring. */
-  void AbortTransferring();
+  // FORK(hollowed-oath): Broadcast on the owning client when a zone
+  // transfer stops before it completes. Only fires on the owning client
+  // (see Client_OnTransferAborted); it does not fire on the server or
+  // other clients.
+  UPROPERTY(BlueprintAssignable, Category = "Events")
+  FOnRedwoodPlayerTransferAborted OnTransferAborted;
+
+  // FORK(hollowed-oath): server-side counterparts of OnTransferring and
+  // OnTransferAborted. The two events above only fire on the owning
+  // client, but game C++ on the server must also know when a transfer
+  // starts and when it stops. Native (not dynamic) because they are
+  // server-only and not for Blueprints; bind them per component.
+  FOnRedwoodPlayerTransferringServer OnTransferringStartedServer;
+  FOnRedwoodPlayerTransferAbortedServer OnTransferAbortedServer;
+
+  // FORK(hollowed-oath): rollback for a transfer that does not complete.
+  // InitTransferring runs BEFORE the TravelPlayerToZone* functions test the
+  // sidecar, and upstream has no path that clears the flag when that test
+  // fails — the player stays marked as transferring for the rest of the
+  // session, which also disables linkdead pawn retention and lastLocation
+  // persistence in the game project. Called from three places:
+  //   1. the sidecar-down early returns, where the request never left this
+  //      server;
+  //   2. a sidecar error response that is NOT ambiguous, which proves the
+  //      realm never started the transfer;
+  //   3. the realm's transfer-failed event, which reports a transfer that
+  //      the realm accepted but could not complete.
+  // An AMBIGUOUS sidecar error (the sidecar lost contact with the realm)
+  // still keeps the flag and kicks the player, because the realm can have
+  // started the transfer and a retained body could duplicate a character.
+  // Unlike the earlier fork state, this now also tells the player: the
+  // server gets OnTransferAbortedServer and the owning client gets
+  // OnTransferAborted, so the game can remove the loading screen.
+  // An upstream merge must keep AbortTransferring on all three paths.
+
+  /**
+   * FORK(hollowed-oath): Server-only. Clears bTransferring, broadcasts
+   * OnTransferAbortedServer, and tells the owning client with
+   * Client_OnTransferAborted. Error tells why the transfer stopped.
+   */
+  void AbortTransferring(const FString &Error);
 
   void ClearDirtyFlags() {
     bCharacterDataDirty = false;

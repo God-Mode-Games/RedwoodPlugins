@@ -104,16 +104,29 @@ void URedwoodPlayerStateComponent::InitTransferring() {
   // player being transferred receives it. On a standalone/listen host
   // the implementation runs locally and broadcasts directly.
   Client_OnTransferring();
+
+  // FORK(hollowed-oath): tell the server-side listeners too; the RPC above
+  // only reaches the owning client.
+  OnTransferringStartedServer.Broadcast();
 }
 
 void URedwoodPlayerStateComponent::Client_OnTransferring_Implementation() {
   OnTransferring.Broadcast();
 }
 
-// FORK(hollowed-oath): rollback for a transfer that never left the game
-// server. See the rationale block in the header.
-void URedwoodPlayerStateComponent::AbortTransferring() {
+// FORK(hollowed-oath): rollback for a transfer that does not complete.
+// See the rationale block in the header.
+void URedwoodPlayerStateComponent::AbortTransferring(const FString &Error) {
   bTransferring = false;
+
+  OnTransferAbortedServer.Broadcast(Error);
+  Client_OnTransferAborted(Error);
+}
+
+void URedwoodPlayerStateComponent::Client_OnTransferAborted_Implementation(
+  const FString &Error
+) {
+  OnTransferAborted.Broadcast(Error);
 }
 
 void URedwoodPlayerStateComponent::SetRedwoodPlayer(

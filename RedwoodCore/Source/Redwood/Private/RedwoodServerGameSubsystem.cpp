@@ -551,6 +551,71 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
     }
   );
 
+  // FORK(hollowed-oath): the realm tells the game server when a transfer it
+  // had accepted then failed. Upstream has no such event, so a player whose
+  // transfer died after the sidecar answered kept the transferring latch for
+  // the rest of the session and never learned that the travel had stopped.
+  Sidecar->OnEvent(
+    TEXT("realm:servers:transfer-zone:transfer-failed"),
+    [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
+      const TSharedPtr<FJsonObject> *Object;
+
+      if (!Message->TryGetObject(Object) || !Object) {
+        return;
+      }
+
+      TSharedPtr<FJsonObject> ActualObject = *Object;
+      FString CharacterId = ActualObject->GetStringField(TEXT("characterId"));
+      FString Error = ActualObject->GetStringField(TEXT("error"));
+      FString Reason = ActualObject->GetStringField(TEXT("reason"));
+
+      UWorld *World = GetWorld();
+      AGameStateBase *GameState =
+        IsValid(World) ? World->GetGameState() : nullptr;
+
+      if (!IsValid(GameState)) {
+        return;
+      }
+
+      // Find the player state for this character.
+      for (APlayerState *PlayerState : GameState->PlayerArray) {
+        if (!IsValid(PlayerState)) {
+          continue;
+        }
+
+        URedwoodPlayerStateComponent *PlayerStateComponent =
+          PlayerState->FindComponentByClass<URedwoodPlayerStateComponent>();
+
+        if (!IsValid(PlayerStateComponent) ||
+            PlayerStateComponent->RedwoodCharacter.Id != CharacterId) {
+          continue;
+        }
+
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT("The realm could not transfer character %s (%s): %s"),
+          *CharacterId,
+          *Reason,
+          *Error
+        );
+
+        PlayerStateComponent->AbortTransferring(Error);
+        return;
+      }
+
+      UE_LOG(
+        LogRedwood,
+        Warning,
+        TEXT(
+          "The realm reported a failed transfer for character %s, but no player on this server matches: %s"
+        ),
+        *CharacterId,
+        *Error
+      );
+    }
+  );
+
   Sidecar->OnConnectedCallback =
     [this](const FString &InSocketId, const FString &InSessionId) {
       if (Sidecar.IsValid()) {
@@ -790,7 +855,9 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
     // must roll the flag back or the player stays latched as transferring
     // for the rest of the session. See AbortTransferring's rationale block.
     if (PlayerStateComponent) {
-      PlayerStateComponent->AbortTransferring();
+      PlayerStateComponent->AbortTransferring(
+        TEXT("Sidecar is not connected; cannot travel player to new zone")
+      );
     }
     return;
   }
@@ -803,36 +870,95 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
     *InZoneName
   );
 
+  // FORK(hollowed-oath): a weak pointer keeps the callback safe if the
+  // player leaves before the sidecar answers.
+  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
+
   Sidecar->Emit(
     TEXT("realm:servers:transfer-zone:game-server-to-sidecar"),
     Payload,
-    [this, PlayerId, CharacterId, PlayerController](auto Response) {
-      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
-      FString Error = MessageStruct->GetStringField(TEXT("error"));
-
-      if (!Error.IsEmpty()) {
-        // kick the player
-        //
-        // FORK(hollowed-oath): the transferring flag is deliberately NOT
-        // rolled back on this path. A sidecar error does not prove the realm
-        // did not begin the transfer, and the kick's Logout must run the
-        // transferring teardown (no linkdead retention — a retained body
-        // could duplicate a character the realm already re-homed). The flag
-        // rollback belongs only to the sidecar-down early return above,
-        // where the request never left this server.
-        UE_LOG(
-          LogRedwood,
-          Error,
-          TEXT("Failed to transfer player to new zone, kicking them now: %s"),
-          *Error
-        );
-        GetGameInstance()
-          ->GetWorld()
-          ->GetAuthGameMode()
-          ->GameSession->KickPlayer(PlayerController, FText::FromString(Error));
-      }
+    // FORK(hollowed-oath): the response rules live in one place now; see
+    // HandleTransferZoneResponse.
+    [this, WeakPlayerController](auto Response) {
+      HandleTransferZoneResponse(Response[0]->AsObject(), WeakPlayerController);
     }
   );
+}
+
+// FORK(hollowed-oath): shared handling of the sidecar's answer to both
+// TravelPlayerToZone* emits.
+//
+// Upstream kicks the player on EVERY error. That is too strong: most errors
+// happen before the realm takes the transfer, so the player can stay in this
+// zone. The sidecar now sets "ambiguous" to true ONLY when it lost contact
+// with the realm during the request, which is the one case where the realm
+// can have moved the character already.
+//
+//   ambiguous     -> keep the transferring flag and kick. The kick's Logout
+//                    must run the transferring teardown (no linkdead
+//                    retention), because a retained body could duplicate a
+//                    character the realm already re-homed.
+//   not ambiguous -> the transfer never started. AbortTransferring rolls the
+//                    flag back and tells the player, who stays in this zone.
+//
+// The callback is asynchronous, so the player, the world, and the game mode
+// can all be gone by the time it runs; every one of them is checked.
+void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
+  const TSharedPtr<FJsonObject> &Response,
+  TWeakObjectPtr<APlayerController> WeakPlayerController
+) {
+  if (!Response.IsValid()) {
+    return;
+  }
+
+  FString Error = Response->GetStringField(TEXT("error"));
+
+  if (Error.IsEmpty()) {
+    return;
+  }
+
+  bool bAmbiguous = false;
+  Response->TryGetBoolField(TEXT("ambiguous"), bAmbiguous);
+
+  APlayerController *PlayerController = WeakPlayerController.Get();
+
+  if (!bAmbiguous) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("Failed to transfer player to new zone, keeping them here: %s"),
+      *Error
+    );
+
+    if (IsValid(PlayerController) && IsValid(PlayerController->PlayerState)) {
+      URedwoodPlayerStateComponent *PlayerStateComponent =
+        PlayerController->PlayerState
+          ->FindComponentByClass<URedwoodPlayerStateComponent>();
+
+      if (IsValid(PlayerStateComponent)) {
+        PlayerStateComponent->AbortTransferring(Error);
+      }
+    }
+
+    return;
+  }
+
+  UE_LOG(
+    LogRedwood,
+    Error,
+    TEXT("Failed to transfer player to new zone, kicking them now: %s"),
+    *Error
+  );
+
+  UWorld *World = GetWorld();
+  AGameModeBase *GameMode = IsValid(World) ? World->GetAuthGameMode() : nullptr;
+
+  if (IsValid(PlayerController) && IsValid(GameMode) &&
+      IsValid(GameMode->GameSession)) {
+    GameMode->GameSession->KickPlayer(
+      PlayerController, FText::FromString(Error)
+    );
+  }
 }
 
 void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
@@ -913,7 +1039,9 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
     // must roll the flag back or the player stays latched as transferring
     // for the rest of the session. See AbortTransferring's rationale block.
     if (PlayerStateComponent) {
-      PlayerStateComponent->AbortTransferring();
+      PlayerStateComponent->AbortTransferring(
+        TEXT("Sidecar is not connected; cannot travel player to new zone")
+      );
     }
     return;
   }
@@ -926,34 +1054,17 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
     *InZoneName
   );
 
+  // FORK(hollowed-oath): a weak pointer keeps the callback safe if the
+  // player leaves before the sidecar answers.
+  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
+
   Sidecar->Emit(
     TEXT("realm:servers:transfer-zone:game-server-to-sidecar"),
     Payload,
-    [this, PlayerId, CharacterId, PlayerController](auto Response) {
-      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
-      FString Error = MessageStruct->GetStringField(TEXT("error"));
-
-      if (!Error.IsEmpty()) {
-        // kick the player
-        //
-        // FORK(hollowed-oath): the transferring flag is deliberately NOT
-        // rolled back on this path. A sidecar error does not prove the realm
-        // did not begin the transfer, and the kick's Logout must run the
-        // transferring teardown (no linkdead retention — a retained body
-        // could duplicate a character the realm already re-homed). The flag
-        // rollback belongs only to the sidecar-down early return above,
-        // where the request never left this server.
-        UE_LOG(
-          LogRedwood,
-          Error,
-          TEXT("Failed to transfer player to new zone, kicking them now: %s"),
-          *Error
-        );
-        GetGameInstance()
-          ->GetWorld()
-          ->GetAuthGameMode()
-          ->GameSession->KickPlayer(PlayerController, FText::FromString(Error));
-      }
+    // FORK(hollowed-oath): the response rules live in one place now; see
+    // HandleTransferZoneResponse.
+    [this, WeakPlayerController](auto Response) {
+      HandleTransferZoneResponse(Response[0]->AsObject(), WeakPlayerController);
     }
   );
 }

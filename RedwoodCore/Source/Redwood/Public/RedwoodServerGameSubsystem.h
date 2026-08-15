@@ -111,6 +111,16 @@ public:
     const FString &OptionalProxyId = TEXT("")
   );
 
+  // FORK(hollowed-oath): shared handling of the sidecar's answer to both
+  // TravelPlayerToZone* emits. Upstream repeats the same block in each
+  // function and kicks the player on every error; this decides between a
+  // kick and a rollback. Full rationale on the definition in the .cpp.
+  // Public only so ZoneTravelHardeningTest can drive it without a sidecar.
+  void HandleTransferZoneResponse(
+    const TSharedPtr<FJsonObject> &Response,
+    TWeakObjectPtr<APlayerController> WeakPlayerController
+  );
+
   void FlushSync();
   void FlushPersistence();
   UFUNCTION(BlueprintCallable, Category = "Redwood")
