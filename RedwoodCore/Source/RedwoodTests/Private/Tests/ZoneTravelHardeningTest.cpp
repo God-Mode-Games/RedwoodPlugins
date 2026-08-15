@@ -42,6 +42,7 @@
 #include "GameFramework/PlayerStart.h"
 #include "GameFramework/PlayerState.h"
 #include "Misc/AutomationTest.h"
+#include "UObject/StrongObjectPtr.h"
 #include "RedwoodGameModeComponent.h"
 #include "RedwoodPlayerStateComponent.h"
 #include "RedwoodServerGameSubsystem.h"
@@ -121,8 +122,9 @@ bool FRedwoodZoneTravelAbortTransferringTest::RunTest(
   Component->OnTransferringStartedServer.AddLambda([&StartCount]() {
     ++StartCount;
   });
-  URedwoodTransferAbortListener *Listener =
-    NewObject<URedwoodTransferAbortListener>(Component);
+  TStrongObjectPtr<URedwoodTransferAbortListener> Listener(
+    NewObject<URedwoodTransferAbortListener>(Component)
+  );
   Listener->Watch(Component);
 
   TestFalse(TEXT("not transferring initially"), Component->bTransferring);
@@ -253,8 +255,9 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
 
   // An explicit false proves the transfer never started: roll back, do not
   // kick.
-  URedwoodTransferAbortListener *Listener =
-    NewObject<URedwoodTransferAbortListener>(Component);
+  TStrongObjectPtr<URedwoodTransferAbortListener> Listener(
+    NewObject<URedwoodTransferAbortListener>(Component)
+  );
   Listener->Watch(Component);
 
   TSharedPtr<FJsonObject> Safe = MakeShareable(new FJsonObject);
@@ -344,8 +347,9 @@ bool FRedwoodZoneTravelTransferFailedEventTest::RunTest(
   }
   Component->RedwoodCharacter.Id = TEXT("character-1");
 
-  URedwoodTransferAbortListener *Listener =
-    NewObject<URedwoodTransferAbortListener>(Component);
+  TStrongObjectPtr<URedwoodTransferAbortListener> Listener(
+    NewObject<URedwoodTransferAbortListener>(Component)
+  );
   Listener->Watch(Component);
 
   // Builds the payload the realm sends.

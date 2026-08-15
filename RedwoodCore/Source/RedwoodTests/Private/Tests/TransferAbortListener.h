@@ -27,8 +27,9 @@ public:
   FString ClientError;
   FString ClientReason;
 
-  // Bind both sides. Outer this listener to Component so the captured
-  // "this" cannot outlive the delegate that holds it.
+  // Bind both sides. The lambda below takes a raw "this", and the dynamic
+  // delegate holds only a weak object pointer, so neither keeps this
+  // listener alive: the test must hold it in a TStrongObjectPtr.
   void Watch(URedwoodPlayerStateComponent *Component) {
     Component->OnTransferAbortedServer.AddLambda(
       [this](const FString &InError, const FString &InReason) {
