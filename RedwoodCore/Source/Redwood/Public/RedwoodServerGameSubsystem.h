@@ -121,6 +121,14 @@ public:
     TWeakObjectPtr<APlayerController> WeakPlayerController
   );
 
+  // FORK(hollowed-oath): wire name of the fork-added transfer-failed
+  // sidecar event. Named and pinned by a test, because the backend pins its
+  // own copy of this string and the two cannot share a constant: a silent
+  // drift on either side would turn the whole rollback off with nothing to
+  // show for it.
+  static constexpr const TCHAR *TransferFailedEventName =
+    TEXT("realm:servers:transfer-zone:transfer-failed");
+
   // FORK(hollowed-oath): body of the fork-added transfer-failed sidecar
   // event, kept out of InitializeSidecar so the fork stays a few lines
   // there. Full rationale on the definition in the .cpp. Public for the

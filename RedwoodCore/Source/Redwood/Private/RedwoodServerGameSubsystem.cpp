@@ -555,7 +555,7 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
   // had accepted then failed. Upstream has no such event. The rules live in
   // HandleTransferFailedEvent.
   Sidecar->OnEvent(
-    TEXT("realm:servers:transfer-zone:transfer-failed"),
+    TransferFailedEventName,
     [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
       const TSharedPtr<FJsonObject> *Object;
 
@@ -948,9 +948,15 @@ void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
 // and only this tells the server that the travel stopped. Without it the
 // player keeps the transferring latch for the rest of the session.
 //
-// Payload: { playerId, characterId, transferId, error, reason }. Reason is
-// the backend's kebab-case token (see AbortTransferring in
-// RedwoodPlayerStateComponent.h); it goes to the game unchanged.
+// Payload: { playerId, characterId, transferId, error, reason }, written by
+// RedwoodBackend packages/common/src/interfaces.ts,
+// TransferFailed.RealmToSidecar.SRequest. C++ and TypeScript cannot share a
+// constant, so that schema and this reader must be changed together.
+// characterId is the ONLY match key: a character is on exactly one game
+// server, while a player can hold several characters, so playerId is for
+// the log alone — do not add a playerId match. Reason is the backend's
+// kebab-case token (see AbortTransferring in RedwoodPlayerStateComponent.h);
+// it goes to the game unchanged.
 //
 // Three gates before the abort, in order: the character must be on this
 // server, the player must still be transferring (bTransferring), and the
@@ -990,74 +996,75 @@ void URedwoodServerGameSubsystem::HandleTransferFailedEvent(
     return;
   }
 
-  // Find the player state for this character.
+  // Gate 1: the character must be on this server.
+  URedwoodPlayerStateComponent *PlayerStateComponent = nullptr;
   for (APlayerState *PlayerState : GameState->PlayerArray) {
-    if (!IsValid(PlayerState)) {
-      continue;
+    URedwoodPlayerStateComponent *Candidate =
+      IsValid(PlayerState)
+      ? PlayerState->FindComponentByClass<URedwoodPlayerStateComponent>()
+      : nullptr;
+
+    if (IsValid(Candidate) && Candidate->RedwoodCharacter.Id == CharacterId) {
+      PlayerStateComponent = Candidate;
+      break;
     }
+  }
 
-    URedwoodPlayerStateComponent *PlayerStateComponent =
-      PlayerState->FindComponentByClass<URedwoodPlayerStateComponent>();
-
-    if (!IsValid(PlayerStateComponent) ||
-        PlayerStateComponent->RedwoodCharacter.Id != CharacterId) {
-      continue;
-    }
-
-    // A report for a player who is not transferring is stale or wrong; an
-    // abort here would fire rollback events for a transfer that does not
-    // exist.
-    if (!PlayerStateComponent->bTransferring) {
-      UE_LOG(
-        LogRedwood,
-        Warning,
-        TEXT(
-          "The realm reported a failed transfer for character %s, but the player is not transferring: %s"
-        ),
-        *CharacterId,
-        *Error
-      );
-      return;
-    }
-
-    // Drop a report that names a different transfer; absence on either side
-    // must never block the abort (see MatchesActiveTransfer).
-    if (!PlayerStateComponent->MatchesActiveTransfer(TransferId)) {
-      UE_LOG(
-        LogRedwood,
-        Warning,
-        TEXT(
-          "Ignoring a failed transfer report for character %s: it names transfer %s, but the player is on transfer %s"
-        ),
-        *CharacterId,
-        *TransferId,
-        *PlayerStateComponent->ActiveTransferId
-      );
-      return;
-    }
-
+  if (!PlayerStateComponent) {
     UE_LOG(
       LogRedwood,
       Warning,
-      TEXT("The realm could not transfer character %s (%s): %s"),
+      TEXT(
+        "The realm reported a failed transfer for character %s, but no player on this server matches: %s"
+      ),
       *CharacterId,
-      *Reason,
       *Error
     );
+    return;
+  }
 
-    PlayerStateComponent->AbortTransferring(Error, Reason);
+  // Gate 2: a report for a player who is not transferring is stale or
+  // wrong; an abort here would fire rollback events for a transfer that
+  // does not exist.
+  if (!PlayerStateComponent->bTransferring) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT(
+        "The realm reported a failed transfer for character %s, but the player is not transferring: %s"
+      ),
+      *CharacterId,
+      *Error
+    );
+    return;
+  }
+
+  // Gate 3: drop a report that names a different transfer; absence on
+  // either side must never block the abort (see MatchesActiveTransfer).
+  if (!PlayerStateComponent->MatchesActiveTransfer(TransferId)) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT(
+        "Ignoring a failed transfer report for character %s: it names transfer %s, but the player is on transfer %s"
+      ),
+      *CharacterId,
+      *TransferId,
+      *PlayerStateComponent->ActiveTransferId
+    );
     return;
   }
 
   UE_LOG(
     LogRedwood,
     Warning,
-    TEXT(
-      "The realm reported a failed transfer for character %s, but no player on this server matches: %s"
-    ),
+    TEXT("The realm could not transfer character %s (%s): %s"),
     *CharacterId,
+    *Reason,
     *Error
   );
+
+  PlayerStateComponent->AbortTransferring(Error, Reason);
 }
 
 void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(

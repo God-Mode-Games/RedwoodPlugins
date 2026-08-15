@@ -64,6 +64,24 @@ struct FScopedWorld {
     World->InitializeActorsForPlay(FURL());
   }
 
+  // Spawns a player state carrying a Redwood player state component, which
+  // every transfer test needs. Returns null when the spawn fails; the
+  // caller asserts on the result.
+  URedwoodPlayerStateComponent *SpawnPlayerStateComponent(
+    APlayerState *&OutPlayerState
+  ) {
+    OutPlayerState = World->SpawnActor<APlayerState>();
+
+    if (!OutPlayerState) {
+      return nullptr;
+    }
+
+    URedwoodPlayerStateComponent *Component =
+      NewObject<URedwoodPlayerStateComponent>(OutPlayerState);
+    Component->RegisterComponent();
+    return Component;
+  }
+
   ~FScopedWorld() {
     if (GameInstance) {
       GameInstance->Shutdown();
@@ -88,13 +106,12 @@ bool FRedwoodZoneTravelAbortTransferringTest::RunTest(
 ) {
   RedwoodZoneTravelTest::FScopedWorld Scoped;
 
-  APlayerState *PlayerState = Scoped.World->SpawnActor<APlayerState>();
-  if (!TestNotNull(TEXT("player state spawned"), PlayerState)) {
+  APlayerState *PlayerState = nullptr;
+  URedwoodPlayerStateComponent *Component =
+    Scoped.SpawnPlayerStateComponent(PlayerState);
+  if (!TestNotNull(TEXT("player state component spawned"), Component)) {
     return false;
   }
-  URedwoodPlayerStateComponent *Component =
-    NewObject<URedwoodPlayerStateComponent>(PlayerState);
-  Component->RegisterComponent();
 
   // The events the game binds to put a loading screen up and take it down
   // again. The world is standalone, so the client RPC runs locally and the
@@ -190,15 +207,13 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
     return false;
   }
 
-  APlayerState *PlayerState = Scoped.World->SpawnActor<APlayerState>();
-  if (!TestNotNull(TEXT("player state spawned"), PlayerState)) {
+  APlayerState *PlayerState = nullptr;
+  URedwoodPlayerStateComponent *Component =
+    Scoped.SpawnPlayerStateComponent(PlayerState);
+  if (!TestNotNull(TEXT("player state component spawned"), Component)) {
     return false;
   }
   PlayerController->PlayerState = PlayerState;
-
-  URedwoodPlayerStateComponent *Component =
-    NewObject<URedwoodPlayerStateComponent>(PlayerState);
-  Component->RegisterComponent();
 
   TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
 
@@ -283,6 +298,15 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodZoneTravelTransferFailedEventTest::RunTest(
   const FString &Parameters
 ) {
+  // The wire name. The backend pins its own copy of this string, and the two
+  // cannot share a constant, so a change on either side must break a test
+  // rather than turn the rollback off in silence.
+  TestEqual(
+    TEXT("the transfer-failed event keeps its wire name"),
+    FString(URedwoodServerGameSubsystem::TransferFailedEventName),
+    TEXT("realm:servers:transfer-zone:transfer-failed")
+  );
+
   // Every gate below logs a warning; expect each one in case the harness
   // raises warnings to errors.
   const EAutomationExpectedErrorFlags::MatchType Contains =
@@ -304,9 +328,11 @@ bool FRedwoodZoneTravelTransferFailedEventTest::RunTest(
   // state. AGameStateBase collects every APlayerState already in the world
   // when it spawns, so the spawn order does not matter.
   AGameStateBase *GameState = Scoped.World->SpawnActor<AGameStateBase>();
-  APlayerState *PlayerState = Scoped.World->SpawnActor<APlayerState>();
+  APlayerState *PlayerState = nullptr;
+  URedwoodPlayerStateComponent *Component =
+    Scoped.SpawnPlayerStateComponent(PlayerState);
   if (!TestNotNull(TEXT("game state spawned"), GameState) ||
-      !TestNotNull(TEXT("player state spawned"), PlayerState)) {
+      !TestNotNull(TEXT("player state component spawned"), Component)) {
     return false;
   }
   if (!TestTrue(
@@ -315,10 +341,6 @@ bool FRedwoodZoneTravelTransferFailedEventTest::RunTest(
       )) {
     return false;
   }
-
-  URedwoodPlayerStateComponent *Component =
-    NewObject<URedwoodPlayerStateComponent>(PlayerState);
-  Component->RegisterComponent();
   Component->RedwoodCharacter.Id = TEXT("character-1");
 
   URedwoodTransferAbortListener *Listener =
@@ -394,13 +416,12 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodZoneTravelTransferIdMatchTest::RunTest(const FString &Parameters) {
   RedwoodZoneTravelTest::FScopedWorld Scoped;
 
-  APlayerState *PlayerState = Scoped.World->SpawnActor<APlayerState>();
-  if (!TestNotNull(TEXT("player state spawned"), PlayerState)) {
+  APlayerState *PlayerState = nullptr;
+  URedwoodPlayerStateComponent *Component =
+    Scoped.SpawnPlayerStateComponent(PlayerState);
+  if (!TestNotNull(TEXT("player state component spawned"), Component)) {
     return false;
   }
-  URedwoodPlayerStateComponent *Component =
-    NewObject<URedwoodPlayerStateComponent>(PlayerState);
-  Component->RegisterComponent();
 
   // Nothing named yet: every report matches, so a failure that arrives
   // before the answer still reaches the abort.
