@@ -116,7 +116,9 @@ void URedwoodPlayerStateComponent::Client_OnTransferring_Implementation() {
 
 // FORK(hollowed-oath): rollback for a transfer that does not complete.
 // See the rationale block in the header.
-void URedwoodPlayerStateComponent::AbortTransferring(const FString &Error) {
+void URedwoodPlayerStateComponent::AbortTransferring(
+  const FString &Error, const FString &Reason
+) {
   // Last line of defence: two failure paths can report the same transfer,
   // and one start must never produce two aborts.
   if (!bTransferring) {
@@ -131,14 +133,14 @@ void URedwoodPlayerStateComponent::AbortTransferring(const FString &Error) {
 
   bTransferring = false;
 
-  OnTransferAbortedServer.Broadcast(Error);
-  Client_OnTransferAborted(Error);
+  OnTransferAbortedServer.Broadcast(Error, Reason);
+  Client_OnTransferAborted(Error, Reason);
 }
 
 void URedwoodPlayerStateComponent::Client_OnTransferAborted_Implementation(
-  const FString &Error
+  const FString &Error, const FString &Reason
 ) {
-  OnTransferAborted.Broadcast(Error);
+  OnTransferAborted.Broadcast(Error, Reason);
 }
 
 void URedwoodPlayerStateComponent::SetRedwoodPlayer(

@@ -37,6 +37,7 @@
 #include "RedwoodPlayerStateComponent.h"
 #include "RedwoodServerGameSubsystem.h"
 #include "RedwoodZoneSpawn.h"
+#include "TransferAbortListener.h"
 
 #if WITH_AUTOMATION_WORKER
 
@@ -92,14 +93,26 @@ bool FRedwoodZoneTravelAbortTransferringTest::RunTest(
   int32 StartCount = 0;
   int32 AbortCount = 0;
   FString AbortError;
+  FString AbortReason;
   Component->OnTransferringStartedServer.AddLambda([&StartCount]() {
     ++StartCount;
   });
   Component->OnTransferAbortedServer.AddLambda(
-    [&AbortCount, &AbortError](const FString &Error) {
+    [&AbortCount, &AbortError, &AbortReason](
+      const FString &Error, const FString &Reason
+    ) {
       ++AbortCount;
       AbortError = Error;
+      AbortReason = Reason;
     }
+  );
+
+  // The owning client gets the same pair through the client RPC. This world
+  // is standalone, so the RPC runs locally and the listener sees it.
+  URedwoodTransferAbortListener *Listener =
+    NewObject<URedwoodTransferAbortListener>(Component);
+  Component->OnTransferAborted.AddDynamic(
+    Listener, &URedwoodTransferAbortListener::OnTransferAborted
   );
 
   TestFalse(TEXT("not transferring initially"), Component->bTransferring);
@@ -107,7 +120,9 @@ bool FRedwoodZoneTravelAbortTransferringTest::RunTest(
   TestTrue(TEXT("InitTransferring latches the flag"), Component->bTransferring);
   TestEqual(TEXT("the server hears the transfer start"), StartCount, 1);
 
-  Component->AbortTransferring(TEXT("zone is full"));
+  // Both the error text and the reason token must survive the whole chain;
+  // the game maps the token to its own failure type.
+  Component->AbortTransferring(TEXT("zone is full"), TEXT("ZoneNotConfigured"));
   TestFalse(
     TEXT("AbortTransferring rolls the flag back"), Component->bTransferring
   );
@@ -115,12 +130,27 @@ bool FRedwoodZoneTravelAbortTransferringTest::RunTest(
   TestEqual(
     TEXT("the abort carries the error"), AbortError, TEXT("zone is full")
   );
+  TestEqual(
+    TEXT("the abort carries the reason"),
+    AbortReason,
+    TEXT("ZoneNotConfigured")
+  );
+  TestEqual(TEXT("the client hears the abort"), Listener->Count, 1);
+  TestEqual(
+    TEXT("the client gets the error"), Listener->Error, TEXT("zone is full")
+  );
+  TestEqual(
+    TEXT("the client gets the reason"),
+    Listener->Reason,
+    TEXT("ZoneNotConfigured")
+  );
 
   // Idempotent on an already-clear flag: two failure paths can report the
   // same transfer, and the second one must broadcast nothing.
-  Component->AbortTransferring(TEXT("zone is full"));
+  Component->AbortTransferring(TEXT("zone is full"), TEXT("ZoneNotConfigured"));
   TestFalse(TEXT("a second abort stays clear"), Component->bTransferring);
   TestEqual(TEXT("a second abort broadcasts nothing"), AbortCount, 1);
+  TestEqual(TEXT("the client hears nothing either"), Listener->Count, 1);
 
   // A repeated start still fires its events; that is upstream behaviour.
   Component->InitTransferring();
@@ -203,10 +233,14 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
   // kick.
   int32 AbortCount = 0;
   FString AbortError;
+  FString AbortReason;
   Component->OnTransferAbortedServer.AddLambda(
-    [&AbortCount, &AbortError](const FString &Error) {
+    [&AbortCount, &AbortError, &AbortReason](
+      const FString &Error, const FString &Reason
+    ) {
       ++AbortCount;
       AbortError = Error;
+      AbortReason = Reason;
     }
   );
   TSharedPtr<FJsonObject> Safe = MakeShareable(new FJsonObject);
@@ -219,6 +253,11 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("the rollback happened once"), AbortCount, 1);
   TestEqual(
     TEXT("the rollback carries the error"), AbortError, TEXT("zone is full")
+  );
+  TestEqual(
+    TEXT("the rollback names the realm as the source"),
+    AbortReason,
+    TEXT("realm-rejected")
   );
 
   // The same answer again, with the player no longer transferring: a stale

@@ -632,7 +632,9 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
           *Error
         );
 
-        PlayerStateComponent->AbortTransferring(Error);
+        // Reason is the backend's typed token; it reaches the game through
+        // OnTransferAbortedServer.
+        PlayerStateComponent->AbortTransferring(Error, Reason);
         return;
       }
 
@@ -888,7 +890,8 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
     // for the rest of the session. See AbortTransferring's rationale block.
     if (PlayerStateComponent) {
       PlayerStateComponent->AbortTransferring(
-        TEXT("Sidecar is not connected; cannot travel player to new zone")
+        TEXT("Sidecar is not connected; cannot travel player to new zone"),
+        TEXT("sidecar-down")
       );
     }
     return;
@@ -980,7 +983,7 @@ void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
       // flag. This gate makes that reasoning unnecessary for safety.
       if (IsValid(PlayerStateComponent)) {
         if (PlayerStateComponent->bTransferring) {
-          PlayerStateComponent->AbortTransferring(Error);
+          PlayerStateComponent->AbortTransferring(Error, TEXT("realm-rejected"));
         } else {
           UE_LOG(
             LogRedwood,
@@ -1093,7 +1096,8 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
     // for the rest of the session. See AbortTransferring's rationale block.
     if (PlayerStateComponent) {
       PlayerStateComponent->AbortTransferring(
-        TEXT("Sidecar is not connected; cannot travel player to new zone")
+        TEXT("Sidecar is not connected; cannot travel player to new zone"),
+        TEXT("sidecar-down")
       );
     }
     return;

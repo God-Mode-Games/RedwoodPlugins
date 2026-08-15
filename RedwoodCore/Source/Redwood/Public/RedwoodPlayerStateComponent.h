@@ -14,12 +14,14 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnRedwoodPlayerTransferring);
 
 // FORK(hollowed-oath): transfer-abort notifications, plus the server-side
 // counterparts of the two client events. See AbortTransferring below.
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
-  FOnRedwoodPlayerTransferAborted, FString, Error
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
+  FOnRedwoodPlayerTransferAborted, FString, Error, FString, Reason
 );
 DECLARE_MULTICAST_DELEGATE(FOnRedwoodPlayerTransferringServer);
-DECLARE_MULTICAST_DELEGATE_OneParam(
-  FOnRedwoodPlayerTransferAbortedServer, const FString & /* Error */
+DECLARE_MULTICAST_DELEGATE_TwoParams(
+  FOnRedwoodPlayerTransferAbortedServer,
+  const FString & /* Error */,
+  const FString & /* Reason */
 );
 
 UCLASS(
@@ -159,7 +161,7 @@ public:
    * the loading screen that Client_OnTransferring put up.
    */
   UFUNCTION(Client, Reliable, Category = "Redwood|PlayerState")
-  void Client_OnTransferAborted(const FString &Error);
+  void Client_OnTransferAborted(const FString &Error, const FString &Reason);
 
   // FORK(hollowed-oath): Broadcast on the owning client when a zone
   // transfer stops before it completes. Only fires on the owning client
@@ -197,15 +199,29 @@ public:
   // server gets OnTransferAbortedServer and the owning client gets
   // OnTransferAborted, so the game can remove the loading screen.
   // An upstream merge must keep AbortTransferring on all three paths.
+  //
+  // Reason is a short token that the game maps to its own failure type;
+  // Error stays the human-readable text. The backend supplies its own
+  // typed reasons (ZoneNotConfigured, NoShardAvailable, ZoneStartTimeout,
+  // and so on) in the transfer-failed payload. Two failures never reach
+  // the backend, so this plugin names them:
+  //   "sidecar-down"    the sidecar is not connected, so the request never
+  //                     left this game server;
+  //   "realm-rejected"  the sidecar answered with an error that it marks
+  //                     safe to roll back.
+  // Keep both tokens stable; the game matches on them.
 
   /**
    * FORK(hollowed-oath): Server-only. Clears bTransferring, broadcasts
    * OnTransferAbortedServer, and tells the owning client with
-   * Client_OnTransferAborted. Error tells why the transfer stopped.
+   * Client_OnTransferAborted. Error tells why the transfer stopped and
+   * Reason gives the token above.
    * Does nothing when the player is not transferring, so one start can
    * never produce two aborts. The callers gate too, only for better logs.
    */
-  void AbortTransferring(const FString &Error);
+  void AbortTransferring(
+    const FString &Error, const FString &Reason = TEXT("")
+  );
 
   void ClearDirtyFlags() {
     bCharacterDataDirty = false;
