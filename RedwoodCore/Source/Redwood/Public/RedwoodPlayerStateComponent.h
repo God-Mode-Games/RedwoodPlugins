@@ -231,10 +231,9 @@ public:
    * loading screen that the transfer put up.
    * Does nothing when the player is not transferring, so one start can
    * never produce two aborts. The callers gate too, only for better logs.
+   * Reason has no default: a new caller must say which failure this is.
    */
-  void AbortTransferring(
-    const FString &Error, const FString &Reason = TEXT("")
-  );
+  void AbortTransferring(const FString &Error, const FString &Reason);
 
   void ClearDirtyFlags() {
     bCharacterDataDirty = false;

@@ -129,6 +129,18 @@ public:
   static constexpr const TCHAR *TransferFailedEventName =
     TEXT("realm:servers:transfer-zone:transfer-failed");
 
+  // FORK(hollowed-oath): the pair both TravelPlayerToZone* early returns
+  // give AbortTransferring when the sidecar is down. Named here, not at
+  // file scope, because the unity build merges translation units and a
+  // file-scope name can collide. SidecarDownError repeats the text of the
+  // upstream log line above each early return on purpose; upstream owns
+  // that line, so it keeps its own literal. SidecarDownReason is a
+  // contract: the game matches on the token, so keep it stable (see
+  // AbortTransferring in RedwoodPlayerStateComponent.h for the token list).
+  static constexpr const TCHAR *SidecarDownError =
+    TEXT("Sidecar is not connected; cannot travel player to new zone");
+  static constexpr const TCHAR *SidecarDownReason = TEXT("sidecar-down");
+
   // FORK(hollowed-oath): body of the fork-added transfer-failed sidecar
   // event, kept out of InitializeSidecar so the fork stays a few lines
   // there. Full rationale on the definition in the .cpp. Public for the

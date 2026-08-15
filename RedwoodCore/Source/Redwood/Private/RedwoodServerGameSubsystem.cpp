@@ -805,8 +805,7 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
     // for the rest of the session. See AbortTransferring's rationale block.
     if (PlayerStateComponent) {
       PlayerStateComponent->AbortTransferring(
-        TEXT("Sidecar is not connected; cannot travel player to new zone"),
-        TEXT("sidecar-down")
+        SidecarDownError, SidecarDownReason
       );
     }
     return;
@@ -1146,8 +1145,7 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
     // for the rest of the session. See AbortTransferring's rationale block.
     if (PlayerStateComponent) {
       PlayerStateComponent->AbortTransferring(
-        TEXT("Sidecar is not connected; cannot travel player to new zone"),
-        TEXT("sidecar-down")
+        SidecarDownError, SidecarDownReason
       );
     }
     return;
