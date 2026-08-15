@@ -199,42 +199,36 @@ public:
 
   // FORK(hollowed-oath): rollback for a transfer that does not complete.
   // InitTransferring runs BEFORE the TravelPlayerToZone* functions test the
-  // sidecar, and upstream has no path that clears the flag when that test
-  // fails — the player stays marked as transferring for the rest of the
-  // session, which also disables linkdead pawn retention and lastLocation
-  // persistence in the game project. Called from three places:
-  //   1. the sidecar-down early returns, where the request never left this
-  //      server;
-  //   2. a sidecar error response that the sidecar marks "ambiguous": false,
-  //      which proves the realm never started the transfer;
-  //   3. the realm's transfer-failed event, which reports a transfer that
-  //      the realm accepted but could not complete.
-  // Both of those callers first make sure the player is still transferring.
-  // An AMBIGUOUS sidecar error (the sidecar lost contact with the realm), or
-  // an answer with no "ambiguous" field at all (an older sidecar), keeps the
-  // flag and kicks the player, because the realm can have started the
-  // transfer and a retained body could duplicate a character.
-  // Unlike the earlier fork state, this now also tells the player: the
-  // server gets OnTransferAbortedServer and the owning client gets
-  // OnTransferAborted, so the game can remove the loading screen.
-  // An upstream merge must keep AbortTransferring on all three paths.
+  // sidecar, and upstream has NO path that clears the flag afterwards — the
+  // player then stays marked as transferring for the rest of the session,
+  // which also disables linkdead pawn retention and lastLocation
+  // persistence in the game project.
+  //
+  // An upstream merge must keep the three callers, all in
+  // RedwoodServerGameSubsystem.cpp, which own their own rules:
+  //   1. the sidecar-down early returns in TravelPlayerToZone*;
+  //   2. HandleTransferZoneResponse (which failures roll back and which
+  //      still kick);
+  //   3. HandleTransferFailedEvent (the realm's later report).
   //
   // Reason is a short token that the game maps to its own failure type;
-  // Error stays the human-readable text. The backend supplies its own
-  // typed reasons (ZoneNotConfigured, NoShardAvailable, ZoneStartTimeout,
-  // and so on) in the transfer-failed payload. Two failures never reach
-  // the backend, so this plugin names them:
+  // Error stays the human-readable text. The transfer-failed payload
+  // carries the backend's own kebab-case tokens ("zone-not-configured",
+  // "no-shard-available", "zone-start-timeout",
+  // "character-not-transferable", "proxy-not-found"), passed through
+  // unchanged. Two failures never reach the backend, so this plugin names
+  // them:
   //   "sidecar-down"    the sidecar is not connected, so the request never
   //                     left this game server;
   //   "realm-rejected"  the sidecar answered with an error that it marks
   //                     safe to roll back.
-  // Keep both tokens stable; the game matches on them.
+  // Keep both plugin tokens stable; the game matches on them.
 
   /**
-   * FORK(hollowed-oath): Server-only. Clears bTransferring, broadcasts
-   * OnTransferAbortedServer, and tells the owning client with
-   * Client_OnTransferAborted. Error tells why the transfer stopped and
-   * Reason gives the token above.
+   * FORK(hollowed-oath): Server-only. Clears bTransferring and
+   * ActiveTransferId, broadcasts OnTransferAbortedServer, and tells the
+   * owning client with Client_OnTransferAborted, so the game can remove the
+   * loading screen that the transfer put up.
    * Does nothing when the player is not transferring, so one start can
    * never produce two aborts. The callers gate too, only for better logs.
    */

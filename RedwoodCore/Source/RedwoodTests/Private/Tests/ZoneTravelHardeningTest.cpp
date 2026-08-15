@@ -24,6 +24,9 @@
 //      report that names a different transfer, but accepts one when either
 //      side has no id (an older backend, or a report that overtakes the
 //      answer that carries the id).
+//   7. URedwoodServerGameSubsystem::HandleTransferFailedEvent rolls the
+//      transfer back for the character the realm names, and only when that
+//      player is still transferring and the ids agree.
 // An upstream merge must keep these APIs or update this file in lockstep.
 
 #include "CoreMinimal.h"
@@ -33,6 +36,7 @@
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/GameModeBase.h"
+#include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerStart.h"
 #include "GameFramework/PlayerState.h"
@@ -92,32 +96,16 @@ bool FRedwoodZoneTravelAbortTransferringTest::RunTest(
     NewObject<URedwoodPlayerStateComponent>(PlayerState);
   Component->RegisterComponent();
 
-  // The server-side events the game binds to put a loading screen up and
-  // take it down again.
+  // The events the game binds to put a loading screen up and take it down
+  // again. The world is standalone, so the client RPC runs locally and the
+  // listener sees both sides.
   int32 StartCount = 0;
-  int32 AbortCount = 0;
-  FString AbortError;
-  FString AbortReason;
   Component->OnTransferringStartedServer.AddLambda([&StartCount]() {
     ++StartCount;
   });
-  Component->OnTransferAbortedServer.AddLambda(
-    [&AbortCount, &AbortError, &AbortReason](
-      const FString &Error, const FString &Reason
-    ) {
-      ++AbortCount;
-      AbortError = Error;
-      AbortReason = Reason;
-    }
-  );
-
-  // The owning client gets the same pair through the client RPC. This world
-  // is standalone, so the RPC runs locally and the listener sees it.
   URedwoodTransferAbortListener *Listener =
     NewObject<URedwoodTransferAbortListener>(Component);
-  Component->OnTransferAborted.AddDynamic(
-    Listener, &URedwoodTransferAbortListener::OnTransferAborted
-  );
+  Listener->Watch(Component);
 
   TestFalse(TEXT("not transferring initially"), Component->bTransferring);
   Component->InitTransferring();
@@ -126,35 +114,43 @@ bool FRedwoodZoneTravelAbortTransferringTest::RunTest(
 
   // Both the error text and the reason token must survive the whole chain;
   // the game maps the token to its own failure type.
-  Component->AbortTransferring(TEXT("zone is full"), TEXT("ZoneNotConfigured"));
+  Component->AbortTransferring(
+    TEXT("zone is full"), TEXT("zone-not-configured")
+  );
   TestFalse(
     TEXT("AbortTransferring rolls the flag back"), Component->bTransferring
   );
-  TestEqual(TEXT("the server hears the abort"), AbortCount, 1);
+  TestEqual(TEXT("the server hears the abort"), Listener->ServerCount, 1);
   TestEqual(
-    TEXT("the abort carries the error"), AbortError, TEXT("zone is full")
+    TEXT("the abort carries the error"),
+    Listener->ServerError,
+    TEXT("zone is full")
   );
   TestEqual(
     TEXT("the abort carries the reason"),
-    AbortReason,
-    TEXT("ZoneNotConfigured")
+    Listener->ServerReason,
+    TEXT("zone-not-configured")
   );
-  TestEqual(TEXT("the client hears the abort"), Listener->Count, 1);
+  TestEqual(TEXT("the client hears the abort"), Listener->ClientCount, 1);
   TestEqual(
-    TEXT("the client gets the error"), Listener->Error, TEXT("zone is full")
+    TEXT("the client gets the error"),
+    Listener->ClientError,
+    TEXT("zone is full")
   );
   TestEqual(
     TEXT("the client gets the reason"),
-    Listener->Reason,
-    TEXT("ZoneNotConfigured")
+    Listener->ClientReason,
+    TEXT("zone-not-configured")
   );
 
   // Idempotent on an already-clear flag: two failure paths can report the
   // same transfer, and the second one must broadcast nothing.
-  Component->AbortTransferring(TEXT("zone is full"), TEXT("ZoneNotConfigured"));
+  Component->AbortTransferring(
+    TEXT("zone is full"), TEXT("zone-not-configured")
+  );
   TestFalse(TEXT("a second abort stays clear"), Component->bTransferring);
-  TestEqual(TEXT("a second abort broadcasts nothing"), AbortCount, 1);
-  TestEqual(TEXT("the client hears nothing either"), Listener->Count, 1);
+  TestEqual(TEXT("a second abort broadcasts nothing"), Listener->ServerCount, 1);
+  TestEqual(TEXT("the client hears nothing either"), Listener->ClientCount, 1);
 
   // A repeated start still fires its events; that is upstream behaviour.
   Component->InitTransferring();
@@ -241,18 +237,10 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
 
   // An explicit false proves the transfer never started: roll back, do not
   // kick.
-  int32 AbortCount = 0;
-  FString AbortError;
-  FString AbortReason;
-  Component->OnTransferAbortedServer.AddLambda(
-    [&AbortCount, &AbortError, &AbortReason](
-      const FString &Error, const FString &Reason
-    ) {
-      ++AbortCount;
-      AbortError = Error;
-      AbortReason = Reason;
-    }
-  );
+  URedwoodTransferAbortListener *Listener =
+    NewObject<URedwoodTransferAbortListener>(Component);
+  Listener->Watch(Component);
+
   TSharedPtr<FJsonObject> Safe = MakeShareable(new FJsonObject);
   Safe->SetStringField(TEXT("error"), TEXT("zone is full"));
   Safe->SetBoolField(TEXT("ambiguous"), false);
@@ -260,13 +248,15 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
   TestFalse(
     TEXT("an explicit false rolls the flag back"), Component->bTransferring
   );
-  TestEqual(TEXT("the rollback happened once"), AbortCount, 1);
+  TestEqual(TEXT("the rollback happened once"), Listener->ServerCount, 1);
   TestEqual(
-    TEXT("the rollback carries the error"), AbortError, TEXT("zone is full")
+    TEXT("the rollback carries the error"),
+    Listener->ServerError,
+    TEXT("zone is full")
   );
   TestEqual(
     TEXT("the rollback names the realm as the source"),
-    AbortReason,
+    Listener->ServerReason,
     TEXT("realm-rejected")
   );
   TestEqual(
@@ -278,7 +268,120 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
   // The same answer again, with the player no longer transferring: a stale
   // answer must not fire the rollback events a second time.
   Subsystem->HandleTransferZoneResponse(Safe, WeakPlayerController);
-  TestEqual(TEXT("a stale answer does not roll back again"), AbortCount, 1);
+  TestEqual(
+    TEXT("a stale answer does not roll back again"), Listener->ServerCount, 1
+  );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodZoneTravelTransferFailedEventTest,
+  "Redwood.ZoneTravel.TheRealmsFailureReportRollsTheTransferBack",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodZoneTravelTransferFailedEventTest::RunTest(
+  const FString &Parameters
+) {
+  // Every gate below logs a warning; expect each one in case the harness
+  // raises warnings to errors.
+  const EAutomationExpectedErrorFlags::MatchType Contains =
+    EAutomationExpectedErrorFlags::Contains;
+  AddExpectedError(TEXT("but the player is not transferring"), Contains, 0);
+  AddExpectedError(TEXT("but no player on this server matches"), Contains, 0);
+  AddExpectedError(TEXT("Ignoring a failed transfer report"), Contains, 0);
+  AddExpectedError(TEXT("The realm could not transfer character"), Contains, 0);
+
+  RedwoodZoneTravelTest::FScopedWorld Scoped;
+
+  URedwoodServerGameSubsystem *Subsystem =
+    Scoped.GameInstance->GetSubsystem<URedwoodServerGameSubsystem>();
+  if (!TestNotNull(TEXT("subsystem available"), Subsystem)) {
+    return false;
+  }
+
+  // The handler walks GameState->PlayerArray, so the world needs a game
+  // state. AGameStateBase collects every APlayerState already in the world
+  // when it spawns, so the spawn order does not matter.
+  AGameStateBase *GameState = Scoped.World->SpawnActor<AGameStateBase>();
+  APlayerState *PlayerState = Scoped.World->SpawnActor<APlayerState>();
+  if (!TestNotNull(TEXT("game state spawned"), GameState) ||
+      !TestNotNull(TEXT("player state spawned"), PlayerState)) {
+    return false;
+  }
+  if (!TestTrue(
+        TEXT("the player state joined the game state"),
+        GameState->PlayerArray.Contains(PlayerState)
+      )) {
+    return false;
+  }
+
+  URedwoodPlayerStateComponent *Component =
+    NewObject<URedwoodPlayerStateComponent>(PlayerState);
+  Component->RegisterComponent();
+  Component->RedwoodCharacter.Id = TEXT("character-1");
+
+  URedwoodTransferAbortListener *Listener =
+    NewObject<URedwoodTransferAbortListener>(Component);
+  Listener->Watch(Component);
+
+  // Builds the payload the realm sends.
+  auto MakeReport = [](const FString &CharacterId, const FString &TransferId) {
+    TSharedPtr<FJsonObject> Report = MakeShareable(new FJsonObject);
+    Report->SetStringField(TEXT("playerId"), TEXT("player-1"));
+    Report->SetStringField(TEXT("characterId"), CharacterId);
+    Report->SetStringField(TEXT("transferId"), TransferId);
+    Report->SetStringField(TEXT("error"), TEXT("the zone did not start"));
+    Report->SetStringField(TEXT("reason"), TEXT("zone-start-timeout"));
+    return Report;
+  };
+
+  // Not transferring: the report is stale or wrong, so nothing fires.
+  Subsystem->HandleTransferFailedEvent(
+    MakeReport(TEXT("character-1"), TEXT("transfer-1"))
+  );
+  TestEqual(
+    TEXT("a report for a player who is not transferring is ignored"),
+    Listener->ServerCount,
+    0
+  );
+
+  Component->InitTransferring();
+  Component->ActiveTransferId = TEXT("transfer-1");
+
+  // A report for another character on this server must not touch this one.
+  Subsystem->HandleTransferFailedEvent(
+    MakeReport(TEXT("character-2"), TEXT("transfer-1"))
+  );
+  TestEqual(
+    TEXT("a report for another character is ignored"), Listener->ServerCount, 0
+  );
+
+  // A report that names an earlier transfer must not roll this one back.
+  Subsystem->HandleTransferFailedEvent(
+    MakeReport(TEXT("character-1"), TEXT("transfer-0"))
+  );
+  TestEqual(
+    TEXT("a report for another transfer is ignored"), Listener->ServerCount, 0
+  );
+  TestTrue(TEXT("the transfer is still in flight"), Component->bTransferring);
+
+  // The matching report aborts once and hands the backend's reason on.
+  Subsystem->HandleTransferFailedEvent(
+    MakeReport(TEXT("character-1"), TEXT("transfer-1"))
+  );
+  TestFalse(TEXT("the report rolls the flag back"), Component->bTransferring);
+  TestEqual(TEXT("the abort fired once"), Listener->ServerCount, 1);
+  TestEqual(
+    TEXT("the abort carries the realm's error"),
+    Listener->ServerError,
+    TEXT("the zone did not start")
+  );
+  TestEqual(
+    TEXT("the abort carries the realm's reason"),
+    Listener->ServerReason,
+    TEXT("zone-start-timeout")
+  );
   return true;
 }
 

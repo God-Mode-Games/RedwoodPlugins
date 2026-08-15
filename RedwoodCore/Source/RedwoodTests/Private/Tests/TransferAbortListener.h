@@ -1,13 +1,16 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
 // FORK(hollowed-oath): file is fork-added, for ZoneTravelHardeningTest.
-// URedwoodPlayerStateComponent::OnTransferAborted is a dynamic (Blueprint)
-// delegate, so only a UFUNCTION on a UObject can listen to it. This holds
-// the last pair the delegate carried.
+// Records what a transfer abort delivered, on both sides at once:
+// OnTransferAbortedServer (native, server) and OnTransferAborted (dynamic,
+// owning client, reached through Client_OnTransferAborted). The client one
+// is a Blueprint delegate, so only a UFUNCTION on a UObject can listen.
 
 #pragma once
 
 #include "CoreMinimal.h"
+
+#include "RedwoodPlayerStateComponent.h"
 
 #include "TransferAbortListener.generated.h"
 
@@ -16,14 +19,33 @@ class URedwoodTransferAbortListener : public UObject {
   GENERATED_BODY()
 
 public:
-  int32 Count = 0;
-  FString Error;
-  FString Reason;
+  int32 ServerCount = 0;
+  FString ServerError;
+  FString ServerReason;
+
+  int32 ClientCount = 0;
+  FString ClientError;
+  FString ClientReason;
+
+  // Bind both sides. Outer this listener to Component so the captured
+  // "this" cannot outlive the delegate that holds it.
+  void Watch(URedwoodPlayerStateComponent *Component) {
+    Component->OnTransferAbortedServer.AddLambda(
+      [this](const FString &InError, const FString &InReason) {
+        ++ServerCount;
+        ServerError = InError;
+        ServerReason = InReason;
+      }
+    );
+    Component->OnTransferAborted.AddDynamic(
+      this, &URedwoodTransferAbortListener::OnTransferAborted
+    );
+  }
 
   UFUNCTION()
   void OnTransferAborted(FString InError, FString InReason) {
-    ++Count;
-    Error = InError;
-    Reason = InReason;
+    ++ClientCount;
+    ClientError = InError;
+    ClientReason = InReason;
   }
 };

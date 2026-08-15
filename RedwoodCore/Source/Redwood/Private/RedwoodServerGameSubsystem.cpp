@@ -552,122 +552,16 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
   );
 
   // FORK(hollowed-oath): the realm tells the game server when a transfer it
-  // had accepted then failed. Upstream has no such event, so a player whose
-  // transfer died after the sidecar answered kept the transferring latch for
-  // the rest of the session and never learned that the travel had stopped.
+  // had accepted then failed. Upstream has no such event. The rules live in
+  // HandleTransferFailedEvent.
   Sidecar->OnEvent(
     TEXT("realm:servers:transfer-zone:transfer-failed"),
     [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
       const TSharedPtr<FJsonObject> *Object;
 
-      if (!Message->TryGetObject(Object) || !Object) {
-        return;
+      if (Message->TryGetObject(Object) && Object) {
+        HandleTransferFailedEvent(*Object);
       }
-
-      TSharedPtr<FJsonObject> ActualObject = *Object;
-
-      // Read every field quietly: GetStringField logs an engine error for a
-      // field that a malformed payload does not carry.
-      FString CharacterId;
-      FString Error;
-      FString Reason;
-      FString TransferId;
-      ActualObject->TryGetStringField(TEXT("error"), Error);
-      ActualObject->TryGetStringField(TEXT("reason"), Reason);
-      ActualObject->TryGetStringField(TEXT("transferId"), TransferId);
-
-      // Without a character id there is no player to tell.
-      if (!ActualObject->TryGetStringField(TEXT("characterId"), CharacterId) ||
-          CharacterId.IsEmpty()) {
-        UE_LOG(
-          LogRedwood,
-          Warning,
-          TEXT("The realm reported a failed transfer with no character id")
-        );
-        return;
-      }
-
-      UWorld *World = GetWorld();
-      AGameStateBase *GameState =
-        IsValid(World) ? World->GetGameState() : nullptr;
-
-      if (!IsValid(GameState)) {
-        return;
-      }
-
-      // Find the player state for this character.
-      for (APlayerState *PlayerState : GameState->PlayerArray) {
-        if (!IsValid(PlayerState)) {
-          continue;
-        }
-
-        URedwoodPlayerStateComponent *PlayerStateComponent =
-          PlayerState->FindComponentByClass<URedwoodPlayerStateComponent>();
-
-        if (!IsValid(PlayerStateComponent) ||
-            PlayerStateComponent->RedwoodCharacter.Id != CharacterId) {
-          continue;
-        }
-
-        // A report for a player who is not transferring is stale or wrong;
-        // an abort here would fire rollback events for a transfer that does
-        // not exist.
-        if (!PlayerStateComponent->bTransferring) {
-          UE_LOG(
-            LogRedwood,
-            Warning,
-            TEXT(
-              "The realm reported a failed transfer for character %s, but the player is not transferring: %s"
-            ),
-            *CharacterId,
-            *Error
-          );
-          return;
-        }
-
-        // FORK(hollowed-oath): drop a report that names a different
-        // transfer. Only two non-empty ids that differ are a mismatch: an
-        // older backend sends no id, and a report can arrive before the
-        // answer that gives this server the id, so absence must never block
-        // the abort. See MatchesActiveTransfer.
-        if (!PlayerStateComponent->MatchesActiveTransfer(TransferId)) {
-          UE_LOG(
-            LogRedwood,
-            Warning,
-            TEXT(
-              "Ignoring a failed transfer report for character %s: it names transfer %s, but the player is on transfer %s"
-            ),
-            *CharacterId,
-            *TransferId,
-            *PlayerStateComponent->ActiveTransferId
-          );
-          return;
-        }
-
-        UE_LOG(
-          LogRedwood,
-          Warning,
-          TEXT("The realm could not transfer character %s (%s): %s"),
-          *CharacterId,
-          *Reason,
-          *Error
-        );
-
-        // Reason is the backend's typed token; it reaches the game through
-        // OnTransferAbortedServer.
-        PlayerStateComponent->AbortTransferring(Error, Reason);
-        return;
-      }
-
-      UE_LOG(
-        LogRedwood,
-        Warning,
-        TEXT(
-          "The realm reported a failed transfer for character %s, but no player on this server matches: %s"
-        ),
-        *CharacterId,
-        *Error
-      );
     }
   );
 
@@ -926,15 +820,15 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
     *InZoneName
   );
 
-  // FORK(hollowed-oath): a weak pointer keeps the callback safe if the
-  // player leaves before the sidecar answers.
+  // FORK(hollowed-oath): upstream handled the answer inline here and in
+  // TravelPlayerToZoneSpawnName; the rules now live once in
+  // HandleTransferZoneResponse. A weak pointer keeps the callback safe if
+  // the player leaves before the sidecar answers.
   TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
 
   Sidecar->Emit(
     TEXT("realm:servers:transfer-zone:game-server-to-sidecar"),
     Payload,
-    // FORK(hollowed-oath): the response rules live in one place now; see
-    // HandleTransferZoneResponse.
     [this, WeakPlayerController](auto Response) {
       HandleTransferZoneResponse(Response[0]->AsObject(), WeakPlayerController);
     }
@@ -1048,6 +942,124 @@ void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
   }
 }
 
+// FORK(hollowed-oath): body of the transfer-failed sidecar event, which
+// upstream does not have. The realm sends it when a transfer it had already
+// accepted then failed, so the answer to the transfer-zone route was empty
+// and only this tells the server that the travel stopped. Without it the
+// player keeps the transferring latch for the rest of the session.
+//
+// Payload: { playerId, characterId, transferId, error, reason }. Reason is
+// the backend's kebab-case token (see AbortTransferring in
+// RedwoodPlayerStateComponent.h); it goes to the game unchanged.
+//
+// Three gates before the abort, in order: the character must be on this
+// server, the player must still be transferring (bTransferring), and the
+// report must name the transfer in flight (MatchesActiveTransfer).
+void URedwoodServerGameSubsystem::HandleTransferFailedEvent(
+  const TSharedPtr<FJsonObject> &Payload
+) {
+  if (!Payload.IsValid()) {
+    return;
+  }
+
+  // Read every field quietly: GetStringField logs an engine error for a
+  // field that a malformed payload does not carry.
+  FString CharacterId;
+  FString Error;
+  FString Reason;
+  FString TransferId;
+  Payload->TryGetStringField(TEXT("error"), Error);
+  Payload->TryGetStringField(TEXT("reason"), Reason);
+  Payload->TryGetStringField(TEXT("transferId"), TransferId);
+
+  // Without a character id there is no player to tell.
+  if (!Payload->TryGetStringField(TEXT("characterId"), CharacterId) ||
+      CharacterId.IsEmpty()) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("The realm reported a failed transfer with no character id")
+    );
+    return;
+  }
+
+  UWorld *World = GetWorld();
+  AGameStateBase *GameState = IsValid(World) ? World->GetGameState() : nullptr;
+
+  if (!IsValid(GameState)) {
+    return;
+  }
+
+  // Find the player state for this character.
+  for (APlayerState *PlayerState : GameState->PlayerArray) {
+    if (!IsValid(PlayerState)) {
+      continue;
+    }
+
+    URedwoodPlayerStateComponent *PlayerStateComponent =
+      PlayerState->FindComponentByClass<URedwoodPlayerStateComponent>();
+
+    if (!IsValid(PlayerStateComponent) ||
+        PlayerStateComponent->RedwoodCharacter.Id != CharacterId) {
+      continue;
+    }
+
+    // A report for a player who is not transferring is stale or wrong; an
+    // abort here would fire rollback events for a transfer that does not
+    // exist.
+    if (!PlayerStateComponent->bTransferring) {
+      UE_LOG(
+        LogRedwood,
+        Warning,
+        TEXT(
+          "The realm reported a failed transfer for character %s, but the player is not transferring: %s"
+        ),
+        *CharacterId,
+        *Error
+      );
+      return;
+    }
+
+    // Drop a report that names a different transfer; absence on either side
+    // must never block the abort (see MatchesActiveTransfer).
+    if (!PlayerStateComponent->MatchesActiveTransfer(TransferId)) {
+      UE_LOG(
+        LogRedwood,
+        Warning,
+        TEXT(
+          "Ignoring a failed transfer report for character %s: it names transfer %s, but the player is on transfer %s"
+        ),
+        *CharacterId,
+        *TransferId,
+        *PlayerStateComponent->ActiveTransferId
+      );
+      return;
+    }
+
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("The realm could not transfer character %s (%s): %s"),
+      *CharacterId,
+      *Reason,
+      *Error
+    );
+
+    PlayerStateComponent->AbortTransferring(Error, Reason);
+    return;
+  }
+
+  UE_LOG(
+    LogRedwood,
+    Warning,
+    TEXT(
+      "The realm reported a failed transfer for character %s, but no player on this server matches: %s"
+    ),
+    *CharacterId,
+    *Error
+  );
+}
+
 void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
   APlayerController *PlayerController,
   const FString &InZoneName,
@@ -1142,15 +1154,13 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
     *InZoneName
   );
 
-  // FORK(hollowed-oath): a weak pointer keeps the callback safe if the
-  // player leaves before the sidecar answers.
+  // FORK(hollowed-oath): same shared answer handling as
+  // TravelPlayerToZoneTransform above; see the comment there.
   TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
 
   Sidecar->Emit(
     TEXT("realm:servers:transfer-zone:game-server-to-sidecar"),
     Payload,
-    // FORK(hollowed-oath): the response rules live in one place now; see
-    // HandleTransferZoneResponse.
     [this, WeakPlayerController](auto Response) {
       HandleTransferZoneResponse(Response[0]->AsObject(), WeakPlayerController);
     }

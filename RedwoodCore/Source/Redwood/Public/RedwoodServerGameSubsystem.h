@@ -121,6 +121,12 @@ public:
     TWeakObjectPtr<APlayerController> WeakPlayerController
   );
 
+  // FORK(hollowed-oath): body of the fork-added transfer-failed sidecar
+  // event, kept out of InitializeSidecar so the fork stays a few lines
+  // there. Full rationale on the definition in the .cpp. Public for the
+  // same reason as HandleTransferZoneResponse above.
+  void HandleTransferFailedEvent(const TSharedPtr<FJsonObject> &Payload);
+
   void FlushSync();
   void FlushPersistence();
   UFUNCTION(BlueprintCallable, Category = "Redwood")
