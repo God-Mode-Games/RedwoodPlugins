@@ -99,6 +99,14 @@ void URedwoodPlayerStateComponent::SetServerReady() {
 void URedwoodPlayerStateComponent::InitTransferring() {
   bTransferring = true;
 
+  // FORK(hollowed-oath): a new transfer must never keep the name of an older
+  // one. The answer of a transfer that is over can land after the abort and
+  // write its id back (the answer and the failure report can pass each
+  // other), and a second travel can start before the first answer arrives.
+  // A kept id then makes MatchesActiveTransfer drop the failure report of
+  // THIS transfer, and the player stays latched as transferring.
+  ActiveTransferId.Empty();
+
   // Notify the owning client. The Client RPC routes through the
   // PlayerState's owning controller's net connection, so only the
   // player being transferred receives it. On a standalone/listen host

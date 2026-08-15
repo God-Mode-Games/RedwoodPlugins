@@ -133,7 +133,8 @@ public:
   // FORK(hollowed-oath): the id the realm gave the transfer that is now in
   // flight, taken from the transfer-zone answer. Server-only and never
   // replicated: only the game server matches reports against it.
-  // AbortTransferring clears it.
+  // InitTransferring and AbortTransferring both clear it, so no transfer can
+  // keep the name of an earlier one.
   FString ActiveTransferId;
 
   /**
@@ -155,7 +156,8 @@ public:
    * via Client_OnTransferring, which broadcasts OnTransferring locally.
    * Called from URedwoodServerGameSubsystem's TravelPlayerToZone* paths
    * in place of setting bTransferring directly.
-   * FORK(hollowed-oath): also broadcasts OnTransferringStartedServer.
+   * FORK(hollowed-oath): also clears ActiveTransferId and broadcasts
+   * OnTransferringStartedServer.
    */
   void InitTransferring();
 

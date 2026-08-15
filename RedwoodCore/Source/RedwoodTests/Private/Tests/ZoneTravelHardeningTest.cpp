@@ -23,7 +23,8 @@
 //   6. URedwoodPlayerStateComponent::MatchesActiveTransfer drops a failure
 //      report that names a different transfer, but accepts one when either
 //      side has no id (an older backend, or a report that overtakes the
-//      answer that carries the id).
+//      answer that carries the id). InitTransferring and AbortTransferring
+//      both clear the id, so no transfer keeps the name of an earlier one.
 //   7. URedwoodServerGameSubsystem::HandleTransferFailedEvent rolls the
 //      transfer back for the character the realm names, and only when that
 //      player is still transferring and the ids agree.
@@ -455,6 +456,22 @@ bool FRedwoodZoneTravelTransferIdMatchTest::RunTest(const FString &Parameters) {
     TEXT("the abort clears the transfer id"),
     Component->ActiveTransferId,
     FString()
+  );
+
+  // A new transfer must not keep the name of an earlier one. The answer of
+  // the transfer that is over can arrive after the abort and write its id
+  // back; the next start must throw that away, or the failure report of the
+  // new transfer does not match and the player stays latched.
+  Component->ActiveTransferId = TEXT("transfer-1");
+  Component->InitTransferring();
+  TestEqual(
+    TEXT("a new start drops the earlier transfer id"),
+    Component->ActiveTransferId,
+    FString()
+  );
+  TestTrue(
+    TEXT("the report of the new transfer matches"),
+    Component->MatchesActiveTransfer(TEXT("transfer-2"))
   );
   return true;
 }
