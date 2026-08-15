@@ -116,10 +116,16 @@ bool FRedwoodZoneTravelAbortTransferringTest::RunTest(
     TEXT("the abort carries the error"), AbortError, TEXT("zone is full")
   );
 
-  // Idempotent on an already-clear flag: the async error path can race a
-  // second failed call.
+  // Idempotent on an already-clear flag: two failure paths can report the
+  // same transfer, and the second one must broadcast nothing.
   Component->AbortTransferring(TEXT("zone is full"));
   TestFalse(TEXT("a second abort stays clear"), Component->bTransferring);
+  TestEqual(TEXT("a second abort broadcasts nothing"), AbortCount, 1);
+
+  // A repeated start still fires its events; that is upstream behaviour.
+  Component->InitTransferring();
+  Component->InitTransferring();
+  TestEqual(TEXT("every start is announced"), StartCount, 3);
   return true;
 }
 

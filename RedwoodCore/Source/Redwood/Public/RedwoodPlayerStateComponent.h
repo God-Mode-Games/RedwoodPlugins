@@ -202,6 +202,8 @@ public:
    * FORK(hollowed-oath): Server-only. Clears bTransferring, broadcasts
    * OnTransferAbortedServer, and tells the owning client with
    * Client_OnTransferAborted. Error tells why the transfer stopped.
+   * Does nothing when the player is not transferring, so one start can
+   * never produce two aborts. The callers gate too, only for better logs.
    */
   void AbortTransferring(const FString &Error);
 

@@ -117,6 +117,18 @@ void URedwoodPlayerStateComponent::Client_OnTransferring_Implementation() {
 // FORK(hollowed-oath): rollback for a transfer that does not complete.
 // See the rationale block in the header.
 void URedwoodPlayerStateComponent::AbortTransferring(const FString &Error) {
+  // Last line of defence: two failure paths can report the same transfer,
+  // and one start must never produce two aborts.
+  if (!bTransferring) {
+    UE_LOG(
+      LogRedwood,
+      Verbose,
+      TEXT("Ignoring an abort for a player who is not transferring: %s"),
+      *Error
+    );
+    return;
+  }
+
   bTransferring = false;
 
   OnTransferAbortedServer.Broadcast(Error);
