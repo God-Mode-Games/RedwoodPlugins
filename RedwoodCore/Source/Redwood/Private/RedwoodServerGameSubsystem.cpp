@@ -591,6 +591,22 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
           continue;
         }
 
+        // A report for a player who is not transferring is stale or wrong;
+        // an abort here would fire rollback events for a transfer that does
+        // not exist.
+        if (!PlayerStateComponent->bTransferring) {
+          UE_LOG(
+            LogRedwood,
+            Warning,
+            TEXT(
+              "The realm reported a failed transfer for character %s, but the player is not transferring: %s"
+            ),
+            *CharacterId,
+            *Error
+          );
+          return;
+        }
+
         UE_LOG(
           LogRedwood,
           Warning,
