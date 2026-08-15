@@ -184,13 +184,15 @@ public:
   // persistence in the game project. Called from three places:
   //   1. the sidecar-down early returns, where the request never left this
   //      server;
-  //   2. a sidecar error response that is NOT ambiguous, which proves the
-  //      realm never started the transfer;
+  //   2. a sidecar error response that the sidecar marks "ambiguous": false,
+  //      which proves the realm never started the transfer;
   //   3. the realm's transfer-failed event, which reports a transfer that
   //      the realm accepted but could not complete.
-  // An AMBIGUOUS sidecar error (the sidecar lost contact with the realm)
-  // still keeps the flag and kicks the player, because the realm can have
-  // started the transfer and a retained body could duplicate a character.
+  // Both of those callers first make sure the player is still transferring.
+  // An AMBIGUOUS sidecar error (the sidecar lost contact with the realm), or
+  // an answer with no "ambiguous" field at all (an older sidecar), keeps the
+  // flag and kicks the player, because the realm can have started the
+  // transfer and a retained body could duplicate a character.
   // Unlike the earlier fork state, this now also tells the player: the
   // server gets OnTransferAbortedServer and the owning client gets
   // OnTransferAborted, so the game can remove the loading screen.

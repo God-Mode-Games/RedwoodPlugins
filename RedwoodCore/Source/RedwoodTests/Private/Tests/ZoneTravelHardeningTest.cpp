@@ -6,9 +6,6 @@
 //      bTransferring latch that InitTransferring sets before the
 //      TravelPlayerToZone* sidecar checks, and both tell the server through
 //      OnTransferringStartedServer / OnTransferAbortedServer.
-//   5. URedwoodServerGameSubsystem::HandleTransferZoneResponse kicks the
-//      player ONLY when the sidecar marks the error ambiguous; any other
-//      error rolls the transfer back and keeps the player in this zone.
 //   2. ARedwoodZoneSpawn::GetSpawnGroundClearance lifts by the default
 //      pawn's capsule half-height plus a margin when the game mode exposes
 //      an ACharacter pawn — never below the upstream 100 units — and keeps
@@ -19,6 +16,10 @@
 //   4. URedwoodGameModeComponent::ResolveFallbackArrivalTransform refuses a
 //      map with no arrival point — never the world-origin AWorldSettings
 //      actor that a bare FindPlayerStart returns.
+//   5. URedwoodServerGameSubsystem::HandleTransferZoneResponse rolls the
+//      transfer back ONLY when the sidecar marks the error "ambiguous":
+//      false, and only while the player is still transferring. An ambiguous
+//      error, or an answer with no such field (an older sidecar), kicks.
 // An upstream merge must keep these APIs or update this file in lockstep.
 
 #include "CoreMinimal.h"
@@ -129,11 +130,17 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
-  // Both failure branches log at Error level on purpose.
+  // Every failure branch logs at Error level on purpose: two kicks and two
+  // rollback attempts below.
   AddExpectedError(
     TEXT("Failed to transfer player to new zone"),
     EAutomationExpectedErrorFlags::Contains,
-    2
+    4
+  );
+  // The stale answer only warns; expect it in case the harness raises
+  // warnings to errors.
+  AddExpectedError(
+    TEXT("not transferring"), EAutomationExpectedErrorFlags::Contains, 0
   );
 
   RedwoodZoneTravelTest::FScopedWorld Scoped;
@@ -176,20 +183,42 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
   Subsystem->HandleTransferZoneResponse(Ambiguous, WeakPlayerController);
   TestTrue(TEXT("an ambiguous error keeps the flag"), Component->bTransferring);
 
-  // A plain error proves the transfer never started: roll back, do not kick.
+  // No "ambiguous" field at all: an old sidecar that does not send it. This
+  // must behave as ambiguous, or a game server that runs against an older
+  // backend can roll a transfer back that the realm already committed.
+  TSharedPtr<FJsonObject> NoField = MakeShareable(new FJsonObject);
+  NoField->SetStringField(TEXT("error"), TEXT("realm timed out"));
+  Subsystem->HandleTransferZoneResponse(NoField, WeakPlayerController);
+  TestTrue(
+    TEXT("a missing ambiguous field keeps the flag"), Component->bTransferring
+  );
+
+  // An explicit false proves the transfer never started: roll back, do not
+  // kick.
+  int32 AbortCount = 0;
   FString AbortError;
   Component->OnTransferAbortedServer.AddLambda(
-    [&AbortError](const FString &Error) { AbortError = Error; }
+    [&AbortCount, &AbortError](const FString &Error) {
+      ++AbortCount;
+      AbortError = Error;
+    }
   );
-  TSharedPtr<FJsonObject> Plain = MakeShareable(new FJsonObject);
-  Plain->SetStringField(TEXT("error"), TEXT("zone is full"));
-  Subsystem->HandleTransferZoneResponse(Plain, WeakPlayerController);
+  TSharedPtr<FJsonObject> Safe = MakeShareable(new FJsonObject);
+  Safe->SetStringField(TEXT("error"), TEXT("zone is full"));
+  Safe->SetBoolField(TEXT("ambiguous"), false);
+  Subsystem->HandleTransferZoneResponse(Safe, WeakPlayerController);
   TestFalse(
-    TEXT("a plain error rolls the flag back"), Component->bTransferring
+    TEXT("an explicit false rolls the flag back"), Component->bTransferring
   );
+  TestEqual(TEXT("the rollback happened once"), AbortCount, 1);
   TestEqual(
     TEXT("the rollback carries the error"), AbortError, TEXT("zone is full")
   );
+
+  // The same answer again, with the player no longer transferring: a stale
+  // answer must not fire the rollback events a second time.
+  Subsystem->HandleTransferZoneResponse(Safe, WeakPlayerController);
+  TestEqual(TEXT("a stale answer does not roll back again"), AbortCount, 1);
   return true;
 }
 

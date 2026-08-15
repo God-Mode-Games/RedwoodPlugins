@@ -565,9 +565,25 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
       }
 
       TSharedPtr<FJsonObject> ActualObject = *Object;
-      FString CharacterId = ActualObject->GetStringField(TEXT("characterId"));
-      FString Error = ActualObject->GetStringField(TEXT("error"));
-      FString Reason = ActualObject->GetStringField(TEXT("reason"));
+
+      // Read every field quietly: GetStringField logs an engine error for a
+      // field that a malformed payload does not carry.
+      FString CharacterId;
+      FString Error;
+      FString Reason;
+      ActualObject->TryGetStringField(TEXT("error"), Error);
+      ActualObject->TryGetStringField(TEXT("reason"), Reason);
+
+      // Without a character id there is no player to tell.
+      if (!ActualObject->TryGetStringField(TEXT("characterId"), CharacterId) ||
+          CharacterId.IsEmpty()) {
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT("The realm reported a failed transfer with no character id")
+        );
+        return;
+      }
 
       UWorld *World = GetWorld();
       AGameStateBase *GameState =
@@ -906,16 +922,21 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
 //
 // Upstream kicks the player on EVERY error. That is too strong: most errors
 // happen before the realm takes the transfer, so the player can stay in this
-// zone. The sidecar now sets "ambiguous" to true ONLY when it lost contact
-// with the realm during the request, which is the one case where the realm
-// can have moved the character already.
+// zone. The sidecar now stamps "ambiguous" on every error answer: false when
+// it knows the realm never took the transfer, true when it lost contact with
+// the realm during the request and the realm can have moved the character
+// already.
 //
-//   ambiguous     -> keep the transferring flag and kick. The kick's Logout
-//                    must run the transferring teardown (no linkdead
+//   ambiguous or ABSENT -> keep the transferring flag and kick. The kick's
+//                    Logout must run the transferring teardown (no linkdead
 //                    retention), because a retained body could duplicate a
-//                    character the realm already re-homed.
-//   not ambiguous -> the transfer never started. AbortTransferring rolls the
-//                    flag back and tells the player, who stays in this zone.
+//                    character the realm already re-homed. An absent field
+//                    means an old sidecar that does not send it; the kick is
+//                    the safe answer, so a game server can run against an
+//                    older backend without a risk of duplication.
+//   explicitly false -> the transfer never started. AbortTransferring rolls
+//                    the flag back and tells the player, who stays in this
+//                    zone.
 //
 // The callback is asynchronous, so the player, the world, and the game mode
 // can all be gone by the time it runs; every one of them is checked.
@@ -933,7 +954,8 @@ void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
     return;
   }
 
-  bool bAmbiguous = false;
+  // Missing field = old sidecar; keep the safe answer.
+  bool bAmbiguous = true;
   Response->TryGetBoolField(TEXT("ambiguous"), bAmbiguous);
 
   APlayerController *PlayerController = WeakPlayerController.Get();
@@ -951,8 +973,23 @@ void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
         PlayerController->PlayerState
           ->FindComponentByClass<URedwoodPlayerStateComponent>();
 
+      // The player must still be transferring. The abort sources are
+      // exclusive — an accepted transfer answers with an empty error, and
+      // only an accepted transfer can make the realm send transfer-failed —
+      // so a late answer can only belong to the transfer that latched the
+      // flag. This gate makes that reasoning unnecessary for safety.
       if (IsValid(PlayerStateComponent)) {
-        PlayerStateComponent->AbortTransferring(Error);
+        if (PlayerStateComponent->bTransferring) {
+          PlayerStateComponent->AbortTransferring(Error);
+        } else {
+          UE_LOG(
+            LogRedwood,
+            Warning,
+            TEXT(
+              "Ignoring a failed transfer answer for a player who is not transferring"
+            )
+          );
+        }
       }
     }
 
