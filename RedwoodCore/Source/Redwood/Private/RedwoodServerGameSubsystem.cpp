@@ -571,8 +571,10 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
       FString CharacterId;
       FString Error;
       FString Reason;
+      FString TransferId;
       ActualObject->TryGetStringField(TEXT("error"), Error);
       ActualObject->TryGetStringField(TEXT("reason"), Reason);
+      ActualObject->TryGetStringField(TEXT("transferId"), TransferId);
 
       // Without a character id there is no player to tell.
       if (!ActualObject->TryGetStringField(TEXT("characterId"), CharacterId) ||
@@ -619,6 +621,25 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
             ),
             *CharacterId,
             *Error
+          );
+          return;
+        }
+
+        // FORK(hollowed-oath): drop a report that names a different
+        // transfer. Only two non-empty ids that differ are a mismatch: an
+        // older backend sends no id, and a report can arrive before the
+        // answer that gives this server the id, so absence must never block
+        // the abort. See MatchesActiveTransfer.
+        if (!PlayerStateComponent->MatchesActiveTransfer(TransferId)) {
+          UE_LOG(
+            LogRedwood,
+            Warning,
+            TEXT(
+              "Ignoring a failed transfer report for character %s: it names transfer %s, but the player is on transfer %s"
+            ),
+            *CharacterId,
+            *TransferId,
+            *PlayerStateComponent->ActiveTransferId
           );
           return;
         }
@@ -951,17 +972,32 @@ void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
     return;
   }
 
+  APlayerController *PlayerController = WeakPlayerController.Get();
+  URedwoodPlayerStateComponent *PlayerStateComponent =
+    IsValid(PlayerController) && IsValid(PlayerController->PlayerState)
+    ? PlayerController->PlayerState
+        ->FindComponentByClass<URedwoodPlayerStateComponent>()
+    : nullptr;
+
   FString Error = Response->GetStringField(TEXT("error"));
 
   if (Error.IsEmpty()) {
+    // FORK(hollowed-oath): the realm took the transfer and named it. Keep
+    // the name, so a later transfer-failed report can be matched to this
+    // transfer. The field is absent on an older backend, and
+    // TryGetStringField then leaves the id as it is (empty).
+    if (IsValid(PlayerStateComponent)) {
+      Response->TryGetStringField(
+        TEXT("transferId"), PlayerStateComponent->ActiveTransferId
+      );
+    }
+
     return;
   }
 
   // Missing field = old sidecar; keep the safe answer.
   bool bAmbiguous = true;
   Response->TryGetBoolField(TEXT("ambiguous"), bAmbiguous);
-
-  APlayerController *PlayerController = WeakPlayerController.Get();
 
   if (!bAmbiguous) {
     UE_LOG(
@@ -971,28 +1007,23 @@ void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
       *Error
     );
 
-    if (IsValid(PlayerController) && IsValid(PlayerController->PlayerState)) {
-      URedwoodPlayerStateComponent *PlayerStateComponent =
-        PlayerController->PlayerState
-          ->FindComponentByClass<URedwoodPlayerStateComponent>();
-
-      // The player must still be transferring. The abort sources are
-      // exclusive — an accepted transfer answers with an empty error, and
-      // only an accepted transfer can make the realm send transfer-failed —
-      // so a late answer can only belong to the transfer that latched the
-      // flag. This gate makes that reasoning unnecessary for safety.
-      if (IsValid(PlayerStateComponent)) {
-        if (PlayerStateComponent->bTransferring) {
-          PlayerStateComponent->AbortTransferring(Error, TEXT("realm-rejected"));
-        } else {
-          UE_LOG(
-            LogRedwood,
-            Warning,
-            TEXT(
-              "Ignoring a failed transfer answer for a player who is not transferring"
-            )
-          );
-        }
+    // The player must still be transferring. The abort sources are
+    // exclusive — an accepted transfer answers with an empty error, and
+    // only an accepted transfer can make the realm send transfer-failed —
+    // so a late answer can only belong to the transfer that latched the
+    // flag. This gate makes that reasoning unnecessary for safety.
+    if (IsValid(PlayerStateComponent)) {
+      if (PlayerStateComponent->bTransferring) {
+        // AbortTransferring also clears ActiveTransferId.
+        PlayerStateComponent->AbortTransferring(Error, TEXT("realm-rejected"));
+      } else {
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT(
+            "Ignoring a failed transfer answer for a player who is not transferring"
+          )
+        );
       }
     }
 

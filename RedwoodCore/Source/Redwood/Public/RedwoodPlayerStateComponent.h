@@ -130,6 +130,25 @@ public:
 
   bool bTransferring = false;
 
+  // FORK(hollowed-oath): the id the realm gave the transfer that is now in
+  // flight, taken from the transfer-zone answer. Server-only and never
+  // replicated: only the game server matches reports against it.
+  // AbortTransferring clears it.
+  FString ActiveTransferId;
+
+  /**
+   * FORK(hollowed-oath): True when a failure report that names TransferId
+   * belongs to the transfer in flight. An empty id on EITHER side counts as
+   * a match: an older backend sends no id at all, and a failure can reach
+   * this server before the answer that carries the id. Only two different
+   * non-empty ids are a mismatch. The bTransferring latch stays the real
+   * guard; this only drops a report for an earlier transfer.
+   */
+  bool MatchesActiveTransfer(const FString &TransferId) const {
+    return TransferId.IsEmpty() || ActiveTransferId.IsEmpty() ||
+      TransferId == ActiveTransferId;
+  }
+
   /**
    * Server-only entry point that begins a zone transfer for this player.
    * Marks the component as transferring and notifies the owning client

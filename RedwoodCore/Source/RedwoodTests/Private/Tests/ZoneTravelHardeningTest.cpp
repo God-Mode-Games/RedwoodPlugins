@@ -20,6 +20,10 @@
 //      transfer back ONLY when the sidecar marks the error "ambiguous":
 //      false, and only while the player is still transferring. An ambiguous
 //      error, or an answer with no such field (an older sidecar), kicks.
+//   6. URedwoodPlayerStateComponent::MatchesActiveTransfer drops a failure
+//      report that names a different transfer, but accepts one when either
+//      side has no id (an older backend, or a report that overtakes the
+//      answer that carries the id).
 // An upstream merge must keep these APIs or update this file in lockstep.
 
 #include "CoreMinimal.h"
@@ -207,8 +211,14 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
   // No error at all: the transfer goes on.
   TSharedPtr<FJsonObject> Success = MakeShareable(new FJsonObject);
   Success->SetStringField(TEXT("error"), TEXT(""));
+  Success->SetStringField(TEXT("transferId"), TEXT("transfer-1"));
   Subsystem->HandleTransferZoneResponse(Success, WeakPlayerController);
   TestTrue(TEXT("no error keeps the transfer"), Component->bTransferring);
+  TestEqual(
+    TEXT("the answer's transfer id is kept"),
+    Component->ActiveTransferId,
+    TEXT("transfer-1")
+  );
 
   // Ambiguous: the realm can hold the character already, so the flag stays
   // and the player is kicked instead (this world has no GameSession, so the
@@ -259,11 +269,69 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
     AbortReason,
     TEXT("realm-rejected")
   );
+  TestEqual(
+    TEXT("the rollback clears the transfer id"),
+    Component->ActiveTransferId,
+    FString()
+  );
 
   // The same answer again, with the player no longer transferring: a stale
   // answer must not fire the rollback events a second time.
   Subsystem->HandleTransferZoneResponse(Safe, WeakPlayerController);
   TestEqual(TEXT("a stale answer does not roll back again"), AbortCount, 1);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodZoneTravelTransferIdMatchTest,
+  "Redwood.ZoneTravel.AFailureReportMustNameTheTransferInFlight",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodZoneTravelTransferIdMatchTest::RunTest(const FString &Parameters) {
+  RedwoodZoneTravelTest::FScopedWorld Scoped;
+
+  APlayerState *PlayerState = Scoped.World->SpawnActor<APlayerState>();
+  if (!TestNotNull(TEXT("player state spawned"), PlayerState)) {
+    return false;
+  }
+  URedwoodPlayerStateComponent *Component =
+    NewObject<URedwoodPlayerStateComponent>(PlayerState);
+  Component->RegisterComponent();
+
+  // Nothing named yet: every report matches, so a failure that arrives
+  // before the answer still reaches the abort.
+  TestTrue(
+    TEXT("an unnamed transfer matches any report"),
+    Component->MatchesActiveTransfer(TEXT("transfer-1"))
+  );
+
+  Component->InitTransferring();
+  Component->ActiveTransferId = TEXT("transfer-1");
+
+  TestTrue(
+    TEXT("the same id matches"),
+    Component->MatchesActiveTransfer(TEXT("transfer-1"))
+  );
+  TestFalse(
+    TEXT("a different id does not match"),
+    Component->MatchesActiveTransfer(TEXT("transfer-0"))
+  );
+  // Compatibility: an older backend sends no id, so a report with none must
+  // still reach the abort.
+  TestTrue(
+    TEXT("a report with no id matches"),
+    Component->MatchesActiveTransfer(TEXT(""))
+  );
+
+  // The abort clears the id, so no later report can match a transfer that
+  // is over.
+  Component->AbortTransferring(TEXT("zone is full"), TEXT("realm-rejected"));
+  TestEqual(
+    TEXT("the abort clears the transfer id"),
+    Component->ActiveTransferId,
+    FString()
+  );
   return true;
 }
 

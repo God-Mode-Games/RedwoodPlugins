@@ -132,6 +132,7 @@ void URedwoodPlayerStateComponent::AbortTransferring(
   }
 
   bTransferring = false;
+  ActiveTransferId.Empty();
 
   OnTransferAbortedServer.Broadcast(Error, Reason);
   Client_OnTransferAborted(Error, Reason);
