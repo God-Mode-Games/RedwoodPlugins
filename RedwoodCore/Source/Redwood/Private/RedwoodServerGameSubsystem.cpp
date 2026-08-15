@@ -822,14 +822,19 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
   // FORK(hollowed-oath): upstream handled the answer inline here and in
   // TravelPlayerToZoneSpawnName; the rules now live once in
   // HandleTransferZoneResponse. A weak pointer keeps the callback safe if
-  // the player leaves before the sidecar answers.
+  // the player leaves before the sidecar answers. Upstream read Response[0]
+  // without a test; an answer with no value at all is out of range there,
+  // and the handler drops an empty answer anyway.
   TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
 
   Sidecar->Emit(
     TEXT("realm:servers:transfer-zone:game-server-to-sidecar"),
     Payload,
     [this, WeakPlayerController](auto Response) {
-      HandleTransferZoneResponse(Response[0]->AsObject(), WeakPlayerController);
+      HandleTransferZoneResponse(
+        Response.IsValidIndex(0) ? Response[0]->AsObject() : nullptr,
+        WeakPlayerController
+      );
     }
   );
 }
@@ -1167,7 +1172,10 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
     TEXT("realm:servers:transfer-zone:game-server-to-sidecar"),
     Payload,
     [this, WeakPlayerController](auto Response) {
-      HandleTransferZoneResponse(Response[0]->AsObject(), WeakPlayerController);
+      HandleTransferZoneResponse(
+        Response.IsValidIndex(0) ? Response[0]->AsObject() : nullptr,
+        WeakPlayerController
+      );
     }
   );
 }
