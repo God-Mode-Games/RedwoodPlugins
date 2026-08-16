@@ -51,6 +51,7 @@
 #include "GameFramework/PlayerStart.h"
 #include "GameFramework/PlayerState.h"
 #include "Misc/AutomationTest.h"
+#include "TimerManager.h"
 #include "UObject/StrongObjectPtr.h"
 #include "RedwoodGameModeComponent.h"
 #include "RedwoodPlayerStateComponent.h"
@@ -285,6 +286,17 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
   // The name of the transfer that asks; every answer below belongs to it.
   const int64 EmitGeneration = Component->TransferGeneration;
 
+  // The wait that EmitTransferZoneRequest arms beside the emit. The good
+  // answer below must end it, or every finished transfer would kick its
+  // player when the wait runs out.
+  FTimerManager &TimerManager = Scoped.GameInstance->GetTimerManager();
+  TimerManager.SetTimer(
+    Component->TransferAnswerTimeout,
+    FTimerDelegate::CreateLambda([] {}),
+    30.f,
+    false // no loop
+  );
+
   // No error at all: the transfer goes on.
   TSharedPtr<FJsonObject> Success = MakeShareable(new FJsonObject);
   Success->SetStringField(TEXT("error"), TEXT(""));
@@ -299,6 +311,10 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
     TEXT("transfer-1")
   );
   TestEqual(TEXT("a good answer kicks nobody"), KickProbe->KickCount, 0);
+  TestFalse(
+    TEXT("a good answer ends the wait for it"),
+    TimerManager.IsTimerActive(Component->TransferAnswerTimeout)
+  );
 
   // Ambiguous: the realm can hold the character already, so the flag stays
   // and the player is kicked instead.
@@ -387,23 +403,30 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodZoneTravelStaleAnswerTest::RunTest(const FString &Parameters) {
-  // The realm can report a failure before it answers the transfer route: it
-  // sends the refusal of one character while it still handles the request.
-  // The report then rolls the transfer back, the player asks for another
-  // zone, and only THEN the first answer lands. It must touch nothing.
+  // The realm can report a failure before it answers the transfer route: the
+  // ticket goes in the queue before the answer leaves, so a worker can fail
+  // it while the answer is still on its way. The report then rolls the
+  // transfer back, the player asks for another zone, and only THEN the first
+  // answer lands. It must write nothing. Only the kick for an ambiguous
+  // answer stays, because that danger is not tied to the transfer in flight.
   AddExpectedError(
     TEXT("a transfer that is over"), EAutomationExpectedErrorFlags::Contains, 0
   );
   AddExpectedError(
     TEXT("Failed to transfer player to new zone"),
     EAutomationExpectedErrorFlags::Contains,
-    1
+    2
   );
 
   RedwoodZoneTravelTest::FScopedWorld Scoped;
 
   RedwoodZoneTravelTest::FTransferScene Scene;
   if (!Scoped.SetUpTransferScene(*this, Scene)) {
+    return false;
+  }
+
+  ARedwoodKickProbeGameSession *KickProbe = Scoped.InstallKickProbe(*this);
+  if (!KickProbe) {
     return false;
   }
 
@@ -427,6 +450,15 @@ bool FRedwoodZoneTravelStaleAnswerTest::RunTest(const FString &Parameters) {
     Component->TransferGeneration != GenerationA
   );
 
+  // B waits for its own answer; nothing that A sends below may end it.
+  FTimerManager &TimerManager = Scoped.GameInstance->GetTimerManager();
+  TimerManager.SetTimer(
+    Component->TransferAnswerTimeout,
+    FTimerDelegate::CreateLambda([] {}),
+    30.f,
+    false // no loop
+  );
+
   // A's late SUCCESS answer must not name B's transfer, or B's own report
   // would no longer match and B would stay latched for ever.
   TSharedPtr<FJsonObject> LateSuccess = MakeShareable(new FJsonObject);
@@ -444,6 +476,10 @@ bool FRedwoodZoneTravelStaleAnswerTest::RunTest(const FString &Parameters) {
     TEXT("the new transfer still matches its own report"),
     Component->MatchesActiveTransfer(TEXT("transfer-b"))
   );
+  TestTrue(
+    TEXT("the late answer does not end the new transfer's wait"),
+    TimerManager.IsTimerActive(Component->TransferAnswerTimeout)
+  );
 
   // A's late ERROR answer must not roll B back either.
   TSharedPtr<FJsonObject> LateError = MakeShareable(new FJsonObject);
@@ -454,6 +490,22 @@ bool FRedwoodZoneTravelStaleAnswerTest::RunTest(const FString &Parameters) {
   );
   TestTrue(
     TEXT("the new transfer is still in flight"), Component->bTransferring
+  );
+  TestEqual(
+    TEXT("a late safe error kicks nobody"), KickProbe->KickCount, 0
+  );
+
+  // A's late AMBIGUOUS answer still kicks: the realm may hold the character
+  // from the transfer that is over, and that danger does not go away because
+  // a new transfer runs. The kick is unconditional on purpose.
+  TSharedPtr<FJsonObject> LateAmbiguous = MakeShareable(new FJsonObject);
+  LateAmbiguous->SetStringField(TEXT("error"), TEXT("realm timed out"));
+  LateAmbiguous->SetBoolField(TEXT("ambiguous"), true);
+  Subsystem->HandleTransferZoneResponse(
+    LateAmbiguous, WeakPlayerController, GenerationA
+  );
+  TestEqual(
+    TEXT("a late ambiguous answer still kicks"), KickProbe->KickCount, 1
   );
   return true;
 }

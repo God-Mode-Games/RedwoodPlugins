@@ -837,8 +837,9 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
 // the handler drops an empty answer anyway.
 //
 // The answer carries the name of the transfer that asked for it.
-// InitTransferring ran before this, so a live transfer never has generation 0,
-// and the 0 for a player with no component can match nothing.
+// InitTransferring ran before this, so a live transfer never has generation
+// 0. A player with no component emits -1, which no component ever holds, so
+// such an answer can match nothing later.
 void URedwoodServerGameSubsystem::EmitTransferZoneRequest(
   URedwoodPlayerStateComponent *PlayerStateComponent,
   APlayerController *PlayerController,
@@ -846,7 +847,9 @@ void URedwoodServerGameSubsystem::EmitTransferZoneRequest(
 ) {
   TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
 
-  int64 EmitGeneration = 0;
+  // -1 and not 0: a component that never transferred still sits at
+  // generation 0, and must not match an emit that ran without a component.
+  int64 EmitGeneration = -1;
 
   if (IsValid(PlayerStateComponent)) {
     EmitGeneration = PlayerStateComponent->TransferGeneration;
@@ -871,13 +874,33 @@ void URedwoodServerGameSubsystem::EmitTransferZoneRequest(
     TEXT("realm:servers:transfer-zone:game-server-to-sidecar"),
     Payload,
     [this, WeakPlayerController, EmitGeneration](auto Response) {
+      // TryGetObject, not AsObject: for a value that is not an object,
+      // AsObject returns a VALID empty object, and an empty object reads
+      // as a success answer in the handler. A null or malformed answer
+      // must reach the handler as "no usable answer" instead.
+      const TSharedPtr<FJsonObject> *ResponseObject = nullptr;
+      if (Response.IsValidIndex(0)) {
+        Response[0]->TryGetObject(ResponseObject);
+      }
       HandleTransferZoneResponse(
-        Response.IsValidIndex(0) ? Response[0]->AsObject() : nullptr,
+        ResponseObject ? *ResponseObject : nullptr,
         WeakPlayerController,
         EmitGeneration
       );
     }
   );
+}
+
+// FORK(hollowed-oath): the answer callback and the timeout both start from a
+// controller they captured long ago; one resolver keeps their component
+// lookups identical.
+static URedwoodPlayerStateComponent *ResolveRedwoodTransferComponent(
+  APlayerController *PlayerController
+) {
+  return IsValid(PlayerController) && IsValid(PlayerController->PlayerState)
+    ? PlayerController->PlayerState
+        ->FindComponentByClass<URedwoodPlayerStateComponent>()
+    : nullptr;
 }
 
 // FORK(hollowed-oath): shared handling of the sidecar's answer to both
@@ -901,8 +924,9 @@ void URedwoodServerGameSubsystem::EmitTransferZoneRequest(
 //                    the flag back and tells the player, who stays in this
 //                    zone.
 //
-// The callback is asynchronous, so the player, the world, and the game mode
-// can all be gone by the time it runs; every one of them is checked.
+// The callback is asynchronous, so the player can be gone by the time it
+// runs; that is checked here, and KickPlayerAfterFailedTransfer checks the
+// world and the game mode.
 void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
   const TSharedPtr<FJsonObject> &Response,
   TWeakObjectPtr<APlayerController> WeakPlayerController,
@@ -910,8 +934,8 @@ void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
 ) {
   if (!Response.IsValid()) {
     // The sidecar answered with nothing, or with a value that is not an
-    // object. Say so: the player keeps the transferring latch, and this line
-    // is the only sign of why.
+    // object. Treat it as no answer at all: the wait set beside the emit
+    // stays armed, and HandleTransferAnswerTimeout takes the player out.
     UE_LOG(
       LogRedwood,
       Warning,
@@ -922,23 +946,20 @@ void URedwoodServerGameSubsystem::HandleTransferZoneResponse(
 
   APlayerController *PlayerController = WeakPlayerController.Get();
   URedwoodPlayerStateComponent *PlayerStateComponent =
-    IsValid(PlayerController) && IsValid(PlayerController->PlayerState)
-    ? PlayerController->PlayerState
-        ->FindComponentByClass<URedwoodPlayerStateComponent>()
-    : nullptr;
+    ResolveRedwoodTransferComponent(PlayerController);
 
   // FORK(hollowed-oath): true while the transfer this answer belongs to is
   // still the transfer in flight. The answer and the realm's failure report
   // travel different paths and hold no order between them, so an answer can
   // land after its own transfer is over.
   //
-  // The report can really come first. The realm sends the refusal of a
-  // single character while it still handles the transfer route (see
-  // sendTransferFailed in RedwoodBackend
-  // packages/realm-backend/src/routes/sidecar/transfer-zone.ts, which runs
-  // before the route answers), so on a request for more than one character
-  // the report leaves the realm BEFORE the answer does. Only a failure
-  // after the queue takes the ticket is sure to come after the answer.
+  // The report can really come first. The transfer route (RedwoodBackend
+  // packages/realm-backend/src/routes/sidecar/transfer-zone.ts) puts the
+  // join ticket in the queue BEFORE it answers, so a ticketing worker in
+  // another process can fail the ticket and send the transfer-failed
+  // report while the answer is still on its way here. This server always
+  // asks for one character, so the route's earlier reports cannot reach
+  // it: a refused single character comes back as an error answer instead.
   //
   // Two orderings need this:
   //   1. the report aborts transfer A, then A's SUCCESS answer lands on an
@@ -1063,10 +1084,13 @@ void URedwoodServerGameSubsystem::KickPlayerAfterFailedTransfer(
   UWorld *World = GetWorld();
   AGameModeBase *GameMode = IsValid(World) ? World->GetAuthGameMode() : nullptr;
 
-  if (IsValid(GameMode) && IsValid(GameMode->GameSession)) {
-    GameMode->GameSession->KickPlayer(
-      PlayerController, FText::FromString(Error)
-    );
+  // KickPlayer answers false and does NOTHING for a player with no net
+  // connection to close (a listen host, or a connection already torn
+  // down), so its answer must be read, not assumed.
+  if (IsValid(GameMode) && IsValid(GameMode->GameSession) &&
+      GameMode->GameSession->KickPlayer(
+        PlayerController, FText::FromString(Error)
+      )) {
     return;
   }
 
@@ -1077,7 +1101,9 @@ void URedwoodServerGameSubsystem::KickPlayerAfterFailedTransfer(
   UE_LOG(
     LogRedwood,
     Error,
-    TEXT("Could not kick the player; this server has no game session")
+    TEXT(
+      "Could not kick the player; this server has no game session, or the player has no net connection to close"
+    )
   );
 }
 
@@ -1098,10 +1124,7 @@ void URedwoodServerGameSubsystem::HandleTransferAnswerTimeout(
 ) {
   APlayerController *PlayerController = WeakPlayerController.Get();
   URedwoodPlayerStateComponent *PlayerStateComponent =
-    IsValid(PlayerController) && IsValid(PlayerController->PlayerState)
-    ? PlayerController->PlayerState
-        ->FindComponentByClass<URedwoodPlayerStateComponent>()
-    : nullptr;
+    ResolveRedwoodTransferComponent(PlayerController);
 
   if (!IsValid(PlayerStateComponent) ||
       PlayerStateComponent->TransferGeneration != EmitGeneration ||
