@@ -422,13 +422,17 @@ private:
     APlayerController *PlayerController, const FString &Error
   );
 
-  // FORK(hollowed-oath): starts the wait for the sidecar's answer, beside
-  // both TravelPlayerToZone* emits. See TransferAnswerTimeoutSeconds and
-  // HandleTransferAnswerTimeout above.
-  void StartTransferAnswerTimeout(
+  // FORK(hollowed-oath): the shared tail of both TravelPlayerToZone*
+  // functions: the wait for the sidecar's answer, then the emit that asks
+  // for the transfer. Upstream wrote the emit out in each travel function;
+  // the fork added the wait and the answer rules to it. Both live here so
+  // each upstream function keeps one fork line, which is the smallest fork
+  // footprint in upstream code. See TransferAnswerTimeoutSeconds,
+  // HandleTransferAnswerTimeout, and HandleTransferZoneResponse above.
+  void EmitTransferZoneRequest(
     URedwoodPlayerStateComponent *PlayerStateComponent,
-    TWeakObjectPtr<APlayerController> WeakPlayerController,
-    int64 EmitGeneration
+    APlayerController *PlayerController,
+    const TSharedPtr<FJsonObject> &Payload
   );
 
   void GetParty(

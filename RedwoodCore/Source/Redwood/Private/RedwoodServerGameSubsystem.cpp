@@ -819,26 +819,53 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
     *InZoneName
   );
 
-  // FORK(hollowed-oath): upstream handled the answer inline here and in
-  // TravelPlayerToZoneSpawnName; the rules now live once in
-  // HandleTransferZoneResponse. A weak pointer for the player controller,
-  // which can go away before the sidecar answers; the subsystem stays a raw
-  // "this", as upstream has it, because it lives as long as the game
-  // instance. Upstream read Response[0] without a test; an answer with no
-  // value at all is out of range there, and the handler drops an empty
-  // answer anyway.
+  // FORK(hollowed-oath): the wait for the answer, and the emit itself.
+  EmitTransferZoneRequest(PlayerStateComponent, PlayerController, Payload);
+}
+
+// FORK(hollowed-oath): the shared tail of both TravelPlayerToZone* functions.
+// Upstream wrote this emit out in each of them and handled the answer inline;
+// the answer rules now live once in HandleTransferZoneResponse, and the wait
+// for an answer that never comes starts here. One function, so each upstream
+// travel function keeps one fork line and the fork footprint in upstream code
+// stays as small as it can be.
+//
+// A weak pointer for the player controller, which can go away before the
+// sidecar answers; the subsystem stays a raw "this", as upstream has it,
+// because it lives as long as the game instance. Upstream read Response[0]
+// without a test; an answer with no value at all is out of range there, and
+// the handler drops an empty answer anyway.
+//
+// The answer carries the name of the transfer that asked for it.
+// InitTransferring ran before this, so a live transfer never has generation 0,
+// and the 0 for a player with no component can match nothing.
+void URedwoodServerGameSubsystem::EmitTransferZoneRequest(
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  APlayerController *PlayerController,
+  const TSharedPtr<FJsonObject> &Payload
+) {
   TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
 
-  // FORK(hollowed-oath): the answer carries the name of the transfer that
-  // asked for it. InitTransferring above added one, so a live transfer never
-  // has generation 0, and the 0 for a player with no component can match
-  // nothing.
-  const int64 EmitGeneration =
-    PlayerStateComponent ? PlayerStateComponent->TransferGeneration : 0;
+  int64 EmitGeneration = 0;
 
-  StartTransferAnswerTimeout(
-    PlayerStateComponent, WeakPlayerController, EmitGeneration
-  );
+  if (IsValid(PlayerStateComponent)) {
+    EmitGeneration = PlayerStateComponent->TransferGeneration;
+
+    // The game instance owns this timer manager, the same one the sidecar
+    // updates use; the answer must be cleared on the same one. See
+    // HandleTransferAnswerTimeout for what happens when no answer comes.
+    GetGameInstance()->GetTimerManager().SetTimer(
+      PlayerStateComponent->TransferAnswerTimeout,
+      FTimerDelegate::CreateWeakLambda(
+        this,
+        [this, WeakPlayerController, EmitGeneration]() {
+          HandleTransferAnswerTimeout(WeakPlayerController, EmitGeneration);
+        }
+      ),
+      TransferAnswerTimeoutSeconds,
+      false // no loop
+    );
+  }
 
   Sidecar->Emit(
     TEXT("realm:servers:transfer-zone:game-server-to-sidecar"),
@@ -850,33 +877,6 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneTransform(
         EmitGeneration
       );
     }
-  );
-}
-
-// FORK(hollowed-oath): starts the wait for the sidecar's answer. Kept beside
-// both emits so neither can forget it; see HandleTransferAnswerTimeout for
-// what happens when no answer comes.
-void URedwoodServerGameSubsystem::StartTransferAnswerTimeout(
-  URedwoodPlayerStateComponent *PlayerStateComponent,
-  TWeakObjectPtr<APlayerController> WeakPlayerController,
-  int64 EmitGeneration
-) {
-  if (!IsValid(PlayerStateComponent)) {
-    return;
-  }
-
-  // The game instance owns this timer manager, the same one the sidecar
-  // updates use above; the answer must be cleared on the same one.
-  GetGameInstance()->GetTimerManager().SetTimer(
-    PlayerStateComponent->TransferAnswerTimeout,
-    FTimerDelegate::CreateWeakLambda(
-      this,
-      [this, WeakPlayerController, EmitGeneration]() {
-        HandleTransferAnswerTimeout(WeakPlayerController, EmitGeneration);
-      }
-    ),
-    TransferAnswerTimeoutSeconds,
-    false // no loop
   );
 }
 
@@ -1342,28 +1342,9 @@ void URedwoodServerGameSubsystem::TravelPlayerToZoneSpawnName(
     *InZoneName
   );
 
-  // FORK(hollowed-oath): same shared answer handling, and the same transfer
-  // generation, as TravelPlayerToZoneTransform above; see the comments there.
-  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
-
-  const int64 EmitGeneration =
-    PlayerStateComponent ? PlayerStateComponent->TransferGeneration : 0;
-
-  StartTransferAnswerTimeout(
-    PlayerStateComponent, WeakPlayerController, EmitGeneration
-  );
-
-  Sidecar->Emit(
-    TEXT("realm:servers:transfer-zone:game-server-to-sidecar"),
-    Payload,
-    [this, WeakPlayerController, EmitGeneration](auto Response) {
-      HandleTransferZoneResponse(
-        Response.IsValidIndex(0) ? Response[0]->AsObject() : nullptr,
-        WeakPlayerController,
-        EmitGeneration
-      );
-    }
-  );
+  // FORK(hollowed-oath): the same wait and emit as
+  // TravelPlayerToZoneTransform above; see EmitTransferZoneRequest.
+  EmitTransferZoneRequest(PlayerStateComponent, PlayerController, Payload);
 }
 
 void URedwoodServerGameSubsystem::FlushSync() {

@@ -62,6 +62,14 @@
 
 namespace RedwoodZoneTravelTest {
 
+// The pieces a transfer test drives: the subsystem it calls, and one player
+// whose player state carries the Redwood component.
+struct FTransferScene {
+  URedwoodServerGameSubsystem *Subsystem = nullptr;
+  URedwoodPlayerStateComponent *Component = nullptr;
+  TWeakObjectPtr<APlayerController> WeakPlayerController;
+};
+
 struct FScopedWorld {
   UGameInstance *GameInstance = nullptr;
   UWorld *World = nullptr;
@@ -91,6 +99,53 @@ struct FScopedWorld {
       NewObject<URedwoodPlayerStateComponent>(OutPlayerState);
     Component->RegisterComponent();
     return Component;
+  }
+
+  // Builds the player that every transfer test drives. Asserts with the
+  // caller's test, so a failure names the test that ran. Returns false when
+  // any piece is missing; the caller stops the test.
+  bool SetUpTransferScene(FAutomationTestBase &Test, FTransferScene &OutScene) {
+    OutScene.Subsystem =
+      GameInstance->GetSubsystem<URedwoodServerGameSubsystem>();
+    APlayerController *PlayerController = World->SpawnActor<APlayerController>();
+    if (!Test.TestNotNull(TEXT("subsystem available"), OutScene.Subsystem) ||
+        !Test.TestNotNull(TEXT("controller spawned"), PlayerController)) {
+      return false;
+    }
+
+    APlayerState *PlayerState = nullptr;
+    OutScene.Component = SpawnPlayerStateComponent(PlayerState);
+    if (!Test.TestNotNull(
+          TEXT("player state component spawned"), OutScene.Component
+        )) {
+      return false;
+    }
+    PlayerController->PlayerState = PlayerState;
+    OutScene.WeakPlayerController = PlayerController;
+    return true;
+  }
+
+  // SetGameMode is the only public way to give a test world an authority
+  // game mode; UWorld::AuthorityGameMode is private.
+  AGameModeBase *EnsureGameMode() {
+    World->SetGameMode(FURL());
+    return World->GetAuthGameMode();
+  }
+
+  // The kick goes through the authority game mode's game session, and a bare
+  // test world has neither. The probe session counts the kicks, which the
+  // upstream one cannot do for a player with no connection. Returns null when
+  // any piece is missing; the caller stops the test.
+  ARedwoodKickProbeGameSession *InstallKickProbe(FAutomationTestBase &Test) {
+    AGameModeBase *GameMode = EnsureGameMode();
+    ARedwoodKickProbeGameSession *KickProbe =
+      World->SpawnActor<ARedwoodKickProbeGameSession>();
+    if (!Test.TestNotNull(TEXT("world game mode set"), GameMode) ||
+        !Test.TestNotNull(TEXT("kick probe spawned"), KickProbe)) {
+      return nullptr;
+    }
+    GameMode->GameSession = KickProbe;
+    return KickProbe;
   }
 
   ~FScopedWorld() {
@@ -211,38 +266,20 @@ bool FRedwoodZoneTravelTransferErrorTest::RunTest(const FString &Parameters) {
 
   RedwoodZoneTravelTest::FScopedWorld Scoped;
 
-  URedwoodServerGameSubsystem *Subsystem =
-    Scoped.GameInstance->GetSubsystem<URedwoodServerGameSubsystem>();
-  APlayerController *PlayerController =
-    Scoped.World->SpawnActor<APlayerController>();
-  if (!TestNotNull(TEXT("subsystem available"), Subsystem) ||
-      !TestNotNull(TEXT("controller spawned"), PlayerController)) {
+  RedwoodZoneTravelTest::FTransferScene Scene;
+  if (!Scoped.SetUpTransferScene(*this, Scene)) {
     return false;
   }
 
-  APlayerState *PlayerState = nullptr;
-  URedwoodPlayerStateComponent *Component =
-    Scoped.SpawnPlayerStateComponent(PlayerState);
-  if (!TestNotNull(TEXT("player state component spawned"), Component)) {
+  ARedwoodKickProbeGameSession *KickProbe = Scoped.InstallKickProbe(*this);
+  if (!KickProbe) {
     return false;
   }
-  PlayerController->PlayerState = PlayerState;
 
-  // The kick goes through the authority game mode's game session, and a bare
-  // test world has neither. SetGameMode is the only public way to give the
-  // world an authority game mode; the probe session then counts the kicks,
-  // which the upstream one cannot do for a player with no connection.
-  Scoped.World->SetGameMode(FURL());
-  AGameModeBase *GameMode = Scoped.World->GetAuthGameMode();
-  ARedwoodKickProbeGameSession *KickProbe =
-    Scoped.World->SpawnActor<ARedwoodKickProbeGameSession>();
-  if (!TestNotNull(TEXT("world game mode set"), GameMode) ||
-      !TestNotNull(TEXT("kick probe spawned"), KickProbe)) {
-    return false;
-  }
-  GameMode->GameSession = KickProbe;
-
-  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
+  URedwoodServerGameSubsystem *Subsystem = Scene.Subsystem;
+  URedwoodPlayerStateComponent *Component = Scene.Component;
+  TWeakObjectPtr<APlayerController> WeakPlayerController =
+    Scene.WeakPlayerController;
 
   Component->InitTransferring();
   // The name of the transfer that asks; every answer below belongs to it.
@@ -365,24 +402,15 @@ bool FRedwoodZoneTravelStaleAnswerTest::RunTest(const FString &Parameters) {
 
   RedwoodZoneTravelTest::FScopedWorld Scoped;
 
-  URedwoodServerGameSubsystem *Subsystem =
-    Scoped.GameInstance->GetSubsystem<URedwoodServerGameSubsystem>();
-  APlayerController *PlayerController =
-    Scoped.World->SpawnActor<APlayerController>();
-  if (!TestNotNull(TEXT("subsystem available"), Subsystem) ||
-      !TestNotNull(TEXT("controller spawned"), PlayerController)) {
+  RedwoodZoneTravelTest::FTransferScene Scene;
+  if (!Scoped.SetUpTransferScene(*this, Scene)) {
     return false;
   }
 
-  APlayerState *PlayerState = nullptr;
-  URedwoodPlayerStateComponent *Component =
-    Scoped.SpawnPlayerStateComponent(PlayerState);
-  if (!TestNotNull(TEXT("player state component spawned"), Component)) {
-    return false;
-  }
-  PlayerController->PlayerState = PlayerState;
-
-  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
+  URedwoodServerGameSubsystem *Subsystem = Scene.Subsystem;
+  URedwoodPlayerStateComponent *Component = Scene.Component;
+  TWeakObjectPtr<APlayerController> WeakPlayerController =
+    Scene.WeakPlayerController;
 
   // Transfer A starts, and the realm's report rolls it back before its
   // answer arrives.
@@ -444,34 +472,20 @@ bool FRedwoodZoneTravelAnswerTimeoutTest::RunTest(const FString &Parameters) {
 
   RedwoodZoneTravelTest::FScopedWorld Scoped;
 
-  URedwoodServerGameSubsystem *Subsystem =
-    Scoped.GameInstance->GetSubsystem<URedwoodServerGameSubsystem>();
-  APlayerController *PlayerController =
-    Scoped.World->SpawnActor<APlayerController>();
-  if (!TestNotNull(TEXT("subsystem available"), Subsystem) ||
-      !TestNotNull(TEXT("controller spawned"), PlayerController)) {
+  RedwoodZoneTravelTest::FTransferScene Scene;
+  if (!Scoped.SetUpTransferScene(*this, Scene)) {
     return false;
   }
 
-  APlayerState *PlayerState = nullptr;
-  URedwoodPlayerStateComponent *Component =
-    Scoped.SpawnPlayerStateComponent(PlayerState);
-  if (!TestNotNull(TEXT("player state component spawned"), Component)) {
+  ARedwoodKickProbeGameSession *KickProbe = Scoped.InstallKickProbe(*this);
+  if (!KickProbe) {
     return false;
   }
-  PlayerController->PlayerState = PlayerState;
 
-  Scoped.World->SetGameMode(FURL());
-  AGameModeBase *GameMode = Scoped.World->GetAuthGameMode();
-  ARedwoodKickProbeGameSession *KickProbe =
-    Scoped.World->SpawnActor<ARedwoodKickProbeGameSession>();
-  if (!TestNotNull(TEXT("world game mode set"), GameMode) ||
-      !TestNotNull(TEXT("kick probe spawned"), KickProbe)) {
-    return false;
-  }
-  GameMode->GameSession = KickProbe;
-
-  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
+  URedwoodServerGameSubsystem *Subsystem = Scene.Subsystem;
+  URedwoodPlayerStateComponent *Component = Scene.Component;
+  TWeakObjectPtr<APlayerController> WeakPlayerController =
+    Scene.WeakPlayerController;
 
   Component->InitTransferring();
   const int64 EmitGeneration = Component->TransferGeneration;
@@ -708,12 +722,10 @@ bool FRedwoodZoneTravelSpawnClearanceTest::RunTest(const FString &Parameters) {
   );
 
   // With a Character default pawn: capsule half-height plus the margin,
-  // never below the upstream lift. SetGameMode is the only public way to
-  // give a world an AuthorityGameMode (UWorld::AuthorityGameMode is
-  // private); WHICH game mode class the host project's ini resolves does
-  // not matter, because the pawn class is overridden right after.
-  Scoped.World->SetGameMode(FURL());
-  AGameModeBase *GameMode = Scoped.World->GetAuthGameMode();
+  // never below the upstream lift. WHICH game mode class the host project's
+  // ini resolves does not matter, because the pawn class is overridden right
+  // after.
+  AGameModeBase *GameMode = Scoped.EnsureGameMode();
   if (!TestNotNull(TEXT("world game mode set"), GameMode)) {
     return false;
   }
