@@ -111,6 +111,66 @@ public:
     const FString &OptionalProxyId = TEXT("")
   );
 
+  // FORK(hollowed-oath): shared handling of the sidecar's answer to both
+  // TravelPlayerToZone* emits. Upstream repeats the same block in each
+  // function and kicks the player on every error; this decides between a
+  // kick and a rollback. Full rationale on the definition in the .cpp.
+  // Public only so ZoneTravelHardeningTest can drive it without a sidecar.
+  // EmitGeneration is the player state component's TransferGeneration at the
+  // time of the emit; the answer is only acted on while that transfer is
+  // still the one in flight.
+  void HandleTransferZoneResponse(
+    const TSharedPtr<FJsonObject> &Response,
+    TWeakObjectPtr<APlayerController> WeakPlayerController,
+    int64 EmitGeneration
+  );
+
+  // FORK(hollowed-oath): wire name of the fork-added transfer-failed
+  // sidecar event. Named and pinned by a test, because the backend pins its
+  // own copy of this string and the two cannot share a constant: a silent
+  // drift on either side would turn the whole rollback off with nothing to
+  // show for it.
+  static constexpr const TCHAR *TransferFailedEventName =
+    TEXT("realm:servers:transfer-zone:transfer-failed");
+
+  // FORK(hollowed-oath): the pair both TravelPlayerToZone* early returns
+  // give AbortTransferring when the sidecar is down. Named here, not at
+  // file scope, because the unity build merges translation units and a
+  // file-scope name can collide. SidecarDownError repeats the text of the
+  // upstream log line above each early return on purpose; upstream owns
+  // that line, so it keeps its own literal. SidecarDownReason is a
+  // contract: the game matches on the token, so keep it stable (see
+  // AbortTransferring in RedwoodPlayerStateComponent.h for the token list).
+  static constexpr const TCHAR *SidecarDownError =
+    TEXT("Sidecar is not connected; cannot travel player to new zone");
+  static constexpr const TCHAR *SidecarDownReason = TEXT("sidecar-down");
+
+  // FORK(hollowed-oath): body of the fork-added transfer-failed sidecar
+  // event, kept out of InitializeSidecar so the fork stays a few lines
+  // there. Full rationale on the definition in the .cpp. Public for the
+  // same reason as HandleTransferZoneResponse above.
+  void HandleTransferFailedEvent(const TSharedPtr<FJsonObject> &Payload);
+
+  // FORK(hollowed-oath): how long a transfer waits for the sidecar's answer
+  // before the player is taken out. The answer itself is quick: the route
+  // answers when the ticket goes in the queue, and the wait for a zone that
+  // starts on demand happens AFTER the answer. This is therefore only a
+  // guard for a sidecar that dies or stops answering, so it can be generous.
+  static constexpr float TransferAnswerTimeoutSeconds = 30.f;
+
+  // FORK(hollowed-oath): runs when a transfer got no answer in
+  // TransferAnswerTimeoutSeconds. Upstream has nothing here: a sidecar that
+  // dies after the connection test above gives no answer and no failure
+  // event, and the player then keeps the transferring latch for the rest of
+  // the session, with no linkdead retention and no lastLocation. An answer
+  // that never came is ambiguous by this plugin's own rule — the realm may
+  // hold the character already — so this kicks, exactly like an ambiguous
+  // answer. Full rationale on the definition in the .cpp. Public for the
+  // same reason as HandleTransferZoneResponse above.
+  void HandleTransferAnswerTimeout(
+    TWeakObjectPtr<APlayerController> WeakPlayerController, int64 EmitGeneration
+  );
+
   void FlushSync();
   void FlushPersistence();
   UFUNCTION(BlueprintCallable, Category = "Redwood")
@@ -353,6 +413,27 @@ private:
 
   void InitializeSidecar();
   void SendUpdateToSidecar();
+
+  // FORK(hollowed-oath): the one kick that a failed transfer uses, shared by
+  // the ambiguous answer and the answer that never came. Says so in the log
+  // when this server has no game session to kick with, because then the
+  // player stays here and stays marked as transferring.
+  void KickPlayerAfterFailedTransfer(
+    APlayerController *PlayerController, const FString &Error
+  );
+
+  // FORK(hollowed-oath): the shared tail of both TravelPlayerToZone*
+  // functions: the wait for the sidecar's answer, then the emit that asks
+  // for the transfer. Upstream wrote the emit out in each travel function;
+  // the fork added the wait and the answer rules to it. Both live here so
+  // each upstream function keeps one fork line, which is the smallest fork
+  // footprint in upstream code. See TransferAnswerTimeoutSeconds,
+  // HandleTransferAnswerTimeout, and HandleTransferZoneResponse above.
+  void EmitTransferZoneRequest(
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    APlayerController *PlayerController,
+    const TSharedPtr<FJsonObject> &Payload
+  );
 
   void GetParty(
     const FString &PartyId,
