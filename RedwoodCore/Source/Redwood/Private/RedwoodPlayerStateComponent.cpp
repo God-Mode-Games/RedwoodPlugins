@@ -99,15 +99,64 @@ void URedwoodPlayerStateComponent::SetServerReady() {
 void URedwoodPlayerStateComponent::InitTransferring() {
   bTransferring = true;
 
+  // FORK(hollowed-oath): a new transfer must never keep the name of an older
+  // one. The answer of a transfer that is over can land after the abort and
+  // write its id back (the answer and the failure report can pass each
+  // other), and a second travel can start before the first answer arrives.
+  // A kept id then makes MatchesActiveTransfer drop the failure report of
+  // THIS transfer, and the player stays latched as transferring.
+  //
+  // The generation names this transfer for its own answer. Clearing the id
+  // alone is not enough: the answer of the earlier transfer can land AFTER
+  // this start and write its id over the empty slot.
+  ActiveTransferId.Empty();
+  ++TransferGeneration;
+
   // Notify the owning client. The Client RPC routes through the
   // PlayerState's owning controller's net connection, so only the
   // player being transferred receives it. On a standalone/listen host
   // the implementation runs locally and broadcasts directly.
   Client_OnTransferring();
+
+  // FORK(hollowed-oath): tell the server-side listeners too; the RPC above
+  // only reaches the owning client.
+  OnTransferringStartedServer.Broadcast();
 }
 
 void URedwoodPlayerStateComponent::Client_OnTransferring_Implementation() {
   OnTransferring.Broadcast();
+}
+
+// FORK(hollowed-oath): rollback for a transfer that does not complete.
+// See the rationale block in the header.
+void URedwoodPlayerStateComponent::AbortTransferring(
+  const FString &Error, const FString &Reason
+) {
+  // Last line of defence: two failure paths can report the same transfer,
+  // and one start must never produce two aborts.
+  if (!bTransferring) {
+    UE_LOG(
+      LogRedwood,
+      Verbose,
+      TEXT("Ignoring an abort for a player who is not transferring: %s"),
+      *Error
+    );
+    return;
+  }
+
+  bTransferring = false;
+  ActiveTransferId.Empty();
+
+  OnTransferAbortedServer.Broadcast(Error, Reason);
+  Client_OnTransferAborted(Error, Reason);
+}
+
+// FORK(hollowed-oath): fork-added, the counterpart of the upstream
+// Client_OnTransferring_Implementation above.
+void URedwoodPlayerStateComponent::Client_OnTransferAborted_Implementation(
+  const FString &Error, const FString &Reason
+) {
+  OnTransferAborted.Broadcast(Error, Reason);
 }
 
 void URedwoodPlayerStateComponent::SetRedwoodPlayer(
