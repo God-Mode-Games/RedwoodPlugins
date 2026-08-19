@@ -243,6 +243,19 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
   FRedwoodStitchToServerDynamicDelegate, FURL, URL
 );
 
+// FORK(hollowed-oath): fork-added. The realm says that the zone of this
+// player has no server and one is being raised. SecondsRemaining is the rest
+// of the wait that the realm bounds; the note ends when the join arrives,
+// when the ticket fails, or when the seconds run out.
+UDELEGATE()
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
+  FRedwoodZoneServerStartingDynamicDelegate,
+  FString,
+  ZoneName,
+  float,
+  SecondsRemaining
+);
+
 USTRUCT(BlueprintType)
 struct FRedwoodServerDetails {
   GENERATED_BODY()

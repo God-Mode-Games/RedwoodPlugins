@@ -2424,6 +2424,35 @@ void URedwoodClientInterface::BindRealmEvents() {
     ESIOThreadOverrideOption::USE_GAME_THREAD
   );
 
+  // FORK(hollowed-oath): fork-added. The realm parked this player because
+  // the zone has no server and one is being raised. The game raises its
+  // connection limit for the wait; connect-to-instance below ends it.
+  Realm->OnEvent(
+    TEXT("realm:servers:instance-starting"),
+    [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
+      TSharedPtr<FJsonObject> MessageObject = Message->AsObject();
+      if (!MessageObject.IsValid()) {
+        // The realm is a trust boundary. A payload that is not an object
+        // would take the client down on the read below.
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT("Ignoring a zone-start note that carries no object")
+        );
+        return;
+      }
+
+      // A field that an older realm does not send reads as an empty name and
+      // zero seconds, which the game reads as a note that buys nothing.
+      OnZoneServerStarting.Broadcast(
+        MessageObject->GetStringField(TEXT("zoneName")),
+        MessageObject->GetNumberField(TEXT("secondsRemaining"))
+      );
+    },
+    TEXT("/"),
+    ESIOThreadOverrideOption::USE_GAME_THREAD
+  );
+
   Realm->OnEvent(
     TEXT("realm:servers:connect-to-instance"),
     [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {

@@ -53,6 +53,9 @@ public:
 
   FRedwoodConnectToServerDynamicDelegate OnRequestToJoinServer;
   FRedwoodStitchToServerDynamicDelegate OnRequestToStitchServer;
+  // FORK(hollowed-oath): fork-added; broadcast from the realm socket handler
+  // for realm:servers:instance-starting.
+  FRedwoodZoneServerStartingDynamicDelegate OnZoneServerStarting;
 
   FRedwoodDynamicDelegate OnDirectorConnectionLost;
   FRedwoodDynamicDelegate OnDirectorConnectionReestablished;

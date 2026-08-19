@@ -32,6 +32,10 @@ void URedwoodClientGameSubsystem::Initialize(
     ClientInterface->OnRequestToJoinServer.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleRequestToJoinServer
     );
+    // FORK(hollowed-oath): fork-added relay of the zone-start note.
+    ClientInterface->OnZoneServerStarting.AddDynamic(
+      this, &URedwoodClientGameSubsystem::HandleZoneServerStarting
+    );
     ClientInterface->OnDirectorConnectionLost.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleOnDirectorConnectionLost
     );
@@ -1247,6 +1251,13 @@ void URedwoodClientGameSubsystem::HandleRequestToJoinServer(
   } else {
     OnRequestToJoinServer.Broadcast(ConsoleCommand);
   }
+}
+
+// FORK(hollowed-oath): fork-added relay of the zone-start note.
+void URedwoodClientGameSubsystem::HandleZoneServerStarting(
+  FString ZoneName, float SecondsRemaining
+) {
+  OnZoneServerStarting.Broadcast(ZoneName, SecondsRemaining);
 }
 
 void URedwoodClientGameSubsystem::HandleOnDirectorConnectionLost() {

@@ -36,6 +36,11 @@ public:
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodConnectToServerDynamicDelegate OnRequestToJoinServer;
 
+  // FORK(hollowed-oath): fork-added relay of RedwoodClientInterface's
+  // OnZoneServerStarting. The game raises its connection limit for the wait.
+  UPROPERTY(BlueprintAssignable, Category = "Redwood")
+  FRedwoodZoneServerStartingDynamicDelegate OnZoneServerStarting;
+
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodDynamicDelegate OnDirectorConnectionLost;
 
@@ -431,6 +436,10 @@ private:
 
   UFUNCTION()
   void HandleRequestToJoinServer(FString ConsoleCommand);
+
+  // FORK(hollowed-oath): fork-added relay; see OnZoneServerStarting above.
+  UFUNCTION()
+  void HandleZoneServerStarting(FString ZoneName, float SecondsRemaining);
 
   UFUNCTION()
   void HandleOnPartyInvited(FRedwoodPartyInvite Invite);
