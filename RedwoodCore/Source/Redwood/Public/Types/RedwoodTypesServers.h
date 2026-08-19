@@ -262,3 +262,20 @@ struct FRedwoodServerDetails {
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   FString ShardName;
 };
+
+// FORK(hollowed-oath) BEGIN: the answer to
+// URedwoodServerGameSubsystem::RequestPlayerRoleChange, the game-server side of
+// the in-game /gm command. Fork-added.
+//
+// bOk is true only when the backend reports no error, which means the role is
+// committed. NewRole is the tier the backend committed, which is not always the
+// tier that was asked for, and is 0 on every refusal. Error is the backend
+// string, carried through WITHOUT translation: the plugin knows nothing about
+// roles, so the game owns every word a player reads.
+//
+// Three plain parameters rather than the output struct the other requests use.
+// The answer has no field the plugin must parse into a Redwood type, and a
+// struct here would only make the game unpack it again.
+typedef TDelegate<void(bool, int32, const FString &)>
+  FRedwoodSetPlayerRoleOutputDelegate;
+// FORK(hollowed-oath) END
