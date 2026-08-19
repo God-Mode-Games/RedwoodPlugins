@@ -3711,6 +3711,107 @@ void URedwoodServerGameSubsystem::GetParty(
   );
 }
 
+// FORK(hollowed-oath) BEGIN: the in-game /gm command. The three functions below
+// let the game server ask the backend to change the account role of a player.
+// All fork-added, and built on the same sidecar request pattern as GetParty
+// above. The request is shaped in one function and the answer read in another,
+// so the automation test can reach both rules without a backend.
+//
+// This code decides NOTHING. The director alone applies the rank rule and
+// writes the role, so the plugin only shapes the request and hands the answer
+// back word for word. Keeping the plugin free of role knowledge is what lets
+// the game add a tier, or change what a player reads, with no fork change here.
+TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::MakeSetPlayerRolePayload(
+  const FString &TargetPlayerId,
+  const FString &RoleKey,
+  const FString &ActorPlayerId
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
+  Payload->SetStringField(TEXT("actorPlayerId"), ActorPlayerId);
+
+  // An empty key clears the role, and the wire must then carry an explicit
+  // null. The backend declares roleKey as a field that must be present, so a
+  // key that is simply left out is refused as a malformed request.
+  if (RoleKey.IsEmpty()) {
+    Payload->SetField(TEXT("roleKey"), MakeShareable(new FJsonValueNull()));
+  } else {
+    Payload->SetStringField(TEXT("roleKey"), RoleKey);
+  }
+
+  return Payload;
+}
+
+void URedwoodServerGameSubsystem::AnswerSetPlayerRole(
+  const TArray<TSharedPtr<FJsonValue>> &Response,
+  FRedwoodSetPlayerRoleOutputDelegate OnOutput
+) {
+  // TryGetObject, not AsObject: for a value that is not an object, AsObject
+  // gives back a VALID empty object, which would read as an answer with no
+  // error -- that is, as a role change that never happened.
+  const TSharedPtr<FJsonObject> *MessageObject = nullptr;
+  if (Response.IsValidIndex(0) && Response[0].IsValid()) {
+    Response[0]->TryGetObject(MessageObject);
+  }
+
+  if (MessageObject == nullptr) {
+    OnOutput.ExecuteIfBound(
+      false, 0, TEXT("The backend did not answer the role change")
+    );
+    return;
+  }
+
+  // The backend puts an error on EVERY answer, empty when the change is made.
+  // An object without the field is therefore not an answer of this backend,
+  // and must not be read as an empty error -- that is the same false success
+  // an empty object gives, which the test above exists to stop.
+  FString Error;
+  if (!(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+    OnOutput.ExecuteIfBound(
+      false, 0, TEXT("The backend did not answer the role change")
+    );
+    return;
+  }
+
+  // The tier the backend committed, which is not always the tier that was
+  // asked for. It is absent on every refusal, and then stays 0.
+  //
+  // The range test is the one ParsePlayerData explains: a JSON number arrives
+  // as a double, and narrowing one that is out of range is undefined
+  // behaviour. A number this fork's own backend cannot send, so the answer is
+  // still reported: the error string decides whether the change took effect,
+  // and a change that DID take effect must never be reported as a failure --
+  // an operator would then ask again for a change that is already made.
+  int32 NewRole = 0;
+  double RoleValue = 0.0;
+  if ((*MessageObject)->TryGetNumberField(TEXT("role"), RoleValue) &&
+      RoleValue >= static_cast<double>(MIN_int32) &&
+      RoleValue <= static_cast<double>(MAX_int32)) {
+    NewRole = static_cast<int32>(RoleValue);
+  }
+
+  OnOutput.ExecuteIfBound(Error.IsEmpty(), NewRole, Error);
+}
+
+void URedwoodServerGameSubsystem::RequestPlayerRoleChange(
+  const FString &TargetPlayerId,
+  const FString &RoleKey,
+  const FString &ActorPlayerId,
+  FRedwoodSetPlayerRoleOutputDelegate OnOutput
+) {
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    OnOutput.ExecuteIfBound(false, 0, TEXT("Sidecar is not connected"));
+    return;
+  }
+
+  Sidecar->Emit(
+    SetPlayerRoleEventName,
+    MakeSetPlayerRolePayload(TargetPlayerId, RoleKey, ActorPlayerId),
+    [OnOutput](auto Response) { AnswerSetPlayerRole(Response, OnOutput); }
+  );
+}
+// FORK(hollowed-oath) END
+
 FRedwoodParty URedwoodServerGameSubsystem::GetTrackedPartyById(
   const FString &InPartyId
 ) const {

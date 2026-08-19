@@ -366,6 +366,53 @@ public:
     const FString &PlayerId, FRedwoodGetPartyOutputDelegate OnOutput
   );
 
+  // FORK(hollowed-oath) BEGIN: the in-game /gm command. Ask the backend to
+  // change the account role of a player, which lasts past the session because
+  // the account service, not this server, holds it. Fork-added.
+  //
+  // RoleKey is a backend role name, or EMPTY to clear the role back to the
+  // lowest tier. The plugin never maps a tier number to a key: the game sends
+  // the key and reads the number back, so a new tier needs no plugin change.
+  //
+  // ActorPlayerId names the player who asked, and the backend applies its rank
+  // rule to it. Take it ONLY from the authenticated session on this server.
+  // A value that comes from anything a client sent would let any player claim
+  // the rank of any other.
+  //
+  // OnOutput IS NOT GUARANTEED TO FIRE. There is no timeout on the answer, so
+  // a sidecar that never answers -- an image without this route during a
+  // rolling deploy, for one -- leaves the request open for the rest of the
+  // session. A caller must not hold state that only this answer can release:
+  // no latch, no "a change is in flight" flag that blocks the next command.
+  // The delegate also fires INLINE, before this function returns, when the
+  // sidecar is down; on every other path it fires later, from the socket.
+  void RequestPlayerRoleChange(
+    const FString &TargetPlayerId,
+    const FString &RoleKey,
+    const FString &ActorPlayerId,
+    FRedwoodSetPlayerRoleOutputDelegate OnOutput
+  );
+
+  // Wire name of the fork-added role-change request. Named and pinned by a
+  // test, because the backend pins its own copy of this string and the two
+  // cannot share a constant: a silent drift on either side would turn the
+  // whole command off with nothing to show for it.
+  static constexpr const TCHAR *SetPlayerRoleEventName =
+    TEXT("realm:servers:set-player-role:game-server-to-sidecar");
+
+  // The two halves of RequestPlayerRoleChange that hold rules, kept apart from
+  // the socket so the automation test can reach them without a backend.
+  static TSharedPtr<FJsonObject> MakeSetPlayerRolePayload(
+    const FString &TargetPlayerId,
+    const FString &RoleKey,
+    const FString &ActorPlayerId
+  );
+  static void AnswerSetPlayerRole(
+    const TArray<TSharedPtr<FJsonValue>> &Response,
+    FRedwoodSetPlayerRoleOutputDelegate OnOutput
+  );
+  // FORK(hollowed-oath) END
+
   // The latest party data for all parties that have at least one
   // member connected to this server, keyed by party id. The realm
   // backend pushes updates as parties change; each push fully replaces
