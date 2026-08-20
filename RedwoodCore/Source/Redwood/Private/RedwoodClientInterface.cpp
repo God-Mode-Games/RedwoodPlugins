@@ -2430,24 +2430,15 @@ void URedwoodClientInterface::BindRealmEvents() {
   Realm->OnEvent(
     TEXT("realm:servers:instance-starting"),
     [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
-      TSharedPtr<FJsonObject> MessageObject = Message->AsObject();
-      if (!MessageObject.IsValid()) {
-        // The realm is a trust boundary. A payload that is not an object
-        // would take the client down on the read below.
-        UE_LOG(
-          LogRedwood,
-          Warning,
-          TEXT("Ignoring a zone-start note that carries no object")
+      // The realm is a trust boundary, so a payload that is not an object is
+      // dropped. A field an older realm does not send reads as zero seconds,
+      // which the game reads as a note that buys nothing.
+      if (const TSharedPtr<FJsonObject> MessageObject = Message->AsObject()) {
+        OnZoneServerStarting.Broadcast(
+          MessageObject->GetStringField(TEXT("zoneName")),
+          MessageObject->GetNumberField(TEXT("secondsRemaining"))
         );
-        return;
       }
-
-      // A field that an older realm does not send reads as an empty name and
-      // zero seconds, which the game reads as a note that buys nothing.
-      OnZoneServerStarting.Broadcast(
-        MessageObject->GetStringField(TEXT("zoneName")),
-        MessageObject->GetNumberField(TEXT("secondsRemaining"))
-      );
     },
     TEXT("/"),
     ESIOThreadOverrideOption::USE_GAME_THREAD
