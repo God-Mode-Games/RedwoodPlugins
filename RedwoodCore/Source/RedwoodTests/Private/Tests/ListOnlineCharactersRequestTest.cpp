@@ -4,9 +4,10 @@
 // Pins the parse half of URedwoodServerGameSubsystem::RequestOnlineCharacters,
 // the game-server side of the in-game /who all command:
 //   1. A good answer yields every character with its name and zone.
-//   2. An answer that is not an object, or has no `error` field, is reported
-//      as an error and not as an empty roster. AsObject would turn such an
-//      answer into a valid EMPTY object, which reads as "nobody online".
+//   2. An answer that is not an object, has no `error` field, or has no
+//      `characters` array, is reported as an error and not as an empty
+//      roster. AsObject would turn such an answer into a valid EMPTY object,
+//      which reads as "nobody online".
 //   3. A backend refusal carries its error string through unchanged.
 //   4. An entry with no name is left out rather than shown as a blank line.
 //   5. ListOnlineCharactersEventName still holds the wire name the backend
@@ -129,6 +130,15 @@ bool FRedwoodListOnlineCharactersBadAnswerTest::RunTest(
   TestFalse(
     TEXT("An object with no error field is not one of our answers"),
     ParseOne(MakeShared<FJsonValueObject>(NoErrorField)).Error.IsEmpty()
+  );
+
+  // A success with no array. The backend puts the array on every answer, so
+  // this is not one of its answers, and it must not read as nobody online.
+  TSharedPtr<FJsonObject> NoArray = MakeShared<FJsonObject>();
+  NoArray->SetStringField(TEXT("error"), TEXT(""));
+  TestFalse(
+    TEXT("A success with no characters array is an error"),
+    ParseOne(MakeShared<FJsonValueObject>(NoArray)).Error.IsEmpty()
   );
 
   TArray<TSharedPtr<FJsonValue>> Empty;

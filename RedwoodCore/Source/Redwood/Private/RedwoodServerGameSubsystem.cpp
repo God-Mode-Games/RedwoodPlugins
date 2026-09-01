@@ -3831,18 +3831,22 @@ URedwoodServerGameSubsystem::ParseListOnlineCharacters(
     return Output;
   }
 
-  Output.Error = Error;
-
+  // The backend puts the array on EVERY answer, empty on a refusal. An answer
+  // without it is not one of its answers, and must keep the default error:
+  // a success with no array would read as nobody online.
   const TArray<TSharedPtr<FJsonValue>> *Characters = nullptr;
-  if ((*MessageObject)->TryGetArrayField(TEXT("characters"), Characters)) {
-    for (const TSharedPtr<FJsonValue> &Value : *Characters) {
-      const TSharedPtr<FJsonObject> *Entry = nullptr;
-      FRedwoodOnlineCharacter Character;
-      if (Value.IsValid() && Value->TryGetObject(Entry) &&
-          (*Entry)->TryGetStringField(TEXT("name"), Character.Name)) {
-        (*Entry)->TryGetStringField(TEXT("zoneName"), Character.ZoneName);
-        Output.Characters.Add(MoveTemp(Character));
-      }
+  if (!(*MessageObject)->TryGetArrayField(TEXT("characters"), Characters)) {
+    return Output;
+  }
+
+  Output.Error = Error;
+  for (const TSharedPtr<FJsonValue> &Value : *Characters) {
+    const TSharedPtr<FJsonObject> *Entry = nullptr;
+    FRedwoodOnlineCharacter Character;
+    if (Value.IsValid() && Value->TryGetObject(Entry) &&
+        (*Entry)->TryGetStringField(TEXT("name"), Character.Name)) {
+      (*Entry)->TryGetStringField(TEXT("zoneName"), Character.ZoneName);
+      Output.Characters.Add(MoveTemp(Character));
     }
   }
 
