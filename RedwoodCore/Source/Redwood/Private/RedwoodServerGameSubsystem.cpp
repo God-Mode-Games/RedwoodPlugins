@@ -3810,6 +3810,63 @@ void URedwoodServerGameSubsystem::RequestPlayerRoleChange(
     [OnOutput](auto Response) { AnswerSetPlayerRole(Response, OnOutput); }
   );
 }
+
+FRedwoodListOnlineCharactersOutput
+URedwoodServerGameSubsystem::ParseListOnlineCharacters(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  FRedwoodListOnlineCharactersOutput Output;
+  Output.Error = TEXT("The backend did not answer the online character list");
+
+  // TryGetObject, not AsObject, for the reason AnswerSetPlayerRole gives: a
+  // value that is not an object must not read as an answer with nobody online.
+  const TSharedPtr<FJsonObject> *MessageObject = nullptr;
+  if (Response.IsValidIndex(0) && Response[0].IsValid()) {
+    Response[0]->TryGetObject(MessageObject);
+  }
+
+  FString Error;
+  if (MessageObject == nullptr ||
+      !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+    return Output;
+  }
+
+  Output.Error = Error;
+
+  const TArray<TSharedPtr<FJsonValue>> *Characters = nullptr;
+  if ((*MessageObject)->TryGetArrayField(TEXT("characters"), Characters)) {
+    for (const TSharedPtr<FJsonValue> &Value : *Characters) {
+      const TSharedPtr<FJsonObject> *Entry = nullptr;
+      FRedwoodOnlineCharacter Character;
+      if (Value.IsValid() && Value->TryGetObject(Entry) &&
+          (*Entry)->TryGetStringField(TEXT("name"), Character.Name)) {
+        (*Entry)->TryGetStringField(TEXT("zoneName"), Character.ZoneName);
+        Output.Characters.Add(MoveTemp(Character));
+      }
+    }
+  }
+
+  return Output;
+}
+
+void URedwoodServerGameSubsystem::RequestOnlineCharacters(
+  FRedwoodListOnlineCharactersOutputDelegate OnOutput
+) {
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    FRedwoodListOnlineCharactersOutput Output;
+    Output.Error = TEXT("Sidecar is not connected");
+    OnOutput.ExecuteIfBound(Output);
+    return;
+  }
+
+  Sidecar->Emit(
+    ListOnlineCharactersEventName,
+    MakeShareable(new FJsonObject),
+    [OnOutput](auto Response) {
+      OnOutput.ExecuteIfBound(ParseListOnlineCharacters(Response));
+    }
+  );
+}
 // FORK(hollowed-oath) END
 
 FRedwoodParty URedwoodServerGameSubsystem::GetTrackedPartyById(
