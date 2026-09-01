@@ -283,26 +283,15 @@ typedef TDelegate<void(bool, int32, const FString &)>
 // game-server side of the in-game /who all command. Fork-added. One entry per
 // character in play on the realm, on any game server, sorted by name by the
 // backend. Error is the backend string, empty on success, carried through
-// WITHOUT translation.
-USTRUCT(BlueprintType)
+// WITHOUT translation. Plain structs: no Blueprint reaches them, and the
+// delegate is a plain TDelegate like the role-change one above.
 struct FRedwoodOnlineCharacter {
-  GENERATED_BODY()
-
-  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   FString Name;
-
-  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   FString ZoneName;
 };
 
-USTRUCT(BlueprintType)
 struct FRedwoodListOnlineCharactersOutput {
-  GENERATED_BODY()
-
-  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   FString Error;
-
-  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   TArray<FRedwoodOnlineCharacter> Characters;
 };
 
