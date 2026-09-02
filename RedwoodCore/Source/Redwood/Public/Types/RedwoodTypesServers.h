@@ -278,4 +278,23 @@ struct FRedwoodServerDetails {
 // struct here would only make the game unpack it again.
 typedef TDelegate<void(bool, int32, const FString &)>
   FRedwoodSetPlayerRoleOutputDelegate;
+
+// The answer to URedwoodServerGameSubsystem::RequestOnlineCharacters, the
+// game-server side of the in-game /who all command. Fork-added. One entry per
+// character in play on the realm, on any game server, sorted by name by the
+// backend. Error is the backend string, empty on success, carried through
+// WITHOUT translation. Plain structs: no Blueprint reaches them, and the
+// delegate is a plain TDelegate like the role-change one above.
+struct FRedwoodOnlineCharacter {
+  FString Name;
+  FString ZoneName;
+};
+
+struct FRedwoodListOnlineCharactersOutput {
+  FString Error;
+  TArray<FRedwoodOnlineCharacter> Characters;
+};
+
+typedef TDelegate<void(const FRedwoodListOnlineCharactersOutput &)>
+  FRedwoodListOnlineCharactersOutputDelegate;
 // FORK(hollowed-oath) END

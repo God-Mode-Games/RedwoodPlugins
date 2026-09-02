@@ -34,6 +34,21 @@
 #include "SIOJsonValue.h"
 #include "SocketIOClient.h"
 
+// FORK(hollowed-oath): the one way the fork's request callbacks read an answer.
+// TryGetObject, not AsObject: for a value that is not an object, AsObject
+// gives back a VALID empty object, which reads as an answer with no error --
+// that is, as work that never happened. A null or malformed answer must reach
+// the caller as "no usable answer" instead.
+static const TSharedPtr<FJsonObject> *TryGetRedwoodAnswerObject(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  const TSharedPtr<FJsonObject> *Object = nullptr;
+  if (Response.IsValidIndex(0) && Response[0].IsValid()) {
+    Response[0]->TryGetObject(Object);
+  }
+  return Object;
+}
+
 void URedwoodServerGameSubsystem::Initialize(
   FSubsystemCollectionBase &Collection
 ) {
@@ -874,14 +889,8 @@ void URedwoodServerGameSubsystem::EmitTransferZoneRequest(
     TEXT("realm:servers:transfer-zone:game-server-to-sidecar"),
     Payload,
     [this, WeakPlayerController, EmitGeneration](auto Response) {
-      // TryGetObject, not AsObject: for a value that is not an object,
-      // AsObject returns a VALID empty object, and an empty object reads
-      // as a success answer in the handler. A null or malformed answer
-      // must reach the handler as "no usable answer" instead.
-      const TSharedPtr<FJsonObject> *ResponseObject = nullptr;
-      if (Response.IsValidIndex(0)) {
-        Response[0]->TryGetObject(ResponseObject);
-      }
+      const TSharedPtr<FJsonObject> *ResponseObject =
+        TryGetRedwoodAnswerObject(Response);
       HandleTransferZoneResponse(
         ResponseObject ? *ResponseObject : nullptr,
         WeakPlayerController,
@@ -3746,14 +3755,8 @@ void URedwoodServerGameSubsystem::AnswerSetPlayerRole(
   const TArray<TSharedPtr<FJsonValue>> &Response,
   FRedwoodSetPlayerRoleOutputDelegate OnOutput
 ) {
-  // TryGetObject, not AsObject: for a value that is not an object, AsObject
-  // gives back a VALID empty object, which would read as an answer with no
-  // error -- that is, as a role change that never happened.
-  const TSharedPtr<FJsonObject> *MessageObject = nullptr;
-  if (Response.IsValidIndex(0) && Response[0].IsValid()) {
-    Response[0]->TryGetObject(MessageObject);
-  }
-
+  const TSharedPtr<FJsonObject> *MessageObject =
+    TryGetRedwoodAnswerObject(Response);
   if (MessageObject == nullptr) {
     OnOutput.ExecuteIfBound(
       false, 0, TEXT("The backend did not answer the role change")
@@ -3808,6 +3811,63 @@ void URedwoodServerGameSubsystem::RequestPlayerRoleChange(
     SetPlayerRoleEventName,
     MakeSetPlayerRolePayload(TargetPlayerId, RoleKey, ActorPlayerId),
     [OnOutput](auto Response) { AnswerSetPlayerRole(Response, OnOutput); }
+  );
+}
+
+FRedwoodListOnlineCharactersOutput
+URedwoodServerGameSubsystem::ParseListOnlineCharacters(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  FRedwoodListOnlineCharactersOutput Output;
+  Output.Error = TEXT("The backend did not answer the online character list");
+
+  const TSharedPtr<FJsonObject> *MessageObject =
+    TryGetRedwoodAnswerObject(Response);
+  FString Error;
+  if (MessageObject == nullptr ||
+      !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+    return Output;
+  }
+
+  // The backend puts the array on EVERY answer, empty on a refusal. An answer
+  // without it is not one of its answers, and must keep the default error:
+  // a success with no array would read as nobody online.
+  const TArray<TSharedPtr<FJsonValue>> *Characters = nullptr;
+  if (!(*MessageObject)->TryGetArrayField(TEXT("characters"), Characters)) {
+    return Output;
+  }
+
+  Output.Error = Error;
+  Output.Characters.Reserve(Characters->Num());
+  for (const TSharedPtr<FJsonValue> &Value : *Characters) {
+    const TSharedPtr<FJsonObject> *Entry = nullptr;
+    FRedwoodOnlineCharacter Character;
+    if (Value.IsValid() && Value->TryGetObject(Entry) &&
+        (*Entry)->TryGetStringField(TEXT("name"), Character.Name)) {
+      (*Entry)->TryGetStringField(TEXT("zoneName"), Character.ZoneName);
+      Output.Characters.Add(MoveTemp(Character));
+    }
+  }
+
+  return Output;
+}
+
+void URedwoodServerGameSubsystem::RequestOnlineCharacters(
+  FRedwoodListOnlineCharactersOutputDelegate OnOutput
+) {
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    FRedwoodListOnlineCharactersOutput Output;
+    Output.Error = TEXT("Sidecar is not connected");
+    OnOutput.ExecuteIfBound(Output);
+    return;
+  }
+
+  Sidecar->Emit(
+    ListOnlineCharactersEventName,
+    MakeShareable(new FJsonObject),
+    [OnOutput](auto Response) {
+      OnOutput.ExecuteIfBound(ParseListOnlineCharacters(Response));
+    }
   );
 }
 // FORK(hollowed-oath) END

@@ -411,6 +411,25 @@ public:
     const TArray<TSharedPtr<FJsonValue>> &Response,
     FRedwoodSetPlayerRoleOutputDelegate OnOutput
   );
+
+  // Ask the realm for every character in play on it, on any game server: the
+  // game-server side of the in-game /who all command. Fork-added. The same
+  // answer contract as RequestPlayerRoleChange: OnOutput is not guaranteed to
+  // fire, and fires INLINE, with an error, when the sidecar is down.
+  void RequestOnlineCharacters(
+    FRedwoodListOnlineCharactersOutputDelegate OnOutput
+  );
+
+  // Wire name, pinned by a test against the backend's own copy of the string.
+  static constexpr const TCHAR *ListOnlineCharactersEventName =
+    TEXT("realm:servers:list-online-characters:game-server-to-sidecar");
+
+  // The parse half of RequestOnlineCharacters, kept apart from the socket so
+  // the automation test can reach it without a backend. An answer that is not
+  // one of the backend's comes back with an error, never as an empty roster.
+  static FRedwoodListOnlineCharactersOutput ParseListOnlineCharacters(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  );
   // FORK(hollowed-oath) END
 
   // The latest party data for all parties that have at least one
