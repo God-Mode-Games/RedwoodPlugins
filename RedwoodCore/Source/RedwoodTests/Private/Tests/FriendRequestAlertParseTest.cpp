@@ -1,9 +1,15 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
-// FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart. It pins the shape of
-// the director "director:friends:request-alert" push. The backend and the game agree on the field
-// names "fromPlayerId" and "fromPlayerNickname" by name only, so a rename on either side stays
-// silent until these tests fail.
+// FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart. It pins the field
+// names this plugin reads out of the director "director:friends:request-alert" push, so a
+// change to the parser cannot quietly stop reading "fromPlayerId" or "fromPlayerNickname".
+//
+// These tests hold the plugin side only. They build their JSON from the same names the parser
+// reads, so a rename in the backend leaves them green. The agreement between the two
+// repositories is held by the RequestAlert schema in the backend,
+// packages/common/src/interfaces.ts: keep the names below equal to the names there. If the
+// backend renames a field, the listener in RedwoodClientInterface.cpp drops every alert and
+// logs a warning, which is the symptom to look for.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -102,8 +108,20 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FRedwoodFriendRequestAlertBadPayloadTest::RunTest(const FString &Parameters
 ) {
-  // A push that is not an object makes AsObject give back an empty pointer, so
-  // the parser must take one. The caller drops a requester that has no id.
+  // A push that is not an object does not give an empty pointer: FJsonValue::AsObject
+  // logs a LogJson error and gives back a shared empty object. That empty object is the
+  // payload the listener can really see, so it is the first case here.
+  const FRedwoodPlayer FromEmptyObject =
+    URedwoodCommonGameSubsystem::ParseFriendRequestAlert(
+      MakeShared<FJsonObject>()
+    );
+  TestEqual(
+    TEXT("An empty push gives no requester id"),
+    FromEmptyObject.PlayerId,
+    FString()
+  );
+
+  // The parser also takes an empty pointer, which a direct caller can still pass.
   const FRedwoodPlayer FromInvalid =
     URedwoodCommonGameSubsystem::ParseFriendRequestAlert(nullptr);
   TestEqual(

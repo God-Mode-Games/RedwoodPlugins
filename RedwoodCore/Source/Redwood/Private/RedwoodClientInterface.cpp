@@ -92,9 +92,13 @@ void URedwoodClientInterface::InitializeDirectorConnection(
 
   // FORK(hollowed-oath) BEGIN: listen for the fork-added friend request push. The director
   // sends it to the player who gets the request. Upstream has no such push, so the game had to
-  // ask for the friend list again to see a new request. A push that is not an object, or that
-  // names no sender, gives a requester with no id; drop it instead of telling the game about a
-  // request it cannot answer.
+  // ask for the friend list again to see a new request.
+  //
+  // A push that is not an object gives an empty object, because FJsonValue::AsObject logs a
+  // LogJson error and returns a shared empty object. Such a push has no sender, and so does a
+  // push in which the director renamed the fields. The game cannot answer a request with no
+  // sender, so it is dropped. The drop is logged, because without a log line a change to the
+  // names of the fields would stop this feature with no symptom at all.
   Director->OnEvent(
     TEXT("director:friends:request-alert"),
     [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
@@ -102,9 +106,18 @@ void URedwoodClientInterface::InitializeDirectorConnection(
       FRedwoodPlayer Requester =
         URedwoodCommonGameSubsystem::ParseFriendRequestAlert(MessageObject);
 
-      if (!Requester.PlayerId.IsEmpty()) {
-        OnFriendRequestReceived.Broadcast(Requester);
+      if (Requester.PlayerId.IsEmpty()) {
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT(
+            "Dropped a director:friends:request-alert that names no sender. The director and the game may no longer agree on the names of the fields in this message."
+          )
+        );
+        return;
       }
+
+      OnFriendRequestReceived.Broadcast(Requester);
     },
     TEXT("/"),
     ESIOThreadOverrideOption::USE_GAME_THREAD
