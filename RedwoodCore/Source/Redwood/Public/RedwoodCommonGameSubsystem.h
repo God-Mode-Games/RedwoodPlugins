@@ -102,6 +102,13 @@ public:
     const TArray<TSharedPtr<FJsonValue>> &InvitesArray
   );
 
+  // FORK(hollowed-oath): parser for the fork-added "director:friends:request-alert" push.
+  // Fork-added; the definition and the full reason live under a matching FORK marker in
+  // RedwoodCommonGameSubsystem.cpp.
+  static FRedwoodPlayer ParseFriendRequestAlert(
+    const TSharedPtr<FJsonObject> &AlertObject
+  );
+
   static FRedwoodParty ParseParty(const TSharedPtr<FJsonObject> &PartyObj);
 
   // FORK(hollowed-oath) BEGIN: item wire-format helper declarations. Fork-added; definitions +

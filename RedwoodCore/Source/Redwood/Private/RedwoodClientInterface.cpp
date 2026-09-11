@@ -90,6 +90,27 @@ void URedwoodClientInterface::InitializeDirectorConnection(
     ESIOThreadOverrideOption::USE_GAME_THREAD
   );
 
+  // FORK(hollowed-oath) BEGIN: listen for the fork-added friend request push. The director
+  // sends it to the player who gets the request. Upstream has no such push, so the game had to
+  // ask for the friend list again to see a new request. A push that is not an object, or that
+  // names no sender, gives a requester with no id; drop it instead of telling the game about a
+  // request it cannot answer.
+  Director->OnEvent(
+    TEXT("director:friends:request-alert"),
+    [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
+      TSharedPtr<FJsonObject> MessageObject = Message->AsObject();
+      FRedwoodPlayer Requester =
+        URedwoodCommonGameSubsystem::ParseFriendRequestAlert(MessageObject);
+
+      if (!Requester.PlayerId.IsEmpty()) {
+        OnFriendRequestReceived.Broadcast(Requester);
+      }
+    },
+    TEXT("/"),
+    ESIOThreadOverrideOption::USE_GAME_THREAD
+  );
+  // FORK(hollowed-oath) END
+
   FString Uri = *URedwoodSettings::GetDirectorUri();
 
   Director->OnReconnectionCallback = [Uri, this](

@@ -57,6 +57,12 @@ public:
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodConnectionAuthFailedDynamicDelegate OnRealmAuthFailed;
 
+  // FORK(hollowed-oath): BlueprintAssignable event telling the game that another player asked
+  // to be a friend. Fork-added; pairs with the delegate of the same name on
+  // RedwoodClientInterface.
+  UPROPERTY(BlueprintAssignable, Category = "Redwood")
+  FRedwoodFriendRequestReceivedDynamicDelegate OnFriendRequestReceived;
+
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodPartyInvitedDynamicDelegate OnPartyInvited;
 
@@ -431,6 +437,11 @@ private:
 
   UFUNCTION()
   void HandleRequestToJoinServer(FString ConsoleCommand);
+
+  // FORK(hollowed-oath): handler for the fork-added friend request delegate; bound in
+  // Initialize, re-broadcast to the BlueprintAssignable event above.
+  UFUNCTION()
+  void HandleOnFriendRequestReceived(FRedwoodPlayer Requester);
 
   UFUNCTION()
   void HandleOnPartyInvited(FRedwoodPartyInvite Invite);

@@ -50,6 +50,14 @@ struct FRedwoodPlayer {
   FRedwoodPlayerOnlineStateRealm OnlineStateRealm;
 };
 
+// FORK(hollowed-oath): delegate type carrying the player who asked to be a friend. Fork-added;
+// upstream has no push for friend requests. Broadcast from the director listener in
+// RedwoodClientInterface.cpp, relayed to the game by RedwoodClientGameSubsystem.
+UDELEGATE()
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+  FRedwoodFriendRequestReceivedDynamicDelegate, FRedwoodPlayer, Requester
+);
+
 USTRUCT(BlueprintType)
 struct FRedwoodListPlayersOutput {
   GENERATED_BODY()
