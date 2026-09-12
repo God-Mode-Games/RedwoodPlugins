@@ -18,27 +18,33 @@
 #include "LatencyCheckerLibrary.h"
 #include "SocketIOClient.h"
 
-// FORK(hollowed-oath): shared text for the null ClientInterface guards on the
-// social functions below (#2445).
+// FORK(hollowed-oath): this text is the shared error for the null
+// ClientInterface guards on the social functions below (#2445).
 //
-// ClientInterface is only built by Initialize(), and only if the backend was on
-// at that moment. Every function here instead gates on ShouldUseBackend(),
-// which is read again at each call. The two can therefore disagree: a client
-// that initialized with the backend off, or a PIE session where the backend
-// setting turned on afterwards, reaches the backend branch with no interface
-// behind it. GetPlayerId() has always checked the pointer, so the guards make
-// the rest of the class agree with it instead of dereferencing null.
+// Initialize() builds ClientInterface only when ShouldUseBackend() is true.
+// Each function tests ShouldUseBackend() again at call time. In the editor that
+// function reads bUseBackendInPIE, and a user can change that setting while PIE
+// runs. A PIE session that starts with the backend off has no interface. It
+// takes the backend branch as soon as the setting turns on, and before these
+// guards the branch read through a null pointer.
 //
-// The text is worded like the "Not connected to Director." errors that
-// RedwoodClientInterface already reports for the same class of failure, because
-// it reaches the player through the same output structs. It is deliberately not
-// the "without using a backend" text of the else branches below -- those
-// branches are the backend-less stubs, and several of them report success, so a
-// missing interface must not fall through to them.
+// Only that PIE toggle reaches the null pointer. A packaged client always gets
+// true from ShouldUseBackend(). Every game instance sets its world before
+// Init(), and nothing clears the pointer later, so a packaged client always has
+// the interface.
 //
-// Only the social functions are guarded here. The rest of the file has the same
-// omission, and the stub branches of the auth and realm functions report
-// success, so they need a different answer -- see #2450.
+// GetPlayerId() has always tested the pointer. These guards make the social
+// functions do the same test.
+//
+// The wording follows the "Not connected to Director." errors in
+// RedwoodClientInterface, because this error reaches the player through the
+// same output structs. The guards deliberately do not reuse the "without using
+// a backend" text of the else branches below. Those branches are the
+// backend-less stubs, and some of them report success, so a null interface must
+// never run them.
+//
+// Only the social functions have a guard. The other functions in this file have
+// the same fault. See #2450.
 namespace {
 
 const TCHAR *const RedwoodNoClientInterfaceError =
@@ -266,8 +272,7 @@ void URedwoodClientGameSubsystem::SearchForPlayers(
   FRedwoodListPlayersOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): null interface guard for #2445; see
-    // RedwoodNoClientInterfaceError.
+    // FORK(hollowed-oath): the file header explains this guard (#2445).
     if (!ClientInterface) {
       FRedwoodListPlayersOutput Output;
       Output.Error = RedwoodNoClientInterfaceError;
@@ -289,8 +294,7 @@ void URedwoodClientGameSubsystem::SearchForPlayerById(
   FString TargetPlayerId, FRedwoodPlayerOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): null interface guard for #2445; see
-    // RedwoodNoClientInterfaceError.
+    // FORK(hollowed-oath): the file header explains this guard (#2445).
     if (!ClientInterface) {
       FRedwoodPlayerOutput Output;
       Output.Error = RedwoodNoClientInterfaceError;
@@ -310,8 +314,7 @@ void URedwoodClientGameSubsystem::ListFriends(
   ERedwoodFriendListType Filter, FRedwoodListPlayersOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): null interface guard for #2445; see
-    // RedwoodNoClientInterfaceError.
+    // FORK(hollowed-oath): the file header explains this guard (#2445).
     if (!ClientInterface) {
       FRedwoodListPlayersOutput Output;
       Output.Error = RedwoodNoClientInterfaceError;
@@ -331,8 +334,7 @@ void URedwoodClientGameSubsystem::RequestFriend(
   FString OtherPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): null interface guard for #2445; see
-    // RedwoodNoClientInterfaceError.
+    // FORK(hollowed-oath): the file header explains this guard (#2445).
     if (!ClientInterface) {
       OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
       return;
@@ -349,8 +351,7 @@ void URedwoodClientGameSubsystem::RemoveFriend(
   FString OtherPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): null interface guard for #2445; see
-    // RedwoodNoClientInterfaceError.
+    // FORK(hollowed-oath): the file header explains this guard (#2445).
     if (!ClientInterface) {
       OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
       return;
@@ -367,8 +368,7 @@ void URedwoodClientGameSubsystem::RespondToFriendRequest(
   FString OtherPlayerId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): null interface guard for #2445; see
-    // RedwoodNoClientInterfaceError.
+    // FORK(hollowed-oath): the file header explains this guard (#2445).
     if (!ClientInterface) {
       OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
       return;
@@ -386,8 +386,7 @@ void URedwoodClientGameSubsystem::SetPlayerBlocked(
   FString OtherPlayerId, bool bBlocked, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): null interface guard for #2445; see
-    // RedwoodNoClientInterfaceError.
+    // FORK(hollowed-oath): the file header explains this guard (#2445).
     if (!ClientInterface) {
       OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
       return;
@@ -404,8 +403,7 @@ void URedwoodClientGameSubsystem::ListRealmContacts(
   FRedwoodListRealmContactsOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): null interface guard for #2445; see
-    // RedwoodNoClientInterfaceError.
+    // FORK(hollowed-oath): the file header explains this guard (#2445).
     if (!ClientInterface) {
       FRedwoodListRealmContactsOutput Output;
       Output.Error = RedwoodNoClientInterfaceError;
@@ -425,8 +423,7 @@ void URedwoodClientGameSubsystem::AddRealmContact(
   FString OtherCharacterId, bool bBlocked, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): null interface guard for #2445; see
-    // RedwoodNoClientInterfaceError.
+    // FORK(hollowed-oath): the file header explains this guard (#2445).
     if (!ClientInterface) {
       OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
       return;
@@ -444,8 +441,7 @@ void URedwoodClientGameSubsystem::RemoveRealmContact(
   FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): null interface guard for #2445; see
-    // RedwoodNoClientInterfaceError.
+    // FORK(hollowed-oath): the file header explains this guard (#2445).
     if (!ClientInterface) {
       OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
       return;

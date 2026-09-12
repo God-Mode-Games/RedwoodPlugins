@@ -4,13 +4,18 @@
 // pins the null ClientInterface guards added to the social functions of
 // URedwoodClientGameSubsystem for #2445.
 //
-// ClientInterface is only built if Initialize() ran while the backend was on,
-// but each of these functions gates on ShouldUseBackend(), which is read again
-// at every call. The two states therefore disagree: a subsystem that never
-// initialized the interface, or a PIE session where the backend setting turned
-// on after Initialize(), reaches the backend branch with a null interface.
-// Before the guards that branch dereferenced null. GetPlayerId() has always
-// checked, which is why the omission is a defect and not a design.
+// Initialize() builds ClientInterface only when ShouldUseBackend() is true, but
+// each of these functions tests ShouldUseBackend() again at call time. In the
+// editor that function reads bUseBackendInPIE, and a user can change it while
+// PIE runs. A PIE session that starts with the backend off therefore has no
+// interface, and it takes the backend branch as soon as the setting turns on.
+// Before the guards, the branch read through a null pointer. That PIE toggle is
+// the only way to reach it: a packaged client always builds the interface.
+//
+// This fixture does not use the toggle. It builds the same end state directly,
+// with a subsystem that never ran Initialize() in a world of type Game, because
+// that needs no editor setting and so gives the same result on every machine.
+// The state it asserts is the one the guards answer, not a production path.
 //
 // Every guarded function is a separate call site with its own output type, so
 // each is asserted. An unguarded site crashes the run instead of failing, so a
@@ -76,8 +81,8 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
   URedwoodClientGameSubsystem *Subsystem =
     NewObject<URedwoodClientGameSubsystem>(GameInstance);
 
-  // Nothing below means anything unless the fixture really is the broken state,
-  // so both halves of it are asserted first.
+  // These two checks prove the fixture is the broken state. Without them the
+  // calls below could pass for the wrong reason.
   TestNull(
     TEXT("Fixture has no client interface"), Subsystem->GetClientInterface()
   );
@@ -110,10 +115,14 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
       [&Error](const FString &Output) { Error = Output; }
     );
 
+  // TestEqualSensitive, not TestEqual: the TCHAR* form of TestEqual compares
+  // with Stricmp, so it would accept the text in the wrong case. This pins what
+  // the player actually reads.
+  //
   // Clearing after each check means a guard that returns without firing its
   // delegate fails here, instead of passing on the previous call's value.
   const auto CheckGuard = [this, &Error](const TCHAR *What) {
-    TestEqual(What, *Error, RedwoodExpectedGuardError);
+    TestEqualSensitive(What, *Error, RedwoodExpectedGuardError);
     Error.Reset();
   };
 
