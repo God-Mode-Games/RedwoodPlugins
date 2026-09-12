@@ -2,14 +2,17 @@
 
 // FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart. It pins the field
 // names this plugin reads out of the director "director:friends:request-alert" push, so a
-// change to the parser cannot quietly stop reading "fromPlayerId" or "fromPlayerNickname".
+// change to the parser cannot stop reading "fromPlayerId" or "fromPlayerNickname" without a
+// test failure.
 //
 // These tests hold the plugin side only. They build their JSON from the same names the parser
 // reads, so a rename in the backend leaves them green. The agreement between the two
 // repositories is held by the RequestAlert schema in the backend,
-// packages/common/src/interfaces.ts: keep the names below equal to the names there. If the
-// backend renames a field, the listener in RedwoodClientInterface.cpp drops every alert and
-// logs a warning, which is the symptom to look for.
+// packages/common/src/interfaces.ts: keep the names below equal to the names there. Each of the
+// two names fails in its own way. If the backend renames "fromPlayerId", the listener in
+// RedwoodClientInterface.cpp drops every alert and logs a warning, which is the symptom to look
+// for. If the backend renames "fromPlayerNickname", every alert still arrives, but with an
+// empty name and no log line, because the name is optional.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -108,9 +111,10 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FRedwoodFriendRequestAlertBadPayloadTest::RunTest(const FString &Parameters
 ) {
-  // A push that is not an object does not give an empty pointer: FJsonValue::AsObject
-  // logs a LogJson error and gives back a shared empty object. That empty object is the
-  // payload the listener can really see, so it is the first case here.
+  // A push that is not an object does not give an empty pointer: FJsonValue::AsObject gives
+  // back a shared empty object, and writes to LogJson -- a warning for a null value, an error
+  // for any other value that is not an object. That empty object is the payload the listener
+  // sees, so it is the first case here.
   const FRedwoodPlayer FromEmptyObject =
     URedwoodCommonGameSubsystem::ParseFriendRequestAlert(
       MakeShared<FJsonObject>()

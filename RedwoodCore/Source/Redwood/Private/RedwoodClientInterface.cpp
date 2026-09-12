@@ -94,11 +94,13 @@ void URedwoodClientInterface::InitializeDirectorConnection(
   // sends it to the player who gets the request. Upstream has no such push, so the game had to
   // ask for the friend list again to see a new request.
   //
-  // A push that is not an object gives an empty object, because FJsonValue::AsObject logs a
-  // LogJson error and returns a shared empty object. Such a push has no sender, and so does a
-  // push in which the director renamed the fields. The game cannot answer a request with no
-  // sender, so it is dropped. The drop is logged, because without a log line a change to the
-  // names of the fields would stop this feature with no symptom at all.
+  // A push that is not an object gives an empty object, because FJsonValue::AsObject returns a
+  // shared empty object and writes to LogJson. The socket layer gives a null value for a null
+  // message, and a null value logs a warning; any other value that is not an object logs an
+  // error. Such a push has no sender, and so does a push in which the director renamed the
+  // fields. The game cannot answer a request with no sender, so it is dropped. The drop is
+  // logged, because without a log line a change to the names of the fields would stop this
+  // feature with no symptom at all.
   Director->OnEvent(
     TEXT("director:friends:request-alert"),
     [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
