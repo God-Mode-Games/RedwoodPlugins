@@ -38,13 +38,15 @@
 //
 // The wording follows the "Not connected to Director." errors in
 // RedwoodClientInterface, because this error reaches the player through the
-// same output structs. The guards deliberately do not reuse the "without using
-// a backend" text of the else branches below. Those branches are the
-// backend-less stubs, and some of them report success, so a null interface must
-// never run them.
+// same output structs. The guards do not reuse the "without using a backend"
+// text of the else branches below, because that text names a different cause.
+// An else branch runs when the backend is off. A guard runs when the backend is
+// on but the interface is missing.
 //
-// Only the social functions have a guard. The other functions in this file have
-// the same fault. See #2450.
+// Only the social functions have a guard. That was the scope of #2445. The
+// other functions in this file have the same fault, and some of their else
+// branches report success instead of an error, so this guard shape does not fit
+// them. See #2450.
 namespace {
 
 const TCHAR *const RedwoodNoClientInterfaceError =
