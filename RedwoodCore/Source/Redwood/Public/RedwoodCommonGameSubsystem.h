@@ -109,11 +109,20 @@ public:
     const TSharedPtr<FJsonObject> &AlertObject
   );
 
+  // FORK(hollowed-oath): the one way the fork's socket callbacks read the
+  // answer object out of the argument array. Returns null for no usable
+  // answer. Fork-added; moved here from RedwoodServerGameSubsystem.cpp so the
+  // client parsers use it too. The full reason lives under a matching FORK
+  // marker in RedwoodCommonGameSubsystem.cpp.
+  static const TSharedPtr<FJsonObject> *TryGetRedwoodAnswerObject(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  );
+
   // FORK(hollowed-oath): parser for the three fork-added arrays of the
   // "realm:contacts:list" answer. Fork-added; the definition and the full
   // reason live under a matching FORK marker in RedwoodCommonGameSubsystem.cpp.
   static FRedwoodListCharacterFriendsOutput ParseListCharacterFriends(
-    const TSharedPtr<FJsonObject> &MessageObject
+    const TArray<TSharedPtr<FJsonValue>> &Response
   );
 
   // FORK(hollowed-oath): parser for the fork-added

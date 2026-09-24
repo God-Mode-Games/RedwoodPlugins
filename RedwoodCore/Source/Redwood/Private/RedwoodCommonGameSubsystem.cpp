@@ -1373,29 +1373,47 @@ FRedwoodPlayer URedwoodCommonGameSubsystem::ParseFriendRequestAlert(
 }
 // FORK(hollowed-oath) END
 
+// FORK(hollowed-oath) BEGIN: read the answer object out of a socket
+// argument array. Moved here from RedwoodServerGameSubsystem.cpp, where the
+// fork first added it, so that the client parsers use the same rule.
+// TryGetObject, not AsObject: for a value that is not an object, AsObject
+// gives back a VALID empty object, which reads as an answer with no error --
+// that is, as work that never happened. A null or malformed answer must reach
+// the caller as "no usable answer" instead.
+const TSharedPtr<FJsonObject> *
+URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  const TSharedPtr<FJsonObject> *Object = nullptr;
+  if (Response.IsValidIndex(0) && Response[0].IsValid()) {
+    Response[0]->TryGetObject(Object);
+  }
+  return Object;
+}
+// FORK(hollowed-oath) END
+
 // FORK(hollowed-oath) BEGIN: parser for the character friend list. The
 // "realm:contacts:list" answer gets three arrays from the RedwoodBackend fork:
 // friends, incomingRequests and outgoingRequests. The upstream arrays
 // (contacts, blockedContacts) are read by ListRealmContacts, not here.
 //
 // The error field decides. An answer without one is not one of the realm's
-// answers (AsObject gives an empty object for a bad answer), and it must not
-// read as "no friends". A refused answer gives no rows. A missing array is an
-// empty list, so an older backend gives an empty list and no error. A row
-// with no characterId is left out, because the game keys every row on it.
+// answers, and it must not read as "no friends". A refused answer gives no
+// rows. A success must carry all three arrays: the backend always sends
+// them, and the game takes a good list as the full truth (it removes the
+// settings of each friend that is not in it), so a partial answer is an
+// error, not a short list. A row with no characterId or no characterName is
+// left out, because the game keys every row on the id and shows the name.
 namespace {
 
+const TCHAR *const BadCharacterFriendListAnswerError =
+  TEXT("Bad answer from the realm.");
+
 void ParseCharacterFriendRows(
-  const TSharedPtr<FJsonObject> &MessageObject,
-  const TCHAR *FieldName,
+  const TArray<TSharedPtr<FJsonValue>> &Rows,
   TArray<FRedwoodCharacterFriend> &OutRows
 ) {
-  const TArray<TSharedPtr<FJsonValue>> *Rows;
-  if (!MessageObject->TryGetArrayField(FieldName, Rows)) {
-    return;
-  }
-
-  for (const TSharedPtr<FJsonValue> &RowValue : *Rows) {
+  for (const TSharedPtr<FJsonValue> &RowValue : Rows) {
     const TSharedPtr<FJsonObject> *RowObject;
     if (!RowValue.IsValid() || !RowValue->TryGetObject(RowObject)) {
       continue;
@@ -1407,7 +1425,7 @@ void ParseCharacterFriendRows(
     (*RowObject)->TryGetBoolField(TEXT("online"), Row.bOnline);
     (*RowObject)->TryGetStringField(TEXT("zoneName"), Row.ZoneName);
 
-    if (!Row.CharacterId.IsEmpty()) {
+    if (!Row.CharacterId.IsEmpty() && !Row.CharacterName.IsEmpty()) {
       OutRows.Add(Row);
     }
   }
@@ -1417,26 +1435,39 @@ void ParseCharacterFriendRows(
 
 FRedwoodListCharacterFriendsOutput
 URedwoodCommonGameSubsystem::ParseListCharacterFriends(
-  const TSharedPtr<FJsonObject> &MessageObject
+  const TArray<TSharedPtr<FJsonValue>> &Response
 ) {
   FRedwoodListCharacterFriendsOutput Output;
+  Output.Error = BadCharacterFriendListAnswerError;
 
-  if (!MessageObject.IsValid() ||
-      !MessageObject->TryGetStringField(TEXT("error"), Output.Error)) {
-    Output.Error = TEXT("Bad answer from the realm.");
+  const TSharedPtr<FJsonObject> *MessageObject =
+    TryGetRedwoodAnswerObject(Response);
+  FString Error;
+  if (MessageObject == nullptr ||
+      !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
     return Output;
   }
 
-  if (Output.Error.IsEmpty()) {
-    ParseCharacterFriendRows(MessageObject, TEXT("friends"), Output.Friends);
-    ParseCharacterFriendRows(
-      MessageObject, TEXT("incomingRequests"), Output.IncomingRequests
-    );
-    ParseCharacterFriendRows(
-      MessageObject, TEXT("outgoingRequests"), Output.OutgoingRequests
-    );
+  if (!Error.IsEmpty()) {
+    Output.Error = Error;
+    return Output;
   }
 
+  const TArray<TSharedPtr<FJsonValue>> *Friends = nullptr;
+  const TArray<TSharedPtr<FJsonValue>> *IncomingRequests = nullptr;
+  const TArray<TSharedPtr<FJsonValue>> *OutgoingRequests = nullptr;
+  if (!(*MessageObject)->TryGetArrayField(TEXT("friends"), Friends) ||
+      !(*MessageObject)
+         ->TryGetArrayField(TEXT("incomingRequests"), IncomingRequests) ||
+      !(*MessageObject)
+         ->TryGetArrayField(TEXT("outgoingRequests"), OutgoingRequests)) {
+    return Output;
+  }
+
+  Output.Error.Empty();
+  ParseCharacterFriendRows(*Friends, Output.Friends);
+  ParseCharacterFriendRows(*IncomingRequests, Output.IncomingRequests);
+  ParseCharacterFriendRows(*OutgoingRequests, Output.OutgoingRequests);
   return Output;
 }
 // FORK(hollowed-oath) END
