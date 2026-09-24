@@ -1441,6 +1441,54 @@ URedwoodCommonGameSubsystem::ParseListCharacterFriends(
 }
 // FORK(hollowed-oath) END
 
+// FORK(hollowed-oath) BEGIN: parser for the character friend alert. The push
+// tells a character that another character asked to be a friend, accepted a
+// request, ended a friendship or a request (removed), came online or went
+// offline. The type word and the two ids are required: the game selects a
+// handler by the type and keys its cache on the ids, so a push without them
+// is refused and the listener drops it. The name and the zone are optional;
+// only Online carries a zone. The output is cleared first, so a caller that
+// reuses it keeps nothing from an earlier push.
+bool URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+  const TSharedPtr<FJsonObject> &AlertObject,
+  FRedwoodCharacterFriendAlert &OutAlert
+) {
+  OutAlert = FRedwoodCharacterFriendAlert();
+
+  if (!AlertObject.IsValid()) {
+    return false;
+  }
+
+  FString Type;
+  AlertObject->TryGetStringField(TEXT("type"), Type);
+  if (Type == TEXT("requested")) {
+    OutAlert.Type = ERedwoodCharacterFriendAlertType::Requested;
+  } else if (Type == TEXT("accepted")) {
+    OutAlert.Type = ERedwoodCharacterFriendAlertType::Accepted;
+  } else if (Type == TEXT("removed")) {
+    OutAlert.Type = ERedwoodCharacterFriendAlertType::Removed;
+  } else if (Type == TEXT("online")) {
+    OutAlert.Type = ERedwoodCharacterFriendAlertType::Online;
+  } else if (Type == TEXT("offline")) {
+    OutAlert.Type = ERedwoodCharacterFriendAlertType::Offline;
+  } else {
+    return false;
+  }
+
+  AlertObject->TryGetStringField(TEXT("characterId"), OutAlert.CharacterId);
+  AlertObject->TryGetStringField(
+    TEXT("otherCharacterId"), OutAlert.OtherCharacterId
+  );
+  AlertObject->TryGetStringField(
+    TEXT("otherCharacterName"), OutAlert.OtherCharacterName
+  );
+  AlertObject->TryGetStringField(TEXT("zoneName"), OutAlert.ZoneName);
+
+  return !OutAlert.CharacterId.IsEmpty() &&
+         !OutAlert.OtherCharacterId.IsEmpty();
+}
+// FORK(hollowed-oath) END
+
 FRedwoodParty URedwoodCommonGameSubsystem::ParseParty(
   const TSharedPtr<FJsonObject> &PartyObj
 ) {
