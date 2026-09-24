@@ -13,8 +13,8 @@
 //      all three arrays. The game takes a good list as the full truth and
 //      removes the settings of each friend that is not in it.
 //   5. A row with no characterId or no characterName is left out, and so is
-//      a row that is not an object. The game keys on the id and shows the
-//      name.
+//      a row that is not an object or an object value that holds no object.
+//      The game keys on the id and shows the name.
 // The field names below must equal the names in the RedwoodBackend fork,
 // packages/common/src/interfaces.ts (Realms.Contacts.List.SResponse).
 
@@ -99,6 +99,8 @@ bool FRedwoodCharacterFriendsListParseTest::RunTest(const FString &Parameters) {
   );
   Friends.Add(MakeShared<FJsonValueNull>());
   Friends.Add(nullptr);
+  // In UE 5.8, TryGetObject says yes to an object value that holds no object.
+  Friends.Add(MakeShared<FJsonValueObject>(TSharedPtr<FJsonObject>()));
   Answer->SetArrayField(TEXT("friends"), Friends);
   Answer->SetArrayField(
     TEXT("incomingRequests"),

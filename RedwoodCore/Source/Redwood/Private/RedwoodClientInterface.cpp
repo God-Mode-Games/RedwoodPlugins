@@ -1289,8 +1289,8 @@ FString URedwoodClientInterface::GetCharacterFriendCallError() const {
 
 // The answer is read through TryGetRedwoodAnswerObject, not
 // Response[0]->AsObject(): a missing, null or malformed answer, or one with no
-// error field, must not read as a success. The error text is the same as the
-// one ParseListCharacterFriends gives for a bad answer.
+// error field, must not read as a success. The error is the one
+// ParseListCharacterFriends gives for a bad answer (BadRealmAnswerError).
 void URedwoodClientInterface::EmitCharacterFriendCommand(
   const FString &EventName,
   TSharedPtr<FJsonObject> Payload,
@@ -1311,7 +1311,7 @@ void URedwoodClientInterface::EmitCharacterFriendCommand(
     FString Error;
     if (MessageObject == nullptr ||
         !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
-      Error = TEXT("Bad answer from the realm.");
+      Error = URedwoodCommonGameSubsystem::BadRealmAnswerError;
     }
     OnOutput.ExecuteIfBound(Error);
   });

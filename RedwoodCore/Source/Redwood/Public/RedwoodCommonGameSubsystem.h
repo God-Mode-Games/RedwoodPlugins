@@ -118,6 +118,13 @@ public:
     const TArray<TSharedPtr<FJsonValue>> &Response
   );
 
+  // FORK(hollowed-oath): the error the character friend calls give when the
+  // realm's answer cannot be read. Fork-added. One text for
+  // ParseListCharacterFriends and the character friend commands in
+  // RedwoodClientInterface.cpp.
+  static constexpr const TCHAR *BadRealmAnswerError =
+    TEXT("Bad answer from the realm.");
+
   // FORK(hollowed-oath): parser for the three fork-added arrays of the
   // "realm:contacts:list" answer. Fork-added; the definition and the full
   // reason live under a matching FORK marker in RedwoodCommonGameSubsystem.cpp.

@@ -1407,10 +1407,9 @@ URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(
 // settings of each friend that is not in it), so a partial answer is an
 // error, not a short list. A row with no characterId or no characterName is
 // left out, because the game keys every row on the id and shows the name.
+// A row that is not an object is left out too. In UE 5.8, TryGetObject says
+// yes to an object value that holds no object, so the pointer is checked.
 namespace {
-
-const TCHAR *const BadCharacterFriendListAnswerError =
-  TEXT("Bad answer from the realm.");
 
 void ParseCharacterFriendRows(
   const TArray<TSharedPtr<FJsonValue>> &Rows,
@@ -1418,7 +1417,8 @@ void ParseCharacterFriendRows(
 ) {
   for (const TSharedPtr<FJsonValue> &RowValue : Rows) {
     const TSharedPtr<FJsonObject> *RowObject;
-    if (!RowValue.IsValid() || !RowValue->TryGetObject(RowObject)) {
+    if (!RowValue.IsValid() || !RowValue->TryGetObject(RowObject) ||
+        !RowObject->IsValid()) {
       continue;
     }
 
@@ -1441,7 +1441,7 @@ URedwoodCommonGameSubsystem::ParseListCharacterFriends(
   const TArray<TSharedPtr<FJsonValue>> &Response
 ) {
   FRedwoodListCharacterFriendsOutput Output;
-  Output.Error = BadCharacterFriendListAnswerError;
+  Output.Error = BadRealmAnswerError;
 
   const TSharedPtr<FJsonObject> *MessageObject =
     TryGetRedwoodAnswerObject(Response);
