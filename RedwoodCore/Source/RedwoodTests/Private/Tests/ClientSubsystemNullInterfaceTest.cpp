@@ -20,15 +20,23 @@
 // Every guarded function is a separate call site with its own output type, so
 // each is asserted. An unguarded site crashes the run instead of failing, so a
 // pass here is also the evidence that no site was missed.
+//
+// The friend relay test below uses the same world, but it runs Initialize(),
+// so the subsystem has a client interface and binds its relays.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
+#include "Misc/ScopeExit.h"
 
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "RedwoodClientGameSubsystem.h"
+#include "RedwoodClientInterface.h"
 #include "RedwoodCommonGameSubsystem.h"
+#include "Subsystems/SubsystemCollection.h"
+
+#include "RedwoodFriendRelayProbe.h"
 
 namespace {
   // Duplicated from the guards on purpose: the test pins the text the game and
@@ -36,6 +44,49 @@ namespace {
   // own constant with itself.
   const TCHAR *const RedwoodExpectedGuardError =
     TEXT("Not connected to the backend.");
+
+  // ShouldUseBackend() reads the world type, so a world of type Game makes the
+  // backend path true without touching the editor's PIE backend setting. That
+  // keeps the fixture independent of how the machine running the suite is set
+  // up. The destructor releases the world, so nothing a test built is left on
+  // the engine for the tests that run after it.
+  struct FRedwoodClientSubsystemTestWorld {
+    UWorld *World = nullptr;
+    UGameInstance *GameInstance = nullptr;
+
+    explicit FRedwoodClientSubsystemTestWorld(const TCHAR *WorldName) {
+      World = UWorld::CreateWorld(EWorldType::Game, false, WorldName);
+      if (!World) {
+        return;
+      }
+
+      // A subsystem must live inside a UGameInstance, because
+      // UGameInstanceSubsystem declares Within = GameInstance, and GetWorld()
+      // resolves up that outer chain to the game instance's world context.
+      // The context has to exist first for the game instance to adopt.
+      FWorldContext &WorldContext =
+        GEngine->CreateNewWorldContext(EWorldType::Game);
+      WorldContext.SetCurrentWorld(World);
+
+      GameInstance = NewObject<UGameInstance>(GEngine);
+      WorldContext.OwningGameInstance = GameInstance;
+      World->SetGameInstance(GameInstance);
+
+      // Adopting the world this way instead of through InitializeStandalone()
+      // skips UGameInstance::Init(), so the test does not build every other
+      // game instance subsystem in the editor process.
+      GameInstance->OnWorldChanged(nullptr, World);
+    }
+
+    ~FRedwoodClientSubsystemTestWorld() {
+      if (!World) {
+        return;
+      }
+      GameInstance->OnWorldChanged(World, nullptr);
+      GEngine->DestroyWorldContext(World);
+      World->DestroyWorld(false);
+    }
+  };
 } // namespace
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -47,39 +98,18 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
   const FString &Parameters
 ) {
-  // ShouldUseBackend() reads the world type, so a world of type Game makes the
-  // backend path true without touching the editor's PIE backend setting. That
-  // keeps the fixture independent of how the machine running the suite is set
-  // up.
-  UWorld *World = UWorld::CreateWorld(
-    EWorldType::Game, false, TEXT("RedwoodNullInterfaceGuardWorld")
+  FRedwoodClientSubsystemTestWorld TestWorld(
+    TEXT("RedwoodNullInterfaceGuardWorld")
   );
-  if (!TestNotNull(TEXT("Test world was created"), World)) {
+  if (!TestNotNull(TEXT("Test world was created"), TestWorld.World)) {
     return false;
   }
-
-  // The subsystem must live inside a UGameInstance, because
-  // UGameInstanceSubsystem declares Within = GameInstance, and GetWorld()
-  // resolves up that outer chain to the game instance's world context. The
-  // context has to exist first for the game instance to adopt.
-  FWorldContext &WorldContext =
-    GEngine->CreateNewWorldContext(EWorldType::Game);
-  WorldContext.SetCurrentWorld(World);
-
-  UGameInstance *GameInstance = NewObject<UGameInstance>(GEngine);
-  WorldContext.OwningGameInstance = GameInstance;
-  World->SetGameInstance(GameInstance);
-
-  // Adopting the world this way instead of through InitializeStandalone()
-  // skips UGameInstance::Init(), so the test does not build every other game
-  // instance subsystem in the editor process.
-  GameInstance->OnWorldChanged(nullptr, World);
 
   // Building the subsystem by hand keeps it out of the game instance's
   // subsystem collection, so Initialize() never runs and ClientInterface stays
   // null -- the exact state the guards exist for.
   URedwoodClientGameSubsystem *Subsystem =
-    NewObject<URedwoodClientGameSubsystem>(GameInstance);
+    NewObject<URedwoodClientGameSubsystem>(TestWorld.GameInstance);
 
   // These two checks prove the fixture is the broken state. Without them the
   // calls below could pass for the wrong reason.
@@ -162,8 +192,7 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
   Subsystem->RemoveRealmContact(TEXT("character-1"), OnError);
   CheckGuard(TEXT("RemoveRealmContact reports the error"));
 
-  // FORK(hollowed-oath): the four character friend calls (fork PR
-  // ruly/character-friends) have the same guard.
+  // The four character friend calls have the same guard.
   Subsystem->ListCharacterFriends(OnListCharacterFriends);
   CheckGuard(TEXT("ListCharacterFriends reports the error"));
 
@@ -178,11 +207,93 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
   Subsystem->RemoveCharacterFriend(TEXT("character-1"), OnError);
   CheckGuard(TEXT("RemoveCharacterFriend reports the error"));
 
-  // Release the world before returning, so nothing this test built is left on
-  // the engine for the tests that run after it.
-  GameInstance->OnWorldChanged(World, nullptr);
-  GEngine->DestroyWorldContext(World);
-  World->DestroyWorld(false);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodClientSubsystemFriendRelayTest,
+  "Redwood.ClientSubsystem.FriendRelay",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The director listeners broadcast the friend delegates of the client
+// interface. The game binds the events of the same name on the subsystem, so
+// each interface broadcast must reach the subsystem event once.
+bool FRedwoodClientSubsystemFriendRelayTest::RunTest(
+  const FString &Parameters
+) {
+  FRedwoodClientSubsystemTestWorld TestWorld(TEXT("RedwoodFriendRelayWorld"));
+  if (!TestNotNull(TEXT("Test world was created"), TestWorld.World)) {
+    return false;
+  }
+
+  // Initialize() builds the client interface and binds the relays, as it does
+  // in the game. It opens no socket.
+  URedwoodClientGameSubsystem *Subsystem =
+    NewObject<URedwoodClientGameSubsystem>(TestWorld.GameInstance);
+  FSubsystemCollection<UGameInstanceSubsystem> Collection;
+  Subsystem->Initialize(Collection);
+
+  // Initialize() also listens for each new world, and that handler reads the
+  // world of this test's game instance. The test world is gone after this
+  // test, so the listener must go first.
+  ON_SCOPE_EXIT {
+    FWorldDelegates::OnPostWorldInitialization.RemoveAll(Subsystem);
+    Subsystem->Deinitialize();
+  };
+
+  URedwoodClientInterface *ClientInterface = Subsystem->GetClientInterface();
+  if (!TestNotNull(TEXT("Initialize built the interface"), ClientInterface)) {
+    return false;
+  }
+
+  URedwoodFriendRelayProbe *Probe = NewObject<URedwoodFriendRelayProbe>();
+  Subsystem->OnCharacterFriendAlert.AddDynamic(
+    Probe, &URedwoodFriendRelayProbe::HandleCharacterFriendAlert
+  );
+  Subsystem->OnFriendRequestReceived.AddDynamic(
+    Probe, &URedwoodFriendRelayProbe::HandleFriendRequestReceived
+  );
+
+  FRedwoodCharacterFriendAlert Alert;
+  Alert.Type = ERedwoodCharacterFriendAlertType::Online;
+  Alert.CharacterId = TEXT("me-1");
+  Alert.OtherCharacterId = TEXT("other-1");
+  Alert.OtherCharacterName = TEXT("Bob");
+  Alert.ZoneName = TEXT("zone-1");
+  ClientInterface->OnCharacterFriendAlert.Broadcast(Alert);
+
+  TestEqual(
+    TEXT("The character friend alert reached the subsystem once"),
+    Probe->CharacterFriendAlertCount,
+    1
+  );
+  const FRedwoodCharacterFriendAlert &Relayed =
+    Probe->LastCharacterFriendAlert;
+  TestTrue(TEXT("Same type"), Relayed.Type == Alert.Type);
+  TestEqual(TEXT("Same character"), Relayed.CharacterId, Alert.CharacterId);
+  TestEqual(
+    TEXT("Same other character"),
+    Relayed.OtherCharacterId,
+    Alert.OtherCharacterId
+  );
+  TestEqual(
+    TEXT("Same name"), Relayed.OtherCharacterName, Alert.OtherCharacterName
+  );
+  TestEqual(TEXT("Same zone"), Relayed.ZoneName, Alert.ZoneName);
+
+  FRedwoodPlayer Requester;
+  Requester.PlayerId = TEXT("player-1");
+  ClientInterface->OnFriendRequestReceived.Broadcast(Requester);
+
+  TestEqual(
+    TEXT("The friend request reached the subsystem once"),
+    Probe->FriendRequestCount,
+    1
+  );
+  TestEqual(
+    TEXT("Same requester"), Probe->LastRequesterId, Requester.PlayerId
+  );
 
   return true;
 }

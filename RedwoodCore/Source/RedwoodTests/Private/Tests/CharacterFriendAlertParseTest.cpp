@@ -87,8 +87,8 @@ bool FRedwoodCharacterFriendAlertParseTest::RunTest(const FString &Parameters) {
   }
 
   // The backend always sends a name and a zone (the zone is empty unless
-  // online), but the game can act without them, so the parser does not
-  // require them. The output is reused from the online parse above, so the
+  // online). The parser does not require them: it passes the push on, and the
+  // game decides what to do when the name is absent. The output is reused from the online parse above, so the
   // test also shows that no name or zone stays from an earlier push.
   TSharedPtr<FJsonObject> Bare = MakeCharacterAlertObj(TEXT("requested"));
   Bare->RemoveField(TEXT("otherCharacterName"));

@@ -8,9 +8,10 @@
 // inline with "Not connected to Realm.", with or without a selected
 // character. The realm guard comes first, as in every realm call of
 // RedwoodClientInterface.cpp. The "No character selected." guard comes after
-// it, so it needs a live realm; review covers it, not this test.
-// The socket path itself has no harness here (the same limit as the
-// request-alert listener, fork PR #27); it is checked in PIE with a backend.
+// it, so it needs a connected realm. The Redwood.Mock.* tests connect a realm,
+// but only to a RedwoodBackend that runs in mock mode. This file keeps to
+// tests that need no backend, so review covers that guard, not this test. The
+// socket path is checked in PIE with a backend.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
