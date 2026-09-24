@@ -1379,16 +1379,19 @@ FRedwoodPlayer URedwoodCommonGameSubsystem::ParseFriendRequestAlert(
 // TryGetObject, not AsObject: for a value that is not an object, AsObject
 // gives back a VALID empty object, which reads as an answer with no error --
 // that is, as work that never happened. A null or malformed answer must reach
-// the caller as "no usable answer" instead.
+// the caller as "no usable answer" instead. TryGetObject also says yes to an
+// object value that holds no object, so the pointer it gives is checked too:
+// every caller reads through the result.
 const TSharedPtr<FJsonObject> *
 URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(
   const TArray<TSharedPtr<FJsonValue>> &Response
 ) {
   const TSharedPtr<FJsonObject> *Object = nullptr;
-  if (Response.IsValidIndex(0) && Response[0].IsValid()) {
-    Response[0]->TryGetObject(Object);
+  if (Response.IsValidIndex(0) && Response[0].IsValid() &&
+      Response[0]->TryGetObject(Object) && Object->IsValid()) {
+    return Object;
   }
-  return Object;
+  return nullptr;
 }
 // FORK(hollowed-oath) END
 

@@ -202,6 +202,16 @@ bool FRedwoodCharacterFriendsListBadAnswerTest::RunTest(
     ParseFriendListAnswer(MakeShared<FJsonObject>()).Error.IsEmpty()
   );
 
+  // In UE 5.8, TryGetObject says yes to an object value that holds no
+  // object. The answer reader must refuse it, because every caller reads
+  // through the pointer it gives.
+  TestNull(
+    TEXT("An object value with no object is no answer"),
+    URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(
+      {MakeShared<FJsonValueObject>(TSharedPtr<FJsonObject>())}
+    )
+  );
+
   // A success must carry all three arrays. Remove each one in turn from an
   // answer that has a row in every array: the result is an error with no
   // rows, so a partial answer cannot read as a short list.

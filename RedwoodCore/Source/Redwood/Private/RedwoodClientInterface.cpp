@@ -126,6 +126,36 @@ void URedwoodClientInterface::InitializeDirectorConnection(
   );
   // FORK(hollowed-oath) END
 
+  // FORK(hollowed-oath) BEGIN: listen for the fork-added character friend
+  // push. The director sends it to the player who owns the character it names.
+  // The parser takes the event value as it comes and refuses a value that is
+  // not an object, an unknown type and a push with no character ids. Such a
+  // push is dropped and logged, for the reason given on the request-alert
+  // listener above.
+  Director->OnEvent(
+    TEXT("director:friends:character-alert"),
+    [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
+      FRedwoodCharacterFriendAlert Alert;
+      if (!URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+            Message, Alert
+          )) {
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT(
+            "Dropped a director:friends:character-alert with an unknown type or no character id. The director and the game may no longer agree on the fields in this message."
+          )
+        );
+        return;
+      }
+
+      OnCharacterFriendAlert.Broadcast(Alert);
+    },
+    TEXT("/"),
+    ESIOThreadOverrideOption::USE_GAME_THREAD
+  );
+  // FORK(hollowed-oath) END
+
   FString Uri = *URedwoodSettings::GetDirectorUri();
 
   Director->OnReconnectionCallback = [Uri, this](
@@ -1243,6 +1273,103 @@ void URedwoodClientInterface::RemoveRealmContact(
     }
   );
 }
+
+// FORK(hollowed-oath) BEGIN: character friend calls. The realm check comes
+// first, as in every other realm call in this file; the character check
+// comes after it.
+FString URedwoodClientInterface::GetCharacterFriendCallError() const {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
+    return TEXT("Not connected to Realm.");
+  }
+  if (SelectedCharacterId.IsEmpty()) {
+    return TEXT("No character selected.");
+  }
+  return FString();
+}
+
+// The answer is read through TryGetRedwoodAnswerObject, not
+// Response[0]->AsObject(): a missing, null or malformed answer, or one with no
+// error field, must not read as a success. The error text is the same as the
+// one ParseListCharacterFriends gives for a bad answer.
+void URedwoodClientInterface::EmitCharacterFriendCommand(
+  const FString &EventName,
+  TSharedPtr<FJsonObject> Payload,
+  FRedwoodErrorOutputDelegate OnOutput
+) {
+  const FString GuardError = GetCharacterFriendCallError();
+  if (!GuardError.IsEmpty()) {
+    OnOutput.ExecuteIfBound(GuardError);
+    return;
+  }
+
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+
+  Realm->Emit(EventName, Payload, [OnOutput](auto Response) {
+    const TSharedPtr<FJsonObject> *MessageObject =
+      URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+    FString Error;
+    if (MessageObject == nullptr ||
+        !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+      Error = TEXT("Bad answer from the realm.");
+    }
+    OnOutput.ExecuteIfBound(Error);
+  });
+}
+
+void URedwoodClientInterface::ListCharacterFriends(
+  FRedwoodListCharacterFriendsOutputDelegate OnOutput
+) {
+  const FString GuardError = GetCharacterFriendCallError();
+  if (!GuardError.IsEmpty()) {
+    FRedwoodListCharacterFriendsOutput Output;
+    Output.Error = GuardError;
+    OnOutput.ExecuteIfBound(Output);
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+
+  Realm->Emit(TEXT("realm:contacts:list"), Payload, [OnOutput](auto Response) {
+    OnOutput.ExecuteIfBound(
+      URedwoodCommonGameSubsystem::ParseListCharacterFriends(Response)
+    );
+  });
+}
+
+void URedwoodClientInterface::RequestCharacterFriend(
+  FString TargetCharacterId, FRedwoodErrorOutputDelegate OnOutput
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("targetCharacterId"), TargetCharacterId);
+  EmitCharacterFriendCommand(
+    TEXT("realm:contacts:friends:request"), Payload, OnOutput
+  );
+}
+
+void URedwoodClientInterface::RespondToCharacterFriendRequest(
+  FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
+  Payload->SetBoolField(TEXT("accept"), bAccept);
+  EmitCharacterFriendCommand(
+    TEXT("realm:contacts:friends:respond"), Payload, OnOutput
+  );
+}
+
+void URedwoodClientInterface::RemoveCharacterFriend(
+  FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
+  EmitCharacterFriendCommand(
+    TEXT("realm:contacts:friends:remove"), Payload, OnOutput
+  );
+}
+// FORK(hollowed-oath) END
 
 void URedwoodClientInterface::ListGuilds(
   bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput

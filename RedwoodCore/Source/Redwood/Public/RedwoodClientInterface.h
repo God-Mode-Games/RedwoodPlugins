@@ -138,6 +138,28 @@ public:
     FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
   );
 
+  // FORK(hollowed-oath) BEGIN: character friend calls. Fork-added; upstream has
+  // no friendship between characters. Each call names the selected character
+  // and goes to the fork-added "realm:contacts:friends:*" routes of the
+  // RedwoodBackend fork; the list reads the fork fields of the upstream
+  // "realm:contacts:list" answer. A call with no realm, or with no selected
+  // character, answers inline with an error (the realm check first).
+  void ListCharacterFriends(FRedwoodListCharacterFriendsOutputDelegate OnOutput
+  );
+
+  void RequestCharacterFriend(
+    FString TargetCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void RespondToCharacterFriendRequest(
+    FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void RemoveCharacterFriend(
+    FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+  // FORK(hollowed-oath) END
+
   void ListGuilds(
     bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
   );
@@ -355,6 +377,14 @@ public:
   // RedwoodClientInterface.cpp, relayed to the game by RedwoodClientGameSubsystem.
   FRedwoodFriendRequestReceivedDynamicDelegate OnFriendRequestReceived;
 
+  // FORK(hollowed-oath): the director tells a character that another character
+  // asked to be a friend, accepted a request, ended a friendship or a
+  // request, came online or went offline.
+  // Fork-added. Broadcast from the "director:friends:character-alert" listener
+  // in RedwoodClientInterface.cpp, relayed to the game by
+  // RedwoodClientGameSubsystem.
+  FRedwoodCharacterFriendAlertDynamicDelegate OnCharacterFriendAlert;
+
   FRedwoodPartyInvitedDynamicDelegate OnPartyInvited;
   FRedwoodPartyUpdatedDynamicDelegate OnPartyUpdated;
   FRedwoodDynamicDelegate OnPartyKicked;
@@ -403,6 +433,17 @@ private:
     FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected
   );
   void BindRealmEvents();
+
+  // FORK(hollowed-oath): shared guard and body of the character friend calls
+  // above. GetCharacterFriendCallError gives the inline error, or empty when
+  // the call can go out. EmitCharacterFriendCommand adds playerId and
+  // characterId and answers with the error string of the realm.
+  FString GetCharacterFriendCallError() const;
+  void EmitCharacterFriendCommand(
+    const FString &EventName,
+    TSharedPtr<FJsonObject> Payload,
+    FRedwoodErrorOutputDelegate OnOutput
+  );
   void FinalizeRealmHandshake(
     FString Token, FRedwoodSocketConnectedDelegate OnRealmConnected
   );
