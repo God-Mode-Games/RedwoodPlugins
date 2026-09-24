@@ -126,11 +126,12 @@ public:
   );
 
   // FORK(hollowed-oath): parser for the fork-added
-  // "director:friends:character-alert" push. Returns false for a push the
-  // game cannot act on. Fork-added; the definition and the full reason live
-  // under a matching FORK marker in RedwoodCommonGameSubsystem.cpp.
+  // "director:friends:character-alert" push. Takes the event value that the
+  // listener gets. Returns false for a push the game cannot act on.
+  // Fork-added; the definition and the full reason live under a matching
+  // FORK marker in RedwoodCommonGameSubsystem.cpp.
   static bool ParseCharacterFriendAlert(
-    const TSharedPtr<FJsonObject> &AlertObject,
+    const TSharedPtr<FJsonValue> &Message,
     FRedwoodCharacterFriendAlert &OutAlert
   );
 

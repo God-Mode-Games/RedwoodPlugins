@@ -17,6 +17,7 @@
 #include "Misc/AutomationTest.h"
 
 #include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 #include "RedwoodCommonGameSubsystem.h"
 #include "Types/RedwoodTypesCharacters.h"
 
@@ -29,6 +30,13 @@ namespace {
     Obj->SetStringField(TEXT("otherCharacterName"), TEXT("Other"));
     Obj->SetStringField(TEXT("zoneName"), TEXT("L_Freewind"));
     return Obj;
+  }
+
+  // The listener gets the push as one event value.
+  TSharedPtr<FJsonValue> AsCharacterAlertValue(
+    const TSharedPtr<FJsonObject> &Obj
+  ) {
+    return MakeShared<FJsonValueObject>(Obj);
   }
 } // namespace
 
@@ -43,7 +51,7 @@ bool FRedwoodCharacterFriendAlertParseTest::RunTest(const FString &Parameters) {
   TestTrue(
     TEXT("An online alert parses"),
     URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
-      MakeCharacterAlertObj(TEXT("online")), Alert
+      AsCharacterAlertValue(MakeCharacterAlertObj(TEXT("online"))), Alert
     )
   );
   TestTrue(
@@ -72,7 +80,7 @@ bool FRedwoodCharacterFriendAlertParseTest::RunTest(const FString &Parameters) {
     TestTrue(
       Words[Index],
       URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
-        MakeCharacterAlertObj(Words[Index]), Each
+        AsCharacterAlertValue(MakeCharacterAlertObj(Words[Index])), Each
       )
     );
     TestTrue(Words[Index], Each.Type == Values[Index]);
@@ -87,7 +95,9 @@ bool FRedwoodCharacterFriendAlertParseTest::RunTest(const FString &Parameters) {
   Bare->RemoveField(TEXT("zoneName"));
   TestTrue(
     TEXT("No name and no zone still parses"),
-    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(Bare, Alert)
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      AsCharacterAlertValue(Bare), Alert
+    )
   );
   TestEqual(
     TEXT("An absent name is empty"), Alert.OtherCharacterName, FString()
@@ -112,14 +122,14 @@ bool FRedwoodCharacterFriendAlertBadPayloadTest::RunTest(
   TestTrue(
     TEXT("A good alert fills the output first"),
     URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
-      MakeCharacterAlertObj(TEXT("online")), Alert
+      AsCharacterAlertValue(MakeCharacterAlertObj(TEXT("online"))), Alert
     )
   );
 
   TestFalse(
     TEXT("An unknown type is refused"),
     URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
-      MakeCharacterAlertObj(TEXT("blocked")), Alert
+      AsCharacterAlertValue(MakeCharacterAlertObj(TEXT("blocked"))), Alert
     )
   );
 
@@ -127,40 +137,66 @@ bool FRedwoodCharacterFriendAlertBadPayloadTest::RunTest(
   NoType->RemoveField(TEXT("type"));
   TestFalse(
     TEXT("A missing type is refused"),
-    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(NoType, Alert)
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      AsCharacterAlertValue(NoType), Alert
+    )
   );
 
   TSharedPtr<FJsonObject> NoRecipient = MakeCharacterAlertObj(TEXT("online"));
   NoRecipient->RemoveField(TEXT("characterId"));
   TestFalse(
     TEXT("A missing recipient id is refused"),
-    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(NoRecipient, Alert)
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      AsCharacterAlertValue(NoRecipient), Alert
+    )
   );
 
   TSharedPtr<FJsonObject> NoOther = MakeCharacterAlertObj(TEXT("online"));
   NoOther->RemoveField(TEXT("otherCharacterId"));
   TestFalse(
     TEXT("A missing other id is refused"),
-    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(NoOther, Alert)
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      AsCharacterAlertValue(NoOther), Alert
+    )
   );
 
   TSharedPtr<FJsonObject> EmptyOther = MakeCharacterAlertObj(TEXT("online"));
   EmptyOther->SetStringField(TEXT("otherCharacterId"), TEXT(""));
   TestFalse(
     TEXT("An empty other id is refused"),
-    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(EmptyOther, Alert)
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      AsCharacterAlertValue(EmptyOther), Alert
+    )
   );
 
-  // AsObject gives an empty object for a push that is not an object; a direct
-  // caller can still pass an empty pointer.
+  // A push that is not an object is refused. AsObject would turn it into a
+  // valid empty object; the parser must not depend on that.
   TestFalse(
-    TEXT("An empty push is refused"),
+    TEXT("An empty object is refused"),
     URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
-      MakeShared<FJsonObject>(), Alert
+      AsCharacterAlertValue(MakeShared<FJsonObject>()), Alert
     )
   );
   TestFalse(
-    TEXT("A null push is refused"),
+    TEXT("A string push is refused"),
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      MakeShared<FJsonValueString>(TEXT("online")), Alert
+    )
+  );
+  TestFalse(
+    TEXT("A JSON null push is refused"),
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      MakeShared<FJsonValueNull>(), Alert
+    )
+  );
+  TestFalse(
+    TEXT("An object value with no object is refused"),
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      MakeShared<FJsonValueObject>(TSharedPtr<FJsonObject>()), Alert
+    )
+  );
+  TestFalse(
+    TEXT("A null value is refused"),
     URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(nullptr, Alert)
   );
 

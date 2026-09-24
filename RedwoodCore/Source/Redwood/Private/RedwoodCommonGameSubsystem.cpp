@@ -1480,15 +1480,22 @@ URedwoodCommonGameSubsystem::ParseListCharacterFriends(
 // is refused and the listener drops it. The name and the zone are optional;
 // only Online carries a zone. The output is cleared first, so a caller that
 // reuses it keeps nothing from an earlier push.
+//
+// TryGetObject, not AsObject: for a value that is not an object, AsObject
+// gives a valid empty object. A null value, a value that is not an object,
+// or an object value that holds no object is refused here.
 bool URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
-  const TSharedPtr<FJsonObject> &AlertObject,
+  const TSharedPtr<FJsonValue> &Message,
   FRedwoodCharacterFriendAlert &OutAlert
 ) {
   OutAlert = FRedwoodCharacterFriendAlert();
 
-  if (!AlertObject.IsValid()) {
+  const TSharedPtr<FJsonObject> *AlertObjectPtr = nullptr;
+  if (!Message.IsValid() || !Message->TryGetObject(AlertObjectPtr) ||
+      !AlertObjectPtr->IsValid()) {
     return false;
   }
+  const TSharedPtr<FJsonObject> &AlertObject = *AlertObjectPtr;
 
   FString Type;
   AlertObject->TryGetStringField(TEXT("type"), Type);
