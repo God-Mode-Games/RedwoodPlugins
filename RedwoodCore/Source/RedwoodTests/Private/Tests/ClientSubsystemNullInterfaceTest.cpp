@@ -93,7 +93,7 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
 
   FString Error;
 
-  // Four output shapes cover all ten functions.
+  // Five output shapes cover all fourteen functions.
   FRedwoodListPlayersOutputDelegate OnListPlayers =
     FRedwoodListPlayersOutputDelegate::CreateLambda(
       [&Error](const FRedwoodListPlayersOutput &Output) {
@@ -113,6 +113,12 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
   FRedwoodErrorOutputDelegate OnError =
     FRedwoodErrorOutputDelegate::CreateLambda(
       [&Error](const FString &Output) { Error = Output; }
+    );
+  FRedwoodListCharacterFriendsOutputDelegate OnListCharacterFriends =
+    FRedwoodListCharacterFriendsOutputDelegate::CreateLambda(
+      [&Error](const FRedwoodListCharacterFriendsOutput &Output) {
+        Error = Output.Error;
+      }
     );
 
   // TestEqualSensitive, not TestEqual: the TCHAR* form of TestEqual compares
@@ -155,6 +161,22 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
 
   Subsystem->RemoveRealmContact(TEXT("character-1"), OnError);
   CheckGuard(TEXT("RemoveRealmContact reports the error"));
+
+  // FORK(hollowed-oath): the four character friend calls (fork PR
+  // ruly/character-friends) have the same guard.
+  Subsystem->ListCharacterFriends(OnListCharacterFriends);
+  CheckGuard(TEXT("ListCharacterFriends reports the error"));
+
+  Subsystem->RequestCharacterFriend(TEXT("character-1"), OnError);
+  CheckGuard(TEXT("RequestCharacterFriend reports the error"));
+
+  Subsystem->RespondToCharacterFriendRequest(
+    TEXT("character-1"), true, OnError
+  );
+  CheckGuard(TEXT("RespondToCharacterFriendRequest reports the error"));
+
+  Subsystem->RemoveCharacterFriend(TEXT("character-1"), OnError);
+  CheckGuard(TEXT("RemoveCharacterFriend reports the error"));
 
   // Release the world before returning, so nothing this test built is left on
   // the engine for the tests that run after it.
