@@ -1373,6 +1373,74 @@ FRedwoodPlayer URedwoodCommonGameSubsystem::ParseFriendRequestAlert(
 }
 // FORK(hollowed-oath) END
 
+// FORK(hollowed-oath) BEGIN: parser for the character friend list. The
+// "realm:contacts:list" answer gets three arrays from the RedwoodBackend fork:
+// friends, incomingRequests and outgoingRequests. The upstream arrays
+// (contacts, blockedContacts) are read by ListRealmContacts, not here.
+//
+// The error field decides. An answer without one is not one of the realm's
+// answers (AsObject gives an empty object for a bad answer), and it must not
+// read as "no friends". A refused answer gives no rows. A missing array is an
+// empty list, so an older backend gives an empty list and no error. A row
+// with no characterId is left out, because the game keys every row on it.
+namespace {
+
+void ParseCharacterFriendRows(
+  const TSharedPtr<FJsonObject> &MessageObject,
+  const TCHAR *FieldName,
+  TArray<FRedwoodCharacterFriend> &OutRows
+) {
+  const TArray<TSharedPtr<FJsonValue>> *Rows;
+  if (!MessageObject->TryGetArrayField(FieldName, Rows)) {
+    return;
+  }
+
+  for (const TSharedPtr<FJsonValue> &RowValue : *Rows) {
+    const TSharedPtr<FJsonObject> *RowObject;
+    if (!RowValue.IsValid() || !RowValue->TryGetObject(RowObject)) {
+      continue;
+    }
+
+    FRedwoodCharacterFriend Row;
+    (*RowObject)->TryGetStringField(TEXT("characterId"), Row.CharacterId);
+    (*RowObject)->TryGetStringField(TEXT("characterName"), Row.CharacterName);
+    (*RowObject)->TryGetBoolField(TEXT("online"), Row.bOnline);
+    (*RowObject)->TryGetStringField(TEXT("zoneName"), Row.ZoneName);
+
+    if (!Row.CharacterId.IsEmpty()) {
+      OutRows.Add(Row);
+    }
+  }
+}
+
+} // namespace
+
+FRedwoodListCharacterFriendsOutput
+URedwoodCommonGameSubsystem::ParseListCharacterFriends(
+  const TSharedPtr<FJsonObject> &MessageObject
+) {
+  FRedwoodListCharacterFriendsOutput Output;
+
+  if (!MessageObject.IsValid() ||
+      !MessageObject->TryGetStringField(TEXT("error"), Output.Error)) {
+    Output.Error = TEXT("Bad answer from the realm.");
+    return Output;
+  }
+
+  if (Output.Error.IsEmpty()) {
+    ParseCharacterFriendRows(MessageObject, TEXT("friends"), Output.Friends);
+    ParseCharacterFriendRows(
+      MessageObject, TEXT("incomingRequests"), Output.IncomingRequests
+    );
+    ParseCharacterFriendRows(
+      MessageObject, TEXT("outgoingRequests"), Output.OutgoingRequests
+    );
+  }
+
+  return Output;
+}
+// FORK(hollowed-oath) END
+
 FRedwoodParty URedwoodCommonGameSubsystem::ParseParty(
   const TSharedPtr<FJsonObject> &PartyObj
 ) {
