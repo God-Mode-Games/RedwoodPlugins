@@ -30,6 +30,9 @@ public class RedwoodTests : ModuleRules {
         "Redwood",
         "Json",
         "SIOJson",
+        // FORK(hollowed-oath): HollowedOath#2854. ReloginFailureTest makes
+        // unconnected sockets to drive the reconnect state.
+        "SocketIOClient",
       }
     );
 

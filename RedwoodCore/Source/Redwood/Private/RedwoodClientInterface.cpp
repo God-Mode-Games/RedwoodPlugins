@@ -113,6 +113,9 @@ void URedwoodClientInterface::InitializeDirectorConnection(
       );
     } else if (!bDirectorDisconnected) {
       bDirectorDisconnected = true;
+      // FORK(hollowed-oath): HollowedOath#2854. Before bAuthenticated is
+      // cleared: it reads whether the player was logged in at the drop.
+      NoteDirectorDrop();
       bAuthenticated = false;
       UE_LOG(
         LogRedwood,
@@ -122,9 +125,6 @@ void URedwoodClientInterface::InitializeDirectorConnection(
         ),
         *Uri
       );
-      // FORK(hollowed-oath): HollowedOath#2854. Count the request grace from
-      // the drop, like the game's own disconnect grace.
-      DirectorHeldRequests.StartGrace(TimerManager);
       OnDirectorConnectionLost.Broadcast();
     }
   };
@@ -395,6 +395,8 @@ void URedwoodClientInterface::Logout() {
 
     PlayerId = TEXT("");
     AuthToken = TEXT("");
+    // FORK(hollowed-oath): HollowedOath#2854. See HasPlayerSession.
+    bLoggedInAtDrop = false;
 
     URedwoodSaveGame *SaveGame = Cast<URedwoodSaveGame>(
       UGameplayStatics::CreateSaveGameObject(URedwoodSaveGame::StaticClass())
@@ -3150,7 +3152,7 @@ void URedwoodClientInterface::ResendOnlineCharacter() {
 // online character).
 bool URedwoodClientInterface::HoldForDirector(TFunction<void()> Request) {
   return DirectorHeldRequests.HoldIfReconnecting(
-    Director.IsValid() && bSentDirectorConnected && !AuthToken.IsEmpty(),
+    Director.IsValid() && bSentDirectorConnected && HasPlayerSession(),
     CanSendToDirector(),
     MoveTemp(Request),
     TimerManager
@@ -3159,22 +3161,36 @@ bool URedwoodClientInterface::HoldForDirector(TFunction<void()> Request) {
 
 bool URedwoodClientInterface::HoldForRealm(TFunction<void()> Request) {
   return RealmHeldRequests.HoldIfReconnecting(
-    Realm.IsValid() && bSentRealmConnected && !AuthToken.IsEmpty(),
+    Realm.IsValid() && bSentRealmConnected && HasPlayerSession(),
     CanSendToRealm(),
     MoveTemp(Request),
     TimerManager
   );
 }
 
+void URedwoodClientInterface::NoteDirectorDrop() {
+  bLoggedInAtDrop = bLoggedInAtDrop || bAuthenticated;
+  // Count the request grace from the drop, like the game's own disconnect
+  // grace.
+  DirectorHeldRequests.StartGrace(TimerManager);
+}
+
+// Not AuthToken: a failed re-login writes the EMPTY ids of its reply before it
+// checks the error, and the requests of a player who was logged in must still
+// fail then, not go out to a socket that does not know the player.
+bool URedwoodClientInterface::HasPlayerSession() const {
+  return bAuthenticated || bLoggedInAtDrop;
+}
+
 bool URedwoodClientInterface::CanSendToDirector() {
   return FRedwoodHeldRequests::CanSend(
-    IsDirectorConnected(), bAuthenticated, !AuthToken.IsEmpty()
+    IsDirectorConnected(), bAuthenticated, HasPlayerSession()
   );
 }
 
 bool URedwoodClientInterface::CanSendToRealm() {
   return FRedwoodHeldRequests::CanSend(
-    IsRealmConnected(), !bRealmReauthPending, !AuthToken.IsEmpty()
+    IsRealmConnected(), !bRealmReauthPending, HasPlayerSession()
   );
 }
 

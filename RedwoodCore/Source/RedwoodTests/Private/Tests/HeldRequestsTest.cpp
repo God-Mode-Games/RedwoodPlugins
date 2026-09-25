@@ -76,7 +76,7 @@ namespace {
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   FRedwoodHeldRequestsTest,
-  "Redwood.HeldRequests",
+  "Redwood.HeldRequests.Queue",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 

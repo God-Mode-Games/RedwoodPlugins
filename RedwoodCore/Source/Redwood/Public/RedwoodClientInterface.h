@@ -423,6 +423,10 @@ private:
   void ResendOnlineCharacter();
   bool HoldForDirector(TFunction<void()> Request);
   bool HoldForRealm(TFunction<void()> Request);
+  void NoteDirectorDrop();
+  bool HasPlayerSession() const;
+  // Drives the private reconnect state without a backend.
+  friend class FRedwoodReloginFailureTest;
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndRealmReauthentication(bool bSucceeded);
@@ -431,6 +435,8 @@ private:
   // The Realm socket dropped and the player is not authenticated on it again
   // yet; the Director has bAuthenticated for this.
   bool bRealmReauthPending = false;
+  // The player was logged in when the Director dropped; kept until Logout.
+  bool bLoggedInAtDrop = false;
 
   void HandleRegionsChanged(
     const FString &Event, const TSharedPtr<FJsonValue> &Message
