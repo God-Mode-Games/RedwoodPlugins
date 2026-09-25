@@ -793,7 +793,7 @@ void URedwoodClientInterface::SearchForPlayers(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodListPlayersOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -870,7 +870,7 @@ void URedwoodClientInterface::SearchForPlayerById(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodPlayerOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -944,7 +944,7 @@ void URedwoodClientInterface::ListFriends(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodListPlayersOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1026,7 +1026,7 @@ void URedwoodClientInterface::RequestFriend(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1059,7 +1059,7 @@ void URedwoodClientInterface::RemoveFriend(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1092,7 +1092,7 @@ void URedwoodClientInterface::RespondToFriendRequest(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1126,7 +1126,7 @@ void URedwoodClientInterface::SetPlayerBlocked(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1160,7 +1160,7 @@ void URedwoodClientInterface::ListRealmContacts(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FRedwoodListRealmContactsOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -1235,7 +1235,7 @@ void URedwoodClientInterface::AddRealmContact(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1270,7 +1270,7 @@ void URedwoodClientInterface::RemoveRealmContact(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1304,7 +1304,7 @@ void URedwoodClientInterface::ListGuilds(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodListGuildsOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1355,7 +1355,7 @@ void URedwoodClientInterface::SearchForGuilds(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodListGuildsOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1405,7 +1405,7 @@ void URedwoodClientInterface::GetGuild(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodGetGuildOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1450,7 +1450,7 @@ void URedwoodClientInterface::GetSelectedGuild(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodGetGuildOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1494,7 +1494,7 @@ void URedwoodClientInterface::SetSelectedGuild(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1527,7 +1527,7 @@ void URedwoodClientInterface::JoinGuild(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1560,7 +1560,7 @@ void URedwoodClientInterface::InviteToGuild(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1594,7 +1594,7 @@ void URedwoodClientInterface::LeaveGuild(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1629,7 +1629,7 @@ void URedwoodClientInterface::ListGuildMembers(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodListGuildMembersOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1700,7 +1700,7 @@ void URedwoodClientInterface::CreateGuild(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodCreateGuildOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1758,7 +1758,7 @@ void URedwoodClientInterface::UpdateGuild(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1799,7 +1799,7 @@ void URedwoodClientInterface::KickPlayerFromGuild(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1834,7 +1834,7 @@ void URedwoodClientInterface::BanPlayerFromGuild(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1875,7 +1875,7 @@ void URedwoodClientInterface::PromotePlayerToGuildAdmin(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1909,7 +1909,7 @@ void URedwoodClientInterface::DemotePlayerFromGuildAdmin(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1943,7 +1943,7 @@ void URedwoodClientInterface::ListAlliances(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodListAlliancesOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -2004,7 +2004,7 @@ void URedwoodClientInterface::SearchForAlliances(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodListAlliancesOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -2052,7 +2052,7 @@ void URedwoodClientInterface::CanAdminAlliance(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     OnOutput.ExecuteIfBound(TEXT("Not connected to Director."));
     return;
   }
@@ -2087,7 +2087,7 @@ void URedwoodClientInterface::CreateAlliance(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodCreateAllianceOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -2129,7 +2129,7 @@ void URedwoodClientInterface::UpdateAlliance(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2164,7 +2164,7 @@ void URedwoodClientInterface::KickGuildFromAlliance(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2199,7 +2199,7 @@ void URedwoodClientInterface::BanGuildFromAlliance(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2242,7 +2242,7 @@ void URedwoodClientInterface::ListAllianceGuilds(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodListAllianceGuildsOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -2306,7 +2306,7 @@ void URedwoodClientInterface::JoinAlliance(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2340,7 +2340,7 @@ void URedwoodClientInterface::LeaveAlliance(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2374,7 +2374,7 @@ void URedwoodClientInterface::InviteGuildToAlliance(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2820,7 +2820,7 @@ void URedwoodClientInterface::ListCharacters(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FRedwoodListCharactersOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -2870,7 +2870,7 @@ void URedwoodClientInterface::ListArchivedCharacters(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FRedwoodListCharactersOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -2968,7 +2968,7 @@ void URedwoodClientInterface::SetCharacterArchived(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -3001,7 +3001,7 @@ void URedwoodClientInterface::GetCharacterData(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FRedwoodGetCharacterOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3151,7 +3151,7 @@ void URedwoodClientInterface::ResendOnlineCharacter() {
 bool URedwoodClientInterface::HoldForDirector(TFunction<void()> Request) {
   return DirectorHeldRequests.HoldIfReconnecting(
     Director.IsValid() && bSentDirectorConnected && !AuthToken.IsEmpty(),
-    IsDirectorConnected() && bAuthenticated,
+    CanSendToDirector(),
     MoveTemp(Request),
     TimerManager
   );
@@ -3160,15 +3160,30 @@ bool URedwoodClientInterface::HoldForDirector(TFunction<void()> Request) {
 bool URedwoodClientInterface::HoldForRealm(TFunction<void()> Request) {
   return RealmHeldRequests.HoldIfReconnecting(
     Realm.IsValid() && bSentRealmConnected && !AuthToken.IsEmpty(),
-    IsRealmConnected() && !bRealmReauthPending,
+    CanSendToRealm(),
     MoveTemp(Request),
     TimerManager
   );
 }
 
+bool URedwoodClientInterface::CanSendToDirector() {
+  return FRedwoodHeldRequests::CanSend(
+    IsDirectorConnected(), bAuthenticated, !AuthToken.IsEmpty()
+  );
+}
+
+bool URedwoodClientInterface::CanSendToRealm() {
+  return FRedwoodHeldRequests::CanSend(
+    IsRealmConnected(), !bRealmReauthPending, !AuthToken.IsEmpty()
+  );
+}
+
+// A failed re-handshake leaves bRealmReauthPending set, so the held requests
+// and later ones fail instead of reaching a Realm that does not know the
+// player. The next handshake clears it.
 void URedwoodClientInterface::EndRealmReauthentication(bool bSucceeded) {
-  bRealmReauthPending = false;
   if (bSucceeded) {
+    bRealmReauthPending = false;
     RealmHeldRequests.Release(TimerManager);
   } else {
     RealmHeldRequests.Expire(TimerManager);
@@ -3687,7 +3702,7 @@ void URedwoodClientInterface::GetOrCreateParty(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FRedwoodGetPartyOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3737,7 +3752,7 @@ void URedwoodClientInterface::LeaveParty(FRedwoodErrorOutputDelegate OnOutput) {
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
     return;
   }
@@ -3771,7 +3786,7 @@ void URedwoodClientInterface::InviteToParty(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
     return;
   }
@@ -3801,7 +3816,7 @@ void URedwoodClientInterface::ListPartyInvites(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FRedwoodListPartyInvitesOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3843,7 +3858,7 @@ void URedwoodClientInterface::RespondToPartyInvite(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FRedwoodGetPartyOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3896,7 +3911,7 @@ void URedwoodClientInterface::PromoteToPartyLeader(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
     return;
   }
@@ -3923,7 +3938,7 @@ void URedwoodClientInterface::KickFromParty(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
     return;
   }
@@ -4073,7 +4088,7 @@ void URedwoodClientInterface::GetDirectorGlobalData(
     return;
   }
 
-  if (!Director.IsValid() || !Director->bIsConnected) {
+  if (!CanSendToDirector()) {
     FRedwoodGetGlobalDataOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -4120,7 +4135,7 @@ void URedwoodClientInterface::GetRealmGlobalData(
     return;
   }
 
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!CanSendToRealm()) {
     FRedwoodGetGlobalDataOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);

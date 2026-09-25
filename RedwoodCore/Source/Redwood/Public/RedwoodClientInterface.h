@@ -423,11 +423,13 @@ private:
   void ResendOnlineCharacter();
   bool HoldForDirector(TFunction<void()> Request);
   bool HoldForRealm(TFunction<void()> Request);
+  bool CanSendToDirector();
+  bool CanSendToRealm();
   void EndRealmReauthentication(bool bSucceeded);
   FRedwoodHeldRequests DirectorHeldRequests;
   FRedwoodHeldRequests RealmHeldRequests;
-  // The Realm socket reconnected (or is reconnecting) but the player is not
-  // authenticated on it yet; the Director has bAuthenticated for this.
+  // The Realm socket dropped and the player is not authenticated on it again
+  // yet; the Director has bAuthenticated for this.
   bool bRealmReauthPending = false;
 
   void HandleRegionsChanged(

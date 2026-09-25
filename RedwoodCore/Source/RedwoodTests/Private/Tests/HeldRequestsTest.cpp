@@ -11,8 +11,11 @@
 //   3. When the socket is not back within the grace, the held request fails
 //      through its own gate, and later requests fail at once until the
 //      socket is back.
-//   4. A failed re-login fails the held requests at once.
-//   5. The grace counts from the drop, not from the first request.
+//   4. A failed re-login fails the held requests at once, and a socket that
+//      is back but not re-logged in does not get them: the server would
+//      answer with an empty error and do nothing, a false success.
+//   5. The grace counts from the drop, not from the first request, and a
+//      new drop gets a new grace.
 //   6. Reset drops the held requests without running them.
 
 #include "CoreMinimal.h"
@@ -24,22 +27,34 @@
 
 namespace {
   // Models the shape of a URedwoodClientInterface request: ask the hold
-  // first, then run the old connection gate, which sends or fails.
+  // first, then run the connection gate, which sends or fails.
   struct FFakeSocket {
     bool bSessionEstablished = true;
-    bool bReady = false;
+    bool bConnected = false;
+    bool bAuthenticated = false;
     int32 SentCount = 0;
     int32 FailedCount = 0;
     FRedwoodHeldRequests Held;
     FTimerManager Timers;
 
+    bool CanSend() const {
+      return FRedwoodHeldRequests::CanSend(
+        bConnected, bAuthenticated, bSessionEstablished
+      );
+    }
+
+    void SetReady(bool bReady) {
+      bConnected = bReady;
+      bAuthenticated = bReady;
+    }
+
     void Request() {
       if (Held.HoldIfReconnecting(
-            bSessionEstablished, bReady, [this]() { Request(); }, Timers
+            bSessionEstablished, CanSend(), [this]() { Request(); }, Timers
           )) {
         return;
       }
-      if (bReady) {
+      if (CanSend()) {
         ++SentCount;
       } else {
         ++FailedCount;
@@ -83,7 +98,7 @@ bool FRedwoodHeldRequestsTest::RunTest(const FString &Parameters) {
 
   {
     FFakeSocket Socket;
-    Socket.bReady = true;
+    Socket.SetReady(true);
     Socket.Request();
     TestEqual(TEXT("Ready socket: sent at once"), Socket.SentCount, 1);
     TestEqual(TEXT("Ready socket: nothing held"), Socket.Held.Num(), 0);
@@ -95,7 +110,7 @@ bool FRedwoodHeldRequestsTest::RunTest(const FString &Parameters) {
     TestEqual(TEXT("Reconnecting: held"), Socket.Held.Num(), 1);
     TestEqual(TEXT("Reconnecting: not failed"), Socket.FailedCount, 0);
 
-    Socket.bReady = true;
+    Socket.SetReady(true);
     Socket.Held.Release(Socket.Timers);
     TestEqual(TEXT("Released: sent once"), Socket.SentCount, 1);
     TestEqual(TEXT("Released: queue empty"), Socket.Held.Num(), 0);
@@ -122,9 +137,9 @@ bool FRedwoodHeldRequestsTest::RunTest(const FString &Parameters) {
     TestEqual(TEXT("After the grace: fails at once"), Socket.FailedCount, 2);
     TestEqual(TEXT("After the grace: nothing held"), Socket.Held.Num(), 0);
 
-    Socket.bReady = true;
+    Socket.SetReady(true);
     Socket.Request();
-    Socket.bReady = false;
+    Socket.SetReady(false);
     Socket.Request();
     TestEqual(
       TEXT("Socket back then dropped again: held again"), Socket.Held.Num(), 1
@@ -134,9 +149,21 @@ bool FRedwoodHeldRequestsTest::RunTest(const FString &Parameters) {
   {
     FFakeSocket Socket;
     Socket.Request();
+    Socket.bConnected = true;
     Socket.Held.Expire(Socket.Timers);
     TestEqual(TEXT("Failed re-login: failed at once"), Socket.FailedCount, 1);
+    TestEqual(
+      TEXT("Failed re-login: not sent unauthenticated"), Socket.SentCount, 0
+    );
     TestEqual(TEXT("Failed re-login: queue empty"), Socket.Held.Num(), 0);
+
+    Socket.Request();
+    TestEqual(
+      TEXT("Failed re-login: later requests fail"), Socket.FailedCount, 2
+    );
+    TestEqual(
+      TEXT("Failed re-login: later requests not sent"), Socket.SentCount, 0
+    );
   }
 
   {
@@ -153,6 +180,10 @@ bool FRedwoodHeldRequestsTest::RunTest(const FString &Parameters) {
       Socket.FailedCount,
       1
     );
+
+    Socket.Held.StartGrace(Socket.Timers);
+    Socket.Request();
+    TestEqual(TEXT("A new drop gets a new grace: held"), Socket.Held.Num(), 1);
   }
 
   {

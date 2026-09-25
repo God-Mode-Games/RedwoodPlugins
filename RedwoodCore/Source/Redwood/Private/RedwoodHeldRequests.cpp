@@ -25,10 +25,12 @@ bool FRedwoodHeldRequests::HoldIfReconnecting(
 }
 
 void FRedwoodHeldRequests::StartGrace(FTimerManager &TimerManager) {
-  if (bGraceExpired || TimerManager.IsTimerActive(GraceTimer)
-      || TimerManager.IsTimerPending(GraceTimer)) {
+  if (TimerManager.IsTimerActive(GraceTimer)) {
     return;
   }
+
+  // A new drop gets a full grace, even when the last one ran out.
+  bGraceExpired = false;
 
   TimerManager.SetTimer(
     GraceTimer,
