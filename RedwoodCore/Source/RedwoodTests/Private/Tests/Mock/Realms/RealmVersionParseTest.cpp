@@ -16,7 +16,8 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
-namespace {
+// Named, not anonymous: anonymous namespaces merge under the unity build.
+namespace RedwoodRealmVersionParseTest {
   const TCHAR *const RealmFieldsWithoutVersion = TEXT(
     "\"id\": \"realm-a\", \"createdAt\": \"2024-01-01T00:00:00.000Z\", "
     "\"updatedAt\": \"2024-01-02T11:42:24.000Z\", \"name\": \"Realm A\", "
@@ -40,6 +41,8 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodRealmVersionParseTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodRealmVersionParseTest;
+
   const FString Commit = TEXT("0123456789abcdef0123456789abcdef01234567");
 
   const FRedwoodRealm WithVersion =

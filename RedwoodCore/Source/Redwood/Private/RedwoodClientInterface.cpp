@@ -2143,6 +2143,7 @@ void URedwoodClientInterface::ListRealms(
     const TArray<TSharedPtr<FJsonValue>> &Realms =
       MessageObject->GetArrayField(TEXT("realms"));
 
+    // FORK(hollowed-oath): the loop body moved into ParseRealm so a test can reach it.
     for (TSharedPtr<FJsonValue> InRealm : Realms) {
       Output.Realms.Add(ParseRealm(InRealm->AsObject()));
     }
