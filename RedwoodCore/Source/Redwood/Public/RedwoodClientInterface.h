@@ -269,6 +269,10 @@ public:
 
   void ListRealms(FRedwoodListRealmsOutputDelegate OnOutput);
 
+  // FORK(hollowed-oath): one realm:list entry, public so a test can feed it
+  // JSON without a director.
+  static FRedwoodRealm ParseRealm(const TSharedPtr<FJsonObject> &RealmObj);
+
   void InitializeConnectionForFirstRealm(
     FRedwoodSocketConnectedDelegate OnRealmConnected
   );

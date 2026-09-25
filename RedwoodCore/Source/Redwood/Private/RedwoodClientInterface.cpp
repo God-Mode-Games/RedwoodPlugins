@@ -2144,25 +2144,32 @@ void URedwoodClientInterface::ListRealms(
       MessageObject->GetArrayField(TEXT("realms"));
 
     for (TSharedPtr<FJsonValue> InRealm : Realms) {
-      FRedwoodRealm OutRealm;
-      TSharedPtr<FJsonObject> RealmObj = InRealm->AsObject();
-      OutRealm.Id = RealmObj->GetStringField(TEXT("id"));
-      FDateTime::ParseIso8601(
-        *RealmObj->GetStringField(TEXT("createdAt")), OutRealm.CreatedAt
-      );
-      FDateTime::ParseIso8601(
-        *RealmObj->GetStringField(TEXT("updatedAt")), OutRealm.UpdatedAt
-      );
-      OutRealm.Name = RealmObj->GetStringField(TEXT("name"));
-      OutRealm.Uri = RealmObj->GetStringField(TEXT("uri"));
-      OutRealm.bListed = RealmObj->GetBoolField(TEXT("listed"));
-      OutRealm.Secret = RealmObj->GetStringField(TEXT("secret"));
-
-      Output.Realms.Add(OutRealm);
+      Output.Realms.Add(ParseRealm(InRealm->AsObject()));
     }
 
     OnOutput.ExecuteIfBound(Output);
   });
+}
+
+FRedwoodRealm URedwoodClientInterface::ParseRealm(
+  const TSharedPtr<FJsonObject> &RealmObj
+) {
+  FRedwoodRealm OutRealm;
+  OutRealm.Id = RealmObj->GetStringField(TEXT("id"));
+  FDateTime::ParseIso8601(
+    *RealmObj->GetStringField(TEXT("createdAt")), OutRealm.CreatedAt
+  );
+  FDateTime::ParseIso8601(
+    *RealmObj->GetStringField(TEXT("updatedAt")), OutRealm.UpdatedAt
+  );
+  OutRealm.Name = RealmObj->GetStringField(TEXT("name"));
+  OutRealm.Uri = RealmObj->GetStringField(TEXT("uri"));
+  OutRealm.bListed = RealmObj->GetBoolField(TEXT("listed"));
+  OutRealm.Secret = RealmObj->GetStringField(TEXT("secret"));
+  // FORK(hollowed-oath): an older director sends no version. TryGet keeps it
+  // empty and does not log the error that GetStringField writes.
+  RealmObj->TryGetStringField(TEXT("version"), OutRealm.Version);
+  return OutRealm;
 }
 
 void URedwoodClientInterface::InitializeConnectionForFirstRealm(
