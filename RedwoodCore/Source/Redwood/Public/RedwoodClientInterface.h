@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "RedwoodHeldRequests.h" // FORK(hollowed-oath): HollowedOath#2854.
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
 
@@ -420,6 +421,14 @@ private:
 
   // FORK(hollowed-oath): HollowedOath#2854. See the .cpp.
   void ResendOnlineCharacter();
+  bool HoldForDirector(TFunction<void()> Request);
+  bool HoldForRealm(TFunction<void()> Request);
+  void EndRealmReauthentication(bool bSucceeded);
+  FRedwoodHeldRequests DirectorHeldRequests;
+  FRedwoodHeldRequests RealmHeldRequests;
+  // The Realm socket reconnected (or is reconnecting) but the player is not
+  // authenticated on it yet; the Director has bAuthenticated for this.
+  bool bRealmReauthPending = false;
 
   void HandleRegionsChanged(
     const FString &Event, const TSharedPtr<FJsonValue> &Message
