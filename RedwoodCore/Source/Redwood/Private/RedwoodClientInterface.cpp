@@ -3200,6 +3200,11 @@ bool URedwoodClientInterface::CanSendToRealm() {
 void URedwoodClientInterface::EndRealmReauthentication(bool bSucceeded) {
   if (bSucceeded) {
     bRealmReauthPending = false;
+    // When the Realm comes back after the Director, the Director re-login
+    // found no Realm and did not restore the online character.
+    if (IsDirectorConnected() && bAuthenticated) {
+      ResendOnlineCharacter();
+    }
     RealmHeldRequests.Release(TimerManager);
   } else {
     RealmHeldRequests.Expire(TimerManager);
