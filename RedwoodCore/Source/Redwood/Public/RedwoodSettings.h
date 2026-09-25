@@ -62,6 +62,26 @@ public:
 
   static FString GetDirectorUri();
 
+  // FORK(hollowed-oath) BEGIN: signed realm pin.
+  /**
+   * The realm pinned by the signed `redwood.json` (`realmId`, `realmUri`),
+   * trusted exactly as `directorUri` is. When one director serves realms
+   * that run different game builds, the installed build must connect to
+   * its own realm, not whichever realm the director lists first. Both are
+   * empty when the file, the fields, or a valid signature are missing.
+   */
+  static void GetSignedRealm(FString &OutRealmId, FString &OutRealmUri);
+
+  /** GetSignedRealm's file half, with the path and key passed in so a test
+   *  can drive the signature check without the project's own redwood.json. */
+  static void ReadSignedRealm(
+    const FString &JsonPath,
+    const FString &PublicSigningKeyBase64,
+    FString &OutRealmId,
+    FString &OutRealmUri
+  );
+  // FORK(hollowed-oath) END
+
   /**
    * If set to true, Redwood will automatically connect clients to servers
    * when they receive a request from the Realm service. This will happen
