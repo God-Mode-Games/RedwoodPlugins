@@ -95,6 +95,12 @@ void URedwoodClientGameSubsystem::Initialize(
     ClientInterface->OnFriendRequestReceived.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleOnFriendRequestReceived
     );
+    // FORK(hollowed-oath): subscribe the fork-added character friend delegate.
+    // Merge must keep this bind paired with the UPROPERTY delegate and the
+    // UFUNCTION handler in RedwoodClientGameSubsystem.h.
+    ClientInterface->OnCharacterFriendAlert.AddDynamic(
+      this, &URedwoodClientGameSubsystem::HandleOnCharacterFriendAlert
+    );
     ClientInterface->OnPartyInvited.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleOnPartyInvited
     );
@@ -456,6 +462,83 @@ void URedwoodClientGameSubsystem::RemoveRealmContact(
     );
   }
 }
+
+// FORK(hollowed-oath) BEGIN: character friend calls. Each has the guard the
+// file header explains (#2445), and the same "without using a backend" else
+// branch as the realm contact calls above.
+void URedwoodClientGameSubsystem::ListCharacterFriends(
+  FRedwoodListCharacterFriendsOutputDelegate OnOutput
+) {
+  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    if (!ClientInterface) {
+      FRedwoodListCharacterFriendsOutput Output;
+      Output.Error = RedwoodNoClientInterfaceError;
+      OnOutput.ExecuteIfBound(Output);
+      return;
+    }
+
+    ClientInterface->ListCharacterFriends(OnOutput);
+  } else {
+    FRedwoodListCharacterFriendsOutput Output;
+    Output.Error =
+      TEXT("Cannot list character friends without using a backend");
+    OnOutput.ExecuteIfBound(Output);
+  }
+}
+
+void URedwoodClientGameSubsystem::RequestCharacterFriend(
+  FString TargetCharacterId, FRedwoodErrorOutputDelegate OnOutput
+) {
+  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    if (!ClientInterface) {
+      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
+      return;
+    }
+
+    ClientInterface->RequestCharacterFriend(TargetCharacterId, OnOutput);
+  } else {
+    OnOutput.ExecuteIfBound(
+      TEXT("Cannot request character friend without using a backend")
+    );
+  }
+}
+
+void URedwoodClientGameSubsystem::RespondToCharacterFriendRequest(
+  FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
+) {
+  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    if (!ClientInterface) {
+      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
+      return;
+    }
+
+    ClientInterface->RespondToCharacterFriendRequest(
+      OtherCharacterId, bAccept, OnOutput
+    );
+  } else {
+    OnOutput.ExecuteIfBound(
+      TEXT("Cannot respond to character friend request without using a backend")
+    );
+  }
+}
+
+void URedwoodClientGameSubsystem::RemoveCharacterFriend(
+  FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+) {
+  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    if (!ClientInterface) {
+      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
+      return;
+    }
+
+    ClientInterface->RemoveCharacterFriend(OtherCharacterId, OnOutput);
+  } else {
+    OnOutput.ExecuteIfBound(
+      TEXT("Cannot remove character friend without using a backend")
+    );
+  }
+}
+// FORK(hollowed-oath) END
 
 void URedwoodClientGameSubsystem::ListGuilds(
   bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
@@ -1389,6 +1472,15 @@ void URedwoodClientGameSubsystem::HandleOnFriendRequestReceived(
   FRedwoodPlayer Requester
 ) {
   OnFriendRequestReceived.Broadcast(Requester);
+}
+
+// FORK(hollowed-oath): re-broadcast handler for the fork-added
+// OnCharacterFriendAlert delegate (see the bind in Initialize). Whole function
+// is fork-added.
+void URedwoodClientGameSubsystem::HandleOnCharacterFriendAlert(
+  const FRedwoodCharacterFriendAlert &Alert
+) {
+  OnCharacterFriendAlert.Broadcast(Alert);
 }
 
 void URedwoodClientGameSubsystem::HandleOnPartyInvited(
