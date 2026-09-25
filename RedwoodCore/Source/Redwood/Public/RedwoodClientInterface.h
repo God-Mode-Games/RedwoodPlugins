@@ -308,6 +308,19 @@ public:
 
   void SetSelectedCharacter(FString CharacterId);
 
+  // FORK(hollowed-oath): HollowedOath#2854. The director route that sets the
+  // character that friends see. Kept here so the unit test pins the name.
+  static constexpr const TCHAR *SetOnlineCharacterEventName =
+    TEXT("director:players:online-state:set-character");
+
+  // FORK(hollowed-oath): HollowedOath#2854. Null when any id is empty: the
+  // director rejects such a request, and there is nothing to restore.
+  static TSharedPtr<FJsonObject> MakeOnlineCharacterPayload(
+    const FString &InPlayerId,
+    const FString &InCharacterId,
+    const FString &InRealmId
+  );
+
   void JoinMatchmaking(
     FString ProfileId,
     TArray<FString> InRegions,
@@ -404,6 +417,9 @@ private:
   UFUNCTION()
   void BeginRealmReauthentication();
   FTimerHandle ReauthenticationAttemptTimer;
+
+  // FORK(hollowed-oath): HollowedOath#2854. See the .cpp.
+  void ResendOnlineCharacter();
 
   void HandleRegionsChanged(
     const FString &Event, const TSharedPtr<FJsonValue> &Message

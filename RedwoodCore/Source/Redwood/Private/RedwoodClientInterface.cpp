@@ -160,6 +160,9 @@ void URedwoodClientInterface::InitializeDirectorConnection(
                 "Reauthenticated connection with Director, calling connection reestablished."
               )
             );
+            // FORK(hollowed-oath): HollowedOath#2854. Restore the online
+            // character before the game reacts to the reconnect.
+            ResendOnlineCharacter();
             OnDirectorConnectionReestablished.Broadcast();
           } else {
             UE_LOG(
@@ -2774,9 +2777,48 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
 
   Realm->Emit(TEXT("realm:parties:select-character"), Payload);
 
-  Payload->SetStringField(TEXT("realmId"), CurrentRealmId);
+  // FORK(hollowed-oath): HollowedOath#2854. Same payload as the re-login path.
+  const TSharedPtr<FJsonObject> OnlinePayload =
+    MakeOnlineCharacterPayload(PlayerId, SelectedCharacterId, CurrentRealmId);
+  if (OnlinePayload.IsValid()) {
+    Director->Emit(SetOnlineCharacterEventName, OnlinePayload);
+  }
+}
 
-  Director->Emit(TEXT("director:players:online-state:set-character"), Payload);
+TSharedPtr<FJsonObject> URedwoodClientInterface::MakeOnlineCharacterPayload(
+  const FString &InPlayerId,
+  const FString &InCharacterId,
+  const FString &InRealmId
+) {
+  if (InPlayerId.IsEmpty() || InCharacterId.IsEmpty() || InRealmId.IsEmpty()) {
+    return nullptr;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), InPlayerId);
+  Payload->SetStringField(TEXT("characterId"), InCharacterId);
+  Payload->SetStringField(TEXT("realmId"), InRealmId);
+  return Payload;
+}
+
+// FORK(hollowed-oath): HollowedOath#2854. A director re-login writes an online
+// state with no realm, so after a director-frontend move friends saw the
+// player with no character until the next character selection. Send the
+// character again when the player is still in the realm. When the realm
+// socket is down too, the realm reconnect runs its own handshake; Task 19 of
+// the plan checks what the online state shows then.
+void URedwoodClientInterface::ResendOnlineCharacter() {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
+    return;
+  }
+
+  const TSharedPtr<FJsonObject> Payload =
+    MakeOnlineCharacterPayload(PlayerId, SelectedCharacterId, CurrentRealmId);
+  if (!Payload.IsValid()) {
+    return;
+  }
+
+  Director->Emit(SetOnlineCharacterEventName, Payload);
 }
 
 void URedwoodClientInterface::JoinMatchmaking(
