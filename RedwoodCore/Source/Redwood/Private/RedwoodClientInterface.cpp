@@ -478,8 +478,13 @@ void URedwoodClientInterface::Logout() {
       Director->Emit(TEXT("player:logout"), Payload);
     }
 
-    if (Realm.IsValid() && Realm->bIsConnected) {
-      Realm->Emit(TEXT("realm:auth:player:logout"), Payload);
+    // FORK(hollowed-oath): HollowedOath#2854. Disconnect a Realm socket that is
+    // still reconnecting too: once back, it would start a re-handshake for a
+    // player who left.
+    if (Realm.IsValid()) {
+      if (Realm->bIsConnected) {
+        Realm->Emit(TEXT("realm:auth:player:logout"), Payload);
+      }
       Realm->Disconnect();
     }
 
@@ -2678,6 +2683,13 @@ void URedwoodClientInterface::InitiateRealmHandshake(
 }
 
 void URedwoodClientInterface::BeginRealmReauthentication() {
+  // FORK(hollowed-oath): HollowedOath#2854. Only a Realm drop of a live
+  // session asks for a re-handshake; a Logout or a new handshake cancels it,
+  // and a socket that comes back after that must not start the retry loop.
+  if (!bRealmReauthPending) {
+    return;
+  }
+
   if (!Director.IsValid() || !Director->bIsConnected || !IsLoggedIn()) {
     TimerManager.SetTimer(
       ReauthenticationAttemptTimer,

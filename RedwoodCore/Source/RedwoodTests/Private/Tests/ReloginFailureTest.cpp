@@ -391,3 +391,61 @@ bool FRedwoodDropAfterLogoutTest::RunTest(const FString &Parameters) {
 
   return true;
 }
+
+// A Logout during a joint move, with the Realm socket still reconnecting,
+// must close that socket. If it comes back anyway, it must not start the
+// re-handshake retry, which would poll at the title screen and later run
+// against the next session's Realm.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodLogoutClosesReconnectingRealmTest,
+  "Redwood.HeldRequests.LogoutClosesReconnectingRealm",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodLogoutClosesReconnectingRealmTest::RunTest(
+  const FString &Parameters
+) {
+  FRedwoodSaveSlotGuard SaveSlot;
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
+
+  Client->Director = ISocketIOClientModule::Get().NewValidNativePointer();
+  Client->Realm = ISocketIOClientModule::Get().NewValidNativePointer();
+  ON_SCOPE_EXIT {
+    Client->Director->bIsConnected = false;
+    Client->Realm->bIsConnected = false;
+    Client->Deinitialize();
+  };
+
+  Client->bSentDirectorConnected = true;
+  Client->bSentRealmConnected = true;
+  Client->bAuthenticated = true;
+  Client->PlayerId = TEXT("player-1");
+  Client->AuthToken = TEXT("token-1");
+
+  // Both sockets drop; the Realm is still reconnecting.
+  Client->NoteDirectorDrop();
+  Client->bAuthenticated = false;
+  Client->NoteRealmDrop();
+
+  int32 RealmDisconnects = 0;
+  Client->Realm->OnDisconnectedCallback =
+    [&RealmDisconnects](ESIOConnectionCloseReason) { ++RealmDisconnects; };
+
+  Client->Logout();
+  TestEqual(TEXT("Logout closes the reconnecting Realm"), RealmDisconnects, 1);
+  // The counter dies before the scope exit disconnects the socket again.
+  Client->Realm->OnDisconnectedCallback = nullptr;
+
+  // The Realm socket comes back anyway, as its reconnect callback does it.
+  Client->Realm->bIsConnected = true;
+  Client->BeginRealmReauthentication();
+  TestFalse(
+    TEXT("No re-handshake retry starts after the Logout"),
+    Client->TimerManager.IsTimerActive(Client->ReauthenticationAttemptTimer)
+  );
+
+  return true;
+}
