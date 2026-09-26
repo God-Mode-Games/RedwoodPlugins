@@ -263,7 +263,10 @@ void URedwoodClientInterface::InitializeDirectorConnection(
             // disconnect/reconnect modal (via RedwoodClientGameSubsystem).
             // FORK(hollowed-oath): HollowedOath#2854.
             EndDirectorReauthentication(false);
-            OnDirectorAuthFailed.Broadcast(Update.Message);
+            // A player who logged out meanwhile is at the title screen.
+            if (!bLoggedOutDuringRelogin) {
+              OnDirectorAuthFailed.Broadcast(Update.Message);
+            }
           }
         }),
         true
