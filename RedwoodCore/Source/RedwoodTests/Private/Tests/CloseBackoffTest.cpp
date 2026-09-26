@@ -152,3 +152,61 @@ bool FRedwoodCloseBackoffJitterTest::RunTest(const FString &Parameters) {
   );
   return true;
 }
+
+// Only a connection that stays up resets the backoff. A server that accepts
+// and then closes, even after a full re-login, must keep its clients at the
+// long delays.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCloseBackoffStableResetTest,
+  "Redwood.Socket.CloseBackoffStableReset",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodCloseBackoffStableResetTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCloseBackoffTest;
+  constexpr float Stable = FRedwoodCloseBackoff::StableConnectionSeconds;
+
+  FHarness Harness;
+  Harness.Schedule();
+  Harness.Schedule();
+
+  // Connected, then closed again before the stable time.
+  Harness.Backoff.NoteConnected(Harness.Timers);
+  Harness.Advance(0.0f);
+  Harness.Advance(Stable - BoundaryMarginSeconds);
+  Harness.Schedule();
+  Harness.Advance(Stable);
+  TestEqual(
+    TEXT("A close before the stable time keeps the backoff"),
+    Harness.Backoff.NumAttempts(),
+    3
+  );
+
+  // A drop the library handles cancels the stable time too.
+  Harness.Backoff.NoteConnected(Harness.Timers);
+  Harness.Advance(0.0f);
+  Harness.Backoff.NoteDropped(Harness.Timers);
+  Harness.Advance(Stable + BoundaryMarginSeconds);
+  TestEqual(
+    TEXT("A drop before the stable time keeps the backoff"),
+    Harness.Backoff.NumAttempts(),
+    3
+  );
+
+  // Connected, and it stays up.
+  Harness.Backoff.NoteConnected(Harness.Timers);
+  Harness.Advance(0.0f);
+  Harness.Advance(Stable - BoundaryMarginSeconds);
+  TestEqual(
+    TEXT("The backoff waits the whole stable time"),
+    Harness.Backoff.NumAttempts(),
+    3
+  );
+  Harness.Advance(2.0f * BoundaryMarginSeconds);
+  TestEqual(
+    TEXT("A stable connection resets the backoff"),
+    Harness.Backoff.NumAttempts(),
+    0
+  );
+  return true;
+}

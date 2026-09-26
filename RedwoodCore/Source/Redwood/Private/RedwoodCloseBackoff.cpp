@@ -7,6 +7,7 @@
 float FRedwoodCloseBackoff::Schedule(
   FTimerManager &TimerManager, TFunction<void()> Reconnect
 ) {
+  NoteDropped(TimerManager);
   const float DelaySeconds = BaseDelaySeconds() *
     FMath::FRandRange(1.0f - JitterFraction, 1.0f + JitterFraction);
   ++Attempts;
@@ -19,9 +20,23 @@ float FRedwoodCloseBackoff::Schedule(
   return DelaySeconds;
 }
 
+void FRedwoodCloseBackoff::NoteConnected(FTimerManager &TimerManager) {
+  TimerManager.SetTimer(
+    StableTimer,
+    FTimerDelegate::CreateLambda([this]() { Attempts = 0; }),
+    StableConnectionSeconds,
+    false
+  );
+}
+
+void FRedwoodCloseBackoff::NoteDropped(FTimerManager &TimerManager) {
+  TimerManager.ClearTimer(StableTimer);
+}
+
 void FRedwoodCloseBackoff::Reset(FTimerManager &TimerManager) {
   Attempts = 0;
   TimerManager.ClearTimer(ReconnectTimer);
+  TimerManager.ClearTimer(StableTimer);
 }
 
 float FRedwoodCloseBackoff::BaseDelaySeconds() const {

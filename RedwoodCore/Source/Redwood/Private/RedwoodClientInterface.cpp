@@ -185,6 +185,7 @@ void URedwoodClientInterface::InitializeDirectorConnection(
                                        unsigned ReconnectionAttempt,
                                        unsigned AttemptDelay
                                      ) {
+    DirectorCloseBackoff.NoteDropped(TimerManager); // FORK(hollowed-oath)
     if (!bSentDirectorConnected && !bSentInitialDirectorConnectionFailureLog) {
       bSentInitialDirectorConnectionFailureLog = true;
       UE_LOG(
@@ -223,6 +224,7 @@ void URedwoodClientInterface::InitializeDirectorConnection(
                                     const FString &InSessionId
                                   ) {
     NoteFirstDirectorConnect(); // FORK(hollowed-oath): HollowedOath#2854.
+    DirectorCloseBackoff.NoteConnected(TimerManager); // FORK(hollowed-oath)
     bDirectorDisconnected = false;
 
     if (!bSentDirectorConnected) {
@@ -246,7 +248,6 @@ void URedwoodClientInterface::InitializeDirectorConnection(
       // authentication failure on the title screen.
       bLoggedOutDuringRelogin = false;
       if (!HasPlayerSession()) {
-        DirectorCloseBackoff.Reset(TimerManager); // FORK(hollowed-oath)
         OnDirectorConnectionReestablished.Broadcast();
         return;
       }
@@ -2667,6 +2668,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
                                         unsigned ReconnectionAttempt,
                                         unsigned AttemptDelay
                                       ) {
+        RealmCloseBackoff.NoteDropped(TimerManager); // FORK(hollowed-oath)
         if (!bSentRealmConnected && !bSentInitialRealmConnectionFailureLog) {
           bSentInitialRealmConnectionFailureLog = true;
           UE_LOG(
@@ -2697,6 +2699,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
                                      const FString &InSessionId
                                    ) {
         NoteFirstRealmConnect(); // FORK(hollowed-oath): HollowedOath#2854.
+        RealmCloseBackoff.NoteConnected(TimerManager); // FORK(hollowed-oath)
         bRealmDisconnected = false;
 
         if (!bSentRealmConnected) {
@@ -3447,7 +3450,6 @@ void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
   }
 
   if (bSucceeded) {
-    DirectorCloseBackoff.Reset(TimerManager); // FORK(hollowed-oath)
     // bAuthenticated carries the session again.
     bLoggedInAtDrop = false;
     // A Realm not back yet cannot take it; its re-handshake sends it then.
@@ -3479,7 +3481,6 @@ void URedwoodClientInterface::EndRealmReauthentication(bool bSucceeded) {
   TimerManager.ClearTimer(ReauthenticationAttemptTimer);
 
   if (bSucceeded) {
-    RealmCloseBackoff.Reset(TimerManager); // FORK(hollowed-oath)
     bRealmReauthPending = false;
     // Only when a Director re-login found the Realm not back yet: after a
     // Realm-only drop, the online state still has the character.

@@ -20,6 +20,11 @@ public:
   // stopping server closes many clients at once; without it they would all
   // reconnect in the same instant, again and again.
   static constexpr float JitterFraction = 0.3f;
+  // A connection that stays up this long is healthy, and the next close
+  // starts again from the first delay. A server that accepts and then closes
+  // at once never gets there, so its clients stay at the long delays. A reset
+  // on connect or on re-login would bring them back to one per second.
+  static constexpr float StableConnectionSeconds = 10.0f;
 
   // Runs Reconnect after the next delay, and returns that delay. It never
   // gives up: a rolling deploy can close a client many times in a row, and
@@ -27,7 +32,13 @@ public:
   // the maximum, it retries at the maximum.
   float Schedule(FTimerManager &TimerManager, TFunction<void()> Reconnect);
 
-  // After a good re-login, and when the socket goes away.
+  // The socket connected: reset once it stays up for the stable time.
+  void NoteConnected(FTimerManager &TimerManager);
+
+  // The socket dropped, so it was not stable. Schedule does this too.
+  void NoteDropped(FTimerManager &TimerManager);
+
+  // The socket goes away, or the client closes it on purpose.
   void Reset(FTimerManager &TimerManager);
 
   // The next delay before jitter.
@@ -44,4 +55,5 @@ public:
 private:
   int32 Attempts = 0;
   FTimerHandle ReconnectTimer;
+  FTimerHandle StableTimer;
 };

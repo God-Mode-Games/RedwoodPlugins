@@ -337,11 +337,14 @@ bool FRedwoodUnrequestedCloseBacksOffTest::RunTest(const FString &Parameters) {
     Client->RealmCloseBackoff.IsReconnectPending(Client->TimerManager)
   );
 
+  // Only a connection that stays up resets the backoff. A server that lets
+  // the re-handshake finish and then closes must not bring it back to the
+  // first delay.
   Client->EndRealmReauthentication(true);
   TestEqual(
-    TEXT("A good re-handshake resets the backoff"),
+    TEXT("A good re-handshake alone does not reset the backoff"),
     Client->RealmCloseBackoff.NumAttempts(),
-    0
+    RepeatedCloses + 1
   );
   return true;
 }
