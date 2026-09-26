@@ -320,6 +320,7 @@ bool FRedwoodLogoutDuringGraceTest::RunTest(const FString &Parameters) {
 
   Client->Logout();
 
+  TestFalse(TEXT("Logout ends the session"), Client->HasPlayerSession());
   TestTrue(TEXT("Logout clears the player id"), Client->PlayerId.IsEmpty());
   TestTrue(TEXT("Logout clears the token"), Client->AuthToken.IsEmpty());
   TestEqual(
@@ -342,6 +343,51 @@ bool FRedwoodLogoutDuringGraceTest::RunTest(const FString &Parameters) {
     Client->IsLoggedIn()
   );
   TestTrue(TEXT("Its token is dropped again"), Client->AuthToken.IsEmpty());
+  TestFalse(
+    TEXT("The late reply leaves no session"), Client->HasPlayerSession()
+  );
+
+  return true;
+}
+
+// After a normal logout the player is at the title screen with no session. A
+// Director drop there must not start a session of its own: the reconnect then
+// skips the re-login, and requests are not held or failed as a dead session's.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodDropAfterLogoutTest,
+  "Redwood.HeldRequests.DropAfterLogout",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodDropAfterLogoutTest::RunTest(const FString &Parameters) {
+  FRedwoodSaveSlotGuard SaveSlot;
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
+
+  Client->Director = ISocketIOClientModule::Get().NewValidNativePointer();
+  Client->Realm = ISocketIOClientModule::Get().NewValidNativePointer();
+  ON_SCOPE_EXIT {
+    Client->Director->bIsConnected = false;
+    Client->Deinitialize();
+  };
+
+  Client->bSentDirectorConnected = true;
+  Client->bAuthenticated = true;
+  Client->PlayerId = TEXT("player-1");
+  Client->AuthToken = TEXT("token-1");
+  Client->Director->bIsConnected = true;
+
+  Client->Logout();
+
+  // The Director moves while the player sits at the title screen.
+  Client->Director->bIsConnected = false;
+  Client->NoteDirectorDrop();
+  Client->bAuthenticated = false;
+
+  TestFalse(TEXT("The drop starts no session"), Client->HasPlayerSession());
+  TestFalse(TEXT("Nothing is marked logged in"), Client->bLoggedInAtDrop);
 
   return true;
 }

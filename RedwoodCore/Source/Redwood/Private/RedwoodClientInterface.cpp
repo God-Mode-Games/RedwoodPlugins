@@ -482,7 +482,10 @@ void URedwoodClientInterface::Logout() {
 
     PlayerId = TEXT("");
     AuthToken = TEXT("");
-    // FORK(hollowed-oath): HollowedOath#2854. See HasPlayerSession.
+    // FORK(hollowed-oath): HollowedOath#2854. See HasPlayerSession: both
+    // flags, or a later Director drop at the title screen re-logs in with
+    // empty ids and reports an authentication failure there.
+    bAuthenticated = false;
     bLoggedInAtDrop = false;
 
     URedwoodSaveGame *SaveGame = Cast<URedwoodSaveGame>(

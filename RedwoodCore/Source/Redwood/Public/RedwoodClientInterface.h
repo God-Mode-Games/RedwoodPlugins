@@ -443,6 +443,7 @@ private:
   friend class FRedwoodLogoutDuringGraceTest;
   friend class FRedwoodRealmReauthRetryTest;
   friend class FRedwoodFirstConnectAfterLossTest;
+  friend class FRedwoodDropAfterLogoutTest;
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);
