@@ -449,3 +449,59 @@ bool FRedwoodLogoutClosesReconnectingRealmTest::RunTest(
 
   return true;
 }
+
+// A failed Director re-login ends the session. A Realm socket that comes back
+// after it must not start the re-handshake retry: the retry waits for a
+// Director login that cannot come, and polls for good.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodFailedReloginStopsRealmRetryTest,
+  "Redwood.HeldRequests.FailedReloginStopsRealmRetry",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodFailedReloginStopsRealmRetryTest::RunTest(
+  const FString &Parameters
+) {
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
+
+  Client->Director = ISocketIOClientModule::Get().NewValidNativePointer();
+  Client->Realm = ISocketIOClientModule::Get().NewValidNativePointer();
+  ON_SCOPE_EXIT {
+    Client->Director->bIsConnected = false;
+    Client->Realm->bIsConnected = false;
+    Client->Deinitialize();
+  };
+
+  Client->bSentDirectorConnected = true;
+  Client->bSentRealmConnected = true;
+  Client->bAuthenticated = true;
+  Client->PlayerId = TEXT("player-1");
+  Client->AuthToken = TEXT("token-1");
+
+  // Both sockets drop; the Director re-login then fails and empties the ids.
+  Client->NoteDirectorDrop();
+  Client->bAuthenticated = false;
+  Client->NoteRealmDrop();
+  Client->Realm->bIsConnected = true;
+  Client->PlayerId.Empty();
+  Client->AuthToken.Empty();
+  Client->EndDirectorReauthentication(false);
+
+  TestFalse(
+    TEXT("The dead session's Realm socket is closed"),
+    Client->Realm->bIsConnected
+  );
+
+  // The Realm socket comes back anyway, as its reconnect callback does it.
+  Client->Realm->bIsConnected = true;
+  Client->BeginRealmReauthentication();
+  TestFalse(
+    TEXT("No re-handshake retry starts after a failed re-login"),
+    Client->TimerManager.IsTimerActive(Client->ReauthenticationAttemptTimer)
+  );
+
+  return true;
+}

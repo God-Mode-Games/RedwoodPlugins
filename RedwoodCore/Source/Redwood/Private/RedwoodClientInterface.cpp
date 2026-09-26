@@ -3344,8 +3344,17 @@ void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
   } else {
     DirectorHeldRequests.Expire(TimerManager);
     // The Realm re-handshake needs a logged-in Director, and this session
-    // cannot log in again, so its retry would poll for good.
+    // cannot log in again, so its Realm session is over too. Its held requests
+    // fail now, while the pending flag still refuses them. Closing the socket
+    // keeps later Realm requests refused once the flag is clear, and stops a
+    // reconnect that would start a retry polling for good, or re-handshake
+    // the old realm after the next login.
+    RealmHeldRequests.Expire(TimerManager);
+    bRealmReauthPending = false;
     TimerManager.ClearTimer(ReauthenticationAttemptTimer);
+    if (Realm.IsValid()) {
+      Realm->Disconnect();
+    }
   }
 }
 

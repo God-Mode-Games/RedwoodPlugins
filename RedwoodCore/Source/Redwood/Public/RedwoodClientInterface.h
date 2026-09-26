@@ -454,6 +454,7 @@ private:
   friend class FRedwoodFirstConnectAfterLossTest;
   friend class FRedwoodDropAfterLogoutTest;
   friend class FRedwoodLogoutClosesReconnectingRealmTest;
+  friend class FRedwoodFailedReloginStopsRealmRetryTest;
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);
