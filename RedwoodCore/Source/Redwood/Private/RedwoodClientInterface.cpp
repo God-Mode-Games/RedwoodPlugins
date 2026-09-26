@@ -3235,7 +3235,6 @@ TSharedPtr<FJsonObject> URedwoodClientInterface::MakeOnlineCharacterPayload(
 // is not back yet, EndRealmReauthentication sends it instead.
 void URedwoodClientInterface::ResendOnlineCharacter() {
   if (!IsRealmConnected() || bRealmReauthPending) {
-    bOnlineCharacterOwedAfterRealm = bRealmReauthPending;
     return;
   }
 
@@ -3336,6 +3335,8 @@ void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
   if (bSucceeded) {
     // bAuthenticated carries the session again.
     bLoggedInAtDrop = false;
+    // A Realm not back yet cannot take it; its re-handshake sends it then.
+    bOnlineCharacterOwedAfterRealm = bRealmReauthPending;
     ResendOnlineCharacter();
     DirectorHeldRequests.Release(TimerManager);
   } else {
