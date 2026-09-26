@@ -5,21 +5,21 @@
 // close. The socket library takes that as a close the client asked for and
 // does not reconnect, so Redwood never learned of the drop and never started
 // its grace and re-login. URedwoodClientInterface::MakeUnrequestedCloseHandler
-// reports such a close as a drop and connects again. A close the client asked
-// for (Logout) must stay clean.
+// reports such a close as a drop and connects again after a backoff.
 //
-// The test runs a minimal websocket server on a raw TCP socket, so the real
-// socket.io client and websocketpp run the whole close handshake.
+// The first test runs a minimal websocket server on a raw TCP socket, so the
+// real socket.io client and websocketpp run the whole close handshake.
 
 #include "CoreMinimal.h"
 #include "HAL/Event.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/ThreadSafeBool.h"
-#include "HAL/ThreadSafeCounter.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/Base64.h"
 #include "Misc/ScopeExit.h"
 #include "Misc/SecureHash.h"
+#include "Templates/Atomic.h"
+#include "UObject/StrongObjectPtr.h"
 #include "Sockets.h"
 #include "SocketSubsystem.h"
 
@@ -31,9 +31,6 @@ namespace RedwoodServerCloseTest {
   // Long enough for a loaded build machine, short enough to fail fast.
   const FTimespan StepTimeout = FTimespan::FromSeconds(5.0);
   constexpr uint32 StepTimeoutMs = 5000;
-
-  // The default 5 s delay would make the reconnect check slow.
-  constexpr uint32 ReconnectionDelayMs = 100;
 
   constexpr uint32 LoopbackIp = 0x7F000001;
   constexpr uint16 NormalCloseCode = 1000;
@@ -202,34 +199,26 @@ namespace RedwoodServerCloseTest {
   struct FClientProbe {
     TSharedPtr<FSocketIONative> Native;
     FEvent *Connected = FPlatformProcess::GetSynchEventFromPool(true);
-    FEvent *Reconnecting = FPlatformProcess::GetSynchEventFromPool(true);
-    FEvent *DisconnectedTwice = FPlatformProcess::GetSynchEventFromPool(true);
-    FThreadSafeCounter DisconnectCount;
-    FThreadSafeBool bCloseRequested = false;
+    FEvent *Disconnected = FPlatformProcess::GetSynchEventFromPool(true);
+    FThreadSafeBool bLibraryReconnected = false;
+    TAtomic<ESIOConnectionCloseReason> CloseReason{
+      ESIOConnectionCloseReason::CLOSE_REASON_DROP
+    };
 
     explicit FClientProbe(int32 Port) {
       Native = ISocketIOClientModule::Get().NewValidNativePointer();
       Native->bCallbackOnGameThread = false;
-      Native->ReconnectionDelay = ReconnectionDelayMs;
       Native->OnConnectedCallback = [this](const FString &, const FString &) {
         Connected->Trigger();
       };
       Native->OnReconnectionCallback = [this](uint32, uint32) {
-        Reconnecting->Trigger();
+        bLibraryReconnected = true;
       };
-      // Disconnect() reports once by itself and once more when the socket
-      // has really closed.
-      TFunction<void(const ESIOConnectionCloseReason)> OnClose =
-        URedwoodClientInterface::MakeUnrequestedCloseHandler(
-          Native, [this]() { return static_cast<bool>(bCloseRequested); }
-        );
       Native->OnDisconnectedCallback =
-        [this, OnClose](const ESIOConnectionCloseReason Reason) {
-        OnClose(Reason);
-        if (DisconnectCount.Increment() == 2) {
-          DisconnectedTwice->Trigger();
-        }
-      };
+        [this](const ESIOConnectionCloseReason Reason) {
+          CloseReason = Reason;
+          Disconnected->Trigger();
+        };
       Native->Connect(FString::Printf(TEXT("ws://127.0.0.1:%d"), Port));
     }
 
@@ -241,19 +230,21 @@ namespace RedwoodServerCloseTest {
       ISocketIOClientModule::Get().ReleaseNativePointer(Native);
       Native.Reset();
       FPlatformProcess::ReturnSynchEventToPool(Connected);
-      FPlatformProcess::ReturnSynchEventToPool(Reconnecting);
-      FPlatformProcess::ReturnSynchEventToPool(DisconnectedTwice);
+      FPlatformProcess::ReturnSynchEventToPool(Disconnected);
     }
   };
 }
 
+// Pins what the Redwood close handler relies on: the library reports a
+// server's 1000 close as CLOSE_REASON_NORMAL and does not reconnect by
+// itself. If it starts to reconnect, the handler would connect a second time.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodServerNormalCloseReconnectsTest,
-  "Redwood.Socket.ServerNormalCloseReconnects",
+  FRedwoodServerNormalCloseIsNormalTest,
+  "Redwood.Socket.ServerNormalCloseIsNormal",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-bool FRedwoodServerNormalCloseReconnectsTest::RunTest(const FString &Parameters) {
+bool FRedwoodServerNormalCloseIsNormalTest::RunTest(const FString &Parameters) {
   using namespace RedwoodServerCloseTest;
 
   TUniquePtr<FFakeSocketIoServer> Server = MakeUnique<FFakeSocketIoServer>();
@@ -267,56 +258,87 @@ bool FRedwoodServerNormalCloseReconnectsTest::RunTest(const FString &Parameters)
   };
 
   if (!TestTrue(TEXT("Client opens a session"), Server->AcceptSession()) ||
-      !TestTrue(TEXT("Client joins the namespace"), Client.Connected->Wait(StepTimeoutMs))) {
+      !TestTrue(
+        TEXT("Client joins the namespace"),
+        Client.Connected->Wait(StepTimeoutMs)
+      )) {
     return false;
   }
   TestTrue(TEXT("Server closes with 1000"), Server->CloseNormally());
 
-  TestTrue(
-    TEXT("A normal close the client did not ask for starts a reconnect"),
-    Client.Reconnecting->Wait(StepTimeoutMs)
+  if (!TestTrue(
+        TEXT("The client reports the close"),
+        Client.Disconnected->Wait(StepTimeoutMs)
+      )) {
+    return false;
+  }
+  TestEqual(
+    TEXT("A server's 1000 close reads as a normal close"),
+    static_cast<int32>(Client.CloseReason.Load()),
+    static_cast<int32>(ESIOConnectionCloseReason::CLOSE_REASON_NORMAL)
   );
-  TestTrue(
-    TEXT("The client connects again"), Server->WaitForConnection()
+  TestFalse(
+    TEXT("The library does not reconnect by itself"),
+    static_cast<bool>(Client.bLibraryReconnected)
   );
   return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodRequestedCloseStaysCleanTest,
-  "Redwood.Socket.RequestedCloseStaysClean",
+  FRedwoodUnrequestedCloseBacksOffTest,
+  "Redwood.Socket.UnrequestedCloseBacksOff",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-bool FRedwoodRequestedCloseStaysCleanTest::RunTest(const FString &Parameters) {
-  using namespace RedwoodServerCloseTest;
+bool FRedwoodUnrequestedCloseBacksOffTest::RunTest(const FString &Parameters) {
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
 
-  TUniquePtr<FFakeSocketIoServer> Server = MakeUnique<FFakeSocketIoServer>();
-  if (!TestTrue(TEXT("Test server listens"), Server->Listen())) {
-    return false;
-  }
-  FClientProbe Client(Server->Port);
+  // Never connected, so no close reaches it but the ones the test sends.
+  Client->Realm = ISocketIOClientModule::Get().NewValidNativePointer();
   ON_SCOPE_EXIT {
-    Server.Reset();
-    Client.Shutdown();
+    Client->Deinitialize();
+  };
+  Client->BindRealmCloseHandler();
+  int32 DropReports = 0;
+  Client->Realm->OnReconnectionCallback = [&DropReports](uint32, uint32) {
+    ++DropReports;
   };
 
-  if (!TestTrue(TEXT("Client opens a session"), Server->AcceptSession()) ||
-      !TestTrue(TEXT("Client joins the namespace"), Client.Connected->Wait(StepTimeoutMs))) {
-    return false;
-  }
-
-  Client.bCloseRequested = true;
-  Client.Native->Disconnect();
-  TestTrue(TEXT("Server acknowledges the close"), Server->CloseNormally());
-
-  TestTrue(
-    TEXT("The socket reports its close"),
-    Client.DisconnectedTwice->Wait(StepTimeoutMs)
+  Client->Realm->OnDisconnectedCallback(
+    ESIOConnectionCloseReason::CLOSE_REASON_NORMAL
   );
-  TestFalse(
-    TEXT("A close the client asked for does not reconnect"),
-    Client.Reconnecting->Wait(0)
+  TestEqual(TEXT("An unrequested close reports the drop"), DropReports, 1);
+  TestEqual(
+    TEXT("The reconnect waits for the backoff, it does not run at once"),
+    Client->RealmCloseBackoff.NumAttempts(),
+    1
+  );
+
+  // A server that accepts and then closes again, past the maximum.
+  for (int32 Close = 1; Close <= FRedwoodCloseBackoff::MaxAttempts; ++Close) {
+    Client->Realm->OnDisconnectedCallback(
+      ESIOConnectionCloseReason::CLOSE_REASON_NORMAL
+    );
+  }
+  TestEqual(
+    TEXT("Every close reports the drop, so the lost connection stands"),
+    DropReports,
+    FRedwoodCloseBackoff::MaxAttempts + 1
+  );
+  TestEqual(
+    TEXT("No reconnect after the maximum attempts"),
+    Client->RealmCloseBackoff.NumAttempts(),
+    FRedwoodCloseBackoff::MaxAttempts
+  );
+
+  Client->EndRealmReauthentication(true);
+  TestEqual(
+    TEXT("A good re-handshake resets the backoff"),
+    Client->RealmCloseBackoff.NumAttempts(),
+    0
   );
   return true;
 }

@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "RedwoodCloseBackoff.h" // FORK(hollowed-oath)
 #include "RedwoodHeldRequests.h" // FORK(hollowed-oath): HollowedOath#2854.
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
@@ -326,18 +327,6 @@ public:
     const FString &InRealmId
   );
 
-  // FORK(hollowed-oath): a stopping backend can close a socket with a normal
-  // (1000) close. The socket library takes that as a close we asked for, so
-  // it neither reconnects nor reports the drop. Bound to
-  // OnDisconnectedCallback, this reports it through the socket's reconnection
-  // callback and connects again. IsCloseRequested names the closes we asked
-  // for; without it, no close was asked for.
-  static TFunction<void(const ESIOConnectionCloseReason)>
-  MakeUnrequestedCloseHandler(
-    TWeakPtr<FSocketIONative> WeakSocket,
-    TFunction<bool()> IsCloseRequested = nullptr
-  );
-
   void JoinMatchmaking(
     FString ProfileId,
     TArray<FString> InRegions,
@@ -429,9 +418,27 @@ private:
   void ReleaseRealmSocket();
   uint32 RealmHandshakeGeneration = 0;
   // FORK(hollowed-oath) END
-  // FORK(hollowed-oath): set by a Realm close we ask for, so the unrequested
-  // close handler does not reconnect it. A new Realm socket clears it.
+  // FORK(hollowed-oath) BEGIN: a stopping backend can close a socket with a
+  // normal (1000) close. The socket library takes that as a close we asked
+  // for, so it neither reconnects nor reports the drop. Bound to
+  // OnDisconnectedCallback, this reports it through the socket's reconnection
+  // callback, which is the drop path, and connects again after the backoff.
+  // IsCloseRequested names the closes we asked for; without it, no close was
+  // asked for.
+  TFunction<void(const ESIOConnectionCloseReason)> MakeUnrequestedCloseHandler(
+    TWeakPtr<FSocketIONative> WeakSocket,
+    FRedwoodCloseBackoff &Backoff,
+    TFunction<bool()> IsCloseRequested = nullptr
+  );
+  void BindRealmCloseHandler();
+  FRedwoodCloseBackoff DirectorCloseBackoff;
+  FRedwoodCloseBackoff RealmCloseBackoff;
+  // Set just before a Realm close we ask for; a new Realm socket clears it.
+  // The handler reads it late on purpose: the library also reports the close
+  // from a lambda queued to the game thread, which runs after Disconnect()
+  // returns, and the flag must still be set then.
   bool bRealmCloseRequested = false;
+  // FORK(hollowed-oath) END
 
   void InitiateRealmHandshake(
     FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected
@@ -481,6 +488,7 @@ private:
   friend class FRedwoodDropAfterLogoutTest;
   friend class FRedwoodLogoutClosesReconnectingRealmTest;
   friend class FRedwoodFailedReloginStopsRealmRetryTest;
+  friend class FRedwoodUnrequestedCloseBacksOffTest; // FORK(hollowed-oath)
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);

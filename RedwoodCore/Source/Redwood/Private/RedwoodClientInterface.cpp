@@ -50,6 +50,7 @@ void URedwoodClientInterface::Deinitialize() {
     ISocketIOClientModule::Get().ReleaseNativePointer(Director);
     Director = nullptr;
   }
+  DirectorCloseBackoff.Reset(TimerManager); // FORK(hollowed-oath)
 
   ReleaseRealmSocket();
 
@@ -67,6 +68,7 @@ void URedwoodClientInterface::ReleaseRealmSocket() {
     ISocketIOClientModule::Get().ReleaseNativePointer(Realm);
     Realm = nullptr;
   }
+  RealmCloseBackoff.Reset(TimerManager);
 }
 // FORK(hollowed-oath) END
 
@@ -213,7 +215,8 @@ void URedwoodClientInterface::InitializeDirectorConnection(
 
   // FORK(hollowed-oath): only Deinitialize closes the Director, and it clears
   // the callbacks first, so every close that reaches this handler is a drop.
-  Director->OnDisconnectedCallback = MakeUnrequestedCloseHandler(Director);
+  Director->OnDisconnectedCallback =
+    MakeUnrequestedCloseHandler(Director, DirectorCloseBackoff);
 
   Director->OnConnectedCallback = [Uri, OnDirectorConnected, this](
                                     const FString &InSocketId,
@@ -243,6 +246,7 @@ void URedwoodClientInterface::InitializeDirectorConnection(
       // authentication failure on the title screen.
       bLoggedOutDuringRelogin = false;
       if (!HasPlayerSession()) {
+        DirectorCloseBackoff.Reset(TimerManager); // FORK(hollowed-oath)
         OnDirectorConnectionReestablished.Broadcast();
         return;
       }
@@ -2653,11 +2657,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
       CurrentRealm = InRealm;
       Realm = ISocketIOClientModule::Get().NewValidNativePointer();
       bSentRealmConnected = false;
-      // FORK(hollowed-oath): see MakeUnrequestedCloseHandler.
-      bRealmCloseRequested = false;
-      Realm->OnDisconnectedCallback = MakeUnrequestedCloseHandler(
-        Realm, [this]() { return bRealmCloseRequested; }
-      );
+      BindRealmCloseHandler(); // FORK(hollowed-oath)
       // FORK(hollowed-oath): HollowedOath#2854. Requests held for the old
       // Realm socket cannot go to this one, so they fail now.
       bRealmReauthPending = false;
@@ -3260,11 +3260,18 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
   }
 }
 
+// FORK(hollowed-oath) BEGIN: see the header.
 TFunction<void(const ESIOConnectionCloseReason)>
 URedwoodClientInterface::MakeUnrequestedCloseHandler(
-  TWeakPtr<FSocketIONative> WeakSocket, TFunction<bool()> IsCloseRequested
+  TWeakPtr<FSocketIONative> WeakSocket,
+  FRedwoodCloseBackoff &Backoff,
+  TFunction<bool()> IsCloseRequested
 ) {
-  return [WeakSocket, IsCloseRequested](const ESIOConnectionCloseReason Reason) {
+  // Backoff is a member, and Deinitialize clears the callbacks and the
+  // timers before it goes, so the reference cannot outlive it.
+  return [this, WeakSocket, &Backoff, IsCloseRequested](
+           const ESIOConnectionCloseReason Reason
+         ) {
     TSharedPtr<FSocketIONative> Socket = WeakSocket.Pin();
     // A drop the library saw by itself is already reconnecting; it reports
     // CLOSE_REASON_DROP only after its last attempt.
@@ -3273,12 +3280,30 @@ URedwoodClientInterface::MakeUnrequestedCloseHandler(
         (IsCloseRequested && IsCloseRequested())) {
       return;
     }
+
+    // Every close reports the drop. When the attempts are spent, that report
+    // is the last word, so the game keeps showing the lost connection.
     if (Socket->OnReconnectionCallback) {
-      Socket->OnReconnectionCallback(0, Socket->ReconnectionDelay);
+      Socket->OnReconnectionCallback(
+        static_cast<uint32>(Backoff.NumAttempts()),
+        static_cast<uint32>(Backoff.NextDelaySeconds() * 1000.0f)
+      );
     }
-    Socket->Connect();
+    Backoff.Schedule(TimerManager, [WeakSocket]() {
+      if (TSharedPtr<FSocketIONative> Pinned = WeakSocket.Pin()) {
+        Pinned->Connect();
+      }
+    });
   };
 }
+
+void URedwoodClientInterface::BindRealmCloseHandler() {
+  bRealmCloseRequested = false;
+  Realm->OnDisconnectedCallback = MakeUnrequestedCloseHandler(
+    Realm, RealmCloseBackoff, [this]() { return bRealmCloseRequested; }
+  );
+}
+// FORK(hollowed-oath) END
 
 TSharedPtr<FJsonObject> URedwoodClientInterface::MakeOnlineCharacterPayload(
   const FString &InPlayerId,
@@ -3403,6 +3428,7 @@ void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
   }
 
   if (bSucceeded) {
+    DirectorCloseBackoff.Reset(TimerManager); // FORK(hollowed-oath)
     // bAuthenticated carries the session again.
     bLoggedInAtDrop = false;
     // A Realm not back yet cannot take it; its re-handshake sends it then.
@@ -3435,6 +3461,7 @@ void URedwoodClientInterface::EndRealmReauthentication(bool bSucceeded) {
   TimerManager.ClearTimer(ReauthenticationAttemptTimer);
 
   if (bSucceeded) {
+    RealmCloseBackoff.Reset(TimerManager); // FORK(hollowed-oath)
     bRealmReauthPending = false;
     // Only when a Director re-login found the Realm not back yet: after a
     // Realm-only drop, the online state still has the character.
