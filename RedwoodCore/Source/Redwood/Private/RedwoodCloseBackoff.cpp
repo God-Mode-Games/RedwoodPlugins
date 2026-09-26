@@ -7,7 +7,8 @@
 float FRedwoodCloseBackoff::Schedule(
   FTimerManager &TimerManager, TFunction<void()> Reconnect
 ) {
-  const float DelaySeconds = NextDelaySeconds();
+  const float DelaySeconds = BaseDelaySeconds() *
+    FMath::FRandRange(1.0f - JitterFraction, 1.0f + JitterFraction);
   ++Attempts;
   TimerManager.SetTimer(
     ReconnectTimer,
@@ -23,7 +24,7 @@ void FRedwoodCloseBackoff::Reset(FTimerManager &TimerManager) {
   TimerManager.ClearTimer(ReconnectTimer);
 }
 
-float FRedwoodCloseBackoff::NextDelaySeconds() const {
+float FRedwoodCloseBackoff::BaseDelaySeconds() const {
   return FMath::Min(
     InitialDelaySeconds * FMath::Pow(DelayMultiplier, Attempts),
     MaxDelaySeconds

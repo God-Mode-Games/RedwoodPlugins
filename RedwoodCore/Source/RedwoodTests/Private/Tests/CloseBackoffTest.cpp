@@ -8,6 +8,8 @@
 //   2. It never gives up: at the maximum, it keeps retrying at the maximum.
 //   3. Reset starts again from the first delay, and drops a pending
 //      reconnect.
+//   4. The delays are spread by the jitter, so many clients that one server
+//      closed do not all come back in the same instant.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -22,6 +24,16 @@ namespace RedwoodCloseBackoffTest {
 
   // Enough retries at the maximum to show that the backoff does not stop.
   constexpr int32 AttemptsToCheckAtMaximum = 3;
+
+  // Enough first delays that equal draws from the jitter are not a chance.
+  constexpr int32 JitterSamples = 20;
+
+  bool IsJitteredFrom(float DelaySeconds, float BaseDelaySeconds) {
+    return DelaySeconds >=
+      BaseDelaySeconds * (1.0f - FRedwoodCloseBackoff::JitterFraction) &&
+      DelaySeconds <=
+      BaseDelaySeconds * (1.0f + FRedwoodCloseBackoff::JitterFraction);
+  }
 
   struct FHarness {
     FRedwoodCloseBackoff Backoff;
@@ -61,10 +73,9 @@ bool FRedwoodCloseBackoffTest::RunTest(const FString &Parameters) {
   for (int32 Attempt = 1; AttemptsAtMaximum < AttemptsToCheckAtMaximum;
        ++Attempt) {
     const float DelaySeconds = Harness.Schedule();
-    TestEqual(
+    TestTrue(
       FString::Printf(TEXT("Attempt %d waits the grown delay"), Attempt),
-      DelaySeconds,
-      ExpectedBaseDelay
+      IsJitteredFrom(DelaySeconds, ExpectedBaseDelay)
     );
     TestTrue(
       FString::Printf(TEXT("Attempt %d is scheduled"), Attempt),
@@ -95,10 +106,11 @@ bool FRedwoodCloseBackoffTest::RunTest(const FString &Parameters) {
 
   const int32 ReconnectsBeforeReset = Harness.Reconnects;
   Harness.Backoff.Reset(Harness.Timers);
-  TestEqual(
+  TestTrue(
     TEXT("Reset starts from the first delay"),
-    Harness.Schedule(),
-    FRedwoodCloseBackoff::InitialDelaySeconds
+    IsJitteredFrom(
+      Harness.Schedule(), FRedwoodCloseBackoff::InitialDelaySeconds
+    )
   );
   Harness.Backoff.Reset(Harness.Timers);
   Harness.Advance(2.0f * FRedwoodCloseBackoff::MaxDelaySeconds);
@@ -108,5 +120,35 @@ bool FRedwoodCloseBackoffTest::RunTest(const FString &Parameters) {
     ReconnectsBeforeReset
   );
 
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCloseBackoffJitterTest,
+  "Redwood.Socket.CloseBackoffJitter",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodCloseBackoffJitterTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCloseBackoffTest;
+
+  FRedwoodCloseBackoff Backoff;
+  FTimerManager Timers;
+  float ShortestDelay = TNumericLimits<float>::Max();
+  float LongestDelay = 0.0f;
+  for (int32 Sample = 0; Sample < JitterSamples; ++Sample) {
+    const float DelaySeconds = Backoff.Schedule(Timers, []() {});
+    Backoff.Reset(Timers);
+    TestTrue(
+      TEXT("Each first delay stays inside the jitter"),
+      IsJitteredFrom(DelaySeconds, FRedwoodCloseBackoff::InitialDelaySeconds)
+    );
+    ShortestDelay = FMath::Min(ShortestDelay, DelaySeconds);
+    LongestDelay = FMath::Max(LongestDelay, DelaySeconds);
+  }
+  TestTrue(
+    TEXT("The first delays are spread, not all the same"),
+    LongestDelay > ShortestDelay
+  );
   return true;
 }

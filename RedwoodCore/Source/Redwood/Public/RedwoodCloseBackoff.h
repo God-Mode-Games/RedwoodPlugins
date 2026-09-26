@@ -16,6 +16,10 @@ public:
   static constexpr float InitialDelaySeconds = 1.0f;
   static constexpr float DelayMultiplier = 2.0f;
   static constexpr float MaxDelaySeconds = 30.0f;
+  // Each delay is the base delay times a random factor in 1 +/- this. One
+  // stopping server closes many clients at once; without it they would all
+  // reconnect in the same instant, again and again.
+  static constexpr float JitterFraction = 0.3f;
 
   // Runs Reconnect after the next delay, and returns that delay. It never
   // gives up: a rolling deploy can close a client many times in a row, and
@@ -26,7 +30,8 @@ public:
   // After a good re-login, and when the socket goes away.
   void Reset(FTimerManager &TimerManager);
 
-  float NextDelaySeconds() const;
+  // The next delay before jitter.
+  float BaseDelaySeconds() const;
 
   bool IsReconnectPending(const FTimerManager &TimerManager) const {
     return TimerManager.IsTimerActive(ReconnectTimer);
