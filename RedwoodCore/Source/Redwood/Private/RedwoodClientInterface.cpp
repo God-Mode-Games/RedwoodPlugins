@@ -213,8 +213,7 @@ void URedwoodClientInterface::InitializeDirectorConnection(
 
   // FORK(hollowed-oath): only Deinitialize closes the Director, and it clears
   // the callbacks first, so every close that reaches this handler is a drop.
-  Director->OnDisconnectedCallback =
-    MakeUnrequestedCloseHandler(Director, []() { return false; });
+  Director->OnDisconnectedCallback = MakeUnrequestedCloseHandler(Director);
 
   Director->OnConnectedCallback = [Uri, OnDirectorConnected, this](
                                     const FString &InSocketId,
@@ -3271,7 +3270,7 @@ URedwoodClientInterface::MakeUnrequestedCloseHandler(
     // CLOSE_REASON_DROP only after its last attempt.
     if (!Socket.IsValid() ||
         Reason != ESIOConnectionCloseReason::CLOSE_REASON_NORMAL ||
-        IsCloseRequested()) {
+        (IsCloseRequested && IsCloseRequested())) {
       return;
     }
     if (Socket->OnReconnectionCallback) {

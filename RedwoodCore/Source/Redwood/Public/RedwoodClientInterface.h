@@ -331,10 +331,11 @@ public:
   // it neither reconnects nor reports the drop. Bound to
   // OnDisconnectedCallback, this reports it through the socket's reconnection
   // callback and connects again. IsCloseRequested names the closes we asked
-  // for.
+  // for; without it, no close was asked for.
   static TFunction<void(const ESIOConnectionCloseReason)>
   MakeUnrequestedCloseHandler(
-    TWeakPtr<FSocketIONative> WeakSocket, TFunction<bool()> IsCloseRequested
+    TWeakPtr<FSocketIONative> WeakSocket,
+    TFunction<bool()> IsCloseRequested = nullptr
   );
 
   void JoinMatchmaking(
