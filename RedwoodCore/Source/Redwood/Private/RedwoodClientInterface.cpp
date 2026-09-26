@@ -3281,8 +3281,10 @@ void URedwoodClientInterface::NoteDirectorDrop() {
   bLostBeforeFirstDirectorConnect = !bSentDirectorConnected;
   bLoggedInAtDrop = bLoggedInAtDrop || bAuthenticated;
   // Count the request grace from the drop, like the game's own disconnect
-  // grace.
-  DirectorHeldRequests.StartGrace(TimerManager);
+  // grace. A first connect that fails has nothing to hold.
+  if (bSentDirectorConnected) {
+    DirectorHeldRequests.StartGrace(TimerManager);
+  }
 
   // A Realm re-handshake that already asked the Director for its token loses
   // the answer with this socket, and nothing would ask again: every Realm
