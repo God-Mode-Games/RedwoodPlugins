@@ -24,8 +24,13 @@ namespace RedwoodCloseBackoffTest {
     FTimerManager Timers;
     int32 Reconnects = 0;
 
+    // A timer set inside a frame starts on the next tick, so the empty
+    // tick lines the delay up with the test's own steps.
     bool Schedule() {
-      return Backoff.Schedule(Timers, [this]() { ++Reconnects; });
+      const bool bScheduled =
+        Backoff.Schedule(Timers, [this]() { ++Reconnects; });
+      Advance(0.0f);
+      return bScheduled;
     }
 
     // FTimerManager ticks at most once per engine frame, and a test runs
