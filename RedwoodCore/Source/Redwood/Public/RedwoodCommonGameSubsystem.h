@@ -102,6 +102,47 @@ public:
     const TArray<TSharedPtr<FJsonValue>> &InvitesArray
   );
 
+  // FORK(hollowed-oath): parser for the fork-added "director:friends:request-alert" push.
+  // Fork-added; the definition and the full reason live under a matching FORK marker in
+  // RedwoodCommonGameSubsystem.cpp.
+  static FRedwoodPlayer ParseFriendRequestAlert(
+    const TSharedPtr<FJsonObject> &AlertObject
+  );
+
+  // FORK(hollowed-oath): the one way the fork's socket callbacks read the
+  // answer object out of the argument array. Returns null for no usable
+  // answer. Fork-added; moved here from RedwoodServerGameSubsystem.cpp so the
+  // client parsers use it too. The full reason lives under a matching FORK
+  // marker in RedwoodCommonGameSubsystem.cpp.
+  static const TSharedPtr<FJsonObject> *TryGetRedwoodAnswerObject(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  );
+
+  // FORK(hollowed-oath): the error the character friend calls give when the
+  // realm's answer cannot be read. Fork-added. One text for
+  // ParseListCharacterFriends and the character friend commands in
+  // RedwoodClientInterface.cpp.
+  static constexpr const TCHAR *BadRealmAnswerError =
+    TEXT("Bad answer from the realm.");
+
+  // FORK(hollowed-oath): parser for the three fork-added arrays of the
+  // "realm:contacts:list" answer. Fork-added; the definition and the full
+  // reason live under a matching FORK marker in RedwoodCommonGameSubsystem.cpp.
+  static FRedwoodListCharacterFriendsOutput ParseListCharacterFriends(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  );
+
+  // FORK(hollowed-oath): parser for the fork-added
+  // "director:friends:character-alert" push. Takes the event value that the
+  // listener gets. Returns false for a push the game cannot act on. When it
+  // returns false, OutAlert has no defined value: it can hold some fields of
+  // the refused push, so do not read it. Fork-added; the definition and the full reason live under a matching
+  // FORK marker in RedwoodCommonGameSubsystem.cpp.
+  static bool ParseCharacterFriendAlert(
+    const TSharedPtr<FJsonValue> &Message,
+    FRedwoodCharacterFriendAlert &OutAlert
+  );
+
   static FRedwoodParty ParseParty(const TSharedPtr<FJsonObject> &PartyObj);
 
   // FORK(hollowed-oath) BEGIN: item wire-format helper declarations. Fork-added; definitions +

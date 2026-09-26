@@ -242,3 +242,90 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
   FRedwoodListRealmContactsOutput,
   Data
 );
+
+// FORK(hollowed-oath) BEGIN: character friend types. Fork-added; upstream has
+// no friendship between characters. A character friendship is mutual, inside
+// one realm, and kept as two Contact rows by the RedwoodBackend fork. The
+// list comes from the fork fields of the "realm:contacts:list" answer; the
+// alert comes from the fork-added "director:friends:character-alert" push.
+// Parsed in RedwoodCommonGameSubsystem, sent and received in
+// RedwoodClientInterface, relayed to the game by RedwoodClientGameSubsystem.
+// An upstream merge must keep every name here: the game binds to them.
+UENUM(BlueprintType)
+enum class ERedwoodCharacterFriendAlertType : uint8 {
+  Requested,
+  Accepted,
+  Removed,
+  Online,
+  Offline
+};
+
+USTRUCT(BlueprintType)
+struct FRedwoodCharacterFriend {
+  GENERATED_BODY()
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString CharacterId;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString CharacterName;
+
+  // Set for a friend only. A request row keeps false and an empty zone.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  bool bOnline = false;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString ZoneName;
+};
+
+USTRUCT(BlueprintType)
+struct FRedwoodListCharacterFriendsOutput {
+  GENERATED_BODY()
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString Error;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  TArray<FRedwoodCharacterFriend> Friends;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  TArray<FRedwoodCharacterFriend> IncomingRequests;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  TArray<FRedwoodCharacterFriend> OutgoingRequests;
+};
+
+typedef TDelegate<void(const FRedwoodListCharacterFriendsOutput &)>
+  FRedwoodListCharacterFriendsOutputDelegate;
+
+USTRUCT(BlueprintType)
+struct FRedwoodCharacterFriendAlert {
+  GENERATED_BODY()
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  ERedwoodCharacterFriendAlertType Type =
+    ERedwoodCharacterFriendAlertType::Requested;
+
+  // The character the alert is for. The game drops an alert for a character
+  // that is not in play.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString CharacterId;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString OtherCharacterId;
+
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString OtherCharacterName;
+
+  // Set for Online only.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString ZoneName;
+};
+
+UDELEGATE()
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+  FRedwoodCharacterFriendAlertDynamicDelegate,
+  const FRedwoodCharacterFriendAlert &,
+  Alert
+);
+// FORK(hollowed-oath) END

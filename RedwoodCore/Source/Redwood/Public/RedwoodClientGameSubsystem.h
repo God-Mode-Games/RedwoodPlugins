@@ -57,6 +57,18 @@ public:
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodConnectionAuthFailedDynamicDelegate OnRealmAuthFailed;
 
+  // FORK(hollowed-oath): BlueprintAssignable event telling the game that another player asked
+  // to be a friend. Fork-added; pairs with the delegate of the same name on
+  // RedwoodClientInterface.
+  UPROPERTY(BlueprintAssignable, Category = "Redwood")
+  FRedwoodFriendRequestReceivedDynamicDelegate OnFriendRequestReceived;
+
+  // FORK(hollowed-oath): BlueprintAssignable event for a character friend
+  // alert (requested, accepted, removed, online, offline). Fork-added; pairs
+  // with the delegate of the same name on RedwoodClientInterface.
+  UPROPERTY(BlueprintAssignable, Category = "Redwood")
+  FRedwoodCharacterFriendAlertDynamicDelegate OnCharacterFriendAlert;
+
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodPartyInvitedDynamicDelegate OnPartyInvited;
 
@@ -143,6 +155,24 @@ public:
   void RemoveRealmContact(
     FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
   );
+
+  // FORK(hollowed-oath) BEGIN: character friend calls, passed 1:1 to
+  // RedwoodClientInterface. Fork-added.
+  void ListCharacterFriends(FRedwoodListCharacterFriendsOutputDelegate OnOutput
+  );
+
+  void RequestCharacterFriend(
+    FString TargetCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void RespondToCharacterFriendRequest(
+    FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void RemoveCharacterFriend(
+    FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+  // FORK(hollowed-oath) END
 
   void ListGuilds(
     bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
@@ -431,6 +461,16 @@ private:
 
   UFUNCTION()
   void HandleRequestToJoinServer(FString ConsoleCommand);
+
+  // FORK(hollowed-oath): handler for the fork-added friend request delegate; bound in
+  // Initialize, re-broadcast to the BlueprintAssignable event above.
+  UFUNCTION()
+  void HandleOnFriendRequestReceived(FRedwoodPlayer Requester);
+
+  // FORK(hollowed-oath): handler for the fork-added character friend delegate;
+  // bound in Initialize, re-broadcast to the BlueprintAssignable event above.
+  UFUNCTION()
+  void HandleOnCharacterFriendAlert(const FRedwoodCharacterFriendAlert &Alert);
 
   UFUNCTION()
   void HandleOnPartyInvited(FRedwoodPartyInvite Invite);

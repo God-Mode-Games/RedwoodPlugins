@@ -139,6 +139,28 @@ public:
     FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
   );
 
+  // FORK(hollowed-oath) BEGIN: character friend calls. Fork-added; upstream has
+  // no friendship between characters. Each call names the selected character
+  // and goes to the fork-added "realm:contacts:friends:*" routes of the
+  // RedwoodBackend fork; the list reads the fork fields of the upstream
+  // "realm:contacts:list" answer. A call with no realm, or with no selected
+  // character, answers inline with an error (the realm check first).
+  void ListCharacterFriends(FRedwoodListCharacterFriendsOutputDelegate OnOutput
+  );
+
+  void RequestCharacterFriend(
+    FString TargetCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void RespondToCharacterFriendRequest(
+    FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void RemoveCharacterFriend(
+    FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+  // FORK(hollowed-oath) END
+
   void ListGuilds(
     bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
   );
@@ -367,6 +389,20 @@ public:
   FString GetConnectionConsoleCommand();
   FURL GetConnectionURL();
 
+  // FORK(hollowed-oath): the director tells a player when another player asks to be a friend.
+  // Fork-added; upstream has no such push, so the game had to ask for the friend list again to
+  // see a new request. Broadcast from the "director:friends:request-alert" listener in
+  // RedwoodClientInterface.cpp, relayed to the game by RedwoodClientGameSubsystem.
+  FRedwoodFriendRequestReceivedDynamicDelegate OnFriendRequestReceived;
+
+  // FORK(hollowed-oath): the director tells a character that another character
+  // asked to be a friend, accepted a request, ended a friendship or a
+  // request, came online or went offline.
+  // Fork-added. Broadcast from the "director:friends:character-alert" listener
+  // in RedwoodClientInterface.cpp, relayed to the game by
+  // RedwoodClientGameSubsystem.
+  FRedwoodCharacterFriendAlertDynamicDelegate OnCharacterFriendAlert;
+
   FRedwoodPartyInvitedDynamicDelegate OnPartyInvited;
   FRedwoodPartyUpdatedDynamicDelegate OnPartyUpdated;
   FRedwoodDynamicDelegate OnPartyKicked;
@@ -422,6 +458,26 @@ private:
     FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected
   );
   void BindRealmEvents();
+
+  // FORK(hollowed-oath): shared guard and body of the character friend calls
+  // above. PrepareCharacterFriendCall gives the inline error ("Not connected
+  // to Realm." or "No character selected."), or, when the call can go out,
+  // adds playerId and characterId to Payload and gives an empty string.
+  // EmitCharacterFriendCommand and ListCharacterFriends go through GateRealm
+  // first: while the Realm socket of a logged-in player reconnects, the call
+  // is held and sent after the re-handshake, or answers "Not connected to
+  // Realm." when the grace ends or the re-handshake fails. Deinitialize drops
+  // a held call with no answer. Otherwise EmitCharacterFriendCommand answers
+  // once with one of: the inline error; the error string of the realm (empty
+  // for a success); or URedwoodCommonGameSubsystem::BadRealmAnswerError when
+  // the answer cannot be read or has no error field.
+  FString PrepareCharacterFriendCall(const TSharedPtr<FJsonObject> &Payload
+  ) const;
+  void EmitCharacterFriendCommand(
+    const FString &EventName,
+    TSharedPtr<FJsonObject> Payload,
+    FRedwoodErrorOutputDelegate OnOutput
+  );
   void FinalizeRealmHandshake(
     FString Token, FRedwoodSocketConnectedDelegate OnRealmConnected
   );
@@ -466,6 +522,9 @@ private:
   friend class FRedwoodDropAfterLogoutTest;
   friend class FRedwoodLogoutClosesReconnectingRealmTest;
   friend class FRedwoodFailedReloginStopsRealmRetryTest;
+  // FORK(hollowed-oath): character friends. Pins that the four character
+  // friend calls are held like the other Realm requests.
+  friend class FRedwoodCharacterFriendsHeldTest;
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);
