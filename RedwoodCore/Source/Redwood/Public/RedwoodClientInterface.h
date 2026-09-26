@@ -270,6 +270,10 @@ public:
 
   void ListRealms(FRedwoodListRealmsOutputDelegate OnOutput);
 
+  // FORK(hollowed-oath): one realm:list entry, public so a test can feed it
+  // JSON without a director.
+  static FRedwoodRealm ParseRealm(const TSharedPtr<FJsonObject> &RealmObj);
+
   void InitializeConnectionForFirstRealm(
     FRedwoodSocketConnectedDelegate OnRealmConnected
   );
@@ -406,6 +410,13 @@ private:
   bool bSentInitialRealmConnectionFailureLog = false;
   TSharedPtr<FSocketIONative> Director;
   TSharedPtr<FSocketIONative> Realm;
+
+  // FORK(hollowed-oath) BEGIN: a retry replaces the realm socket. The old
+  // socket's callbacks go with it, and a Director or Realm answer of an older
+  // handshake is dropped, so neither can act on the new socket.
+  void ReleaseRealmSocket();
+  uint32 RealmHandshakeGeneration = 0;
+  // FORK(hollowed-oath) END
 
   void InitiateRealmHandshake(
     FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected

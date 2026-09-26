@@ -31,6 +31,13 @@ struct FRedwoodRealm {
   // This is always an empty string from the ListRealms API call
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   FString Secret;
+
+  // FORK(hollowed-oath) BEGIN: the HollowedOath commit the realm's game server
+  // was built from, so the client can offer only realms of its own build. Empty
+  // when the director does not know it or is too old to send it.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString Version;
+  // FORK(hollowed-oath) END
 };
 
 USTRUCT(BlueprintType)
