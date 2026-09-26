@@ -3193,8 +3193,7 @@ TSharedPtr<FJsonObject> URedwoodClientInterface::MakeOnlineCharacterPayload(
 // state with no realm, so after a director-frontend move friends saw the
 // player with no character until the next character selection. Send the
 // character again when the player is still in the realm. When the realm
-// socket is down too, the realm reconnect runs its own handshake; Task 19 of
-// the plan checks what the online state shows then.
+// socket is down too, EndRealmReauthentication sends it instead.
 void URedwoodClientInterface::ResendOnlineCharacter() {
   if (!Realm.IsValid() || !Realm->bIsConnected) {
     return;
