@@ -443,7 +443,9 @@ private:
   // The Realm socket dropped and the player is not authenticated on it again
   // yet; the Director has bAuthenticated for this.
   bool bRealmReauthPending = false;
-  // The player was logged in when the Director dropped; kept until Logout.
+  // The player was logged in when the Director dropped. Kept through a failed
+  // re-login, so the dead session's requests fail; cleared by a successful
+  // re-login and by Logout.
   bool bLoggedInAtDrop = false;
   // A Director re-login could not restore the online character because the
   // Realm re-handshake was still pending.

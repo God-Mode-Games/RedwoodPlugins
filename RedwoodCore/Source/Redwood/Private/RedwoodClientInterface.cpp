@@ -3269,6 +3269,8 @@ void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
   }
 
   if (bSucceeded) {
+    // bAuthenticated carries the session again.
+    bLoggedInAtDrop = false;
     ResendOnlineCharacter();
     DirectorHeldRequests.Release(TimerManager);
   } else {
