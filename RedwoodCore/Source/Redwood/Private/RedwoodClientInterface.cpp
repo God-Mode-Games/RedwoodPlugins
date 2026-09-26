@@ -88,49 +88,56 @@ namespace {
 }
 
 template <typename TOutput>
-bool URedwoodClientInterface::GateDirector(
-  TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
+bool URedwoodClientInterface::Gate(
+  FRedwoodHeldRequests &Held,
+  bool bSessionEstablished,
+  bool bCanSend,
+  const TCHAR *NotConnectedError,
+  TFunction<void()> Request,
+  const TDelegate<void(const TOutput &)> &OnOutput
 ) {
-  if (DirectorHeldRequests.HoldIfReconnecting(
-        Director.IsValid() && bSentDirectorConnected && HasPlayerSession(),
-        CanSendToDirector(),
-        MoveTemp(Request),
-        TimerManager
+  if (Held.HoldIfReconnecting(
+        bSessionEstablished, bCanSend, MoveTemp(Request), TimerManager
       )) {
     return true;
   }
 
-  if (CanSendToDirector()) {
+  if (bCanSend) {
     return false;
   }
 
   TOutput Output;
-  SetRedwoodGateError(Output, TEXT("Not connected to Director."));
+  SetRedwoodGateError(Output, NotConnectedError);
   OnOutput.ExecuteIfBound(Output);
   return true;
+}
+
+template <typename TOutput>
+bool URedwoodClientInterface::GateDirector(
+  TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
+) {
+  return Gate(
+    DirectorHeldRequests,
+    Director.IsValid() && bSentDirectorConnected && HasPlayerSession(),
+    CanSendToDirector(),
+    TEXT("Not connected to Director."),
+    MoveTemp(Request),
+    OnOutput
+  );
 }
 
 template <typename TOutput>
 bool URedwoodClientInterface::GateRealm(
   TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
 ) {
-  if (RealmHeldRequests.HoldIfReconnecting(
-        Realm.IsValid() && bSentRealmConnected && HasPlayerSession(),
-        CanSendToRealm(),
-        MoveTemp(Request),
-        TimerManager
-      )) {
-    return true;
-  }
-
-  if (CanSendToRealm()) {
-    return false;
-  }
-
-  TOutput Output;
-  SetRedwoodGateError(Output, TEXT("Not connected to Realm."));
-  OnOutput.ExecuteIfBound(Output);
-  return true;
+  return Gate(
+    RealmHeldRequests,
+    Realm.IsValid() && bSentRealmConnected && HasPlayerSession(),
+    CanSendToRealm(),
+    TEXT("Not connected to Realm."),
+    MoveTemp(Request),
+    OnOutput
+  );
 }
 
 void URedwoodClientInterface::Tick(float DeltaTime) {

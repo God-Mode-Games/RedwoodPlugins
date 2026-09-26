@@ -422,6 +422,15 @@ private:
   // FORK(hollowed-oath): HollowedOath#2854. See the .cpp.
   void ResendOnlineCharacter();
   template <typename TOutput>
+  bool Gate(
+    FRedwoodHeldRequests &Held,
+    bool bSessionEstablished,
+    bool bCanSend,
+    const TCHAR *NotConnectedError,
+    TFunction<void()> Request,
+    const TDelegate<void(const TOutput &)> &OnOutput
+  );
+  template <typename TOutput>
   bool GateDirector(
     TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
   );
