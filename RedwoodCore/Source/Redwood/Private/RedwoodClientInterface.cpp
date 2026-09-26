@@ -211,6 +211,11 @@ void URedwoodClientInterface::InitializeDirectorConnection(
     }
   };
 
+  // FORK(hollowed-oath): only Deinitialize closes the Director, and it clears
+  // the callbacks first, so every close that reaches this handler is a drop.
+  Director->OnDisconnectedCallback =
+    MakeUnrequestedCloseHandler(Director, []() { return false; });
+
   Director->OnConnectedCallback = [Uri, OnDirectorConnected, this](
                                     const FString &InSocketId,
                                     const FString &InSessionId
@@ -498,6 +503,7 @@ void URedwoodClientInterface::Logout() {
       if (Realm->bIsConnected) {
         Realm->Emit(TEXT("realm:auth:player:logout"), Payload);
       }
+      bRealmCloseRequested = true;
       Realm->Disconnect();
     }
 
@@ -2648,6 +2654,11 @@ void URedwoodClientInterface::InitiateRealmHandshake(
       CurrentRealm = InRealm;
       Realm = ISocketIOClientModule::Get().NewValidNativePointer();
       bSentRealmConnected = false;
+      // FORK(hollowed-oath): see MakeUnrequestedCloseHandler.
+      bRealmCloseRequested = false;
+      Realm->OnDisconnectedCallback = MakeUnrequestedCloseHandler(
+        Realm, [this]() { return bRealmCloseRequested; }
+      );
       // FORK(hollowed-oath): HollowedOath#2854. Requests held for the old
       // Realm socket cannot go to this one, so they fail now.
       bRealmReauthPending = false;
@@ -3250,6 +3261,26 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
   }
 }
 
+TFunction<void(const ESIOConnectionCloseReason)>
+URedwoodClientInterface::MakeUnrequestedCloseHandler(
+  TWeakPtr<FSocketIONative> WeakSocket, TFunction<bool()> IsCloseRequested
+) {
+  return [WeakSocket, IsCloseRequested](const ESIOConnectionCloseReason Reason) {
+    TSharedPtr<FSocketIONative> Socket = WeakSocket.Pin();
+    // A drop the library saw by itself is already reconnecting; it reports
+    // CLOSE_REASON_DROP only after its last attempt.
+    if (!Socket.IsValid() ||
+        Reason != ESIOConnectionCloseReason::CLOSE_REASON_NORMAL ||
+        IsCloseRequested()) {
+      return;
+    }
+    if (Socket->OnReconnectionCallback) {
+      Socket->OnReconnectionCallback(0, Socket->ReconnectionDelay);
+    }
+    Socket->Connect();
+  };
+}
+
 TSharedPtr<FJsonObject> URedwoodClientInterface::MakeOnlineCharacterPayload(
   const FString &InPlayerId,
   const FString &InCharacterId,
@@ -3391,6 +3422,7 @@ void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
     bRealmReauthPending = false;
     TimerManager.ClearTimer(ReauthenticationAttemptTimer);
     if (Realm.IsValid()) {
+      bRealmCloseRequested = true;
       Realm->Disconnect();
     }
   }

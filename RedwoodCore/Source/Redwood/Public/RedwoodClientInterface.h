@@ -326,6 +326,17 @@ public:
     const FString &InRealmId
   );
 
+  // FORK(hollowed-oath): a stopping backend can close a socket with a normal
+  // (1000) close. The socket library takes that as a close we asked for, so
+  // it neither reconnects nor reports the drop. Bound to
+  // OnDisconnectedCallback, this reports it through the socket's reconnection
+  // callback and connects again. IsCloseRequested names the closes we asked
+  // for.
+  static TFunction<void(const ESIOConnectionCloseReason)>
+  MakeUnrequestedCloseHandler(
+    TWeakPtr<FSocketIONative> WeakSocket, TFunction<bool()> IsCloseRequested
+  );
+
   void JoinMatchmaking(
     FString ProfileId,
     TArray<FString> InRegions,
@@ -417,6 +428,9 @@ private:
   void ReleaseRealmSocket();
   uint32 RealmHandshakeGeneration = 0;
   // FORK(hollowed-oath) END
+  // FORK(hollowed-oath): set by a Realm close we ask for, so the unrequested
+  // close handler does not reconnect it. A new Realm socket clears it.
+  bool bRealmCloseRequested = false;
 
   void InitiateRealmHandshake(
     FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected
