@@ -498,6 +498,7 @@ private:
   friend class FRedwoodUnrequestedCloseBacksOffTest;
   friend class FRedwoodLogoutRealmCloseStaysCleanTest;
   friend class FRedwoodFailedReloginRealmCloseStaysCleanTest;
+  friend class FRedwoodQueuedRequestedCloseStaysCleanTest;
   // FORK(hollowed-oath) END
   bool CanSendToDirector();
   bool CanSendToRealm();

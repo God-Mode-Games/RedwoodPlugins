@@ -11,6 +11,7 @@
 // real socket.io client and websocketpp run the whole close handshake.
 
 #include "CoreMinimal.h"
+#include "Async/TaskGraphInterfaces.h"
 #include "HAL/Event.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/ThreadSafeBool.h"
@@ -34,6 +35,28 @@ namespace RedwoodServerCloseTest {
 
   constexpr uint32 LoopbackIp = 0x7F000001;
   constexpr uint16 NormalCloseCode = 1000;
+
+  // The library queues its reports to the game thread, which a test holds.
+  // The pump runs those tasks at 10 Hz, the fastest this project allows a
+  // wait to check, until the test's condition holds or the step times out.
+  constexpr float PumpIntervalSeconds = 0.1f;
+
+  bool PumpGameThreadUntil(TFunctionRef<bool()> Done) {
+    const double Deadline =
+      FPlatformTime::Seconds() + StepTimeout.GetTotalSeconds();
+    while (true) {
+      FTaskGraphInterface::Get().ProcessThreadUntilIdle(
+        ENamedThreads::GameThread
+      );
+      if (Done()) {
+        return true;
+      }
+      if (FPlatformTime::Seconds() > Deadline) {
+        return false;
+      }
+      FPlatformProcess::Sleep(PumpIntervalSeconds);
+    }
+  }
 
   // RFC 6455 section 1.3.
   const TCHAR *WebSocketAcceptGuid = TEXT("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
@@ -277,6 +300,9 @@ bool FRedwoodServerNormalCloseIsNormalTest::RunTest(const FString &Parameters) {
     static_cast<int32>(Client.CloseReason.Load()),
     static_cast<int32>(ESIOConnectionCloseReason::CLOSE_REASON_NORMAL)
   );
+  // The library calls its close listener only on the branch where it does
+  // not reconnect: the reconnect branch returns before it. So the report
+  // above already proves this; the flag guards against a later change.
   TestFalse(
     TEXT("The library does not reconnect by itself"),
     static_cast<bool>(Client.bLibraryReconnected)
@@ -354,5 +380,74 @@ bool FRedwoodUnrequestedCloseBacksOffTest::RunTest(const FString &Parameters) {
     Client->RealmCloseBackoff.NumAttempts(),
     RepeatedCloses + 1
   );
+  return true;
+}
+
+// The game gets its close reports on the game thread. A close the client
+// asks for is reported twice: at once from Disconnect(), and again from a
+// lambda the library queues when the close handshake ends. The second report
+// reads bRealmCloseRequested late, so the flag must still be set then.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodQueuedRequestedCloseStaysCleanTest,
+  "Redwood.Socket.QueuedRequestedCloseStaysClean",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodQueuedRequestedCloseStaysCleanTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodServerCloseTest;
+
+  TUniquePtr<FFakeSocketIoServer> Server = MakeUnique<FFakeSocketIoServer>();
+  if (!TestTrue(TEXT("Test server listens"), Server->Listen())) {
+    return false;
+  }
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
+
+  // bCallbackOnGameThread stays on, as in the game.
+  Client->Realm = ISocketIOClientModule::Get().NewValidNativePointer();
+  ON_SCOPE_EXIT {
+    Server.Reset();
+    Client->Deinitialize();
+  };
+  Client->BindRealmCloseHandler();
+  int32 CloseReports = 0;
+  TFunction<void(const ESIOConnectionCloseReason)> Handler =
+    Client->Realm->OnDisconnectedCallback;
+  Client->Realm->OnDisconnectedCallback =
+    [Handler, &CloseReports](const ESIOConnectionCloseReason Reason) {
+      Handler(Reason);
+      ++CloseReports;
+    };
+  int32 DropReports = 0;
+  Client->Realm->OnReconnectionCallback = [&DropReports](uint32, uint32) {
+    ++DropReports;
+  };
+  int32 Reconnects = 0;
+  Client->ReconnectSocket = [&Reconnects](FSocketIONative &) { ++Reconnects; };
+
+  Client->Realm->Connect(FString::Printf(TEXT("ws://127.0.0.1:%d"), Server->Port));
+  if (!TestTrue(TEXT("Client opens a session"), Server->AcceptSession())) {
+    return false;
+  }
+
+  Client->RequestRealmClose();
+  TestTrue(TEXT("Server acknowledges the close"), Server->CloseNormally());
+  if (!TestTrue(
+        TEXT("The queued close report runs"),
+        PumpGameThreadUntil([&CloseReports]() { return CloseReports >= 2; })
+      )) {
+    return false;
+  }
+
+  TestEqual(TEXT("A requested close reports no drop"), DropReports, 0);
+  TestFalse(
+    TEXT("A requested close leaves no reconnect pending"),
+    Client->RealmCloseBackoff.IsReconnectPending(Client->TimerManager)
+  );
+  TestEqual(TEXT("A requested close does not reconnect"), Reconnects, 0);
   return true;
 }
