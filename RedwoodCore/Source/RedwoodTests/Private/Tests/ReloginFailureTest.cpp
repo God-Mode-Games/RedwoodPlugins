@@ -507,8 +507,9 @@ bool FRedwoodFailedReloginStopsRealmRetryTest::RunTest(
 }
 
 // FORK(hollowed-oath): Logout and a failed re-login close the Realm on
-// purpose. The close handler must not take that close as a drop: it would
-// report a lost connection and reconnect a session that is over.
+// purpose. The close handler must not take that close as a drop, and a
+// reconnect that an earlier server close scheduled must not fire after it:
+// either would bring back a session that is over.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   FRedwoodLogoutRealmCloseStaysCleanTest,
   "Redwood.HeldRequests.LogoutRealmCloseStaysClean",
@@ -542,14 +543,32 @@ bool FRedwoodLogoutRealmCloseStaysCleanTest::RunTest(
   Client->Realm->OnReconnectionCallback = [&DropReports](uint32, uint32) {
     ++DropReports;
   };
+  int32 Reconnects = 0;
+  Client->ReconnectSocket = [&Reconnects](FSocketIONative &) { ++Reconnects; };
+
+  // The server closed with 1000 first, so a reconnect is waiting.
+  Client->Realm->OnDisconnectedCallback(
+    ESIOConnectionCloseReason::CLOSE_REASON_NORMAL
+  );
+  const int32 DropReportsBefore = DropReports;
 
   Client->Logout();
-  TestEqual(TEXT("Logout's Realm close reports no drop"), DropReports, 0);
   TestEqual(
-    TEXT("Logout's Realm close schedules no reconnect"),
-    Client->RealmCloseBackoff.NumAttempts(),
-    0
+    TEXT("Logout's Realm close reports no drop"),
+    DropReports,
+    DropReportsBefore
   );
+  // A timer set inside a frame starts on the next tick. Then go past the
+  // longest delay the backoff can pick.
+  ++GFrameCounter;
+  Client->TimerManager.Tick(0.0f);
+  ++GFrameCounter;
+  Client->TimerManager.Tick(2.0f * FRedwoodCloseBackoff::MaxDelaySeconds);
+  TestFalse(
+    TEXT("No reconnect is left pending after Logout"),
+    Client->RealmCloseBackoff.IsReconnectPending(Client->TimerManager)
+  );
+  TestEqual(TEXT("The Realm does not reconnect after Logout"), Reconnects, 0);
   return true;
 }
 
@@ -585,6 +604,14 @@ bool FRedwoodFailedReloginRealmCloseStaysCleanTest::RunTest(
   Client->Realm->OnReconnectionCallback = [&DropReports](uint32, uint32) {
     ++DropReports;
   };
+  int32 Reconnects = 0;
+  Client->ReconnectSocket = [&Reconnects](FSocketIONative &) { ++Reconnects; };
+
+  // The server closed with 1000 first, so a reconnect is waiting.
+  Client->Realm->OnDisconnectedCallback(
+    ESIOConnectionCloseReason::CLOSE_REASON_NORMAL
+  );
+  const int32 DropReportsBefore = DropReports;
 
   // The Director drops, and its re-login fails and empties the ids.
   Client->NoteDirectorDrop();
@@ -594,11 +621,23 @@ bool FRedwoodFailedReloginRealmCloseStaysCleanTest::RunTest(
   Client->EndDirectorReauthentication(false);
 
   TestEqual(
-    TEXT("A failed re-login's Realm close reports no drop"), DropReports, 0
+    TEXT("A failed re-login's Realm close reports no drop"),
+    DropReports,
+    DropReportsBefore
+  );
+  // A timer set inside a frame starts on the next tick. Then go past the
+  // longest delay the backoff can pick.
+  ++GFrameCounter;
+  Client->TimerManager.Tick(0.0f);
+  ++GFrameCounter;
+  Client->TimerManager.Tick(2.0f * FRedwoodCloseBackoff::MaxDelaySeconds);
+  TestFalse(
+    TEXT("No reconnect is left pending after a failed re-login"),
+    Client->RealmCloseBackoff.IsReconnectPending(Client->TimerManager)
   );
   TestEqual(
-    TEXT("A failed re-login's Realm close schedules no reconnect"),
-    Client->RealmCloseBackoff.NumAttempts(),
+    TEXT("The Realm does not reconnect after a failed re-login"),
+    Reconnects,
     0
   );
   return true;

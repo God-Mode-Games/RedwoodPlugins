@@ -28,6 +28,10 @@ public:
 
   float NextDelaySeconds() const;
 
+  bool IsReconnectPending(const FTimerManager &TimerManager) const {
+    return TimerManager.IsTimerActive(ReconnectTimer);
+  }
+
   int32 NumAttempts() const {
     return Attempts;
   }

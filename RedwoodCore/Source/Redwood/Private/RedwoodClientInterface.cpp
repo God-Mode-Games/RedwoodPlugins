@@ -506,8 +506,7 @@ void URedwoodClientInterface::Logout() {
       if (Realm->bIsConnected) {
         Realm->Emit(TEXT("realm:auth:player:logout"), Payload);
       }
-      bRealmCloseRequested = true;
-      Realm->Disconnect();
+      RequestRealmClose(); // FORK(hollowed-oath)
     }
 
     PlayerId = TEXT("");
@@ -3289,12 +3288,21 @@ URedwoodClientInterface::MakeUnrequestedCloseHandler(
         static_cast<uint32>(Backoff.NextDelaySeconds() * 1000.0f)
       );
     }
-    Backoff.Schedule(TimerManager, [WeakSocket]() {
+    Backoff.Schedule(TimerManager, [this, WeakSocket]() {
       if (TSharedPtr<FSocketIONative> Pinned = WeakSocket.Pin()) {
-        Pinned->Connect();
+        ReconnectSocket(*Pinned);
       }
     });
   };
+}
+
+// The reset matters as much as the flag: a reconnect that an earlier
+// unrequested close scheduled would otherwise fire after this close, and
+// bring back a Realm session that is over.
+void URedwoodClientInterface::RequestRealmClose() {
+  bRealmCloseRequested = true;
+  RealmCloseBackoff.Reset(TimerManager);
+  Realm->Disconnect();
 }
 
 void URedwoodClientInterface::BindRealmCloseHandler() {
@@ -3447,8 +3455,7 @@ void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
     bRealmReauthPending = false;
     TimerManager.ClearTimer(ReauthenticationAttemptTimer);
     if (Realm.IsValid()) {
-      bRealmCloseRequested = true;
-      Realm->Disconnect();
+      RequestRealmClose(); // FORK(hollowed-oath)
     }
   }
 }

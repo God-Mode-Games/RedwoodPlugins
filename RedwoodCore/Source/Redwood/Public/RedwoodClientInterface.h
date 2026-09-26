@@ -431,6 +431,12 @@ private:
     TFunction<bool()> IsCloseRequested = nullptr
   );
   void BindRealmCloseHandler();
+  // The one Realm close we ask for. Every such close must go through it.
+  void RequestRealmClose();
+  // What the close handler runs when its backoff ends. Tests count it
+  // instead of connecting.
+  TFunction<void(FSocketIONative &)> ReconnectSocket =
+    [](FSocketIONative &Socket) { Socket.Connect(); };
   FRedwoodCloseBackoff DirectorCloseBackoff;
   FRedwoodCloseBackoff RealmCloseBackoff;
   // Set just before a Realm close we ask for; a new Realm socket clears it.
