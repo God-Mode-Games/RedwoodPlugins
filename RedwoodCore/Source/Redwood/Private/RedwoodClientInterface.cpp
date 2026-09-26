@@ -64,6 +64,75 @@ void URedwoodClientInterface::Deinitialize() {
   RealmHeldRequests.Reset(TimerManager);
 }
 
+// FORK(hollowed-oath): HollowedOath#2854. A backend move drops a socket for a
+// few seconds. A request made then used to fail at once ("Not connected"), or,
+// once the socket was back but before the re-login, reach a server socket that
+// did not know the player and be refused. The gate holds it and sends it after
+// the re-login instead; FRedwoodHeldRequests bounds the wait. True means the
+// request was held or failed, and the caller returns. When it lets a request
+// through, the socket is connected, so the upstream check after it passes.
+// Not gated: login and the handshakes (they are the re-login), ticketing and
+// proxies (a late join can move a player who has given up waiting), requests
+// that carry a USIOJsonObject (nothing keeps it alive while held), and
+// requests with no reply (a late emote is worse than none; the Director
+// re-login re-sends the online character).
+namespace {
+  void SetRedwoodGateError(FString &Output, const TCHAR *Error) {
+    Output = Error;
+  }
+
+  template <typename TOutput>
+  void SetRedwoodGateError(TOutput &Output, const TCHAR *Error) {
+    Output.Error = Error;
+  }
+}
+
+template <typename TOutput>
+bool URedwoodClientInterface::GateDirector(
+  TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
+) {
+  if (DirectorHeldRequests.HoldIfReconnecting(
+        Director.IsValid() && bSentDirectorConnected && HasPlayerSession(),
+        CanSendToDirector(),
+        MoveTemp(Request),
+        TimerManager
+      )) {
+    return true;
+  }
+
+  if (CanSendToDirector()) {
+    return false;
+  }
+
+  TOutput Output;
+  SetRedwoodGateError(Output, TEXT("Not connected to Director."));
+  OnOutput.ExecuteIfBound(Output);
+  return true;
+}
+
+template <typename TOutput>
+bool URedwoodClientInterface::GateRealm(
+  TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
+) {
+  if (RealmHeldRequests.HoldIfReconnecting(
+        Realm.IsValid() && bSentRealmConnected && HasPlayerSession(),
+        CanSendToRealm(),
+        MoveTemp(Request),
+        TimerManager
+      )) {
+    return true;
+  }
+
+  if (CanSendToRealm()) {
+    return false;
+  }
+
+  TOutput Output;
+  SetRedwoodGateError(Output, TEXT("Not connected to Realm."));
+  OnOutput.ExecuteIfBound(Output);
+  return true;
+}
+
 void URedwoodClientInterface::Tick(float DeltaTime) {
   TimerManager.Tick(DeltaTime);
 }
@@ -788,14 +857,14 @@ void URedwoodClientInterface::SearchForPlayers(
   bool bIncludePartialMatches,
   FRedwoodListPlayersOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         SearchForPlayers(UsernameOrNickname, bIncludePartialMatches, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodListPlayersOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -865,14 +934,14 @@ void URedwoodClientInterface::SearchForPlayers(
 void URedwoodClientInterface::SearchForPlayerById(
   FString TargetPlayerId, FRedwoodPlayerOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         SearchForPlayerById(TargetPlayerId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodPlayerOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -939,14 +1008,14 @@ void URedwoodClientInterface::SearchForPlayerById(
 void URedwoodClientInterface::ListFriends(
   ERedwoodFriendListType Filter, FRedwoodListPlayersOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         ListFriends(Filter, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodListPlayersOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1021,14 +1090,14 @@ void URedwoodClientInterface::ListFriends(
 void URedwoodClientInterface::RequestFriend(
   FString OtherPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         RequestFriend(OtherPlayerId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1054,14 +1123,14 @@ void URedwoodClientInterface::RequestFriend(
 void URedwoodClientInterface::RemoveFriend(
   FString OtherPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         RemoveFriend(OtherPlayerId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1087,14 +1156,14 @@ void URedwoodClientInterface::RemoveFriend(
 void URedwoodClientInterface::RespondToFriendRequest(
   FString OtherPlayerId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         RespondToFriendRequest(OtherPlayerId, bAccept, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1121,14 +1190,14 @@ void URedwoodClientInterface::RespondToFriendRequest(
 void URedwoodClientInterface::SetPlayerBlocked(
   FString OtherPlayerId, bool bBlocked, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         SetPlayerBlocked(OtherPlayerId, bBlocked, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1155,14 +1224,14 @@ void URedwoodClientInterface::SetPlayerBlocked(
 void URedwoodClientInterface::ListRealmContacts(
   FRedwoodListRealmContactsOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         ListRealmContacts(OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodListRealmContactsOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -1230,14 +1299,14 @@ void URedwoodClientInterface::ListRealmContacts(
 void URedwoodClientInterface::AddRealmContact(
   FString OtherCharacterId, bool bBlocked, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         AddRealmContact(OtherCharacterId, bBlocked, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1265,14 +1334,14 @@ void URedwoodClientInterface::AddRealmContact(
 void URedwoodClientInterface::RemoveRealmContact(
   FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         RemoveRealmContact(OtherCharacterId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1299,14 +1368,14 @@ void URedwoodClientInterface::RemoveRealmContact(
 void URedwoodClientInterface::ListGuilds(
   bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         ListGuilds(bOnlyPlayersGuilds, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodListGuildsOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1350,14 +1419,14 @@ void URedwoodClientInterface::SearchForGuilds(
   bool bIncludePartialMatches,
   FRedwoodListGuildsOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         SearchForGuilds(SearchText, bIncludePartialMatches, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodListGuildsOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1400,14 +1469,14 @@ void URedwoodClientInterface::SearchForGuilds(
 void URedwoodClientInterface::GetGuild(
   FString GuildId, FRedwoodGetGuildOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         GetGuild(GuildId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodGetGuildOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1445,14 +1514,14 @@ void URedwoodClientInterface::GetGuild(
 void URedwoodClientInterface::GetSelectedGuild(
   FRedwoodGetGuildOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         GetSelectedGuild(OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodGetGuildOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1489,14 +1558,14 @@ void URedwoodClientInterface::GetSelectedGuild(
 void URedwoodClientInterface::SetSelectedGuild(
   FString GuildId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         SetSelectedGuild(GuildId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1522,14 +1591,14 @@ void URedwoodClientInterface::SetSelectedGuild(
 void URedwoodClientInterface::JoinGuild(
   FString GuildId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         JoinGuild(GuildId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1555,14 +1624,14 @@ void URedwoodClientInterface::JoinGuild(
 void URedwoodClientInterface::InviteToGuild(
   FString GuildId, FString TargetId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         InviteToGuild(GuildId, TargetId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1589,14 +1658,14 @@ void URedwoodClientInterface::InviteToGuild(
 void URedwoodClientInterface::LeaveGuild(
   FString GuildId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         LeaveGuild(GuildId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1624,14 +1693,14 @@ void URedwoodClientInterface::ListGuildMembers(
   ERedwoodGuildAndAllianceMemberState State,
   FRedwoodListGuildMembersOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         ListGuildMembers(GuildId, State, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodListGuildMembersOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1693,16 +1762,16 @@ void URedwoodClientInterface::CreateGuild(
   bool bMembershipPublic,
   FRedwoodCreateGuildOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         CreateGuild(
           GuildName, GuildTag, InviteType, bListed, bMembershipPublic, OnOutput
         );
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodCreateGuildOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1745,8 +1814,8 @@ void URedwoodClientInterface::UpdateGuild(
   bool bMembershipPublic,
   FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         UpdateGuild(
           GuildId,
           GuildName,
@@ -1756,11 +1825,11 @@ void URedwoodClientInterface::UpdateGuild(
           bMembershipPublic,
           OnOutput
         );
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1794,14 +1863,14 @@ void URedwoodClientInterface::UpdateGuild(
 void URedwoodClientInterface::KickPlayerFromGuild(
   FString GuildId, FString TargetId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         KickPlayerFromGuild(GuildId, TargetId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1829,14 +1898,14 @@ void URedwoodClientInterface::KickPlayerFromGuild(
 void URedwoodClientInterface::BanPlayerFromGuild(
   FString GuildId, FString TargetId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         BanPlayerFromGuild(GuildId, TargetId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1870,14 +1939,14 @@ void URedwoodClientInterface::UnbanPlayerFromGuild(
 void URedwoodClientInterface::PromotePlayerToGuildAdmin(
   FString GuildId, FString TargetId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         PromotePlayerToGuildAdmin(GuildId, TargetId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1904,14 +1973,14 @@ void URedwoodClientInterface::PromotePlayerToGuildAdmin(
 void URedwoodClientInterface::DemotePlayerFromGuildAdmin(
   FString GuildId, FString TargetId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         DemotePlayerFromGuildAdmin(GuildId, TargetId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -1938,14 +2007,14 @@ void URedwoodClientInterface::DemotePlayerFromGuildAdmin(
 void URedwoodClientInterface::ListAlliances(
   FString GuildIdFilter, FRedwoodListAlliancesOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         ListAlliances(GuildIdFilter, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodListAlliancesOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -1999,14 +2068,14 @@ void URedwoodClientInterface::SearchForAlliances(
   bool bIncludePartialMatches,
   FRedwoodListAlliancesOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         SearchForAlliances(SearchText, bIncludePartialMatches, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodListAlliancesOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -2047,14 +2116,14 @@ void URedwoodClientInterface::SearchForAlliances(
 void URedwoodClientInterface::CanAdminAlliance(
   FString AllianceId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         CanAdminAlliance(AllianceId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     OnOutput.ExecuteIfBound(TEXT("Not connected to Director."));
     return;
   }
@@ -2082,14 +2151,14 @@ void URedwoodClientInterface::CreateAlliance(
   bool bInviteOnly,
   FRedwoodCreateAllianceOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         CreateAlliance(AllianceName, GuildId, bInviteOnly, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodCreateAllianceOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -2124,14 +2193,14 @@ void URedwoodClientInterface::UpdateAlliance(
   bool bInviteOnly,
   FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         UpdateAlliance(AllianceId, AllianceName, bInviteOnly, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2159,14 +2228,14 @@ void URedwoodClientInterface::UpdateAlliance(
 void URedwoodClientInterface::KickGuildFromAlliance(
   FString AllianceId, FString GuildId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         KickGuildFromAlliance(AllianceId, GuildId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2194,14 +2263,14 @@ void URedwoodClientInterface::KickGuildFromAlliance(
 void URedwoodClientInterface::BanGuildFromAlliance(
   FString AllianceId, FString GuildId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         BanGuildFromAlliance(AllianceId, GuildId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2237,14 +2306,14 @@ void URedwoodClientInterface::ListAllianceGuilds(
   ERedwoodGuildAndAllianceMemberState State,
   FRedwoodListAllianceGuildsOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         ListAllianceGuilds(AllianceId, State, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodListAllianceGuildsOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -2301,14 +2370,14 @@ void URedwoodClientInterface::ListAllianceGuilds(
 void URedwoodClientInterface::JoinAlliance(
   FString AllianceId, FString GuildId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         JoinAlliance(AllianceId, GuildId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2335,14 +2404,14 @@ void URedwoodClientInterface::JoinAlliance(
 void URedwoodClientInterface::LeaveAlliance(
   FString AllianceId, FString GuildId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         LeaveAlliance(AllianceId, GuildId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2369,14 +2438,14 @@ void URedwoodClientInterface::LeaveAlliance(
 void URedwoodClientInterface::InviteGuildToAlliance(
   FString AllianceId, FString GuildId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         InviteGuildToAlliance(AllianceId, GuildId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FString Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2815,14 +2884,14 @@ TMap<FString, float> URedwoodClientInterface::GetRegions() {
 void URedwoodClientInterface::ListCharacters(
   FRedwoodListCharactersOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         ListCharacters(OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodListCharactersOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -2865,14 +2934,14 @@ void URedwoodClientInterface::ListCharacters(
 void URedwoodClientInterface::ListArchivedCharacters(
   FRedwoodListCharactersOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         ListArchivedCharacters(OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodListCharactersOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -2963,14 +3032,14 @@ void URedwoodClientInterface::CreateCharacter(
 void URedwoodClientInterface::SetCharacterArchived(
   FString CharacterId, bool bArchived, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         SetCharacterArchived(CharacterId, bArchived, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -2996,14 +3065,14 @@ void URedwoodClientInterface::SetCharacterArchived(
 void URedwoodClientInterface::GetCharacterData(
   FString CharacterIdOrName, FRedwoodGetCharacterOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         GetCharacterData(CharacterIdOrName, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodGetCharacterOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3138,34 +3207,6 @@ void URedwoodClientInterface::ResendOnlineCharacter() {
   }
 
   Director->Emit(SetOnlineCharacterEventName, Payload);
-}
-
-// FORK(hollowed-oath): HollowedOath#2854. A backend move drops a socket for a
-// few seconds. A request made then used to fail at once ("Not connected"), or,
-// once the socket was back but before the re-login, reach a server socket that
-// did not know the player and be refused. Hold it and send it after the
-// re-login instead; FRedwoodHeldRequests bounds the wait. Not held: login and
-// the handshakes (they are the re-login), ticketing and proxies (a late join
-// can move a player who has given up waiting), requests that carry a
-// USIOJsonObject (nothing keeps it alive while held), and requests with no
-// reply (a late emote is worse than none; the Director re-login re-sends the
-// online character).
-bool URedwoodClientInterface::HoldForDirector(TFunction<void()> Request) {
-  return DirectorHeldRequests.HoldIfReconnecting(
-    Director.IsValid() && bSentDirectorConnected && HasPlayerSession(),
-    CanSendToDirector(),
-    MoveTemp(Request),
-    TimerManager
-  );
-}
-
-bool URedwoodClientInterface::HoldForRealm(TFunction<void()> Request) {
-  return RealmHeldRequests.HoldIfReconnecting(
-    Realm.IsValid() && bSentRealmConnected && HasPlayerSession(),
-    CanSendToRealm(),
-    MoveTemp(Request),
-    TimerManager
-  );
 }
 
 void URedwoodClientInterface::NoteDirectorDrop() {
@@ -3716,14 +3757,14 @@ void URedwoodClientInterface::AttemptJoinMatchmaking() {
 void URedwoodClientInterface::GetOrCreateParty(
   bool bCreateIfNotInParty, FRedwoodGetPartyOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         GetOrCreateParty(bCreateIfNotInParty, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodGetPartyOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3766,14 +3807,14 @@ void URedwoodClientInterface::GetOrCreateParty(
 }
 
 void URedwoodClientInterface::LeaveParty(FRedwoodErrorOutputDelegate OnOutput) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         LeaveParty(OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
     return;
   }
@@ -3800,14 +3841,14 @@ void URedwoodClientInterface::LeaveParty(FRedwoodErrorOutputDelegate OnOutput) {
 void URedwoodClientInterface::InviteToParty(
   FString TargetPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         InviteToParty(TargetPlayerId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
     return;
   }
@@ -3830,14 +3871,14 @@ void URedwoodClientInterface::InviteToParty(
 void URedwoodClientInterface::ListPartyInvites(
   FRedwoodListPartyInvitesOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         ListPartyInvites(OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodListPartyInvitesOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3872,14 +3913,14 @@ void URedwoodClientInterface::ListPartyInvites(
 void URedwoodClientInterface::RespondToPartyInvite(
   FString PartyId, bool bAccept, FRedwoodGetPartyOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         RespondToPartyInvite(PartyId, bAccept, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodGetPartyOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3925,14 +3966,14 @@ void URedwoodClientInterface::RespondToPartyInvite(
 void URedwoodClientInterface::PromoteToPartyLeader(
   FString TargetPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         PromoteToPartyLeader(TargetPlayerId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
     return;
   }
@@ -3952,14 +3993,14 @@ void URedwoodClientInterface::PromoteToPartyLeader(
 void URedwoodClientInterface::KickFromParty(
   FString TargetPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         KickFromParty(TargetPlayerId, OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
     return;
   }
@@ -4102,14 +4143,14 @@ FURL URedwoodClientInterface::GetConnectionURL() {
 void URedwoodClientInterface::GetDirectorGlobalData(
   FRedwoodGetGlobalDataOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForDirector.
-  if (HoldForDirector([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
         GetDirectorGlobalData(OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToDirector()) {
+  if (!Director.IsValid() || !Director->bIsConnected) {
     FRedwoodGetGlobalDataOutput Output;
     Output.Error = TEXT("Not connected to Director.");
     OnOutput.ExecuteIfBound(Output);
@@ -4149,14 +4190,14 @@ void URedwoodClientInterface::GetDirectorGlobalData(
 void URedwoodClientInterface::GetRealmGlobalData(
   FRedwoodGetGlobalDataOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See HoldForRealm.
-  if (HoldForRealm([=, this]() {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
         GetRealmGlobalData(OnOutput);
-      })) {
+      }, OnOutput)) {
     return;
   }
 
-  if (!CanSendToRealm()) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodGetGlobalDataOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
