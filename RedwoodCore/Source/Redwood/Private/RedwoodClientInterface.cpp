@@ -2618,10 +2618,12 @@ void URedwoodClientInterface::InitiateRealmHandshake(
           // FORK(hollowed-oath): HollowedOath#2854. The Realm socket reports
           // connected again before the player is authenticated on it, so the
           // held requests wait for the re-handshake, not for the socket. A
-          // first connection that keeps failing also lands here, and has no
-          // handshake to redo.
-          bRealmReauthPending = bSentRealmConnected;
-          RealmHeldRequests.StartGrace(TimerManager);
+          // first connection that keeps failing also lands here; it has no
+          // handshake to redo and no request to hold.
+          if (bSentRealmConnected) {
+            bRealmReauthPending = true;
+            RealmHeldRequests.StartGrace(TimerManager);
+          }
           OnRealmConnectionLost.Broadcast();
         }
       };
