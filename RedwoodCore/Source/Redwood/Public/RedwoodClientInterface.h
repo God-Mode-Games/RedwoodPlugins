@@ -507,6 +507,9 @@ private:
   friend class FRedwoodDropAfterLogoutTest;
   friend class FRedwoodLogoutClosesReconnectingRealmTest;
   friend class FRedwoodFailedReloginStopsRealmRetryTest;
+  // FORK(hollowed-oath): character friends. Pins that the four character
+  // friend calls are held like the other Realm requests.
+  friend class FRedwoodCharacterFriendsHeldTest;
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);

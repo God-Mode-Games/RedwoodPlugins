@@ -15,8 +15,11 @@
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
+#include "Misc/ScopeExit.h"
+#include "UObject/StrongObjectPtr.h"
 
 #include "RedwoodClientInterface.h"
+#include "SocketIOClient.h"
 #include "Types/RedwoodTypesCharacters.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -69,6 +72,82 @@ bool FRedwoodCharacterFriendsNotConnectedTest::RunTest(
   // SetSelectedCharacter keeps the id and sends nothing without a realm.
   Redwood->SetSelectedCharacter(TEXT("me-1"));
   CheckAll(TEXT("Not connected to Realm."), TEXT("No realm, a character"));
+
+  return true;
+}
+
+// HollowedOath#2854 made a Realm request that the player makes while the Realm
+// socket reconnects wait for the re-handshake (GateRealm). The character
+// friend calls must wait too. Sent before the re-handshake, they reach a
+// server socket that does not know the player: the game's friends list
+// fetch at the Director reconnect then fails, and a command gets refused.
+// The sockets never connect: bIsConnected is set by hand, as in
+// ReloginFailureTest.cpp, so a call that is emitted is never answered.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCharacterFriendsHeldTest,
+  "Redwood.CharacterFriends.HeldWhileRealmReconnects",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
+
+  Client->Realm = ISocketIOClientModule::Get().NewValidNativePointer();
+  ON_SCOPE_EXIT {
+    Client->Realm->bIsConnected = false;
+    Client->Deinitialize();
+  };
+
+  // Logged in, in the realm, with a character.
+  Client->bSentRealmConnected = true;
+  Client->bAuthenticated = true;
+  Client->PlayerId = TEXT("player-1");
+  Client->SelectedCharacterId = TEXT("me-1");
+  Client->Realm->bIsConnected = true;
+
+  // The Realm socket drops and comes back; the re-handshake is in flight.
+  Client->Realm->bIsConnected = false;
+  Client->NoteRealmDrop();
+  Client->Realm->bIsConnected = true;
+
+  TArray<FString> Errors;
+  FRedwoodListCharacterFriendsOutputDelegate OnList =
+    FRedwoodListCharacterFriendsOutputDelegate::CreateLambda(
+      [&Errors](const FRedwoodListCharacterFriendsOutput &Output) {
+        Errors.Add(Output.Error);
+      }
+    );
+  FRedwoodErrorOutputDelegate OnError =
+    FRedwoodErrorOutputDelegate::CreateLambda(
+      [&Errors](const FString &Output) { Errors.Add(Output); }
+    );
+
+  Client->ListCharacterFriends(OnList);
+  Client->RequestCharacterFriend(TEXT("other-1"), OnError);
+  Client->RespondToCharacterFriendRequest(TEXT("other-1"), true, OnError);
+  Client->RemoveCharacterFriend(TEXT("other-1"), OnError);
+
+  TestEqual(
+    TEXT("Every character friend call is held"),
+    Client->RealmHeldRequests.Num(),
+    4
+  );
+  TestEqual(TEXT("No held call is answered yet"), Errors.Num(), 0);
+
+  // The re-handshake fails: every held call answers with the realm error.
+  Client->EndRealmReauthentication(false);
+
+  TestEqual(TEXT("Every held call is answered"), Errors.Num(), 4);
+  for (const FString &Error : Errors) {
+    TestEqualSensitive(
+      TEXT("A held call fails, it is not sent"),
+      *Error,
+      TEXT("Not connected to Realm.")
+    );
+  }
 
   return true;
 }

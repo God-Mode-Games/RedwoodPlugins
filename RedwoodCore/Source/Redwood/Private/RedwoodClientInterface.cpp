@@ -1502,6 +1502,14 @@ void URedwoodClientInterface::EmitCharacterFriendCommand(
   TSharedPtr<FJsonObject> Payload,
   FRedwoodErrorOutputDelegate OnOutput
 ) {
+  // FORK(hollowed-oath): HollowedOath#2854. Held while the Realm socket
+  // reconnects, like the other Realm requests; see GateRealm.
+  if (GateRealm([=, this]() {
+        EmitCharacterFriendCommand(EventName, Payload, OnOutput);
+      }, OnOutput)) {
+    return;
+  }
+
   const FString GuardError = PrepareCharacterFriendCall(Payload);
   if (!GuardError.IsEmpty()) {
     OnOutput.ExecuteIfBound(GuardError);
@@ -1523,6 +1531,13 @@ void URedwoodClientInterface::EmitCharacterFriendCommand(
 void URedwoodClientInterface::ListCharacterFriends(
   FRedwoodListCharacterFriendsOutputDelegate OnOutput
 ) {
+  // FORK(hollowed-oath): HollowedOath#2854. See EmitCharacterFriendCommand.
+  if (GateRealm([=, this]() {
+        ListCharacterFriends(OnOutput);
+      }, OnOutput)) {
+    return;
+  }
+
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   const FString GuardError = PrepareCharacterFriendCall(Payload);
   if (!GuardError.IsEmpty()) {
