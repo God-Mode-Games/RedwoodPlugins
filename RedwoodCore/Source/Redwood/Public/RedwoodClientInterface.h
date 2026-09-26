@@ -435,6 +435,7 @@ private:
   friend class FRedwoodReloginFailureTest;
   bool CanSendToDirector();
   bool CanSendToRealm();
+  void EndDirectorReauthentication(bool bSucceeded);
   void EndRealmReauthentication(bool bSucceeded);
   FRedwoodHeldRequests DirectorHeldRequests;
   FRedwoodHeldRequests RealmHeldRequests;

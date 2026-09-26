@@ -9,7 +9,7 @@
 // the player, and several routes answer that with an empty error: a false
 // success.
 //   1. A Director request made after the socket is back, before the re-login
-//      ends, is held (no answer yet).
+//      ends, is held.
 //   2. When the re-login fails, it fails with the not-connected error, and so
 //      does a later request. A request that was emitted instead would get no
 //      answer at all here, because no backend runs.
@@ -83,16 +83,18 @@ bool FRedwoodReloginFailureTest::RunTest(const FString &Parameters) {
 
   FErrorCapture Friend;
   Client->RequestFriend(TEXT("player-2"), Friend.MakeDelegate());
-  TestFalse(TEXT("Director request is held"), Friend.bAnswered);
+  TestEqual(
+    TEXT("Director request is held"), Client->DirectorHeldRequests.Num(), 1
+  );
 
   FErrorCapture Party;
   Client->InviteToParty(TEXT("player-2"), Party.MakeDelegate());
-  TestFalse(TEXT("Realm request is held"), Party.bAnswered);
+  TestEqual(TEXT("Realm request is held"), Client->RealmHeldRequests.Num(), 1);
 
   // The Director re-login fails: the reply empties the ids first.
   Client->PlayerId.Empty();
   Client->AuthToken.Empty();
-  Client->DirectorHeldRequests.Expire(Client->TimerManager);
+  Client->EndDirectorReauthentication(false);
 
   TestTrue(TEXT("Held Director request is answered"), Friend.bAnswered);
   TestEqual(

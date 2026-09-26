@@ -237,11 +237,9 @@ void URedwoodClientInterface::InitializeDirectorConnection(
                 "Reauthenticated connection with Director, calling connection reestablished."
               )
             );
-            // FORK(hollowed-oath): HollowedOath#2854. Restore the online
-            // character, then send what the player asked for while the
-            // Director was away, before the game reacts to the reconnect.
-            ResendOnlineCharacter();
-            DirectorHeldRequests.Release(TimerManager);
+            // FORK(hollowed-oath): HollowedOath#2854. Before the game reacts
+            // to the reconnect.
+            EndDirectorReauthentication(true);
             OnDirectorConnectionReestablished.Broadcast();
           } else {
             UE_LOG(
@@ -253,9 +251,8 @@ void URedwoodClientInterface::InitializeDirectorConnection(
             // FORK(hollowed-oath): fire the fork-added OnDirectorAuthFailed delegate on reauth
             // failure. Upstream only logs the failure; the fork surfaces it up to the client's
             // disconnect/reconnect modal (via RedwoodClientGameSubsystem).
-            // FORK(hollowed-oath): HollowedOath#2854. The session is gone, so
-            // the held requests fail now instead of at the end of the grace.
-            DirectorHeldRequests.Expire(TimerManager);
+            // FORK(hollowed-oath): HollowedOath#2854.
+            EndDirectorReauthentication(false);
             OnDirectorAuthFailed.Broadcast(Update.Message);
           }
         }),
@@ -3234,6 +3231,18 @@ bool URedwoodClientInterface::CanSendToRealm() {
   return FRedwoodHeldRequests::CanSend(
     IsRealmConnected(), !bRealmReauthPending, HasPlayerSession()
   );
+}
+
+// Restore the online character, then send what the player asked for while the
+// Director was away. A failed re-login ended the session, so the held requests
+// fail now instead of at the end of the grace.
+void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
+  if (bSucceeded) {
+    ResendOnlineCharacter();
+    DirectorHeldRequests.Release(TimerManager);
+  } else {
+    DirectorHeldRequests.Expire(TimerManager);
+  }
 }
 
 // A failed re-handshake leaves bRealmReauthPending set, so the held requests
