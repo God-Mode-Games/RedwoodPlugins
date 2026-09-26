@@ -51,13 +51,23 @@ void URedwoodClientInterface::Deinitialize() {
     Director = nullptr;
   }
 
+  ReleaseRealmSocket();
+}
+
+// FORK(hollowed-oath) BEGIN: shared by Deinitialize and a new handshake.
+void URedwoodClientInterface::ReleaseRealmSocket() {
+  TimerManager.ClearTimer(ReauthenticationAttemptTimer);
   if (Realm.IsValid()) {
     Realm->ClearAllCallbacks();
     Realm->Disconnect();
     ISocketIOClientModule::Get().ReleaseNativePointer(Realm);
     Realm = nullptr;
   }
+  // The next socket starts as a first connect, not as a drop of this one.
+  bRealmDisconnected = true;
+  bSentInitialRealmConnectionFailureLog = false;
 }
+// FORK(hollowed-oath) END
 
 void URedwoodClientInterface::Tick(float DeltaTime) {
   TimerManager.Tick(DeltaTime);
@@ -2241,6 +2251,9 @@ void URedwoodClientInterface::InitiateRealmHandshake(
         return;
       }
 
+      // FORK(hollowed-oath): a retry replaces the socket. Release the old one
+      // first, or its callbacks still act on the new socket.
+      ReleaseRealmSocket();
       CurrentRealmId = InRealm.Id;
       CurrentRealm = InRealm;
       Realm = ISocketIOClientModule::Get().NewValidNativePointer();

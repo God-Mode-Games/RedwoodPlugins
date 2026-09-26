@@ -397,6 +397,10 @@ private:
   TSharedPtr<FSocketIONative> Director;
   TSharedPtr<FSocketIONative> Realm;
 
+  // FORK(hollowed-oath): tears down the realm socket and its state, so a
+  // replaced socket cannot finish a handshake or report a false connection loss.
+  void ReleaseRealmSocket();
+
   void InitiateRealmHandshake(
     FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected
   );
