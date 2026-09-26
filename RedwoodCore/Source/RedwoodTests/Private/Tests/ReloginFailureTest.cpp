@@ -20,11 +20,35 @@
 #include "Misc/ScopeExit.h"
 #include "UObject/StrongObjectPtr.h"
 
+#include "GameFramework/SaveGame.h"
+#include "Kismet/GameplayStatics.h"
+
 #include "ReconnectListener.h"
 #include "RedwoodClientInterface.h"
 #include "SocketIOClient.h"
 
 namespace {
+  // Logout writes an empty remember-me save game. Keep the developer's slot:
+  // take it before the test and put it back after.
+  struct FRedwoodSaveSlotGuard {
+    const FString SlotName = TEXT("RedwoodSaveGame");
+    TStrongObjectPtr<USaveGame> Saved;
+
+    FRedwoodSaveSlotGuard() {
+      if (UGameplayStatics::DoesSaveGameExist(SlotName, 0)) {
+        Saved.Reset(UGameplayStatics::LoadGameFromSlot(SlotName, 0));
+      }
+    }
+
+    ~FRedwoodSaveSlotGuard() {
+      if (Saved.IsValid()) {
+        UGameplayStatics::SaveGameToSlot(Saved.Get(), SlotName, 0);
+      } else {
+        UGameplayStatics::DeleteGameInSlot(SlotName, 0);
+      }
+    }
+  };
+
   struct FErrorCapture {
     bool bAnswered = false;
     FString Error;
@@ -220,11 +244,14 @@ bool FRedwoodRealmReauthRetryTest::RunTest(const FString &Parameters) {
   Client->AuthToken = TEXT("token-1");
   Client->Director->bIsConnected = true;
 
-  // The Realm is back and its re-handshake has asked the Director.
+  // The Realm is back and its re-handshake asks the Director. With the
+  // Director logged in, it sends at once and waits for the answer, not on
+  // the retry.
   Client->Realm->bIsConnected = true;
   Client->bRealmReauthPending = true;
+  Client->BeginRealmReauthentication();
   TestFalse(
-    TEXT("No retry waits while the answer is in flight"),
+    TEXT("The re-handshake waits for its answer, not on the retry"),
     Client->TimerManager.IsTimerActive(Client->ReauthenticationAttemptTimer)
   );
 
@@ -258,6 +285,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodLogoutDuringGraceTest::RunTest(const FString &Parameters) {
+  FRedwoodSaveSlotGuard SaveSlot;
   TStrongObjectPtr<URedwoodClientInterface> Interface(
     NewObject<URedwoodClientInterface>()
   );
