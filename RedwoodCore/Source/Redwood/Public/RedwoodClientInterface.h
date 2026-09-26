@@ -452,10 +452,14 @@ private:
   // above. PrepareCharacterFriendCall gives the inline error ("Not connected
   // to Realm." or "No character selected."), or, when the call can go out,
   // adds playerId and characterId to Payload and gives an empty string.
-  // EmitCharacterFriendCommand answers once with one of: the inline error;
-  // the error string of the realm (empty for a success); or
-  // URedwoodCommonGameSubsystem::BadRealmAnswerError when the answer cannot
-  // be read or has no error field.
+  // EmitCharacterFriendCommand and ListCharacterFriends go through GateRealm
+  // first: while the Realm socket of a logged-in player reconnects, the call
+  // is held and sent after the re-handshake, or answers "Not connected to
+  // Realm." when the grace ends or the re-handshake fails. Deinitialize drops
+  // a held call with no answer. Otherwise EmitCharacterFriendCommand answers
+  // once with one of: the inline error; the error string of the realm (empty
+  // for a success); or URedwoodCommonGameSubsystem::BadRealmAnswerError when
+  // the answer cannot be read or has no error field.
   FString PrepareCharacterFriendCall(const TSharedPtr<FJsonObject> &Payload
   ) const;
   void EmitCharacterFriendCommand(

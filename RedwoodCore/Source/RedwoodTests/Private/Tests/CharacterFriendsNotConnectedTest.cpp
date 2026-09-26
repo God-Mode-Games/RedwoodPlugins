@@ -1,17 +1,17 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
 // FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart.
-// Pins the inline error path of the four character friend calls on
-// URedwoodClientInterface. The class exists apart from the subsystem so a
-// test can build it without a world (RedwoodClientInterface.h header
-// comment). A fresh instance has no realm socket, so every call must answer
-// inline with "Not connected to Realm.", with or without a selected
-// character. The realm guard comes first, as in every realm call of
-// RedwoodClientInterface.cpp. The "No character selected." guard comes after
-// it, so it needs a connected realm. The Redwood.Mock.* tests connect a realm,
-// but only to a RedwoodBackend that runs in mock mode. This file keeps to
-// tests that need no backend, so review covers that guard, not this test. The
-// socket path is checked in PIE with a backend.
+// Pins the guards of the four character friend calls on
+// URedwoodClientInterface, with no backend. The class exists apart from the
+// subsystem so a test can build it without a world (RedwoodClientInterface.h
+// header comment). A fresh instance has no realm socket, so every call must
+// answer inline with "Not connected to Realm.", with or without a selected
+// character: the realm guard comes first, as in every realm call of
+// RedwoodClientInterface.cpp. The guards after it need a realm socket that
+// looks connected. HeldWhileRealmReconnects makes one by hand, as
+// ReloginFailureTest.cpp does, and pins "No character selected." and the hold
+// while the realm socket reconnects. The answer of a real realm is checked in
+// PIE with a backend.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -101,16 +101,10 @@ bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
     Client->Deinitialize();
   };
 
-  // Logged in, in the realm, with a character.
+  // Logged in and in the realm.
   Client->bSentRealmConnected = true;
   Client->bAuthenticated = true;
   Client->PlayerId = TEXT("player-1");
-  Client->SelectedCharacterId = TEXT("me-1");
-  Client->Realm->bIsConnected = true;
-
-  // The Realm socket drops and comes back; the re-handshake is in flight.
-  Client->Realm->bIsConnected = false;
-  Client->NoteRealmDrop();
   Client->Realm->bIsConnected = true;
 
   TArray<FString> Errors;
@@ -124,11 +118,31 @@ bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
     FRedwoodErrorOutputDelegate::CreateLambda(
       [&Errors](const FString &Output) { Errors.Add(Output); }
     );
+  const auto CallAll = [&]() {
+    Client->ListCharacterFriends(OnList);
+    Client->RequestCharacterFriend(TEXT("other-1"), OnError);
+    Client->RespondToCharacterFriendRequest(TEXT("other-1"), true, OnError);
+    Client->RemoveCharacterFriend(TEXT("other-1"), OnError);
+  };
 
-  Client->ListCharacterFriends(OnList);
-  Client->RequestCharacterFriend(TEXT("other-1"), OnError);
-  Client->RespondToCharacterFriendRequest(TEXT("other-1"), true, OnError);
-  Client->RemoveCharacterFriend(TEXT("other-1"), OnError);
+  // No character is selected yet: the realm check passes, and the character
+  // guard answers each call inline.
+  CallAll();
+  TestEqual(TEXT("Every call answers at once"), Errors.Num(), 4);
+  for (const FString &Error : Errors) {
+    TestEqualSensitive(
+      TEXT("The character guard answers"), *Error, TEXT("No character selected.")
+    );
+  }
+  Errors.Reset();
+  Client->SelectedCharacterId = TEXT("me-1");
+
+  // The Realm socket drops and comes back; the re-handshake is in flight.
+  Client->Realm->bIsConnected = false;
+  Client->NoteRealmDrop();
+  Client->Realm->bIsConnected = true;
+
+  CallAll();
 
   TestEqual(
     TEXT("Every character friend call is held"),
@@ -148,6 +162,29 @@ bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
       TEXT("Not connected to Realm.")
     );
   }
+  Errors.Reset();
+
+  // A second drop, and this time the re-handshake succeeds: each held call
+  // is sent once. No backend runs, so a sent call gets no answer; a call that
+  // answers was refused, and a call still held was not sent.
+  Client->Realm->bIsConnected = false;
+  Client->NoteRealmDrop();
+  Client->Realm->bIsConnected = true;
+  CallAll();
+  TestEqual(
+    TEXT("Held again after the second drop"), Client->RealmHeldRequests.Num(), 4
+  );
+
+  Client->EndRealmReauthentication(true);
+
+  TestEqual(
+    TEXT("Released: nothing stays held"), Client->RealmHeldRequests.Num(), 0
+  );
+  TestEqual(TEXT("Released: no call is refused"), Errors.Num(), 0);
+
+  // The end of a grace after the release runs no call a second time.
+  Client->RealmHeldRequests.Expire(Client->TimerManager);
+  TestEqual(TEXT("Released: no call runs again"), Errors.Num(), 0);
 
   return true;
 }

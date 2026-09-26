@@ -1502,8 +1502,9 @@ void URedwoodClientInterface::EmitCharacterFriendCommand(
   TSharedPtr<FJsonObject> Payload,
   FRedwoodErrorOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. Held while the Realm socket
-  // reconnects, like the other Realm requests; see GateRealm.
+  // FORK(hollowed-oath): character friends. Held while the Realm socket
+  // reconnects, like the other Realm requests; see GateRealm. This gate is
+  // ours, not part of the HollowedOath#2854 work, so it stays if that goes.
   if (GateRealm([=, this]() {
         EmitCharacterFriendCommand(EventName, Payload, OnOutput);
       }, OnOutput)) {
@@ -1531,7 +1532,7 @@ void URedwoodClientInterface::EmitCharacterFriendCommand(
 void URedwoodClientInterface::ListCharacterFriends(
   FRedwoodListCharacterFriendsOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2854. See EmitCharacterFriendCommand.
+  // FORK(hollowed-oath): character friends. See EmitCharacterFriendCommand.
   if (GateRealm([=, this]() {
         ListCharacterFriends(OnOutput);
       }, OnOutput)) {
