@@ -202,6 +202,7 @@ void URedwoodClientInterface::InitializeDirectorConnection(
                                     const FString &InSocketId,
                                     const FString &InSessionId
                                   ) {
+    NoteFirstDirectorConnect(); // FORK(hollowed-oath): HollowedOath#2854.
     bDirectorDisconnected = false;
 
     if (!bSentDirectorConnected) {
@@ -2650,6 +2651,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
                                      const FString &InSocketId,
                                      const FString &InSessionId
                                    ) {
+        NoteFirstRealmConnect(); // FORK(hollowed-oath): HollowedOath#2854.
         bRealmDisconnected = false;
 
         if (!bSentRealmConnected) {
@@ -3227,6 +3229,21 @@ void URedwoodClientInterface::ResendOnlineCharacter() {
   }
 
   Director->Emit(SetOnlineCharacterEventName, Payload);
+}
+
+// A first connect that failed twice already broadcast a lost connection, and
+// the game shows a message for it. Its success is the only event that can take
+// that message down; the reconnect path broadcasts after its re-login instead.
+void URedwoodClientInterface::NoteFirstDirectorConnect() {
+  if (!bSentDirectorConnected && bDirectorDisconnected) {
+    OnDirectorConnectionReestablished.Broadcast();
+  }
+}
+
+void URedwoodClientInterface::NoteFirstRealmConnect() {
+  if (!bSentRealmConnected && bRealmDisconnected) {
+    OnRealmConnectionReestablished.Broadcast();
+  }
 }
 
 void URedwoodClientInterface::NoteDirectorDrop() {

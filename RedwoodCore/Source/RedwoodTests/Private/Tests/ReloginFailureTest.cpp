@@ -20,6 +20,7 @@
 #include "Misc/ScopeExit.h"
 #include "UObject/StrongObjectPtr.h"
 
+#include "ReconnectListener.h"
 #include "RedwoodClientInterface.h"
 #include "SocketIOClient.h"
 
@@ -128,6 +129,59 @@ bool FRedwoodReloginFailureTest::RunTest(const FString &Parameters) {
     LaterParty.Error,
     TEXT("Not connected to Realm.")
   );
+
+  return true;
+}
+
+// A first connect that fails twice broadcasts a lost connection, and the game
+// shows a message for it. When that connect then succeeds, a reestablished
+// broadcast must follow, or the message stays up over a working socket. A
+// later reconnect is left to the re-login, which broadcasts after it.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodFirstConnectAfterLossTest,
+  "Redwood.HeldRequests.FirstConnectAfterLoss",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodFirstConnectAfterLossTest::RunTest(const FString &Parameters) {
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
+  TStrongObjectPtr<URedwoodReconnectListener> Listener(
+    NewObject<URedwoodReconnectListener>()
+  );
+  Listener->Watch(Client);
+
+  // A first connect with no loss broadcast says nothing extra.
+  Client->NoteFirstDirectorConnect();
+  Client->NoteFirstRealmConnect();
+  TestEqual(TEXT("Plain first Director connect"), Listener->DirectorCount, 0);
+  TestEqual(TEXT("Plain first Realm connect"), Listener->RealmCount, 0);
+
+  // Both first connects failed twice: the lost broadcasts went out.
+  Client->bDirectorDisconnected = true;
+  Client->bRealmDisconnected = true;
+  Client->NoteFirstDirectorConnect();
+  Client->NoteFirstRealmConnect();
+  TestEqual(
+    TEXT("First Director connect after a loss is reestablished"),
+    Listener->DirectorCount,
+    1
+  );
+  TestEqual(
+    TEXT("First Realm connect after a loss is reestablished"),
+    Listener->RealmCount,
+    1
+  );
+
+  // A reconnect of an established socket waits for its re-login.
+  Client->bSentDirectorConnected = true;
+  Client->bSentRealmConnected = true;
+  Client->NoteFirstDirectorConnect();
+  Client->NoteFirstRealmConnect();
+  TestEqual(TEXT("Director reconnect waits"), Listener->DirectorCount, 1);
+  TestEqual(TEXT("Realm reconnect waits"), Listener->RealmCount, 1);
 
   return true;
 }

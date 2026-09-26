@@ -430,11 +430,14 @@ private:
     TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
   );
   void NoteDirectorDrop();
+  void NoteFirstDirectorConnect();
+  void NoteFirstRealmConnect();
   bool HasPlayerSession() const;
   // Drives the private reconnect state without a backend.
   friend class FRedwoodReloginFailureTest;
   friend class FRedwoodLogoutDuringGraceTest;
   friend class FRedwoodRealmReauthRetryTest;
+  friend class FRedwoodFirstConnectAfterLossTest;
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);
