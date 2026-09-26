@@ -309,16 +309,24 @@ bool FRedwoodUnrequestedCloseBacksOffTest::RunTest(const FString &Parameters) {
   Client->Realm->OnReconnectionCallback = [&DropReports](uint32, uint32) {
     ++DropReports;
   };
+  int32 Reconnects = 0;
+  Client->ReconnectSocket = [&Reconnects](FSocketIONative &) { ++Reconnects; };
 
   Client->Realm->OnDisconnectedCallback(
     ESIOConnectionCloseReason::CLOSE_REASON_NORMAL
   );
   TestEqual(TEXT("An unrequested close reports the drop"), DropReports, 1);
   TestEqual(
-    TEXT("The reconnect waits for the backoff, it does not run at once"),
-    Client->RealmCloseBackoff.NumAttempts(),
-    1
+    TEXT("The reconnect does not run at once"), Reconnects, 0
   );
+
+  // A timer set inside a frame starts on the next tick. Then go past the
+  // longest first delay the jitter can pick.
+  ++GFrameCounter;
+  Client->TimerManager.Tick(0.0f);
+  ++GFrameCounter;
+  Client->TimerManager.Tick(2.0f * FRedwoodCloseBackoff::InitialDelaySeconds);
+  TestEqual(TEXT("The reconnect runs after the delay"), Reconnects, 1);
 
   // A server that accepts and then closes again, long past the point where
   // the delay reaches its maximum.
