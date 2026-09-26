@@ -3343,6 +3343,9 @@ void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
     DirectorHeldRequests.Release(TimerManager);
   } else {
     DirectorHeldRequests.Expire(TimerManager);
+    // The Realm re-handshake needs a logged-in Director, and this session
+    // cannot log in again, so its retry would poll for good.
+    TimerManager.ClearTimer(ReauthenticationAttemptTimer);
   }
 }
 
