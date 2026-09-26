@@ -132,6 +132,65 @@ bool FRedwoodReloginFailureTest::RunTest(const FString &Parameters) {
   return true;
 }
 
+// Both sockets move. The Realm is back first and asks the Director for its
+// re-handshake token; then the Director drops again before it answers. That
+// answer is lost with the socket, so the re-handshake must be tried again,
+// or bRealmReauthPending stays set and every Realm request fails for good.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodRealmReauthRetryTest,
+  "Redwood.HeldRequests.RealmReauthSurvivesDirectorDrop",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodRealmReauthRetryTest::RunTest(const FString &Parameters) {
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
+
+  Client->Director = ISocketIOClientModule::Get().NewValidNativePointer();
+  Client->Realm = ISocketIOClientModule::Get().NewValidNativePointer();
+  ON_SCOPE_EXIT {
+    Client->Director->bIsConnected = false;
+    Client->Realm->bIsConnected = false;
+    Client->Deinitialize();
+  };
+
+  Client->bSentDirectorConnected = true;
+  Client->bSentRealmConnected = true;
+  Client->bAuthenticated = true;
+  Client->PlayerId = TEXT("player-1");
+  Client->AuthToken = TEXT("token-1");
+  Client->Director->bIsConnected = true;
+
+  // The Realm is back and its re-handshake has asked the Director.
+  Client->Realm->bIsConnected = true;
+  Client->bRealmReauthPending = true;
+  TestFalse(
+    TEXT("No retry waits while the answer is in flight"),
+    Client->TimerManager.IsTimerActive(Client->ReauthenticationAttemptTimer)
+  );
+
+  // The Director drops before it answers.
+  Client->Director->bIsConnected = false;
+  Client->NoteDirectorDrop();
+  Client->bAuthenticated = false;
+
+  TestTrue(
+    TEXT("The lost re-handshake is tried again"),
+    Client->TimerManager.IsTimerActive(Client->ReauthenticationAttemptTimer)
+  );
+
+  // The retry's answer ends the re-handshake, and no second one starts.
+  Client->EndRealmReauthentication(true);
+  TestFalse(
+    TEXT("The finished re-handshake leaves no retry"),
+    Client->TimerManager.IsTimerActive(Client->ReauthenticationAttemptTimer)
+  );
+
+  return true;
+}
+
 // A Logout in the silent grace after a Director drop, when the player is not
 // authenticated, must end the session: the held requests fail, the ids go, and
 // a re-login reply that lands after it does not log the player back in.

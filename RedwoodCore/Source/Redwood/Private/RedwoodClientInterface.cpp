@@ -3234,6 +3234,21 @@ void URedwoodClientInterface::NoteDirectorDrop() {
   // Count the request grace from the drop, like the game's own disconnect
   // grace.
   DirectorHeldRequests.StartGrace(TimerManager);
+
+  // A Realm re-handshake that already asked the Director for its token loses
+  // the answer with this socket, and nothing would ask again: every Realm
+  // request would then fail for good with no notice. Retry it the way it
+  // waits for the Director, once the re-login is done.
+  if (bRealmReauthPending && IsRealmConnected() &&
+      !TimerManager.IsTimerActive(ReauthenticationAttemptTimer)) {
+    TimerManager.SetTimer(
+      ReauthenticationAttemptTimer,
+      this,
+      &URedwoodClientInterface::BeginRealmReauthentication,
+      0.5f,
+      false
+    );
+  }
 }
 
 // Not AuthToken: a failed re-login writes the EMPTY ids of its reply before it
@@ -3282,6 +3297,9 @@ void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
 // and later ones fail instead of reaching a Realm that does not know the
 // player. The next handshake clears it.
 void URedwoodClientInterface::EndRealmReauthentication(bool bSucceeded) {
+  // A retry armed by a Director drop must not start a second handshake.
+  TimerManager.ClearTimer(ReauthenticationAttemptTimer);
+
   if (bSucceeded) {
     bRealmReauthPending = false;
     // Only when a Director re-login found the Realm not back yet: after a

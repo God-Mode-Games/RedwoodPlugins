@@ -434,6 +434,7 @@ private:
   // Drives the private reconnect state without a backend.
   friend class FRedwoodReloginFailureTest;
   friend class FRedwoodLogoutDuringGraceTest;
+  friend class FRedwoodRealmReauthRetryTest;
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);
