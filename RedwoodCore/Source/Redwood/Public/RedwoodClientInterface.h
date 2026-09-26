@@ -488,7 +488,11 @@ private:
   friend class FRedwoodDropAfterLogoutTest;
   friend class FRedwoodLogoutClosesReconnectingRealmTest;
   friend class FRedwoodFailedReloginStopsRealmRetryTest;
-  friend class FRedwoodUnrequestedCloseBacksOffTest; // FORK(hollowed-oath)
+  // FORK(hollowed-oath) BEGIN: the close handler tests.
+  friend class FRedwoodUnrequestedCloseBacksOffTest;
+  friend class FRedwoodLogoutRealmCloseStaysCleanTest;
+  friend class FRedwoodFailedReloginRealmCloseStaysCleanTest;
+  // FORK(hollowed-oath) END
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);

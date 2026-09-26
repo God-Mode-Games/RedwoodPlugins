@@ -505,3 +505,101 @@ bool FRedwoodFailedReloginStopsRealmRetryTest::RunTest(
 
   return true;
 }
+
+// FORK(hollowed-oath): Logout and a failed re-login close the Realm on
+// purpose. The close handler must not take that close as a drop: it would
+// report a lost connection and reconnect a session that is over.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodLogoutRealmCloseStaysCleanTest,
+  "Redwood.HeldRequests.LogoutRealmCloseStaysClean",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodLogoutRealmCloseStaysCleanTest::RunTest(
+  const FString &Parameters
+) {
+  FRedwoodSaveSlotGuard SaveSlot;
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
+
+  Client->Director = ISocketIOClientModule::Get().NewValidNativePointer();
+  Client->Realm = ISocketIOClientModule::Get().NewValidNativePointer();
+  ON_SCOPE_EXIT {
+    Client->Director->bIsConnected = false;
+    Client->Realm->bIsConnected = false;
+    Client->Deinitialize();
+  };
+
+  Client->bSentDirectorConnected = true;
+  Client->bSentRealmConnected = true;
+  Client->bAuthenticated = true;
+  Client->PlayerId = TEXT("player-1");
+  Client->AuthToken = TEXT("token-1");
+  Client->BindRealmCloseHandler();
+  int32 DropReports = 0;
+  Client->Realm->OnReconnectionCallback = [&DropReports](uint32, uint32) {
+    ++DropReports;
+  };
+
+  Client->Logout();
+  TestEqual(TEXT("Logout's Realm close reports no drop"), DropReports, 0);
+  TestEqual(
+    TEXT("Logout's Realm close schedules no reconnect"),
+    Client->RealmCloseBackoff.NumAttempts(),
+    0
+  );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodFailedReloginRealmCloseStaysCleanTest,
+  "Redwood.HeldRequests.FailedReloginRealmCloseStaysClean",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodFailedReloginRealmCloseStaysCleanTest::RunTest(
+  const FString &Parameters
+) {
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
+
+  Client->Director = ISocketIOClientModule::Get().NewValidNativePointer();
+  Client->Realm = ISocketIOClientModule::Get().NewValidNativePointer();
+  ON_SCOPE_EXIT {
+    Client->Director->bIsConnected = false;
+    Client->Realm->bIsConnected = false;
+    Client->Deinitialize();
+  };
+
+  Client->bSentDirectorConnected = true;
+  Client->bSentRealmConnected = true;
+  Client->bAuthenticated = true;
+  Client->PlayerId = TEXT("player-1");
+  Client->AuthToken = TEXT("token-1");
+  Client->BindRealmCloseHandler();
+  int32 DropReports = 0;
+  Client->Realm->OnReconnectionCallback = [&DropReports](uint32, uint32) {
+    ++DropReports;
+  };
+
+  // The Director drops, and its re-login fails and empties the ids.
+  Client->NoteDirectorDrop();
+  Client->bAuthenticated = false;
+  Client->PlayerId.Empty();
+  Client->AuthToken.Empty();
+  Client->EndDirectorReauthentication(false);
+
+  TestEqual(
+    TEXT("A failed re-login's Realm close reports no drop"), DropReports, 0
+  );
+  TestEqual(
+    TEXT("A failed re-login's Realm close schedules no reconnect"),
+    Client->RealmCloseBackoff.NumAttempts(),
+    0
+  );
+  return true;
+}
