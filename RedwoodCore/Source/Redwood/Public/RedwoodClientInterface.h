@@ -444,6 +444,9 @@ private:
   bool bRealmReauthPending = false;
   // The player was logged in when the Director dropped; kept until Logout.
   bool bLoggedInAtDrop = false;
+  // A Director re-login could not restore the online character because the
+  // Realm re-handshake was still pending.
+  bool bOnlineCharacterOwedAfterRealm = false;
 
   void HandleRegionsChanged(
     const FString &Event, const TSharedPtr<FJsonValue> &Message

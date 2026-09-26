@@ -2586,6 +2586,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
       // FORK(hollowed-oath): HollowedOath#2854. Requests held for the old
       // Realm socket cannot go to this one, so they fail now.
       bRealmReauthPending = false;
+      bOnlineCharacterOwedAfterRealm = false;
       RealmHeldRequests.Expire(TimerManager);
 
       Realm->OnReconnectionCallback = [InRealm, this](
@@ -3192,9 +3193,10 @@ TSharedPtr<FJsonObject> URedwoodClientInterface::MakeOnlineCharacterPayload(
 // state with no realm, so after a director-frontend move friends saw the
 // player with no character until the next character selection. Send the
 // character again when the player is still in the realm. When the realm
-// socket is down too, EndRealmReauthentication sends it instead.
+// is not back yet, EndRealmReauthentication sends it instead.
 void URedwoodClientInterface::ResendOnlineCharacter() {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  if (!IsRealmConnected() || bRealmReauthPending) {
+    bOnlineCharacterOwedAfterRealm = bRealmReauthPending;
     return;
   }
 
@@ -3251,11 +3253,12 @@ void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
 void URedwoodClientInterface::EndRealmReauthentication(bool bSucceeded) {
   if (bSucceeded) {
     bRealmReauthPending = false;
-    // When the Realm comes back after the Director, the Director re-login
-    // found no Realm and did not restore the online character.
-    if (IsDirectorConnected() && bAuthenticated) {
+    // Only when a Director re-login found the Realm not back yet: after a
+    // Realm-only drop, the online state still has the character.
+    if (bOnlineCharacterOwedAfterRealm && IsDirectorConnected() && bAuthenticated) {
       ResendOnlineCharacter();
     }
+    bOnlineCharacterOwedAfterRealm = false;
     RealmHeldRequests.Release(TimerManager);
   } else {
     RealmHeldRequests.Expire(TimerManager);
