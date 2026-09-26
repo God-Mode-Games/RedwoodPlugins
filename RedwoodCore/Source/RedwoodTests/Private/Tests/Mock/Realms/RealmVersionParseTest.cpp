@@ -24,12 +24,15 @@ namespace RedwoodRealmVersionParseTest {
     "\"uri\": \"ws://127.0.0.1:3011\", \"listed\": true, \"secret\": \"\""
   );
 
-  FRedwoodRealm ParseRealmJson(const FString &ExtraFields) {
+  FRedwoodRealm
+  ParseRealmJson(FAutomationTestBase &Test, const FString &ExtraFields) {
     const FString Json =
       FString::Printf(TEXT("{%s%s}"), RealmFieldsWithoutVersion, *ExtraFields);
     TSharedPtr<FJsonObject> Object;
     FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Object);
-    check(Object.IsValid());
+    if (!Test.TestTrue(TEXT("the fixture is JSON"), Object.IsValid())) {
+      return FRedwoodRealm();
+    }
     return URedwoodClientInterface::ParseRealm(Object);
   }
 }
@@ -46,10 +49,10 @@ bool FRedwoodRealmVersionParseTest::RunTest(const FString &Parameters) {
   const FString Commit = TEXT("0123456789abcdef0123456789abcdef01234567");
 
   const FRedwoodRealm WithVersion =
-    ParseRealmJson(FString::Printf(TEXT(", \"version\": \"%s\""), *Commit));
+    ParseRealmJson(*this, FString::Printf(TEXT(", \"version\": \"%s\""), *Commit));
   TestEqual(TEXT("version is kept"), WithVersion.Version, Commit);
 
-  const FRedwoodRealm WithoutVersion = ParseRealmJson(FString());
+  const FRedwoodRealm WithoutVersion = ParseRealmJson(*this, FString());
   TestEqual(
     TEXT("missing version is empty"), WithoutVersion.Version, FString()
   );
@@ -58,7 +61,7 @@ bool FRedwoodRealmVersionParseTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("listed still parses"), WithoutVersion.bListed);
 
   const FRedwoodRealm NullVersion =
-    ParseRealmJson(TEXT(", \"version\": null"));
+    ParseRealmJson(*this, TEXT(", \"version\": null"));
   TestEqual(TEXT("null version is empty"), NullVersion.Version, FString());
 
   return true;
