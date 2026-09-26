@@ -4,13 +4,9 @@
 
 #include "RedwoodCloseBackoff.h"
 
-bool FRedwoodCloseBackoff::Schedule(
+float FRedwoodCloseBackoff::Schedule(
   FTimerManager &TimerManager, TFunction<void()> Reconnect
 ) {
-  if (Attempts >= MaxAttempts) {
-    return false;
-  }
-
   const float DelaySeconds = NextDelaySeconds();
   ++Attempts;
   TimerManager.SetTimer(
@@ -19,7 +15,7 @@ bool FRedwoodCloseBackoff::Schedule(
     DelaySeconds,
     false
   );
-  return true;
+  return DelaySeconds;
 }
 
 void FRedwoodCloseBackoff::Reset(FTimerManager &TimerManager) {

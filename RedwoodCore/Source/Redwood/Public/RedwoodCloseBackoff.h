@@ -16,12 +16,12 @@ public:
   static constexpr float InitialDelaySeconds = 1.0f;
   static constexpr float DelayMultiplier = 2.0f;
   static constexpr float MaxDelaySeconds = 30.0f;
-  // About a minute of closes in a row. After that the socket stays down and
-  // the lost connection stands, so the game shows it.
-  static constexpr int32 MaxAttempts = 6;
 
-  // Runs Reconnect after the next delay. False when the attempts are spent.
-  bool Schedule(FTimerManager &TimerManager, TFunction<void()> Reconnect);
+  // Runs Reconnect after the next delay, and returns that delay. It never
+  // gives up: a rolling deploy can close a client many times in a row, and
+  // the client must come back when the backend does. Once the delay reaches
+  // the maximum, it retries at the maximum.
+  float Schedule(FTimerManager &TimerManager, TFunction<void()> Reconnect);
 
   // After a good re-login, and when the socket goes away.
   void Reset(FTimerManager &TimerManager);

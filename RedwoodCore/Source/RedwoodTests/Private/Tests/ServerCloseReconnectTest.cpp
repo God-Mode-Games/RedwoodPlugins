@@ -291,6 +291,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodUnrequestedCloseBacksOffTest::RunTest(const FString &Parameters) {
+  // More closes than it takes the delay to reach its maximum.
+  constexpr int32 RepeatedCloses = 10;
+
   TStrongObjectPtr<URedwoodClientInterface> Interface(
     NewObject<URedwoodClientInterface>()
   );
@@ -317,8 +320,9 @@ bool FRedwoodUnrequestedCloseBacksOffTest::RunTest(const FString &Parameters) {
     1
   );
 
-  // A server that accepts and then closes again, past the maximum.
-  for (int32 Close = 1; Close <= FRedwoodCloseBackoff::MaxAttempts; ++Close) {
+  // A server that accepts and then closes again, long past the point where
+  // the delay reaches its maximum.
+  for (int32 Close = 1; Close <= RepeatedCloses; ++Close) {
     Client->Realm->OnDisconnectedCallback(
       ESIOConnectionCloseReason::CLOSE_REASON_NORMAL
     );
@@ -326,12 +330,11 @@ bool FRedwoodUnrequestedCloseBacksOffTest::RunTest(const FString &Parameters) {
   TestEqual(
     TEXT("Every close reports the drop, so the lost connection stands"),
     DropReports,
-    FRedwoodCloseBackoff::MaxAttempts + 1
+    RepeatedCloses + 1
   );
-  TestEqual(
-    TEXT("No reconnect after the maximum attempts"),
-    Client->RealmCloseBackoff.NumAttempts(),
-    FRedwoodCloseBackoff::MaxAttempts
+  TestTrue(
+    TEXT("The client still retries after many closes"),
+    Client->RealmCloseBackoff.IsReconnectPending(Client->TimerManager)
   );
 
   Client->EndRealmReauthentication(true);

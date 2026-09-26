@@ -3280,19 +3280,30 @@ URedwoodClientInterface::MakeUnrequestedCloseHandler(
       return;
     }
 
-    // Every close reports the drop. When the attempts are spent, that report
-    // is the last word, so the game keeps showing the lost connection.
+    const float DelaySeconds =
+      Backoff.Schedule(TimerManager, [this, WeakSocket]() {
+        if (TSharedPtr<FSocketIONative> Pinned = WeakSocket.Pin()) {
+          ReconnectSocket(*Pinned);
+        }
+      });
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT(
+        "The server closed a socket that the client did not ask to close; reconnecting in %.1f s (attempt %d)."
+      ),
+      DelaySeconds,
+      Backoff.NumAttempts()
+    );
+
+    // Every close reports the drop, so the game shows the lost connection
+    // until the socket is back.
     if (Socket->OnReconnectionCallback) {
       Socket->OnReconnectionCallback(
         static_cast<uint32>(Backoff.NumAttempts()),
-        static_cast<uint32>(Backoff.NextDelaySeconds() * 1000.0f)
+        static_cast<uint32>(DelaySeconds * 1000.0f)
       );
     }
-    Backoff.Schedule(TimerManager, [this, WeakSocket]() {
-      if (TSharedPtr<FSocketIONative> Pinned = WeakSocket.Pin()) {
-        ReconnectSocket(*Pinned);
-      }
-    });
   };
 }
 
