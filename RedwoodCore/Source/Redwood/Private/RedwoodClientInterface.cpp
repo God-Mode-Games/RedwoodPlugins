@@ -220,6 +220,15 @@ void URedwoodClientInterface::InitializeDirectorConnection(
         *Uri
       );
 
+      // FORK(hollowed-oath): HollowedOath#2854. A player who logged out has
+      // nothing to re-login with, and a failed re-login would report an
+      // authentication failure on the title screen.
+      bLoggedOutDuringRelogin = false;
+      if (!HasPlayerSession()) {
+        OnDirectorConnectionReestablished.Broadcast();
+        return;
+      }
+
       Login(
         PlayerId,
         AuthToken,
@@ -446,7 +455,18 @@ void URedwoodClientInterface::Register(
 }
 
 void URedwoodClientInterface::Logout() {
-  if (IsLoggedIn()) {
+  // FORK(hollowed-oath): HollowedOath#2854. Not IsLoggedIn: in the silent grace
+  // after a Director drop the player is not authenticated, and a no-op here
+  // let the re-login bring the player back after they chose to leave.
+  if (HasPlayerSession()) {
+    // Before the ids are cleared, so the held requests fail and are not sent.
+    DirectorHeldRequests.Expire(TimerManager);
+    RealmHeldRequests.Expire(TimerManager);
+    TimerManager.ClearTimer(ReauthenticationAttemptTimer);
+    bRealmReauthPending = false;
+    bOnlineCharacterOwedAfterRealm = false;
+    bLoggedOutDuringRelogin = true;
+
     TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
     Payload->SetStringField(TEXT("playerId"), PlayerId);
 
@@ -3239,6 +3259,15 @@ bool URedwoodClientInterface::CanSendToRealm() {
 // Director was away. A failed re-login ended the session, so the held requests
 // fail now instead of at the end of the grace.
 void URedwoodClientInterface::EndDirectorReauthentication(bool bSucceeded) {
+  // The player logged out while the re-login was in flight; its reply has
+  // just logged them in again, so log out again.
+  if (bLoggedOutDuringRelogin) {
+    if (bSucceeded) {
+      Logout();
+    }
+    return;
+  }
+
   if (bSucceeded) {
     ResendOnlineCharacter();
     DirectorHeldRequests.Release(TimerManager);

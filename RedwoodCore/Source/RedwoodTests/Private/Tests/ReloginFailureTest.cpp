@@ -131,3 +131,73 @@ bool FRedwoodReloginFailureTest::RunTest(const FString &Parameters) {
 
   return true;
 }
+
+// A Logout in the silent grace after a Director drop, when the player is not
+// authenticated, must end the session: the held requests fail, the ids go, and
+// a re-login reply that lands after it does not log the player back in.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodLogoutDuringGraceTest,
+  "Redwood.HeldRequests.LogoutDuringGrace",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodLogoutDuringGraceTest::RunTest(const FString &Parameters) {
+  TStrongObjectPtr<URedwoodClientInterface> Interface(
+    NewObject<URedwoodClientInterface>()
+  );
+  URedwoodClientInterface *Client = Interface.Get();
+
+  Client->Director = ISocketIOClientModule::Get().NewValidNativePointer();
+  Client->Realm = ISocketIOClientModule::Get().NewValidNativePointer();
+  ON_SCOPE_EXIT {
+    Client->Director->bIsConnected = false;
+    Client->Realm->bIsConnected = false;
+    Client->Deinitialize();
+  };
+
+  Client->bSentDirectorConnected = true;
+  Client->bSentRealmConnected = true;
+  Client->bAuthenticated = true;
+  Client->PlayerId = TEXT("player-1");
+  Client->AuthToken = TEXT("token-1");
+
+  // The Director drops and is back, but the player's re-login is not done,
+  // so a Director request is held. The Realm stays down: Logout would close a
+  // connected Realm socket, and none is open here.
+  Client->NoteDirectorDrop();
+  Client->bAuthenticated = false;
+  Client->Director->bIsConnected = true;
+
+  FErrorCapture Friend;
+  Client->RequestFriend(TEXT("player-2"), Friend.MakeDelegate());
+  TestEqual(
+    TEXT("Director request is held"), Client->DirectorHeldRequests.Num(), 1
+  );
+
+  Client->Logout();
+
+  TestTrue(TEXT("Logout clears the player id"), Client->PlayerId.IsEmpty());
+  TestTrue(TEXT("Logout clears the token"), Client->AuthToken.IsEmpty());
+  TestEqual(
+    TEXT("Held request fails, it is not sent"),
+    Friend.Error,
+    TEXT("Not connected to Director.")
+  );
+  TestEqual(
+    TEXT("Nothing stays held"), Client->DirectorHeldRequests.Num(), 0
+  );
+
+  // The re-login reply lands after the Logout, as the Login reply writes it.
+  Client->PlayerId = TEXT("player-1");
+  Client->AuthToken = TEXT("token-1");
+  Client->bAuthenticated = true;
+  Client->EndDirectorReauthentication(true);
+
+  TestFalse(
+    TEXT("A late re-login reply does not log the player back in"),
+    Client->IsLoggedIn()
+  );
+  TestTrue(TEXT("Its token is dropped again"), Client->AuthToken.IsEmpty());
+
+  return true;
+}

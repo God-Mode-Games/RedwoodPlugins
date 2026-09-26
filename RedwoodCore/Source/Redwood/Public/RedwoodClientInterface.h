@@ -433,6 +433,7 @@ private:
   bool HasPlayerSession() const;
   // Drives the private reconnect state without a backend.
   friend class FRedwoodReloginFailureTest;
+  friend class FRedwoodLogoutDuringGraceTest;
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);
@@ -447,6 +448,9 @@ private:
   // A Director re-login could not restore the online character because the
   // Realm re-handshake was still pending.
   bool bOnlineCharacterOwedAfterRealm = false;
+  // Set by Logout, cleared when a re-login starts: a re-login reply after it
+  // must not log the player back in.
+  bool bLoggedOutDuringRelogin = false;
 
   void HandleRegionsChanged(
     const FString &Event, const TSharedPtr<FJsonValue> &Message
