@@ -15,10 +15,9 @@
 // hangs. That gate must refuse a socket whose re-login is not done.
 class REDWOOD_API FRedwoodHeldRequests {
 public:
-  // Keep equal to SocketDropGraceSeconds in HollowedOath
-  // (Source/HollowedOath/Connection/ConnectionNotificationSubsystem.cpp):
-  // past it the game shows its disconnect modal, so a held request must have
-  // failed by then.
+  // HollowedOath reads this for the grace of its disconnect modal
+  // (ConnectionNotificationSubsystem), so a held request fails when the
+  // player is told.
   static constexpr float GraceSeconds = 10.0f;
 
   // The connection gate of a held request. A socket that is back but whose
