@@ -61,16 +61,12 @@ void URedwoodClientInterface::Deinitialize() {
 
 // FORK(hollowed-oath) BEGIN: shared by Deinitialize and a new handshake.
 void URedwoodClientInterface::ReleaseRealmSocket() {
-  TimerManager.ClearTimer(ReauthenticationAttemptTimer);
   if (Realm.IsValid()) {
     Realm->ClearAllCallbacks();
     Realm->Disconnect();
     ISocketIOClientModule::Get().ReleaseNativePointer(Realm);
     Realm = nullptr;
   }
-  // The next socket starts as a first connect, not as a drop of this one.
-  bRealmDisconnected = true;
-  bSentInitialRealmConnectionFailureLog = false;
 }
 // FORK(hollowed-oath) END
 
@@ -2616,6 +2612,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
   }
 
   CurrentRealm = FRedwoodRealm();
+  const uint32 Generation = ++RealmHandshakeGeneration; // FORK(hollowed-oath)
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
@@ -2624,7 +2621,15 @@ void URedwoodClientInterface::InitiateRealmHandshake(
   Director->Emit(
     TEXT("realm:auth:player:connect:client-to-director"),
     Payload,
-    [this, InRealm, OnRealmConnected](auto Response) {
+    [this, InRealm, OnRealmConnected, Generation](auto Response) {
+      // FORK(hollowed-oath): a late answer must not replace a newer socket.
+      if (Generation != RealmHandshakeGeneration) {
+        FRedwoodSocketConnected Output;
+        Output.Error = TEXT("A newer Realm connection replaced this one.");
+        OnRealmConnected.ExecuteIfBound(Output);
+        return;
+      }
+
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
       FString Token = MessageObject->GetStringField(TEXT("token"));
@@ -2733,10 +2738,16 @@ void URedwoodClientInterface::BeginRealmReauthentication() {
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("realmId"), CurrentRealmId);
 
+  const uint32 Generation = RealmHandshakeGeneration; // FORK(hollowed-oath)
   Director->Emit(
     TEXT("realm:auth:player:connect:client-to-director"),
     Payload,
-    [this](auto Response) {
+    [this, Generation](auto Response) {
+      // FORK(hollowed-oath): the token is for a socket a new handshake replaced.
+      if (Generation != RealmHandshakeGeneration) {
+        return;
+      }
+
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
       FString Token = MessageObject->GetStringField(TEXT("token"));
@@ -2797,10 +2808,16 @@ void URedwoodClientInterface::FinalizeRealmHandshake(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("token"), Token);
 
+  const uint32 Generation = RealmHandshakeGeneration; // FORK(hollowed-oath)
   Realm->Emit(
     TEXT("realm:auth:player:connect:client-to-realm"),
     Payload,
-    [this, OnRealmConnected](auto Response) {
+    [this, OnRealmConnected, Generation](auto Response) {
+      // FORK(hollowed-oath): an answer queued before its socket was replaced.
+      if (Generation != RealmHandshakeGeneration) {
+        return;
+      }
+
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 

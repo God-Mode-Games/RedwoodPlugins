@@ -411,9 +411,12 @@ private:
   TSharedPtr<FSocketIONative> Director;
   TSharedPtr<FSocketIONative> Realm;
 
-  // FORK(hollowed-oath): tears down the realm socket and its state, so a
-  // replaced socket cannot finish a handshake or report a false connection loss.
+  // FORK(hollowed-oath) BEGIN: a retry replaces the realm socket. The old
+  // socket's callbacks go with it, and a Director or Realm answer of an older
+  // handshake is dropped, so neither can act on the new socket.
   void ReleaseRealmSocket();
+  uint32 RealmHandshakeGeneration = 0;
+  // FORK(hollowed-oath) END
 
   void InitiateRealmHandshake(
     FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected
