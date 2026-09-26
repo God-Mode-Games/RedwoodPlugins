@@ -51,18 +51,24 @@ void URedwoodClientInterface::Deinitialize() {
     Director = nullptr;
   }
 
-  if (Realm.IsValid()) {
-    Realm->ClearAllCallbacks();
-    Realm->Disconnect();
-    ISocketIOClientModule::Get().ReleaseNativePointer(Realm);
-    Realm = nullptr;
-  }
+  ReleaseRealmSocket();
 
   // FORK(hollowed-oath): HollowedOath#2854. The callers are going away too, so
   // a held request is dropped, not failed.
   DirectorHeldRequests.Reset(TimerManager);
   RealmHeldRequests.Reset(TimerManager);
 }
+
+// FORK(hollowed-oath) BEGIN: shared by Deinitialize and a new handshake.
+void URedwoodClientInterface::ReleaseRealmSocket() {
+  if (Realm.IsValid()) {
+    Realm->ClearAllCallbacks();
+    Realm->Disconnect();
+    ISocketIOClientModule::Get().ReleaseNativePointer(Realm);
+    Realm = nullptr;
+  }
+}
+// FORK(hollowed-oath) END
 
 // FORK(hollowed-oath): HollowedOath#2854. A backend move drops a socket for a
 // few seconds. A request made then used to fail at once ("Not connected"), or,
@@ -2714,26 +2720,34 @@ void URedwoodClientInterface::ListRealms(
     const TArray<TSharedPtr<FJsonValue>> &Realms =
       MessageObject->GetArrayField(TEXT("realms"));
 
+    // FORK(hollowed-oath): the loop body moved into ParseRealm so a test can reach it.
     for (TSharedPtr<FJsonValue> InRealm : Realms) {
-      FRedwoodRealm OutRealm;
-      TSharedPtr<FJsonObject> RealmObj = InRealm->AsObject();
-      OutRealm.Id = RealmObj->GetStringField(TEXT("id"));
-      FDateTime::ParseIso8601(
-        *RealmObj->GetStringField(TEXT("createdAt")), OutRealm.CreatedAt
-      );
-      FDateTime::ParseIso8601(
-        *RealmObj->GetStringField(TEXT("updatedAt")), OutRealm.UpdatedAt
-      );
-      OutRealm.Name = RealmObj->GetStringField(TEXT("name"));
-      OutRealm.Uri = RealmObj->GetStringField(TEXT("uri"));
-      OutRealm.bListed = RealmObj->GetBoolField(TEXT("listed"));
-      OutRealm.Secret = RealmObj->GetStringField(TEXT("secret"));
-
-      Output.Realms.Add(OutRealm);
+      Output.Realms.Add(ParseRealm(InRealm->AsObject()));
     }
 
     OnOutput.ExecuteIfBound(Output);
   });
+}
+
+FRedwoodRealm URedwoodClientInterface::ParseRealm(
+  const TSharedPtr<FJsonObject> &RealmObj
+) {
+  FRedwoodRealm OutRealm;
+  OutRealm.Id = RealmObj->GetStringField(TEXT("id"));
+  FDateTime::ParseIso8601(
+    *RealmObj->GetStringField(TEXT("createdAt")), OutRealm.CreatedAt
+  );
+  FDateTime::ParseIso8601(
+    *RealmObj->GetStringField(TEXT("updatedAt")), OutRealm.UpdatedAt
+  );
+  OutRealm.Name = RealmObj->GetStringField(TEXT("name"));
+  OutRealm.Uri = RealmObj->GetStringField(TEXT("uri"));
+  OutRealm.bListed = RealmObj->GetBoolField(TEXT("listed"));
+  OutRealm.Secret = RealmObj->GetStringField(TEXT("secret"));
+  // FORK(hollowed-oath): an older director sends no version. TryGet keeps it
+  // empty and does not log the error that GetStringField writes.
+  RealmObj->TryGetStringField(TEXT("version"), OutRealm.Version);
+  return OutRealm;
 }
 
 void URedwoodClientInterface::InitializeConnectionForFirstRealm(
@@ -2784,6 +2798,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
   }
 
   CurrentRealm = FRedwoodRealm();
+  const uint32 Generation = ++RealmHandshakeGeneration; // FORK(hollowed-oath)
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
@@ -2792,7 +2807,15 @@ void URedwoodClientInterface::InitiateRealmHandshake(
   Director->Emit(
     TEXT("realm:auth:player:connect:client-to-director"),
     Payload,
-    [this, InRealm, OnRealmConnected](auto Response) {
+    [this, InRealm, OnRealmConnected, Generation](auto Response) {
+      // FORK(hollowed-oath): a late answer must not replace a newer socket.
+      if (Generation != RealmHandshakeGeneration) {
+        FRedwoodSocketConnected Output;
+        Output.Error = TEXT("A newer Realm connection replaced this one.");
+        OnRealmConnected.ExecuteIfBound(Output);
+        return;
+      }
+
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
       FString Token = MessageObject->GetStringField(TEXT("token"));
@@ -2804,6 +2827,9 @@ void URedwoodClientInterface::InitiateRealmHandshake(
         return;
       }
 
+      // FORK(hollowed-oath): a retry replaces the socket. Release the old one
+      // first, or its callbacks still act on the new socket.
+      ReleaseRealmSocket();
       CurrentRealmId = InRealm.Id;
       CurrentRealm = InRealm;
       Realm = ISocketIOClientModule::Get().NewValidNativePointer();
@@ -2898,10 +2924,16 @@ void URedwoodClientInterface::BeginRealmReauthentication() {
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("realmId"), CurrentRealmId);
 
+  const uint32 Generation = RealmHandshakeGeneration; // FORK(hollowed-oath)
   Director->Emit(
     TEXT("realm:auth:player:connect:client-to-director"),
     Payload,
-    [this](auto Response) {
+    [this, Generation](auto Response) {
+      // FORK(hollowed-oath): the token is for a socket a new handshake replaced.
+      if (Generation != RealmHandshakeGeneration) {
+        return;
+      }
+
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
       FString Token = MessageObject->GetStringField(TEXT("token"));
@@ -2962,10 +2994,16 @@ void URedwoodClientInterface::FinalizeRealmHandshake(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("token"), Token);
 
+  const uint32 Generation = RealmHandshakeGeneration; // FORK(hollowed-oath)
   Realm->Emit(
     TEXT("realm:auth:player:connect:client-to-realm"),
     Payload,
-    [this, OnRealmConnected](auto Response) {
+    [this, OnRealmConnected, Generation](auto Response) {
+      // FORK(hollowed-oath): an answer queued before its socket was replaced.
+      if (Generation != RealmHandshakeGeneration) {
+        return;
+      }
+
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
