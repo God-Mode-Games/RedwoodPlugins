@@ -432,6 +432,11 @@ private:
   void NoteDirectorDrop();
   void NoteFirstDirectorConnect();
   void NoteFirstRealmConnect();
+  void NoteRealmDrop();
+  // A first connect failed twice, so a lost connection was broadcast before
+  // the socket ever connected.
+  bool bLostBeforeFirstDirectorConnect = false;
+  bool bLostBeforeFirstRealmConnect = false;
   bool HasPlayerSession() const;
   // Drives the private reconnect state without a backend.
   friend class FRedwoodReloginFailureTest;

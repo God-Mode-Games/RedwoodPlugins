@@ -2634,15 +2634,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
             ),
             *InRealm.Uri
           );
-          // FORK(hollowed-oath): HollowedOath#2854. The Realm socket reports
-          // connected again before the player is authenticated on it, so the
-          // held requests wait for the re-handshake, not for the socket. A
-          // first connection that keeps failing also lands here; it has no
-          // handshake to redo and no request to hold.
-          if (bSentRealmConnected) {
-            bRealmReauthPending = true;
-            RealmHeldRequests.StartGrace(TimerManager);
-          }
+          NoteRealmDrop(); // FORK(hollowed-oath): HollowedOath#2854.
           OnRealmConnectionLost.Broadcast();
         }
       };
@@ -3235,18 +3227,34 @@ void URedwoodClientInterface::ResendOnlineCharacter() {
 // the game shows a message for it. Its success is the only event that can take
 // that message down; the reconnect path broadcasts after its re-login instead.
 void URedwoodClientInterface::NoteFirstDirectorConnect() {
-  if (!bSentDirectorConnected && bDirectorDisconnected) {
+  if (bLostBeforeFirstDirectorConnect && !bSentDirectorConnected) {
+    bLostBeforeFirstDirectorConnect = false;
     OnDirectorConnectionReestablished.Broadcast();
   }
 }
 
 void URedwoodClientInterface::NoteFirstRealmConnect() {
-  if (!bSentRealmConnected && bRealmDisconnected) {
+  if (bLostBeforeFirstRealmConnect && !bSentRealmConnected) {
+    bLostBeforeFirstRealmConnect = false;
     OnRealmConnectionReestablished.Broadcast();
   }
 }
 
+// The Realm socket reports connected again before the player is authenticated
+// on it, so the held requests wait for the re-handshake, not for the socket. A
+// first connection that keeps failing also lands here; it has no handshake to
+// redo and no request to hold, but the game was told the connection is lost.
+void URedwoodClientInterface::NoteRealmDrop() {
+  if (bSentRealmConnected) {
+    bRealmReauthPending = true;
+    RealmHeldRequests.StartGrace(TimerManager);
+  } else {
+    bLostBeforeFirstRealmConnect = true;
+  }
+}
+
 void URedwoodClientInterface::NoteDirectorDrop() {
+  bLostBeforeFirstDirectorConnect = !bSentDirectorConnected;
   bLoggedInAtDrop = bLoggedInAtDrop || bAuthenticated;
   // Count the request grace from the drop, like the game's own disconnect
   // grace.

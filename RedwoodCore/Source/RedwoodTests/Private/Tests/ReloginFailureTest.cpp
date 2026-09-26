@@ -159,9 +159,10 @@ bool FRedwoodFirstConnectAfterLossTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("Plain first Director connect"), Listener->DirectorCount, 0);
   TestEqual(TEXT("Plain first Realm connect"), Listener->RealmCount, 0);
 
-  // Both first connects failed twice: the lost broadcasts went out.
-  Client->bDirectorDisconnected = true;
-  Client->bRealmDisconnected = true;
+  // Both first connects failed twice: the lost broadcasts went out, through
+  // the same hooks the reconnection callbacks call.
+  Client->NoteDirectorDrop();
+  Client->NoteRealmDrop();
   Client->NoteFirstDirectorConnect();
   Client->NoteFirstRealmConnect();
   TestEqual(
@@ -175,9 +176,11 @@ bool FRedwoodFirstConnectAfterLossTest::RunTest(const FString &Parameters) {
     1
   );
 
-  // A reconnect of an established socket waits for its re-login.
+  // A drop of an established socket waits for its re-login instead.
   Client->bSentDirectorConnected = true;
   Client->bSentRealmConnected = true;
+  Client->NoteDirectorDrop();
+  Client->NoteRealmDrop();
   Client->NoteFirstDirectorConnect();
   Client->NoteFirstRealmConnect();
   TestEqual(TEXT("Director reconnect waits"), Listener->DirectorCount, 1);
