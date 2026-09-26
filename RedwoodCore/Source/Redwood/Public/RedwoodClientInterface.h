@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "RedwoodHeldRequests.h" // FORK(hollowed-oath): HollowedOath#2854.
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
 
@@ -312,6 +313,19 @@ public:
 
   void SetSelectedCharacter(FString CharacterId);
 
+  // FORK(hollowed-oath): HollowedOath#2854. The director route that sets the
+  // character that friends see. Kept here so the unit test pins the name.
+  static constexpr const TCHAR *SetOnlineCharacterEventName =
+    TEXT("director:players:online-state:set-character");
+
+  // FORK(hollowed-oath): HollowedOath#2854. Null when any id is empty: the
+  // director rejects such a request, and there is nothing to restore.
+  static TSharedPtr<FJsonObject> MakeOnlineCharacterPayload(
+    const FString &InPlayerId,
+    const FString &InCharacterId,
+    const FString &InRealmId
+  );
+
   void JoinMatchmaking(
     FString ProfileId,
     TArray<FString> InRegions,
@@ -412,6 +426,62 @@ private:
   UFUNCTION()
   void BeginRealmReauthentication();
   FTimerHandle ReauthenticationAttemptTimer;
+
+  // FORK(hollowed-oath): HollowedOath#2854. See the .cpp.
+  void ResendOnlineCharacter();
+  template <typename TOutput>
+  bool Gate(
+    FRedwoodHeldRequests &Held,
+    bool bSessionEstablished,
+    bool bCanSend,
+    const TCHAR *NotConnectedError,
+    TFunction<void()> Request,
+    const TDelegate<void(const TOutput &)> &OnOutput
+  );
+  template <typename TOutput>
+  bool GateDirector(
+    TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
+  );
+  template <typename TOutput>
+  bool GateRealm(
+    TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
+  );
+  void NoteDirectorDrop();
+  void NoteFirstDirectorConnect();
+  void NoteFirstRealmConnect();
+  void NoteRealmDrop();
+  // A first connect failed twice, so a lost connection was broadcast before
+  // the socket ever connected.
+  bool bLostBeforeFirstDirectorConnect = false;
+  bool bLostBeforeFirstRealmConnect = false;
+  bool HasPlayerSession() const;
+  // Drives the private reconnect state without a backend.
+  friend class FRedwoodReloginFailureTest;
+  friend class FRedwoodLogoutDuringGraceTest;
+  friend class FRedwoodRealmReauthRetryTest;
+  friend class FRedwoodFirstConnectAfterLossTest;
+  friend class FRedwoodDropAfterLogoutTest;
+  friend class FRedwoodLogoutClosesReconnectingRealmTest;
+  friend class FRedwoodFailedReloginStopsRealmRetryTest;
+  bool CanSendToDirector();
+  bool CanSendToRealm();
+  void EndDirectorReauthentication(bool bSucceeded);
+  void EndRealmReauthentication(bool bSucceeded);
+  FRedwoodHeldRequests DirectorHeldRequests;
+  FRedwoodHeldRequests RealmHeldRequests;
+  // The Realm socket dropped and the player is not authenticated on it again
+  // yet; the Director has bAuthenticated for this.
+  bool bRealmReauthPending = false;
+  // The player was logged in when the Director dropped. Kept through a failed
+  // re-login, so the dead session's requests fail; cleared by a successful
+  // re-login and by Logout.
+  bool bLoggedInAtDrop = false;
+  // A Director re-login could not restore the online character because the
+  // Realm re-handshake was still pending.
+  bool bOnlineCharacterOwedAfterRealm = false;
+  // Set by Logout, cleared when a re-login starts: a re-login reply after it
+  // must not log the player back in.
+  bool bLoggedOutDuringRelogin = false;
 
   void HandleRegionsChanged(
     const FString &Event, const TSharedPtr<FJsonValue> &Message
