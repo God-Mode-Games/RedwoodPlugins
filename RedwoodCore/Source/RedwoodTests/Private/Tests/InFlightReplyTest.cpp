@@ -50,6 +50,48 @@ public:
   static void NoteRealmDrop(FClient &C) {
     C.NoteRealmDrop();
   }
+  static void NoteRealmReconnected(FClient &C) {
+    C.NoteRealmReconnected();
+  }
+  static bool &bAbandonedQueueJoin(FClient &C) {
+    return C.bAbandonedQueueJoin;
+  }
+  static FString &ServerConnection(FClient &C) {
+    return C.ServerConnection;
+  }
+  static FRedwoodTicketingUpdateDelegate &OnTicketingUpdate(FClient &C) {
+    return C.OnTicketingUpdate;
+  }
+  static void BindRealmEvents(FClient &C) {
+    C.BindRealmEvents();
+  }
+  static TSharedPtr<FSocketIONative> &Director(FClient &C) {
+    return C.Director;
+  }
+  static bool &bDirectorDisconnected(FClient &C) {
+    return C.bDirectorDisconnected;
+  }
+  static bool &bSentDirectorConnected(FClient &C) {
+    return C.bSentDirectorConnected;
+  }
+  static bool &bRealmReauthPending(FClient &C) {
+    return C.bRealmReauthPending;
+  }
+  static void NoteDirectorDrop(FClient &C) {
+    C.NoteDirectorDrop();
+  }
+  static void BeginRealmReauthentication(FClient &C) {
+    C.BeginRealmReauthentication();
+  }
+  static bool IsRealmReauthRetryPending(FClient &C) {
+    return C.TimerManager.IsTimerActive(C.ReauthenticationAttemptTimer);
+  }
+  static int32 NumDirectorReplies(FClient &C) {
+    return C.DirectorReplies.Num();
+  }
+  static int32 NumRealmHeldRequests(FClient &C) {
+    return C.RealmHeldRequests.Num();
+  }
 };
 
 namespace RedwoodInFlightTest {
@@ -101,6 +143,7 @@ namespace RedwoodInFlightTest {
         }
       };
       Realm->OnConnectedCallback = [Raw](const FString &, const FString &) {
+        FAccess::NoteRealmReconnected(*Raw);
         FAccess::bRealmDisconnected(*Raw) = false;
       };
       Realm->Connect(FString::Printf(TEXT("ws://127.0.0.1:%d"), Server->Port));
@@ -201,6 +244,229 @@ namespace RedwoodInFlightTest {
     ExpectClearError(Test, TEXT("Zone join"), bAnswered, Error);
     return true;
   }
+
+  // Review focus: JoinQueue is not held by a gate, so one sent after the drop
+  // was not pending when the drop failed the others. It must fail at the
+  // reconnect. Pins: the FailAll in NoteRealmReconnected.
+  bool RunZoneJoinSentAfterDrop(FAutomationTestBase &Test) {
+    bool bAnswered = false;
+    FString Error;
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    Test.TestTrue(TEXT("The server closes"), Harness.Close(EClose::ServiceRestart));
+    if (!Test.TestTrue(
+          TEXT("The client notes the drop"),
+          PumpGameThreadUntil([&C]() { return FAccess::bRealmDisconnected(C); })
+        )) {
+      return false;
+    }
+
+    C.JoinQueue(
+      TEXT("proxy-1"),
+      TEXT("zone-1"),
+      false,
+      false,
+      FRedwoodTicketingUpdateDelegate::CreateLambda(
+        [&](const FRedwoodTicketingUpdate &Update) {
+          bAnswered = true;
+          Error = Update.Message;
+        }
+      )
+    );
+    Test.TestFalse(TEXT("Nothing answers before the reconnect"), bAnswered);
+
+    Test.TestTrue(TEXT("The client reconnects"), Harness.Server->AcceptSession());
+    PumpGameThreadUntil([&bAnswered]() { return bAnswered; });
+    ExpectClearError(Test, TEXT("Zone join sent after the drop"), bAnswered, Error);
+    Test.TestTrue(
+      TEXT("The lost join is dropped until the queue is left"),
+      FAccess::bAbandonedQueueJoin(C)
+    );
+    return true;
+  }
+
+  // C1: a Director drop while the Realm re-login waits for its token must not
+  // end the session. The retry asks for a new token; the held Realm request
+  // waits for it. Pins: the token request of BeginRealmReauthentication is
+  // not tracked (tracked, the drop fails it into EndRealmReauthentication(false),
+  // which expires the held request and fires OnRealmAuthFailed).
+  bool RunDirectorDropDuringRealmRelogin(FAutomationTestBase &Test) {
+    bool bInviteAnswered = false;
+    FRealmHarness Harness;
+    TUniquePtr<FFakeSocketIoServer> DirectorServer =
+      MakeUnique<FFakeSocketIoServer>();
+    if (!Harness.Open(Test) ||
+        !Test.TestTrue(TEXT("Director server listens"), DirectorServer->Listen())) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    URedwoodClientInterface *Raw = &C;
+
+    // As InitializeDirectorConnection wires it.
+    TSharedPtr<FSocketIONative> &Director = FAccess::Director(C);
+    Director = ISocketIOClientModule::Get().NewValidNativePointer();
+    Director->OnReconnectionCallback = [Raw](uint32, uint32) {
+      if (!FAccess::bDirectorDisconnected(*Raw)) {
+        FAccess::bDirectorDisconnected(*Raw) = true;
+        FAccess::NoteDirectorDrop(*Raw);
+        FAccess::bAuthenticated(*Raw) = false;
+      }
+    };
+    Director->OnConnectedCallback = [Raw](const FString &, const FString &) {
+      FAccess::bDirectorDisconnected(*Raw) = false;
+    };
+    Director->Connect(
+      FString::Printf(TEXT("ws://127.0.0.1:%d"), DirectorServer->Port)
+    );
+    if (!Test.TestTrue(TEXT("Director opens a session"), DirectorServer->AcceptSession()) ||
+        !Test.TestTrue(
+          TEXT("Director joins the namespace"),
+          PumpGameThreadUntil([Raw]() {
+            return !FAccess::bDirectorDisconnected(*Raw);
+          })
+        )) {
+      return false;
+    }
+    FAccess::bSentDirectorConnected(C) = true;
+    // The Realm socket came back; its re-login has not run yet.
+    FAccess::bRealmReauthPending(C) = true;
+
+    C.InviteToParty(
+      TEXT("player-2"),
+      FRedwoodErrorOutputDelegate::CreateLambda(
+        [&bInviteAnswered](const FString &) { bInviteAnswered = true; }
+      )
+    );
+    Test.TestEqual(
+      TEXT("The gate holds the invite for the re-login"),
+      FAccess::NumRealmHeldRequests(C),
+      1
+    );
+
+    FAccess::BeginRealmReauthentication(C);
+    Test.TestTrue(
+      TEXT("The token request reaches the Director"),
+      DirectorServer->ReadClientFrame()
+    );
+    Test.TestEqual(
+      TEXT("The token request is not tracked"), FAccess::NumDirectorReplies(C), 0
+    );
+
+    Test.TestTrue(
+      TEXT("The Director closes"),
+      DirectorServer->CloseWithCode(ServiceRestartCloseCode)
+    );
+    if (!Test.TestTrue(
+          TEXT("The client notes the Director drop"),
+          PumpGameThreadUntil([Raw]() {
+            return FAccess::bDirectorDisconnected(*Raw);
+          })
+        )) {
+      return false;
+    }
+
+    // EndRealmReauthentication(false) is the only step here that expires the
+    // held requests, and OnRealmAuthFailed fires right after it.
+    Test.TestEqual(
+      TEXT("The invite is still held, so the re-login did not fail"),
+      FAccess::NumRealmHeldRequests(C),
+      1
+    );
+    Test.TestFalse(TEXT("The invite has no answer yet"), bInviteAnswered);
+    Test.TestTrue(
+      TEXT("The Realm re-login asks again"), FAccess::IsRealmReauthRetryPending(C)
+    );
+    return true;
+  }
+
+  // Sends a zone assignment, then a ticketing update as a marker: the client
+  // handles events in order, so when the marker arrives, the assignment was
+  // handled. The marker's handler records whether the assignment moved.
+  bool AssignmentMoves(
+    FAutomationTestBase &Test, FRealmHarness &Harness, const char *Assignment
+  ) {
+    URedwoodClientInterface &C = Harness.Client();
+    bool bMarkerSeen = false;
+    FAccess::ServerConnection(C).Reset();
+    FAccess::OnTicketingUpdate(C) = FRedwoodTicketingUpdateDelegate::CreateLambda(
+      [&bMarkerSeen](const FRedwoodTicketingUpdate &) { bMarkerSeen = true; }
+    );
+    Test.TestTrue(TEXT("The server sends the assignment"), Harness.Server->SendText(Assignment));
+    Test.TestTrue(
+      TEXT("The server sends the marker"),
+      Harness.Server->SendText("42[\"realm:ticketing:update\",{\"message\":\"m\"}]")
+    );
+    // A handled assignment clears the ticketing delegate, so the marker is
+    // not seen then; the connection is set in either case once it ran.
+    PumpGameThreadUntil([&C, &bMarkerSeen]() {
+      return bMarkerSeen || !FAccess::ServerConnection(C).IsEmpty();
+    });
+    // Let the marker run too when the assignment was handled.
+    PumpGameThreadUntil([]() { return true; });
+    FAccess::OnTicketingUpdate(C).Unbind();
+    return !FAccess::ServerConnection(C).IsEmpty();
+  }
+
+  bool OpenWithRealmEvents(FAutomationTestBase &Test, FRealmHarness &Harness) {
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    FAccess::BindRealmEvents(Harness.Client());
+    return true;
+  }
+
+  const char *const AssignmentWithoutCharacter =
+    "42[\"realm:servers:connect-to-instance\","
+    "{\"shouldStitch\":false,\"connection\":\"x:1\",\"token\":\"t\"}]";
+
+  // M7. Pins: the bAbandonedQueueJoin check in the connect-to-instance handler.
+  bool RunDroppedQueueRequestDoesNotMove(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    FAccess::bAbandonedQueueJoin(Harness.Client()) = true;
+    Test.TestFalse(
+      TEXT("An assignment for a dropped queue request does not move the player"),
+      AssignmentMoves(Test, Harness, AssignmentWithoutCharacter)
+    );
+    return true;
+  }
+
+  // M6. Pins: the characterId check in the connect-to-instance handler, and
+  // that an old server (no characterId) still moves the player.
+  bool RunAssignmentForAnotherCharacter(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    Test.TestFalse(
+      TEXT("An assignment for another character does not move the player"),
+      AssignmentMoves(
+        Test,
+        Harness,
+        "42[\"realm:servers:connect-to-instance\",{\"shouldStitch\":false,"
+        "\"connection\":\"x:1\",\"token\":\"t\",\"characterId\":\"c-2\"}]"
+      )
+    );
+    Test.TestTrue(
+      TEXT("An assignment for the selected character moves the player"),
+      AssignmentMoves(
+        Test,
+        Harness,
+        "42[\"realm:servers:connect-to-instance\",{\"shouldStitch\":false,"
+        "\"connection\":\"x:1\",\"token\":\"t\",\"characterId\":\"character-1\"}]"
+      )
+    );
+    Test.TestTrue(
+      TEXT("An assignment with no characterId moves the player as before"),
+      AssignmentMoves(Test, Harness, AssignmentWithoutCharacter)
+    );
+    return true;
+  }
 }
 
 #define REDWOOD_IN_FLIGHT_TEST(Class, Name, Body)                              \
@@ -250,4 +516,24 @@ REDWOOD_IN_FLIGHT_TEST(
   RedwoodInFlightTest::RunJoinQueue(
     *this, RedwoodInFlightTest::EClose::NoCloseFrame
   )
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightZoneJoinAfterDropTest,
+  "ZoneJoinSentAfterDropFailsAtReconnect",
+  RedwoodInFlightTest::RunZoneJoinSentAfterDrop(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightDirectorDropDuringReloginTest,
+  "DirectorDropDuringRealmRelogin",
+  RedwoodInFlightTest::RunDirectorDropDuringRealmRelogin(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightDroppedQueueRequestTest,
+  "DroppedQueueRequestDoesNotMove",
+  RedwoodInFlightTest::RunDroppedQueueRequestDoesNotMove(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightOtherCharacterTest,
+  "AssignmentForAnotherCharacterDoesNotMove",
+  RedwoodInFlightTest::RunAssignmentForAnotherCharacter(*this)
 )

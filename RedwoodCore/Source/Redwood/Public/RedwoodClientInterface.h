@@ -4,6 +4,7 @@
 
 #include "RedwoodCloseBackoff.h" // FORK(hollowed-oath)
 #include "RedwoodHeldRequests.h" // FORK(hollowed-oath): HollowedOath#2854.
+#include "RedwoodPendingReplies.h" // FORK(hollowed-oath): HollowedOath#2886.
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
 
@@ -477,6 +478,14 @@ private:
   bool GateRealm(
     TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
   );
+  // FORK(hollowed-oath): HollowedOath#2886. See the .cpp.
+  template <typename TOutput>
+  FRedwoodReplyCallback TrackReply(
+    FRedwoodPendingReplies &Replies,
+    FRedwoodReplyCallback OnReply,
+    const TDelegate<void(const TOutput &)> &OnOutput
+  );
+  void FailTicketingJoin();
   void NoteDirectorDrop();
   void NoteFirstDirectorConnect();
   void NoteFirstRealmConnect();
@@ -507,6 +516,17 @@ private:
   void EndRealmReauthentication(bool bSucceeded);
   FRedwoodHeldRequests DirectorHeldRequests;
   FRedwoodHeldRequests RealmHeldRequests;
+  // FORK(hollowed-oath) BEGIN: HollowedOath#2886. The requests still waiting
+  // for a reply on each socket; a drop fails them.
+  FRedwoodPendingReplies DirectorReplies;
+  FRedwoodPendingReplies RealmReplies;
+  void NoteDirectorReconnected();
+  void NoteRealmReconnected();
+  // A JoinQueue whose reply was lost: the game went back to character
+  // select, so its assignment must not move the player. Cleared when
+  // LeaveTicketing succeeds or a new JoinQueue starts.
+  bool bAbandonedQueueJoin = false;
+  // FORK(hollowed-oath) END
   // The Realm socket dropped and the player is not authenticated on it again
   // yet; the Director has bAuthenticated for this.
   bool bRealmReauthPending = false;
