@@ -89,10 +89,11 @@ void URedwoodClientInterface::ReleaseRealmSocket() {
 // request was held or failed, and the caller returns. When it lets a request
 // through, the socket is connected, so the upstream check after it passes.
 // Not gated: login and the handshakes (they are the re-login), ticketing and
-// proxies (a late join can move a player who has given up waiting), requests
-// that carry a USIOJsonObject (nothing keeps it alive while held), and
-// requests with no reply (a late emote is worse than none; the Director
-// re-login re-sends the online character).
+// proxies (a late join can move a player who has given up waiting),
+// CreateCharacter (the creation screen shows its failure), and requests with
+// no reply (a late emote is worse than none; the Director re-login re-sends
+// the online character). A held request that carries a USIOJsonObject keeps
+// it alive with a TStrongObjectPtr.
 namespace {
   void SetRedwoodGateError(FString &Output, const TCHAR *Error) {
     Output = Error;
@@ -189,6 +190,15 @@ FRedwoodReplyCallback URedwoodClientInterface::TrackReply(
   const TDelegate<void(const TOutput &)> &OnOutput
 ) {
   return Replies.Track(MoveTemp(OnReply), MakeLostReply(OnOutput));
+}
+
+// The travel of an assignment finished, even after the game gave up on it
+// (its enter-world timer can fire during the travel). The player is in the
+// world: later zone transfers must move them, and the ticket is used up.
+void URedwoodClientInterface::NoteArrivedInWorld() {
+  bAbandonedQueueJoin = false;
+  bAssignmentExpected = true;
+  bLeaveTicketingOwed = false;
 }
 
 // A join replaces any ticket the server kept, so a leave owed for it would
@@ -569,7 +579,12 @@ void URedwoodClientInterface::Logout() {
     // player who left.
     if (Realm.IsValid()) {
       if (Realm->bIsConnected) {
-        SendOwedLeave(); // FORK(hollowed-oath): HollowedOath#2886.
+        // FORK(hollowed-oath): HollowedOath#2886. Only a Realm that knows the
+        // player can run the leave. In the re-login window the flag is
+        // dropped below all the same; the server ticket then expires.
+        if (IsRealmReady()) {
+          SendOwedLeave();
+        }
         Realm->Emit(TEXT("realm:auth:player:logout"), Payload);
       }
       RequestRealmClose(); // FORK(hollowed-oath)
@@ -3973,6 +3988,9 @@ void URedwoodClientInterface::LeaveTicketing(
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
+      if (Error.IsEmpty()) {
+        bLeaveTicketingOwed = false;
+      }
       OnOutput.ExecuteIfBound(Error);
     }, [this, OnLost = MakeLostReply(OnOutput)]() {
       // A leave that may not have run is owed.

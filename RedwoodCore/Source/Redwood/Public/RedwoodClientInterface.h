@@ -48,6 +48,10 @@ public:
     return Director;
   }
 
+  // FORK(hollowed-oath): HollowedOath#2886. The client world of a game
+  // server began play. See the .cpp.
+  void NoteArrivedInWorld();
+
   // FORK(hollowed-oath): HollowedOath#2886. For a request that another module
   // sends on GetDirectorConnection(): a Director drop fails it with OnLost.
   FRedwoodReplyCallback TrackDirectorReply(

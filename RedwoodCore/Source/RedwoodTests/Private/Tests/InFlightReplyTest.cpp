@@ -1026,6 +1026,27 @@ namespace RedwoodInFlightTest {
       AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
     );
 
+    // Sent and answered: it pays a leave that was owed. Pins: the reset in
+    // the LeaveTicketing reply.
+    FAccess::bAssignmentExpected(C) = true;
+    C.LeaveTicketing(OnOutput);
+    FString Request;
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("A successful leave pays the owed one"),
+      PumpGameThreadUntil([&C]() { return !FAccess::bLeaveTicketingOwed(C); })
+    );
+
+    // The travel of the assignment finished after the leave: the player is
+    // in the world. Pins: NoteArrivedInWorld.
+    C.NoteArrivedInWorld();
+    Test.TestTrue(
+      TEXT("After the arrival, a zone transfer moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+
     // Sent, and then lost in a drop: owed again.
     FAccess::bLeaveTicketingOwed(C) = false;
     FAccess::bAbandonedQueueJoin(C) = false;
@@ -1041,6 +1062,46 @@ namespace RedwoodInFlightTest {
       TEXT("The drop fails the leave"), PumpGameThreadUntil([&bAnswered]() { return bAnswered; })
     );
     Test.TestTrue(TEXT("A lost leave is owed"), FAccess::bLeaveTicketingOwed(C));
+    return true;
+  }
+
+  // Pins: Logout sends an owed leave before the Realm logout, so the Realm
+  // still knows the player when it runs the leave.
+  bool RunLogoutPaysOwedLeave(FAutomationTestBase &Test) {
+    int32 CloseReports = 0;
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bLeaveTicketingOwed(C) = true;
+    // The library reports a close we ask for twice; the test waits for the
+    // second, as in PartyInviteFailsOnRequestedClose.
+    TSharedPtr<FSocketIONative> &Realm = FAccess::Realm(C);
+    TFunction<void(const ESIOConnectionCloseReason)> Handler =
+      Realm->OnDisconnectedCallback;
+    Realm->OnDisconnectedCallback =
+      [Handler, &CloseReports](const ESIOConnectionCloseReason Reason) {
+        Handler(Reason);
+        ++CloseReports;
+      };
+
+    C.Logout();
+    FString Request;
+    Test.TestTrue(TEXT("A request arrives"), Harness.Server->ReadClientText(Request));
+    Test.TestTrue(
+      TEXT("The leave goes before the Realm logout"),
+      Request.Contains(TEXT("realm:ticketing:leave"))
+    );
+    Test.TestFalse(TEXT("The flag is dropped"), FAccess::bLeaveTicketingOwed(C));
+    // Not checked: the read above can already hold the client's close frame,
+    // so the server may find no echo to read. The close reports below are
+    // what the test waits for.
+    Harness.Server->CloseNormally();
+    Test.TestTrue(
+      TEXT("The close handshake ends"),
+      PumpGameThreadUntil([&CloseReports]() { return CloseReports >= 2; })
+    );
     return true;
   }
 }
@@ -1147,6 +1208,11 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightLeaveTicketingTest,
   "LeaveTicketingDropsTheJoin",
   RedwoodInFlightTest::RunLeaveTicketingDropsTheJoin(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightLogoutPaysOwedLeaveTest,
+  "LogoutPaysOwedLeave",
+  RedwoodInFlightTest::RunLogoutPaysOwedLeave(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,
