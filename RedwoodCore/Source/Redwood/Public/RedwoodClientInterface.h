@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "RedwoodCloseBackoff.h" // FORK(hollowed-oath)
 #include "RedwoodHeldRequests.h" // FORK(hollowed-oath): HollowedOath#2854.
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
@@ -453,6 +454,33 @@ private:
   void ReleaseRealmSocket();
   uint32 RealmHandshakeGeneration = 0;
   // FORK(hollowed-oath) END
+  // FORK(hollowed-oath) BEGIN: a stopping backend can close a socket with a
+  // normal (1000) close. The socket library takes that as a close we asked
+  // for, so it neither reconnects nor reports the drop. Bound to
+  // OnDisconnectedCallback, this reports it through the socket's reconnection
+  // callback, which is the drop path, and connects again after the backoff.
+  // IsCloseRequested names the closes we asked for; without it, no close was
+  // asked for.
+  TFunction<void(const ESIOConnectionCloseReason)> MakeUnrequestedCloseHandler(
+    TWeakPtr<FSocketIONative> WeakSocket,
+    FRedwoodCloseBackoff &Backoff,
+    TFunction<bool()> IsCloseRequested = nullptr
+  );
+  void BindRealmCloseHandler();
+  // The one Realm close we ask for. Every such close must go through it.
+  void RequestRealmClose();
+  // What the close handler runs when its backoff ends. Tests count it
+  // instead of connecting.
+  TFunction<void(FSocketIONative &)> ReconnectSocket =
+    [](FSocketIONative &Socket) { Socket.Connect(); };
+  FRedwoodCloseBackoff DirectorCloseBackoff;
+  FRedwoodCloseBackoff RealmCloseBackoff;
+  // Set just before a Realm close we ask for; a new Realm socket clears it.
+  // The handler reads it late on purpose: the library also reports the close
+  // from a lambda queued to the game thread, which runs after Disconnect()
+  // returns, and the flag must still be set then.
+  bool bRealmCloseRequested = false;
+  // FORK(hollowed-oath) END
 
   void InitiateRealmHandshake(
     FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected
@@ -525,6 +553,12 @@ private:
   // FORK(hollowed-oath): character friends. Pins that the four character
   // friend calls are held like the other Realm requests.
   friend class FRedwoodCharacterFriendsHeldTest;
+  // FORK(hollowed-oath) BEGIN: the close handler tests.
+  friend class FRedwoodUnrequestedCloseBacksOffTest;
+  friend class FRedwoodLogoutRealmCloseStaysCleanTest;
+  friend class FRedwoodFailedReloginRealmCloseStaysCleanTest;
+  friend class FRedwoodQueuedRequestedCloseStaysCleanTest;
+  // FORK(hollowed-oath) END
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);
