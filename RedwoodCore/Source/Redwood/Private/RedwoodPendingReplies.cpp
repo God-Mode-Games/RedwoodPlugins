@@ -26,7 +26,6 @@ void FRedwoodPendingReplies::FailAll() {
   // Take the map first: a failure handler can send a new request, which
   // must stay pending on the next connection.
   TMap<uint64, TFunction<void()>> Lost = MoveTemp(State->Pending);
-  State->Pending.Reset();
   for (TPair<uint64, TFunction<void()>> &Entry : Lost) {
     Entry.Value();
   }

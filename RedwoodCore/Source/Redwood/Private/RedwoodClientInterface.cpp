@@ -109,14 +109,16 @@ namespace {
     Output.Message = Error;
   }
 
-  // FORK(hollowed-oath): HollowedOath#2886. For the OAuth finalize requests,
-  // which are sent from inside a reply callback, where MSVC does not resolve
-  // TrackReply.
-  TFunction<void()> MakeLostAuthUpdate(FRedwoodAuthUpdateDelegate OnUpdate) {
-    return [OnUpdate]() {
-      FRedwoodAuthUpdate Update;
-      SetRedwoodGateError(Update, FRedwoodPendingReplies::LostReplyError);
-      OnUpdate.ExecuteIfBound(Update);
+  // FORK(hollowed-oath): HollowedOath#2886. What a request whose reply was
+  // lost tells its caller.
+  template <typename TOutput>
+  TFunction<void()> MakeLostReply(
+    const TDelegate<void(const TOutput &)> &OnOutput
+  ) {
+    return [OnOutput]() {
+      TOutput Output;
+      SetRedwoodGateError(Output, FRedwoodPendingReplies::LostReplyError);
+      OnOutput.ExecuteIfBound(Output);
     };
   }
 }
@@ -185,11 +187,7 @@ FRedwoodReplyCallback URedwoodClientInterface::TrackReply(
   FRedwoodReplyCallback OnReply,
   const TDelegate<void(const TOutput &)> &OnOutput
 ) {
-  return Replies.Track(MoveTemp(OnReply), [OnOutput]() {
-    TOutput Output;
-    SetRedwoodGateError(Output, FRedwoodPendingReplies::LostReplyError);
-    OnOutput.ExecuteIfBound(Output);
-  });
+  return Replies.Track(MoveTemp(OnReply), MakeLostReply(OnOutput));
 }
 
 void URedwoodClientInterface::FailTicketingJoin() {
@@ -822,7 +820,7 @@ void URedwoodClientInterface::LoginWithDiscord(
 
               OnUpdate.ExecuteIfBound(Update);
             },
-            MakeLostAuthUpdate(OnUpdate)
+            MakeLostReply(OnUpdate)
           )
         );
       } else {
@@ -947,7 +945,7 @@ void URedwoodClientInterface::LoginWithTwitch(
 
               OnUpdate.ExecuteIfBound(Update);
             },
-            MakeLostAuthUpdate(OnUpdate)
+            MakeLostReply(OnUpdate)
           )
         );
       } else {
