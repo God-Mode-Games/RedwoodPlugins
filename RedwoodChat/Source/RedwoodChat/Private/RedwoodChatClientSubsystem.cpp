@@ -52,10 +52,11 @@ void URedwoodClientChatSubsystem::InitializeChatConnection(
       TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
       Payload->SetStringField(TEXT("playerId"), PlayerId);
 
+      // FORK(hollowed-oath): HollowedOath#2886. See TrackDirectorReply.
       Director->Emit(
         TEXT("player:get-text-chat-credentials"),
         Payload,
-        [this, OnOutput](auto Response) {
+        ClientInterface->TrackDirectorReply([this, OnOutput](auto Response) {
           TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
           FString Error = MessageObject->GetStringField(TEXT("error"));
@@ -137,7 +138,9 @@ void URedwoodClientChatSubsystem::InitializeChatConnection(
 
           XmppPlayerConnection->SetServer(XmppServer);
           XmppPlayerConnection->Login(PlayerId, XmppPassword);
-        }
+        }, [OnOutput]() {
+          OnOutput.ExecuteIfBound(FRedwoodPendingReplies::LostReplyError);
+        })
       );
     } else {
       OnOutput.ExecuteIfBound(TEXT("Redwood Client Interface not found."));
@@ -559,15 +562,18 @@ void URedwoodClientChatSubsystem::CreateCustomRoom(
         Payload->SetStringField(TEXT("password"), Password);
       }
 
+      // FORK(hollowed-oath): HollowedOath#2886. See TrackDirectorReply.
       Director->Emit(
         TEXT("director:text-chat:create-room"),
         Payload,
-        [this, OnOutput](auto Response) {
+        ClientInterface->TrackDirectorReply([this, OnOutput](auto Response) {
           TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
           FString Error = MessageObject->GetStringField(TEXT("error"));
           OnOutput.ExecuteIfBound(Error);
-        }
+        }, [OnOutput]() {
+          OnOutput.ExecuteIfBound(FRedwoodPendingReplies::LostReplyError);
+        })
       );
     } else {
       OnOutput.ExecuteIfBound(TEXT("Redwood Client Interface not found."));
