@@ -539,6 +539,7 @@ private:
   bool IsRealmReady();
   void SendOwedLeave();
   void NoteJoinSent();
+  void HandleTicketingJoinReply(const FString &Error, uint32 Sequence);
   // A join whose reply was lost: the game went back to character select, so
   // its assignment must not move the player. A new join clears it.
   bool bAbandonedQueueJoin = false;

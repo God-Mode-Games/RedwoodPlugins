@@ -6,12 +6,11 @@
 
 #include "Async/Async.h"
 #include "Containers/Ticker.h"
+#include "HAL/CriticalSection.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/CoreDelegates.h"
 #include "SocketIOClient.h"
 #include "SocketIONative.h"
-
-#include <atomic>
 
 namespace {
   // One fallback release, counted from the close, when the library never
@@ -26,7 +25,18 @@ namespace {
 
   // Set first at exit. The task graph shuts down after it, and a close report
   // dispatched then would crash the socket thread.
-  std::atomic<bool> bClosingSocketsExiting{false};
+  bool bClosingSocketsExiting = false;
+  // Makes the socket thread's flag check and its dispatch one step against
+  // the exit's store. Without it, the socket thread can read false, stall,
+  // and dispatch after the task graph shut down. OnPreExit runs before that
+  // shutdown, so a dispatch that got the lock first still finds the graph
+  // alive. Never held around ReleaseHeld: the game thread must not wait on
+  // the socket thread. Leaked, because a kept socket's timer can take it
+  // after static destruction.
+  FCriticalSection &ClosingSocketsExitLock() {
+    static FCriticalSection *Lock = new FCriticalSection();
+    return *Lock;
+  }
 
   // Game thread only. Its sockets move to a leaked array at exit.
   TArray<FClosingSocket> &ClosingSockets() {
@@ -62,7 +72,10 @@ namespace {
   // process ends the socket thread. It is never a static TSharedPtr released
   // at atexit, a known crash class.
   void KeepAllAtExit() {
-    bClosingSocketsExiting.store(true);
+    {
+      FScopeLock Lock(&ClosingSocketsExitLock());
+      bClosingSocketsExiting = true;
+    }
     TArray<TSharedPtr<FSocketIONative>> *Kept =
       new TArray<TSharedPtr<FSocketIONative>>();
     for (FClosingSocket &Entry : ClosingSockets()) {
@@ -98,7 +111,8 @@ void RedwoodClosingSockets::Release(
   // task.
   Socket->bCallbackOnGameThread = false;
   Socket->OnNamespaceDisconnectedCallback = [Id](const FString &) {
-    if (!bClosingSocketsExiting.load()) {
+    FScopeLock Lock(&ClosingSocketsExitLock());
+    if (!bClosingSocketsExiting) {
       AsyncTask(ENamedThreads::GameThread, [Id]() { ReleaseHeld(Id, false); });
     }
   };

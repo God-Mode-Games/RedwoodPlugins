@@ -241,11 +241,34 @@ void URedwoodClientInterface::NoteLeftWorld() {
 }
 
 // A join replaces any ticket the server kept, so a leave owed for it would
-// cancel the new one.
+// cancel the new one. It also replaces a dropped join, from any entry point
+// (a ticketing join, a create that joins, a proxy join).
 void URedwoodClientInterface::NoteJoinSent() {
   ++JoinSequence;
   bAssignmentExpected = true;
+  bAbandonedQueueJoin = false;
   bLeaveTicketingOwed = false;
+}
+
+// A join that the server refused gets no assignment, so a replay of an
+// earlier ticket must not move the player. The refusal left no ticket, so no
+// leave is owed. Set before the update runs: the game can join again in it.
+// Only for the latest join: an older join's refusal must not close the guard
+// for a newer one.
+void URedwoodClientInterface::HandleTicketingJoinReply(
+  const FString &Error, uint32 Sequence
+) {
+  if (!Error.IsEmpty() && Sequence == JoinSequence) {
+    bAssignmentExpected = false;
+  }
+  FRedwoodTicketingUpdate Update;
+  Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
+  Update.Message = Error;
+  OnTicketingUpdate.ExecuteIfBound(Update);
+
+  if (!Error.IsEmpty()) {
+    OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+  }
 }
 
 void URedwoodClientInterface::FailTicketingJoin() {
@@ -3835,8 +3858,6 @@ void URedwoodClientInterface::JoinMatchmaking(
   TArray<FString> InRegions,
   FRedwoodTicketingUpdateDelegate OnUpdate
 ) {
-  bAbandonedQueueJoin = false; // FORK(hollowed-oath): HollowedOath#2886.
-
   if (SelectedCharacterId.IsEmpty()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
@@ -3859,10 +3880,6 @@ void URedwoodClientInterface::JoinQueue(
   bool bFavorLastZone,
   FRedwoodTicketingUpdateDelegate OnUpdate
 ) {
-  // FORK(hollowed-oath): HollowedOath#2886. A new request replaces the one
-  // whose reply was lost.
-  bAbandonedQueueJoin = false;
-
   if (SelectedCharacterId.IsEmpty()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
@@ -3905,18 +3922,10 @@ void URedwoodClientInterface::JoinQueue(
   Realm->Emit(
     TEXT("realm:ticketing:join:queue"),
     Payload,
-    RealmReplies.Track([this](auto Response) {
-      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-      FString Error = MessageObject->GetStringField(TEXT("error"));
-
-      FRedwoodTicketingUpdate Update;
-      Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
-      Update.Message = Error;
-      OnTicketingUpdate.ExecuteIfBound(Update);
-
-      if (!Error.IsEmpty()) {
-        OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
-      }
+    RealmReplies.Track([this, Sequence = JoinSequence](auto Response) {
+      HandleTicketingJoinReply(
+        Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
+      );
     }, [this]() { FailTicketingJoin(); })
   );
 }
@@ -3926,8 +3935,6 @@ void URedwoodClientInterface::JoinCustom(
   TArray<FString> InRegions,
   FRedwoodTicketingUpdateDelegate OnUpdate
 ) {
-  bAbandonedQueueJoin = false; // FORK(hollowed-oath): HollowedOath#2886.
-
   if (SelectedCharacterId.IsEmpty()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
@@ -4017,18 +4024,10 @@ void URedwoodClientInterface::AttemptJoinCustom() {
   Realm->Emit(
     TEXT("realm:ticketing:join:custom"),
     Payload,
-    RealmReplies.Track([this](auto Response) {
-      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-      FString Error = MessageObject->GetStringField(TEXT("error"));
-
-      FRedwoodTicketingUpdate Update;
-      Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
-      Update.Message = Error;
-      OnTicketingUpdate.ExecuteIfBound(Update);
-
-      if (!Error.IsEmpty()) {
-        OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
-      }
+    RealmReplies.Track([this, Sequence = JoinSequence](auto Response) {
+      HandleTicketingJoinReply(
+        Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
+      );
     }, [this]() { FailTicketingJoin(); })
   );
 }
@@ -4378,18 +4377,10 @@ void URedwoodClientInterface::AttemptJoinMatchmaking() {
   Realm->Emit(
     TEXT("realm:ticketing:join:matchmaking"),
     Payload,
-    RealmReplies.Track([this](auto Response) {
-      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-      FString Error = MessageObject->GetStringField(TEXT("error"));
-
-      FRedwoodTicketingUpdate Update;
-      Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
-      Update.Message = Error;
-      OnTicketingUpdate.ExecuteIfBound(Update);
-
-      if (!Error.IsEmpty()) {
-        OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
-      }
+    RealmReplies.Track([this, Sequence = JoinSequence](auto Response) {
+      HandleTicketingJoinReply(
+        Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
+      );
     }, [this]() { FailTicketingJoin(); })
   );
 }

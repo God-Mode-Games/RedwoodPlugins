@@ -959,6 +959,62 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
+  // A dropped join, then a create that joins: its assignment must move the
+  // player. Pins: the dropped-join reset in NoteJoinSent.
+  bool RunCreateProxyAfterDroppedJoin(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    // In the re-login window, so the leave fails at once and drops the join.
+    FAccess::bRealmReauthPending(C) = true;
+    C.LeaveTicketing(FRedwoodErrorOutputDelegate());
+    FAccess::bRealmReauthPending(C) = false;
+    Test.TestTrue(TEXT("The leave drops the join"), FAccess::bAbandonedQueueJoin(C));
+    C.CreateProxy(true, FRedwoodCreateProxyInput(), FRedwoodCreateProxyOutputDelegate());
+    Test.TestTrue(
+      TEXT("After a dropped join, a create that joins moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    return true;
+  }
+
+  // The server refuses a join: a replay of an earlier ticket must not move
+  // the player, and no leave is owed. Pins: HandleTicketingJoinReply.
+  bool RunRefusedJoinDoesNotMove(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAssignmentExpected(C) = false;
+    bool bAnswered = false;
+    C.JoinQueue(
+      TEXT("proxy-1"),
+      TEXT("zone-1"),
+      false,
+      false,
+      FRedwoodTicketingUpdateDelegate::CreateLambda(
+        [&bAnswered](const FRedwoodTicketingUpdate &) { bAnswered = true; }
+      )
+    );
+    FString Request;
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"refused\"}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("The refusal reaches the game"),
+      PumpGameThreadUntil([&bAnswered]() { return bAnswered; })
+    );
+    Test.TestFalse(TEXT("A refused join owes no leave"), FAccess::bLeaveTicketingOwed(C));
+    Test.TestFalse(
+      TEXT("After a refused join, a replay does not move the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    return true;
+  }
+
   // Pins: the resets in Logout.
   bool RunLogoutForgetsCharacter(FAutomationTestBase &Test) {
     FRealmHarness Harness;
@@ -1498,6 +1554,16 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightPartyMemberTest,
   "PartyMemberAssignmentMoves",
   RedwoodInFlightTest::RunPartyMemberAssignment(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCreateProxyAfterDroppedJoinTest,
+  "CreateProxyAfterDroppedJoinMoves",
+  RedwoodInFlightTest::RunCreateProxyAfterDroppedJoin(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightRefusedJoinTest,
+  "RefusedJoinDoesNotMove",
+  RedwoodInFlightTest::RunRefusedJoinDoesNotMove(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,
