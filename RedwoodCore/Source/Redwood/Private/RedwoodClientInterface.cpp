@@ -54,11 +54,10 @@ void URedwoodClientInterface::Deinitialize() {
   if (Director.IsValid()) {
     // FORK(hollowed-oath): HollowedOath#2999. A connected socket starts the
     // library's close timer here; see RedwoodClosingSockets.
-    const double CloseStartedAt =
-      Director->bIsConnected ? FPlatformTime::Seconds() : -1.0;
+    const bool bCloseTimerPending = Director->bIsConnected;
     Director->ClearAllCallbacks();
     Director->Disconnect();
-    RedwoodClosingSockets::Release(Director, CloseStartedAt);
+    RedwoodClosingSockets::Release(Director, bCloseTimerPending);
     Director = nullptr;
   }
   DirectorCloseBackoff.Reset(TimerManager); // FORK(hollowed-oath)
@@ -79,14 +78,13 @@ void URedwoodClientInterface::ReleaseRealmSocket() {
     // turns into an early on_close with the timer still set. A connected
     // socket starts the timer here.
     const bool bClosing = bRealmCloseRequested;
-    const double CloseStartedAt =
-      bClosing ? RealmCloseStartedAt
-               : (Realm->bIsConnected ? FPlatformTime::Seconds() : -1.0);
+    const bool bCloseTimerPending =
+      bClosing ? bRealmCloseTimerPending : Realm->bIsConnected;
     Realm->ClearAllCallbacks();
     if (!bClosing) {
       Realm->Disconnect();
     }
-    RedwoodClosingSockets::Release(Realm, CloseStartedAt);
+    RedwoodClosingSockets::Release(Realm, bCloseTimerPending);
     Realm = nullptr;
     // HollowedOath#2886. No reply comes over a released socket. After the
     // release, so a failure handler cannot reach the old socket.
@@ -277,10 +275,31 @@ void URedwoodClientInterface::HandleTicketingJoinReply(
   }
 }
 
-void URedwoodClientInterface::FailTicketingJoin() {
+// A join whose reply was lost: the game gives up on it, so its assignment
+// must not move the player, and the ticket or assignment the server may
+// have kept is left at the next auth.
+void URedwoodClientInterface::NoteJoinLost() {
   bAbandonedQueueJoin = true;
   bAssignmentExpected = false;
   bLeaveTicketingOwed = true;
+}
+
+// A proxy join or a create that joins, lost in a drop. Only for the latest
+// join, as for a refusal. Before the game sees the failure: it can join
+// again then.
+TFunction<void()> URedwoodClientInterface::MakeLostProxyJoin(
+  uint32 Sequence, TFunction<void()> OnLost
+) {
+  return [this, Sequence, OnLost = MoveTemp(OnLost)]() {
+    if (Sequence == JoinSequence) {
+      NoteJoinLost();
+    }
+    OnLost();
+  };
+}
+
+void URedwoodClientInterface::FailTicketingJoin() {
+  NoteJoinLost();
   FRedwoodTicketingUpdate Update;
   Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
   Update.Message = FRedwoodPendingReplies::LostReplyError;
@@ -3096,6 +3115,10 @@ void URedwoodClientInterface::BindRealmEvents() {
       FRedwoodTicketingUpdate Update;
       Update.Type = ERedwoodTicketingUpdateType::TicketError;
       Update.Message = Message->AsObject()->GetStringField(TEXT("error"));
+      // FORK(hollowed-oath): HollowedOath#2886. The ticket ended, so no
+      // assignment comes for it; a replay of an earlier one must not move
+      // the player. No ticket is left, so no leave is owed.
+      bAssignmentExpected = false;
       OnTicketingUpdate.ExecuteIfBound(Update);
 
       OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
@@ -3620,11 +3643,11 @@ void URedwoodClientInterface::RequestRealmClose() {
   RealmCloseBackoff.Reset(TimerManager);
   // HollowedOath#2999. The library reports the namespace closed when its
   // close timer ran; only a connected socket starts one.
-  RealmCloseStartedAt = Realm->bIsConnected ? FPlatformTime::Seconds() : -1.0;
+  bRealmCloseTimerPending = Realm->bIsConnected;
   Realm->OnNamespaceDisconnectedCallback =
     [WeakThis = TWeakObjectPtr<URedwoodClientInterface>(this)](const FString &) {
       if (WeakThis.IsValid()) {
-        WeakThis->RealmCloseStartedAt = -1.0;
+        WeakThis->bRealmCloseTimerPending = false;
       }
     };
   Realm->Disconnect();
@@ -3635,7 +3658,7 @@ void URedwoodClientInterface::RequestRealmClose() {
 
 void URedwoodClientInterface::BindRealmCloseHandler() {
   bRealmCloseRequested = false;
-  RealmCloseStartedAt = -1.0;
+  bRealmCloseTimerPending = false;
   Realm->OnDisconnectedCallback = MakeUnrequestedCloseHandler(
     Realm, RealmCloseBackoff, [this]() { return bRealmCloseRequested; }
   );
@@ -4213,7 +4236,7 @@ void URedwoodClientInterface::CreateProxy(
   Realm->Emit(
     TEXT("realm:servers:create-proxy"),
     Payload,
-    TrackReply(RealmReplies, [this, OnOutput, bJoinSession, Sequence = JoinSequence](
+    RealmReplies.Track([this, OnOutput, bJoinSession, Sequence = JoinSequence](
       auto Response
     ) {
       FRedwoodCreateProxyOutput Output;
@@ -4229,7 +4252,8 @@ void URedwoodClientInterface::CreateProxy(
       );
 
       OnOutput.ExecuteIfBound(Output);
-    }, OnOutput)
+    }, bJoinSession ? MakeLostProxyJoin(JoinSequence, MakeLostReply(OnOutput))
+                    : MakeLostReply(OnOutput))
   );
 }
 
@@ -4273,7 +4297,7 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
   Realm->Emit(
     TEXT("realm:servers:join-proxy"),
     Payload,
-    TrackReply(RealmReplies, [this, OnOutput, Sequence = JoinSequence](auto Response) {
+    RealmReplies.Track([this, OnOutput, Sequence = JoinSequence](auto Response) {
       FRedwoodJoinServerOutput Output;
 
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
@@ -4286,7 +4310,7 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
       MessageObject->TryGetStringField(TEXT("token"), Output.Token);
 
       OnOutput.ExecuteIfBound(Output);
-    }, OnOutput)
+    }, MakeLostProxyJoin(JoinSequence, MakeLostReply(OnOutput)))
   );
 }
 

@@ -1109,6 +1109,105 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
+  // A proxy join or a create that joins lost in a drop: after the reconnect,
+  // a replay must not move the player. Pins: MakeLostProxyJoin.
+  bool RunLostProxyJoinDoesNotMove(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    // Drops the socket with the request out, waits for the failure, and lets
+    // the socket come back.
+    auto DropAndReconnect = [&Test, &Harness, &C](bool &bAnswered, const TCHAR *What) {
+      Test.TestTrue(TEXT("The request reaches the server"), Harness.Server->ReadClientFrame());
+      Test.TestTrue(TEXT("The server drops"), Harness.Close(EClose::NoCloseFrame));
+      Test.TestTrue(
+        *FString::Printf(TEXT("The drop fails the %s"), What),
+        PumpGameThreadUntil([&bAnswered]() { return bAnswered; })
+      );
+      Test.TestTrue(
+        *FString::Printf(TEXT("The lost %s is dropped"), What),
+        FAccess::bAbandonedQueueJoin(C)
+      );
+      Test.TestTrue(TEXT("The client reconnects"), AcceptReconnect(*Harness.Server));
+      Test.TestTrue(
+        TEXT("The socket is back"),
+        PumpGameThreadUntil([&C]() { return !FAccess::bRealmDisconnected(C); })
+      );
+      FAccess::bRealmReauthPending(C) = false;
+    };
+
+    FAccess::bAssignmentExpected(C) = false;
+    bool bJoinAnswered = false;
+    C.JoinProxyWithSingleInstance(
+      TEXT("proxy-1"),
+      FString(),
+      FRedwoodJoinServerOutputDelegate::CreateLambda(
+        [&bJoinAnswered](const FRedwoodJoinServerOutput &) { bJoinAnswered = true; }
+      )
+    );
+    DropAndReconnect(bJoinAnswered, TEXT("proxy join"));
+    Test.TestFalse(
+      TEXT("After a lost proxy join, a replay does not move the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+
+    bool bCreateAnswered = false;
+    C.CreateProxy(
+      true,
+      FRedwoodCreateProxyInput(),
+      FRedwoodCreateProxyOutputDelegate::CreateLambda(
+        [&bCreateAnswered](const FRedwoodCreateProxyOutput &) { bCreateAnswered = true; }
+      )
+    );
+    DropAndReconnect(bCreateAnswered, TEXT("create that joins"));
+    Test.TestFalse(
+      TEXT("After a lost create that joins, a replay does not move the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    return true;
+  }
+
+  // The server ends the ticket: no assignment comes for it, so a replay must
+  // not move the player, and no leave is owed. Pins: the reset in the
+  // ticket-error handler.
+  bool RunTicketErrorDoesNotMove(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAssignmentExpected(C) = false;
+    bool bTicketError = false;
+    C.JoinQueue(
+      TEXT("proxy-1"),
+      TEXT("zone-1"),
+      false,
+      false,
+      FRedwoodTicketingUpdateDelegate::CreateLambda(
+        [&bTicketError](const FRedwoodTicketingUpdate &Update) {
+          bTicketError |= Update.Type == ERedwoodTicketingUpdateType::TicketError;
+        }
+      )
+    );
+    Test.TestTrue(TEXT("The join reaches the server"), Harness.Server->ReadClientFrame());
+    Test.TestTrue(
+      TEXT("The server ends the ticket"),
+      Harness.Server->SendText("42[\"realm:ticketing:ticket-error\",{\"error\":\"ended\"}]")
+    );
+    Test.TestTrue(
+      TEXT("The ticket error reaches the game"),
+      PumpGameThreadUntil([&bTicketError]() { return bTicketError; })
+    );
+    Test.TestFalse(TEXT("An ended ticket owes no leave"), FAccess::bLeaveTicketingOwed(C));
+    Test.TestFalse(
+      TEXT("After a ticket error, a replay does not move the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    return true;
+  }
+
   // Pins: the resets in Logout.
   bool RunLogoutForgetsCharacter(FAutomationTestBase &Test) {
     FRealmHarness Harness;
@@ -1668,6 +1767,16 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightCharacterSwitchTest,
   "CharacterSwitchClearsDroppedJoin",
   RedwoodInFlightTest::RunCharacterSwitchClearsDroppedJoin(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightLostProxyJoinTest,
+  "LostProxyJoinDoesNotMove",
+  RedwoodInFlightTest::RunLostProxyJoinDoesNotMove(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightTicketErrorTest,
+  "TicketErrorDoesNotMove",
+  RedwoodInFlightTest::RunTicketErrorDoesNotMove(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,

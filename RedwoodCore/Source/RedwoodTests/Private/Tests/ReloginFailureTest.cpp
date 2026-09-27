@@ -83,6 +83,10 @@ bool FRedwoodReloginFailureTest::RunTest(const FString &Parameters) {
   ON_SCOPE_EXIT {
     Client->Director->bIsConnected = false;
     Client->Realm->bIsConnected = false;
+    // The faked connection made the failed re-login's close look like one
+    // that started the library's close timer. No timer runs on a socket that
+    // never connected, so nothing would release it.
+    Client->bRealmCloseTimerPending = false;
     Client->Deinitialize();
   };
 
@@ -472,6 +476,10 @@ bool FRedwoodFailedReloginStopsRealmRetryTest::RunTest(
   ON_SCOPE_EXIT {
     Client->Director->bIsConnected = false;
     Client->Realm->bIsConnected = false;
+    // The faked connection made the failed re-login's close look like one
+    // that started the library's close timer. No timer runs on a socket that
+    // never connected, so nothing would release it.
+    Client->bRealmCloseTimerPending = false;
     Client->Deinitialize();
   };
 

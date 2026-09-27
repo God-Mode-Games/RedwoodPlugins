@@ -456,9 +456,9 @@ private:
   // from a lambda queued to the game thread, which runs after Disconnect()
   // returns, and the flag must still be set then.
   bool bRealmCloseRequested = false;
-  // HollowedOath#2999. When that close started the library's close timer,
-  // until the timer ran; negative otherwise. See RedwoodClosingSockets.
-  double RealmCloseStartedAt = -1.0;
+  // HollowedOath#2999. That close started the library's close timer, and the
+  // timer has not run yet. See RedwoodClosingSockets.
+  bool bRealmCloseTimerPending = false;
   // FORK(hollowed-oath) END
 
   void InitiateRealmHandshake(
@@ -540,6 +540,8 @@ private:
   void SendOwedLeave();
   void NoteJoinSent();
   void NoteJoinAnswered(const FString &Error, uint32 Sequence);
+  void NoteJoinLost();
+  TFunction<void()> MakeLostProxyJoin(uint32 Sequence, TFunction<void()> OnLost);
   void HandleTicketingJoinReply(const FString &Error, uint32 Sequence);
   // A join whose reply was lost: the game went back to character select, so
   // its assignment must not move the player. A new join clears it.

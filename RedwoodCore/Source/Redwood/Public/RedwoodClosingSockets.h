@@ -13,14 +13,15 @@ class FSocketIONative;
 // the socket's own thread. It keeps a raw pointer to the socket, and a
 // cancelled wait still calls it, so freeing the socket before it runs is a
 // use-after-free. A socket with that close in progress is held here until
-// the library reports the namespace closed, which the timer does. At exit,
-// a socket still held is kept, never freed.
+// the library reports the namespace closed, which the timer does. There is
+// no fallback release by time: a stalled socket thread can still have the
+// close queued. A socket whose close is never reported is held until exit,
+// and at exit it is kept, never freed.
 namespace RedwoodClosingSockets {
-  // Releases Socket through the plugin, now or once its close timer ran.
-  // CloseStartedAt is the FPlatformTime::Seconds() of the close, or negative
-  // when no close timer is pending. Game thread only.
+  // Releases Socket through the plugin, now, or once its close timer ran
+  // when bCloseTimerPending. Game thread only.
   REDWOOD_API void Release(
-    TSharedPtr<FSocketIONative> Socket, double CloseStartedAt
+    TSharedPtr<FSocketIONative> Socket, bool bCloseTimerPending
   );
 
   // The sockets held now. For tests.
