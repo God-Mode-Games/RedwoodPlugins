@@ -11,6 +11,8 @@
 #include "SocketIOClient.h"
 #include "SocketIONative.h"
 
+#include <atomic>
+
 namespace {
   // One fallback release, counted from the close, when the library never
   // reports it. Longer than the library's 3 s close timer.
@@ -22,7 +24,11 @@ namespace {
     FTSTicker::FDelegateHandle SafetyRelease;
   };
 
-  // Emptied at exit, so no socket outlives the plugin.
+  // Set first at exit. The task graph shuts down after it, and a close report
+  // dispatched then would crash the socket thread.
+  std::atomic<bool> bClosingSocketsExiting{false};
+
+  // Game thread only. Its sockets move to a leaked array at exit.
   TArray<FClosingSocket> &ClosingSockets() {
     static TArray<FClosingSocket> Sockets;
     return Sockets;
@@ -48,12 +54,15 @@ namespace {
     ReleaseNow(MoveTemp(Entry.Socket));
   }
 
-  // At exit, a socket still held is never freed. Its close report can be
-  // queued to the game thread and run in a later pump during the exit, and
-  // the timer can still run; either would reach freed memory. The heap
-  // array is leaked on purpose: the process ends the socket thread. It is
-  // never a static TSharedPtr released at atexit, a known crash class.
+  // At exit, a socket still held is never freed. Its close timer can still
+  // run before the process ends: the socket is alive, and with the flag set
+  // its close report dispatches nothing to the task graph, which shuts down
+  // after this. The callback is not cleared here, because the timer thread
+  // can read it at any time. The heap array is leaked on purpose: the
+  // process ends the socket thread. It is never a static TSharedPtr released
+  // at atexit, a known crash class.
   void KeepAllAtExit() {
+    bClosingSocketsExiting.store(true);
     TArray<TSharedPtr<FSocketIONative>> *Kept =
       new TArray<TSharedPtr<FSocketIONative>>();
     for (FClosingSocket &Entry : ClosingSockets()) {
@@ -83,10 +92,15 @@ void RedwoodClosingSockets::Release(
 
   static uint64 NextId = 0;
   const uint64 Id = ++NextId;
-  // The library runs this callback from the socket; the release waits for a
-  // later game-thread task.
+  // The callback runs on the socket's own thread, not through a queued
+  // game-thread lambda, so the exit flag can stop it; the socket's other
+  // callbacks are already cleared. The release waits for a later game-thread
+  // task.
+  Socket->bCallbackOnGameThread = false;
   Socket->OnNamespaceDisconnectedCallback = [Id](const FString &) {
-    AsyncTask(ENamedThreads::GameThread, [Id]() { ReleaseHeld(Id, false); });
+    if (!bClosingSocketsExiting.load()) {
+      AsyncTask(ENamedThreads::GameThread, [Id]() { ReleaseHeld(Id, false); });
+    }
   };
 
   FClosingSocket Entry;
