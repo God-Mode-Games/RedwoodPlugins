@@ -500,6 +500,7 @@ private:
   friend class FRedwoodFailedReloginRealmCloseStaysCleanTest;
   friend class FRedwoodQueuedRequestedCloseStaysCleanTest;
   // FORK(hollowed-oath) END
+  friend class FRedwoodInFlightTestAccess; // FORK(hollowed-oath): HollowedOath#2886.
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);
