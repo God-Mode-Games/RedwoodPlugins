@@ -7,6 +7,7 @@
 // that the caller hears back with an error in bounded time.
 
 #include "CoreMinimal.h"
+#include "Algo/AllOf.h"
 #include "Misc/AutomationTest.h"
 #include "UObject/StrongObjectPtr.h"
 
@@ -169,8 +170,25 @@ namespace RedwoodInFlightTest {
     }
 
     ~FRealmHarness() {
+      // The library queues game-thread callbacks that point at the socket,
+      // and Deinitialize frees the socket on a background thread. Keep the
+      // sockets until that release is done and the queue has run, so no
+      // callback of this test runs on a freed socket in a later test.
+      URedwoodClientInterface &C = Client();
+      TArray<TSharedPtr<FSocketIONative>> Sockets;
+      for (const TSharedPtr<FSocketIONative> &Socket :
+           {FAccess::Realm(C), FAccess::Director(C)}) {
+        if (Socket.IsValid()) {
+          Sockets.Add(Socket);
+        }
+      }
       Server.Reset();
       Interface->Deinitialize();
+      PumpGameThreadUntil([&Sockets]() {
+        return Algo::AllOf(Sockets, [](const TSharedPtr<FSocketIONative> &S) {
+          return S.GetSharedReferenceCount() == 1;
+        });
+      });
     }
   };
 
