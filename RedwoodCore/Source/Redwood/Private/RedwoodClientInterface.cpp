@@ -202,14 +202,27 @@ void URedwoodClientInterface::NoteArrivedInWorld() {
     return;
   }
   bTravelPending = false;
+  // A join sent after this travel's one owns the flags now; its lost reply
+  // must keep its dropped assignment and its owed leave.
+  if (TravelJoinSequence != JoinSequence) {
+    return;
+  }
   bAbandonedQueueJoin = false;
   bAssignmentExpected = true;
   bLeaveTicketingOwed = false;
 }
 
+// Back at the entry level without a Logout or a new character: the player is
+// at character select, where no assignment may move them.
+void URedwoodClientInterface::NoteLeftWorld() {
+  bAssignmentExpected = false;
+  bTravelPending = false;
+}
+
 // A join replaces any ticket the server kept, so a leave owed for it would
 // cancel the new one.
 void URedwoodClientInterface::NoteJoinSent() {
+  ++JoinSequence;
   bAssignmentExpected = true;
   bLeaveTicketingOwed = false;
 }
@@ -3068,7 +3081,9 @@ void URedwoodClientInterface::BindRealmEvents() {
         return;
       }
 
-      bTravelPending = true; // FORK(hollowed-oath): HollowedOath#2886.
+      // FORK(hollowed-oath): HollowedOath#2886. See NoteArrivedInWorld.
+      bTravelPending = true;
+      TravelJoinSequence = JoinSequence;
 
       bool bShouldStitch = MessageObject->GetBoolField(TEXT("shouldStitch"));
       ServerConnection = MessageObject->GetStringField(TEXT("connection"));

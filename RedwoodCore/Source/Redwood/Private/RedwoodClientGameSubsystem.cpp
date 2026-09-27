@@ -88,13 +88,17 @@ void URedwoodClientGameSubsystem::HandleOnWorldAdded(
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
     if (IsValid(World) && (World->WorldType == EWorldType::Game || World->WorldType == EWorldType::PIE)) {
       World->GetOnBeginPlayEvent().AddUObject(
-        this, &URedwoodClientGameSubsystem::HandleOnWorldBeginPlay
+        this,
+        &URedwoodClientGameSubsystem::HandleOnWorldBeginPlay,
+        TWeakObjectPtr<UWorld>(World)
       );
     }
   }
 }
 
-void URedwoodClientGameSubsystem::HandleOnWorldBeginPlay(bool bBegunPlay) {
+void URedwoodClientGameSubsystem::HandleOnWorldBeginPlay(
+  bool bBegunPlay, TWeakObjectPtr<UWorld> BegunWorld
+) {
   UWorld *World = GetWorld();
 
   if (IsValid(World) && bBegunPlay) {
@@ -102,10 +106,15 @@ void URedwoodClientGameSubsystem::HandleOnWorldBeginPlay(bool bBegunPlay) {
     // but this is now reported by the server instead of the client. We're
     // leaving this function here just in case we need it in the future.
 
-    // FORK(hollowed-oath): HollowedOath#2886. A client world is a game
-    // server's world: the player arrived.
-    if (World->GetNetMode() == NM_Client && ClientInterface) {
-      ClientInterface->NoteArrivedInWorld();
+    // FORK(hollowed-oath): HollowedOath#2886. Only this game instance's own
+    // world. A client world is a game server's world: the player arrived. A
+    // standalone world is the entry level: the player left the game server.
+    if (BegunWorld.Get() == World && ClientInterface) {
+      if (World->GetNetMode() == NM_Client) {
+        ClientInterface->NoteArrivedInWorld();
+      } else if (World->GetNetMode() == NM_Standalone) {
+        ClientInterface->NoteLeftWorld();
+      }
     }
   }
 }

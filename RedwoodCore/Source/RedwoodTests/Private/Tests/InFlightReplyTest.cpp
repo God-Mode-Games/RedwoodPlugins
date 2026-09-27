@@ -1050,6 +1050,10 @@ namespace RedwoodInFlightTest {
       TEXT("A successful leave pays the owed one"),
       PumpGameThreadUntil([&C]() { return !FAccess::bLeaveTicketingOwed(C); })
     );
+    Test.TestFalse(
+      TEXT("Between the leave and the arrival, a replay does not move the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
 
     // The travel of the assignment finished after the leave: the player is
     // in the world. Pins: NoteArrivedInWorld.
@@ -1113,6 +1117,52 @@ namespace RedwoodInFlightTest {
     Test.TestTrue(
       TEXT("The close handshake ends"),
       PumpGameThreadUntil([&CloseReports]() { return CloseReports >= 2; })
+    );
+    return true;
+  }
+
+  // The timer fires, the player joins again from character select, and that
+  // join's reply is lost; then the OLD travel arrives. Pins: the join count
+  // in NoteArrivedInWorld.
+  bool RunOldTravelAfterNewJoin(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    Test.TestTrue(
+      TEXT("The first assignment moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    C.LeaveTicketing(FRedwoodErrorOutputDelegate());
+    C.JoinQueue(
+      TEXT("proxy-1"), TEXT("zone-1"), false, false, FRedwoodTicketingUpdateDelegate()
+    );
+    // What the lost reply of the new join leaves.
+    FAccess::bAbandonedQueueJoin(C) = true;
+    FAccess::bLeaveTicketingOwed(C) = true;
+    C.NoteArrivedInWorld();
+    Test.TestTrue(
+      TEXT("The old travel keeps the new join dropped"), FAccess::bAbandonedQueueJoin(C)
+    );
+    Test.TestTrue(
+      TEXT("The old travel keeps the new join's leave owed"),
+      FAccess::bLeaveTicketingOwed(C)
+    );
+    return true;
+  }
+
+  // Back at the entry level: character select. Pins: NoteLeftWorld.
+  bool RunLeftWorld(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    C.NoteLeftWorld();
+    Test.TestFalse(
+      TEXT("At the entry level, a replay does not move the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
     );
     return true;
   }
@@ -1252,6 +1302,16 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightArrivalWithoutTravelTest,
   "ArrivalWithoutTravelKeepsGuard",
   RedwoodInFlightTest::RunArrivalWithoutTravel(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightOldTravelTest,
+  "OldTravelKeepsNewJoinFlags",
+  RedwoodInFlightTest::RunOldTravelAfterNewJoin(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightLeftWorldTest,
+  "LeftWorldExpectsNoAssignment",
+  RedwoodInFlightTest::RunLeftWorld(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,

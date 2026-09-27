@@ -49,8 +49,9 @@ public:
   }
 
   // FORK(hollowed-oath): HollowedOath#2886. The client world of a game
-  // server began play. See the .cpp.
+  // server, or a standalone world (the entry level), began play. See the .cpp.
   void NoteArrivedInWorld();
+  void NoteLeftWorld();
 
   // FORK(hollowed-oath): HollowedOath#2886. For a request that another module
   // sends on GetDirectorConnection(): a Director drop fails it with OnLost.
@@ -547,6 +548,10 @@ private:
   // NoteArrivedInWorld. LeaveTicketing keeps it: the game's timer can fire
   // during the travel, which can still arrive.
   bool bTravelPending = false;
+  // Counts the joins sent. The travel keeps the count of its join, so an
+  // arrival does not clear the flags of a newer join.
+  uint32 JoinSequence = 0;
+  uint32 TravelJoinSequence = 0;
   // FORK(hollowed-oath) END
   // The Realm socket dropped and the player is not authenticated on it again
   // yet; the Director has bAuthenticated for this.
