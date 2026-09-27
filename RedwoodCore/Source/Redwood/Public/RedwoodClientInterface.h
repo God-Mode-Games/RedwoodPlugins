@@ -48,6 +48,12 @@ public:
     return Director;
   }
 
+  // FORK(hollowed-oath): HollowedOath#2886. For a request that another module
+  // sends on GetDirectorConnection(): a Director drop fails it with OnLost.
+  FRedwoodReplyCallback TrackDirectorReply(
+    FRedwoodReplyCallback OnReply, TFunction<void()> OnLost
+  );
+
   TSharedPtr<FSocketIONative> GetRealmConnection() const {
     return Realm;
   }
@@ -522,10 +528,16 @@ private:
   FRedwoodPendingReplies RealmReplies;
   void NoteDirectorReconnected();
   void NoteRealmReconnected();
-  // A JoinQueue whose reply was lost: the game went back to character
-  // select, so its assignment must not move the player. A new join clears
-  // it.
+  bool IsRealmReady();
+  void SendOwedLeave();
+  // A join whose reply was lost: the game went back to character select, so
+  // its assignment must not move the player. A new join clears it.
   bool bAbandonedQueueJoin = false;
+  // A join is out, or the player is in the world. Otherwise an assignment is
+  // a replay for a player at character select.
+  bool bAssignmentExpected = false;
+  // A lost join left a ticket on the server. See SendOwedLeave.
+  bool bLeaveTicketingOwed = false;
   // FORK(hollowed-oath) END
   // The Realm socket dropped and the player is not authenticated on it again
   // yet; the Director has bAuthenticated for this.

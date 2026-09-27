@@ -191,6 +191,8 @@ FRedwoodReplyCallback URedwoodClientInterface::TrackReply(
 }
 
 void URedwoodClientInterface::FailTicketingJoin() {
+  bAbandonedQueueJoin = true;
+  bLeaveTicketingOwed = true;
   FRedwoodTicketingUpdate Update;
   Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
   Update.Message = FRedwoodPendingReplies::LostReplyError;
@@ -565,6 +567,11 @@ void URedwoodClientInterface::Logout() {
 
     PlayerId = TEXT("");
     AuthToken = TEXT("");
+    // FORK(hollowed-oath): HollowedOath#2886. The server can replay an
+    // assignment kept for the last character; nothing here may accept it.
+    SelectedCharacterId = TEXT("");
+    bAssignmentExpected = false;
+    bAbandonedQueueJoin = false;
     // FORK(hollowed-oath): HollowedOath#2854. See HasPlayerSession: both
     // flags, or a later Director drop at the title screen re-logs in with
     // empty ids and reports an authentication failure there.
@@ -2728,6 +2735,11 @@ void URedwoodClientInterface::InitiateRealmHandshake(
 
   CurrentRealm = FRedwoodRealm();
   const uint32 Generation = ++RealmHandshakeGeneration; // FORK(hollowed-oath)
+  // FORK(hollowed-oath): HollowedOath#2886. The server can replay an
+  // assignment kept for the last character; nothing here may accept it.
+  SelectedCharacterId = TEXT("");
+  bAssignmentExpected = false;
+  bAbandonedQueueJoin = false;
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
@@ -2946,6 +2958,11 @@ void URedwoodClientInterface::FinalizeRealmHandshake(
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
+      // FORK(hollowed-oath): HollowedOath#2886. Before the caller can join.
+      if (Error.IsEmpty()) {
+        SendOwedLeave();
+      }
+
       FRedwoodSocketConnected Output;
       Output.Error = Error;
       OnRealmConnected.ExecuteIfBound(Output);
@@ -2995,11 +3012,12 @@ void URedwoodClientInterface::BindRealmEvents() {
       TSharedPtr<FJsonObject> MessageObject = Message->AsObject();
 
       // FORK(hollowed-oath): HollowedOath#2886. A zone assignment sent again
-      // after a reconnect can be for a request the game dropped, or for a
-      // character the player no longer plays. Neither may move the player.
+      // after a reconnect can be for a request the game dropped, for a
+      // character the player no longer plays, or reach a player who is at
+      // character select with no join. None may move the player.
       // An old server sends no characterId; its assignment moves as before.
       FString AssignedCharacterId;
-      if (bAbandonedQueueJoin ||
+      if (!bAssignmentExpected || bAbandonedQueueJoin ||
           (MessageObject->TryGetStringField(
              TEXT("characterId"), AssignedCharacterId
            ) &&
@@ -3098,6 +3116,13 @@ bool URedwoodClientInterface::IsRealmConnected(FRedwoodRealm &OutRealm) {
 
 bool URedwoodClientInterface::IsRealmConnected() {
   return Realm.IsValid() && Realm->bIsConnected;
+}
+
+// FORK(hollowed-oath): HollowedOath#2886. For the requests the gates do not
+// hold. In the re-login window the socket is back but does not know the
+// player, and nothing answers a request sent to it.
+bool URedwoodClientInterface::IsRealmReady() {
+  return IsRealmConnected() && !bRealmReauthPending;
 }
 
 TMap<FString, float> URedwoodClientInterface::GetRegions() {
@@ -3210,7 +3235,8 @@ void URedwoodClientInterface::CreateCharacter(
   USIOJsonObject *CharacterCreatorData,
   FRedwoodGetCharacterOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodGetCharacterOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3338,7 +3364,8 @@ void URedwoodClientInterface::SetCharacterData(
   USIOJsonObject *CharacterCreatorData,
   FRedwoodGetCharacterOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodGetCharacterOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3382,6 +3409,11 @@ void URedwoodClientInterface::SetCharacterData(
 }
 
 void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
+  // FORK(hollowed-oath): HollowedOath#2886. A new character is at character
+  // select until it joins.
+  if (CharacterId != SelectedCharacterId) {
+    bAssignmentExpected = false;
+  }
   SelectedCharacterId = CharacterId;
 
   if (!CurrentParty.bValid || !Realm.IsValid() || !Realm->bIsConnected) {
@@ -3548,6 +3580,33 @@ void URedwoodClientInterface::NoteRealmReconnected() {
   }
 }
 
+// The server can still hold a ticket whose join reply was lost, and replay
+// its assignment. Leaving deletes both. Sent at the first Realm auth after
+// the loss, whatever came between; the reply to the auth is the first moment
+// the Realm knows the player. The flag stays until a leave succeeds.
+void URedwoodClientInterface::SendOwedLeave() {
+  if (!bLeaveTicketingOwed || !IsRealmConnected()) {
+    return;
+  }
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Realm->Emit(
+    TEXT("realm:ticketing:leave"),
+    Payload,
+    RealmReplies.Track([this](auto Response) {
+      if (Response[0]->AsObject()->GetStringField(TEXT("error")).IsEmpty()) {
+        bLeaveTicketingOwed = false;
+      }
+    }, []() {})
+  );
+}
+
+FRedwoodReplyCallback URedwoodClientInterface::TrackDirectorReply(
+  FRedwoodReplyCallback OnReply, TFunction<void()> OnLost
+) {
+  return DirectorReplies.Track(MoveTemp(OnReply), MoveTemp(OnLost));
+}
+
 void URedwoodClientInterface::NoteDirectorReconnected() {
   if (bDirectorDisconnected) {
     DirectorReplies.FailAll();
@@ -3656,13 +3715,6 @@ void URedwoodClientInterface::EndRealmReauthentication(bool bSucceeded) {
     }
     bOnlineCharacterOwedAfterRealm = false;
     RealmHeldRequests.Release(TimerManager);
-    // FORK(hollowed-oath): HollowedOath#2886. The server can still hold the
-    // queue request whose reply was lost. Leave the queue, which also deletes
-    // an assignment kept for it. The flag stays: the server answers the leave
-    // before it runs it, so only a new join may clear it.
-    if (bAbandonedQueueJoin) {
-      LeaveTicketing(FRedwoodErrorOutputDelegate());
-    }
   } else {
     RealmHeldRequests.Expire(TimerManager);
   }
@@ -3710,9 +3762,8 @@ void URedwoodClientInterface::JoinQueue(
     return;
   }
 
-  // FORK(hollowed-oath): HollowedOath#2886. A failure handler can call this
-  // while a new handshake has released the old socket and made no new one.
-  if (!Realm.IsValid()) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message = TEXT("Not connected to Realm.");
@@ -3740,6 +3791,7 @@ void URedwoodClientInterface::JoinQueue(
   OnTicketingUpdate = OnUpdate;
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  bAssignmentExpected = true; // FORK(hollowed-oath): HollowedOath#2886.
   Realm->Emit(
     TEXT("realm:ticketing:join:queue"),
     Payload,
@@ -3755,10 +3807,7 @@ void URedwoodClientInterface::JoinQueue(
       if (!Error.IsEmpty()) {
         OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
       }
-    }, [this]() {
-      bAbandonedQueueJoin = true;
-      FailTicketingJoin();
-    })
+    }, [this]() { FailTicketingJoin(); })
   );
 }
 
@@ -3784,7 +3833,8 @@ void URedwoodClientInterface::JoinCustom(
 }
 
 void URedwoodClientInterface::AttemptJoinCustom() {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message = TEXT("Not connected to Realm.");
@@ -3853,6 +3903,7 @@ void URedwoodClientInterface::AttemptJoinCustom() {
   Payload->SetArrayField(TEXT("regions"), DesiredRegions);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  bAssignmentExpected = true; // FORK(hollowed-oath): HollowedOath#2886.
   Realm->Emit(
     TEXT("realm:ticketing:join:custom"),
     Payload,
@@ -3875,7 +3926,8 @@ void URedwoodClientInterface::AttemptJoinCustom() {
 void URedwoodClientInterface::LeaveTicketing(
   FRedwoodErrorOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -3901,7 +3953,8 @@ void URedwoodClientInterface::ListProxies(
   TArray<FString> PrivateProxyReferences,
   FRedwoodListProxiesOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodListProxiesOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3952,7 +4005,8 @@ void URedwoodClientInterface::CreateProxy(
   FRedwoodCreateProxyInput Parameters,
   FRedwoodCreateProxyOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodCreateProxyOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -4042,7 +4096,8 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
   FString Password,
   FRedwoodJoinServerOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodJoinServerOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -4072,6 +4127,7 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
   }
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  bAssignmentExpected = true; // FORK(hollowed-oath): HollowedOath#2886.
   Realm->Emit(
     TEXT("realm:servers:join-proxy"),
     Payload,
@@ -4094,7 +4150,8 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
 void URedwoodClientInterface::StopProxy(
   FString ServerProxyId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -4118,7 +4175,8 @@ void URedwoodClientInterface::StopProxy(
 }
 
 void URedwoodClientInterface::AttemptJoinMatchmaking() {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message = TEXT("Not connected to Realm.");
@@ -4186,6 +4244,7 @@ void URedwoodClientInterface::AttemptJoinMatchmaking() {
   Payload->SetObjectField(TEXT("data"), MatchmakingData);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  bAssignmentExpected = true; // FORK(hollowed-oath): HollowedOath#2886.
   Realm->Emit(
     TEXT("realm:ticketing:join:matchmaking"),
     Payload,
@@ -4486,7 +4545,8 @@ void URedwoodClientInterface::SetPartyData(
   USIOJsonObject *PartyData,
   FRedwoodGetPartyOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodGetPartyOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
