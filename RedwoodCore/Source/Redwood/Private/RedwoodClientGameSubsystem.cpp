@@ -83,22 +83,39 @@ void URedwoodClientGameSubsystem::Deinitialize() {
 void URedwoodClientGameSubsystem::HandleOnWorldAdded(
   UWorld *World, FWorldInitializationValues IVS
 ) {
-  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld()) && IsDirectorConnected()) {
+  // FORK(hollowed-oath): HollowedOath#2886. Not only while the Director is
+  // connected: the arrival in a game server's world must always be seen.
+  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
     if (IsValid(World) && (World->WorldType == EWorldType::Game || World->WorldType == EWorldType::PIE)) {
       World->GetOnBeginPlayEvent().AddUObject(
-        this, &URedwoodClientGameSubsystem::HandleOnWorldBeginPlay
+        this,
+        &URedwoodClientGameSubsystem::HandleOnWorldBeginPlay,
+        TWeakObjectPtr<UWorld>(World)
       );
     }
   }
 }
 
-void URedwoodClientGameSubsystem::HandleOnWorldBeginPlay(bool bBegunPlay) {
+void URedwoodClientGameSubsystem::HandleOnWorldBeginPlay(
+  bool bBegunPlay, TWeakObjectPtr<UWorld> BegunWorld
+) {
   UWorld *World = GetWorld();
 
   if (IsValid(World) && bBegunPlay) {
     // This function was using for an older method to report online status
     // but this is now reported by the server instead of the client. We're
     // leaving this function here just in case we need it in the future.
+
+    // FORK(hollowed-oath): HollowedOath#2886. Only this game instance's own
+    // world. A client world is a game server's world: the player arrived. A
+    // standalone world is the entry level: the player left the game server.
+    if (BegunWorld.Get() == World && ClientInterface) {
+      if (World->GetNetMode() == NM_Client) {
+        ClientInterface->NoteArrivedInWorld();
+      } else if (World->GetNetMode() == NM_Standalone) {
+        ClientInterface->NoteLeftWorld();
+      }
+    }
   }
 }
 
