@@ -106,6 +106,9 @@ public:
   static bool &bAssignmentExpected(FClient &C) {
     return C.bAssignmentExpected;
   }
+  static bool &bTravelPending(FClient &C) {
+    return C.bTravelPending;
+  }
   static bool &bLeaveTicketingOwed(FClient &C) {
     return C.bLeaveTicketingOwed;
   }
@@ -1026,9 +1029,18 @@ namespace RedwoodInFlightTest {
       AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
     );
 
+    // The timer race: an assignment is accepted, and the game's timer then
+    // leaves during its travel.
+    FAccess::bAbandonedQueueJoin(C) = false;
+    FAccess::bAssignmentExpected(C) = true;
+    Test.TestTrue(
+      TEXT("The assignment moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    Test.TestTrue(TEXT("Its travel is pending"), FAccess::bTravelPending(C));
+
     // Sent and answered: it pays a leave that was owed. Pins: the reset in
     // the LeaveTicketing reply.
-    FAccess::bAssignmentExpected(C) = true;
     C.LeaveTicketing(OnOutput);
     FString Request;
     if (!AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request)) {
@@ -1101,6 +1113,28 @@ namespace RedwoodInFlightTest {
     Test.TestTrue(
       TEXT("The close handshake ends"),
       PumpGameThreadUntil([&CloseReports]() { return CloseReports >= 2; })
+    );
+    return true;
+  }
+
+  // A client world that is not the travel of an accepted assignment (a PIE
+  // client, a future lobby) must not open the guard. Pins: the
+  // bTravelPending check in NoteArrivedInWorld.
+  bool RunArrivalWithoutTravel(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAssignmentExpected(C) = false;
+    C.NoteArrivedInWorld();
+    Test.TestFalse(
+      TEXT("An arrival with no travel expects no assignment"),
+      FAccess::bAssignmentExpected(C)
+    );
+    Test.TestFalse(
+      TEXT("A replay does not move the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
     );
     return true;
   }
@@ -1213,6 +1247,11 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightLogoutPaysOwedLeaveTest,
   "LogoutPaysOwedLeave",
   RedwoodInFlightTest::RunLogoutPaysOwedLeave(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightArrivalWithoutTravelTest,
+  "ArrivalWithoutTravelKeepsGuard",
+  RedwoodInFlightTest::RunArrivalWithoutTravel(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,

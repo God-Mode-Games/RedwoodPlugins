@@ -195,7 +195,13 @@ FRedwoodReplyCallback URedwoodClientInterface::TrackReply(
 // The travel of an assignment finished, even after the game gave up on it
 // (its enter-world timer can fire during the travel). The player is in the
 // world: later zone transfers must move them, and the ticket is used up.
+// Only the travel of an accepted assignment counts: any other client world
+// (a PIE client, a future lobby) must not open the guard for a replay.
 void URedwoodClientInterface::NoteArrivedInWorld() {
+  if (!bTravelPending) {
+    return;
+  }
+  bTravelPending = false;
   bAbandonedQueueJoin = false;
   bAssignmentExpected = true;
   bLeaveTicketingOwed = false;
@@ -597,6 +603,7 @@ void URedwoodClientInterface::Logout() {
     SelectedCharacterId = TEXT("");
     bAssignmentExpected = false;
     bAbandonedQueueJoin = false;
+    bTravelPending = false;
     // The next login can be another account, whose tickets are not ours.
     bLeaveTicketingOwed = false;
     // FORK(hollowed-oath): HollowedOath#2854. See HasPlayerSession: both
@@ -2767,6 +2774,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
   SelectedCharacterId = TEXT("");
   bAssignmentExpected = false;
   bAbandonedQueueJoin = false;
+  bTravelPending = false;
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
@@ -3059,6 +3067,8 @@ void URedwoodClientInterface::BindRealmEvents() {
         );
         return;
       }
+
+      bTravelPending = true; // FORK(hollowed-oath): HollowedOath#2886.
 
       bool bShouldStitch = MessageObject->GetBoolField(TEXT("shouldStitch"));
       ServerConnection = MessageObject->GetStringField(TEXT("connection"));
@@ -3448,6 +3458,7 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
   // select until it joins.
   if (CharacterId != SelectedCharacterId) {
     bAssignmentExpected = false;
+    bTravelPending = false;
   }
   SelectedCharacterId = CharacterId;
 

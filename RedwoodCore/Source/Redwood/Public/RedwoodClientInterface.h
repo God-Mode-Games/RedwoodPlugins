@@ -543,6 +543,10 @@ private:
   bool bAssignmentExpected = false;
   // A lost join left a ticket on the server. See SendOwedLeave.
   bool bLeaveTicketingOwed = false;
+  // An accepted assignment's travel has not arrived yet. See
+  // NoteArrivedInWorld. LeaveTicketing keeps it: the game's timer can fire
+  // during the travel, which can still arrive.
+  bool bTravelPending = false;
   // FORK(hollowed-oath) END
   // The Realm socket dropped and the player is not authenticated on it again
   // yet; the Director has bAuthenticated for this.
