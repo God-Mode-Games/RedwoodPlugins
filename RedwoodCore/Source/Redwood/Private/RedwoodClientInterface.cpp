@@ -3086,12 +3086,21 @@ void URedwoodClientInterface::BindRealmEvents() {
       // character select with no join. None may move the player.
       // An old server sends no characterId; its assignment moves as before.
       FString AssignedCharacterId;
-      if (!bAssignmentExpected || bAbandonedQueueJoin ||
-          (MessageObject->TryGetStringField(
-             TEXT("characterId"), AssignedCharacterId
-           ) &&
-           !AssignedCharacterId.IsEmpty() &&
-           AssignedCharacterId != SelectedCharacterId)) {
+      MessageObject->TryGetStringField(TEXT("characterId"), AssignedCharacterId);
+      const bool bForAnotherCharacter = !AssignedCharacterId.IsEmpty() &&
+        AssignedCharacterId != SelectedCharacterId;
+      // When the leader queues the whole party, a member's client sends no
+      // join, and no event names it before the assignment. So a party member
+      // (not the leader) accepts an assignment named for its selected
+      // character. The cost: for a party member, a replay after a relaunch
+      // within 60 s is not refused here; the server's login-lineage and
+      // unused-token checks still apply. Remove this rule when
+      // HollowedOath#3002 ships.
+      const bool bPartyMemberAssignment = CurrentParty.bValid &&
+        CurrentParty.LeaderId != PlayerId && !AssignedCharacterId.IsEmpty() &&
+        !bForAnotherCharacter;
+      if ((!bAssignmentExpected && !bPartyMemberAssignment) ||
+          bAbandonedQueueJoin || bForAnotherCharacter) {
         UE_LOG(
           LogRedwood,
           Warning,
@@ -4188,6 +4197,11 @@ void URedwoodClientInterface::CreateProxy(
 
   Payload->SetBoolField(TEXT("startOnBoot"), Parameters.bStartOnBoot);
 
+  // FORK(hollowed-oath): HollowedOath#2886. A create that joins its session
+  // gets its assignment as a connect-to-instance, like a ticketing join.
+  if (bJoinSession) {
+    NoteJoinSent();
+  }
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:servers:create-proxy"),

@@ -107,6 +107,9 @@ public:
   static bool &bAssignmentExpected(FClient &C) {
     return C.bAssignmentExpected;
   }
+  static FRedwoodParty &CurrentParty(FClient &C) {
+    return C.CurrentParty;
+  }
   static bool &bTravelPending(FClient &C) {
     return C.bTravelPending;
   }
@@ -894,6 +897,68 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
+  // A create that joins its session gets a connect-to-instance, which must
+  // move the player. Pins: NoteJoinSent in CreateProxy.
+  bool RunCreateProxyJoinMoves(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAssignmentExpected(C) = false;
+    C.CreateProxy(true, FRedwoodCreateProxyInput(), FRedwoodCreateProxyOutputDelegate());
+    Test.TestTrue(
+      TEXT("The assignment of a create that joins moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    return true;
+  }
+
+  // A whole-party join sends no join from a member's client. Pins: the
+  // party-member case of the assignment guard.
+  bool RunPartyMemberAssignment(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAssignmentExpected(C) = false;
+    Test.TestFalse(
+      TEXT("Outside a party, with no join, an assignment does not move the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+
+    FRedwoodParty &Party = FAccess::CurrentParty(C);
+    Party.bValid = true;
+    Party.LeaderId = TEXT("player-2");
+    Test.TestFalse(
+      TEXT("A member does not move for another character"),
+      AssignmentMoves(
+        Test,
+        Harness,
+        "42[\"realm:servers:connect-to-instance\",{\"shouldStitch\":false,"
+        "\"connection\":\"x:1\",\"token\":\"t\",\"characterId\":\"c-2\"}]"
+      )
+    );
+    Test.TestFalse(
+      TEXT("A member does not move for an assignment with no character"),
+      AssignmentMoves(Test, Harness, AssignmentWithoutCharacter)
+    );
+    Test.TestTrue(
+      TEXT("A member at character select moves for its selected character"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+
+    Party.LeaderId = TEXT("player-1");
+    FAccess::bAssignmentExpected(C) = false;
+    FAccess::bTravelPending(C) = false;
+    Test.TestFalse(
+      TEXT("The leader with no join does not move"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    return true;
+  }
+
   // Pins: the resets in Logout.
   bool RunLogoutForgetsCharacter(FAutomationTestBase &Test) {
     FRealmHarness Harness;
@@ -1423,6 +1488,16 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightFreeDuringSecondCloseTest,
   "FreeAfterSecondRequestedCloseKeepsSocket",
   RedwoodInFlightTest::RunFreeDuringRequestedClose(*this, true)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCreateProxyJoinTest,
+  "CreateProxyJoinMoves",
+  RedwoodInFlightTest::RunCreateProxyJoinMoves(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyMemberTest,
+  "PartyMemberAssignmentMoves",
+  RedwoodInFlightTest::RunPartyMemberAssignment(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,
