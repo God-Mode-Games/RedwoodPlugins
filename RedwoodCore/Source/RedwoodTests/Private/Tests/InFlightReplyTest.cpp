@@ -775,6 +775,7 @@ namespace RedwoodInFlightTest {
     bool bAnswered = false;
     FString Error;
     int32 CloseReports = 0;
+    bool bNamespaceClosed = false;
     FRealmHarness Harness;
     if (!Harness.Open(Test)) {
       return false;
@@ -799,6 +800,10 @@ namespace RedwoodInFlightTest {
         Handler(Reason);
         ++CloseReports;
       };
+    // The library's 3 s close timer reports the namespace closed when it
+    // runs. The socket must not be freed before: the timer would run on it.
+    Realm->OnNamespaceDisconnectedCallback =
+      [&bNamespaceClosed](const FString &) { bNamespaceClosed = true; };
 
     FAccess::RequestRealmClose(C);
     ExpectClearError(Test, TEXT("Party invite at a requested close"), bAnswered, Error);
@@ -806,6 +811,10 @@ namespace RedwoodInFlightTest {
     Test.TestTrue(
       TEXT("The close handshake ends"),
       PumpGameThreadUntil([&CloseReports]() { return CloseReports >= 2; })
+    );
+    Test.TestTrue(
+      TEXT("The close timer ran"),
+      PumpGameThreadUntil([&bNamespaceClosed]() { return bNamespaceClosed; })
     );
     return true;
   }
@@ -1085,6 +1094,7 @@ namespace RedwoodInFlightTest {
   // still knows the player when it runs the leave.
   bool RunLogoutPaysOwedLeave(FAutomationTestBase &Test) {
     int32 CloseReports = 0;
+    bool bNamespaceClosed = false;
     FRealmHarness Harness;
     if (!Harness.Open(Test)) {
       return false;
@@ -1101,6 +1111,10 @@ namespace RedwoodInFlightTest {
         Handler(Reason);
         ++CloseReports;
       };
+    // The library's 3 s close timer reports the namespace closed when it
+    // runs. The socket must not be freed before: the timer would run on it.
+    Realm->OnNamespaceDisconnectedCallback =
+      [&bNamespaceClosed](const FString &) { bNamespaceClosed = true; };
 
     C.Logout();
     FString Request;
@@ -1117,6 +1131,10 @@ namespace RedwoodInFlightTest {
     Test.TestTrue(
       TEXT("The close handshake ends"),
       PumpGameThreadUntil([&CloseReports]() { return CloseReports >= 2; })
+    );
+    Test.TestTrue(
+      TEXT("The close timer ran"),
+      PumpGameThreadUntil([&bNamespaceClosed]() { return bNamespaceClosed; })
     );
     return true;
   }
@@ -1152,6 +1170,34 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
+  // The newer join was left, and its leave went through; then the old
+  // travel arrives. The player is in the world. Pins: the no-leave-owed case
+  // of the join count check in NoteArrivedInWorld.
+  bool RunOldTravelAfterCleanLeave(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    Test.TestTrue(
+      TEXT("The first assignment moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    C.JoinQueue(
+      TEXT("proxy-1"), TEXT("zone-1"), false, false, FRedwoodTicketingUpdateDelegate()
+    );
+    // What a leave of the new join leaves once it went through.
+    FAccess::bAbandonedQueueJoin(C) = true;
+    FAccess::bAssignmentExpected(C) = false;
+    FAccess::bLeaveTicketingOwed(C) = false;
+    C.NoteArrivedInWorld();
+    Test.TestTrue(
+      TEXT("After the old travel arrives, a zone transfer moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    return true;
+  }
+
   // Back at the entry level: character select. Pins: NoteLeftWorld.
   bool RunLeftWorld(FAutomationTestBase &Test) {
     FRealmHarness Harness;
@@ -1159,7 +1205,9 @@ namespace RedwoodInFlightTest {
       return false;
     }
     URedwoodClientInterface &C = Harness.Client();
+    FAccess::bTravelPending(C) = true;
     C.NoteLeftWorld();
+    Test.TestFalse(TEXT("Leaving ends the travel"), FAccess::bTravelPending(C));
     Test.TestFalse(
       TEXT("At the entry level, a replay does not move the player"),
       AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
@@ -1307,6 +1355,11 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightOldTravelTest,
   "OldTravelKeepsNewJoinFlags",
   RedwoodInFlightTest::RunOldTravelAfterNewJoin(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightOldTravelCleanLeaveTest,
+  "OldTravelAfterCleanLeaveMoves",
+  RedwoodInFlightTest::RunOldTravelAfterCleanLeave(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightLeftWorldTest,

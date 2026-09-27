@@ -203,8 +203,14 @@ void URedwoodClientInterface::NoteArrivedInWorld() {
   }
   bTravelPending = false;
   // A join sent after this travel's one owns the flags now; its lost reply
-  // must keep its dropped assignment and its owed leave.
+  // must keep its dropped assignment and its owed leave. When no leave is
+  // owed, that join is still out or was left, and the player, who is in the
+  // world now, must get zone transfers.
   if (TravelJoinSequence != JoinSequence) {
+    if (!bLeaveTicketingOwed) {
+      bAbandonedQueueJoin = false;
+      bAssignmentExpected = true;
+    }
     return;
   }
   bAbandonedQueueJoin = false;
