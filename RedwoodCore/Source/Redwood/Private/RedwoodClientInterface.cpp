@@ -659,8 +659,8 @@ void URedwoodClientInterface::Login(
     Payload->SetBoolField(TEXT("bypassProviderCheck"), true);
   }
 
-  // FORK(hollowed-oath): HollowedOath#2886. Not tracked: the re-login
-  // retries a lost reply; a failure here would end the session.
+  // FORK(hollowed-oath): HollowedOath#2886. Not tracked (HA plan ruling
+  // C1): the re-login also runs this, and a failure would end the session.
   Director->Emit(
     TEXT("player:login:username"),
     Payload,
@@ -2735,8 +2735,8 @@ void URedwoodClientInterface::InitiateRealmHandshake(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("realmId"), InRealm.Id);
 
-  // FORK(hollowed-oath): HollowedOath#2886. Not tracked: the re-login
-  // retries a lost reply; a failure here would end the session.
+  // FORK(hollowed-oath): HollowedOath#2886. Not tracked (HA plan ruling
+  // C1): the re-login also runs this, and a failure would end the session.
   Director->Emit(
     TEXT("realm:auth:player:connect:client-to-director"),
     Payload,
@@ -2862,8 +2862,8 @@ void URedwoodClientInterface::BeginRealmReauthentication() {
   Payload->SetStringField(TEXT("realmId"), CurrentRealmId);
 
   const uint32 Generation = RealmHandshakeGeneration; // FORK(hollowed-oath)
-  // FORK(hollowed-oath): HollowedOath#2886. Not tracked: the re-login
-  // retries a lost reply; a failure here would end the session.
+  // FORK(hollowed-oath): HollowedOath#2886. Not tracked (HA plan ruling
+  // C1): the re-login also runs this, and a failure would end the session.
   Director->Emit(
     TEXT("realm:auth:player:connect:client-to-director"),
     Payload,
@@ -2934,8 +2934,8 @@ void URedwoodClientInterface::FinalizeRealmHandshake(
   Payload->SetStringField(TEXT("token"), Token);
 
   const uint32 Generation = RealmHandshakeGeneration; // FORK(hollowed-oath)
-  // FORK(hollowed-oath): HollowedOath#2886. Not tracked: the re-login
-  // retries a lost reply; a failure here would end the session.
+  // FORK(hollowed-oath): HollowedOath#2886. Not tracked (HA plan ruling
+  // C1): the re-login also runs this, and a failure would end the session.
   Realm->Emit(
     TEXT("realm:auth:player:connect:client-to-realm"),
     Payload,
@@ -3660,16 +3660,10 @@ void URedwoodClientInterface::EndRealmReauthentication(bool bSucceeded) {
     RealmHeldRequests.Release(TimerManager);
     // FORK(hollowed-oath): HollowedOath#2886. The server can still hold the
     // queue request whose reply was lost. Leave the queue, which also deletes
-    // an assignment kept for it. The flag stays until the leave succeeds.
+    // an assignment kept for it. The flag stays: the server answers the leave
+    // before it runs it, so only a new join may clear it.
     if (bAbandonedQueueJoin) {
-      LeaveTicketing(FRedwoodErrorOutputDelegate::CreateWeakLambda(
-        this,
-        [this](const FString &Error) {
-          if (Error.IsEmpty()) {
-            bAbandonedQueueJoin = false;
-          }
-        }
-      ));
+      LeaveTicketing(FRedwoodErrorOutputDelegate());
     }
   } else {
     RealmHeldRequests.Expire(TimerManager);
@@ -3681,6 +3675,8 @@ void URedwoodClientInterface::JoinMatchmaking(
   TArray<FString> InRegions,
   FRedwoodTicketingUpdateDelegate OnUpdate
 ) {
+  bAbandonedQueueJoin = false; // FORK(hollowed-oath): HollowedOath#2886.
+
   if (SelectedCharacterId.IsEmpty()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
@@ -3712,6 +3708,16 @@ void URedwoodClientInterface::JoinQueue(
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message =
       TEXT("Please select a character before joining a server queue.");
+    OnUpdate.ExecuteIfBound(Update);
+    return;
+  }
+
+  // FORK(hollowed-oath): HollowedOath#2886. A failure handler can call this
+  // while a new handshake has released the old socket and made no new one.
+  if (!Realm.IsValid()) {
+    FRedwoodTicketingUpdate Update;
+    Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
+    Update.Message = TEXT("Not connected to Realm.");
     OnUpdate.ExecuteIfBound(Update);
     return;
   }
@@ -3763,6 +3769,8 @@ void URedwoodClientInterface::JoinCustom(
   TArray<FString> InRegions,
   FRedwoodTicketingUpdateDelegate OnUpdate
 ) {
+  bAbandonedQueueJoin = false; // FORK(hollowed-oath): HollowedOath#2886.
+
   if (SelectedCharacterId.IsEmpty()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;

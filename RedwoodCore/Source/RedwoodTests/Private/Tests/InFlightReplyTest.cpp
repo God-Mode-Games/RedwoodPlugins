@@ -51,6 +51,9 @@ public:
   static void NoteRealmDrop(FClient &C) {
     C.NoteRealmDrop();
   }
+  static void RequestRealmClose(FClient &C) {
+    C.RequestRealmClose();
+  }
   static void NoteRealmReconnected(FClient &C) {
     C.NoteRealmReconnected();
   }
@@ -119,7 +122,10 @@ namespace RedwoodInFlightTest {
       return *Interface.Get();
     }
 
+    FAutomationTestBase *OpenedBy = nullptr;
+
     bool Open(FAutomationTestBase &Test) {
+      OpenedBy = &Test;
       URedwoodClientInterface &C = Client();
       if (!Test.TestTrue(TEXT("Test server listens"), Server->Listen())) {
         return false;
@@ -184,11 +190,14 @@ namespace RedwoodInFlightTest {
       }
       Server.Reset();
       Interface->Deinitialize();
-      PumpGameThreadUntil([&Sockets]() {
+      const bool bReleased = PumpGameThreadUntil([&Sockets]() {
         return Algo::AllOf(Sockets, [](const TSharedPtr<FSocketIONative> &S) {
           return S.GetSharedReferenceCount() == 1;
         });
       });
+      if (OpenedBy) {
+        OpenedBy->TestTrue(TEXT("The library releases the sockets"), bReleased);
+      }
     }
   };
 
@@ -446,10 +455,62 @@ namespace RedwoodInFlightTest {
     if (!OpenWithRealmEvents(Test, Harness)) {
       return false;
     }
-    FAccess::bAbandonedQueueJoin(Harness.Client()) = true;
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAbandonedQueueJoin(C) = true;
     Test.TestFalse(
       TEXT("An assignment for a dropped queue request does not move the player"),
       AssignmentMoves(Test, Harness, AssignmentWithoutCharacter)
+    );
+
+    // The server answers a leave before it runs it, so only a new join may
+    // let an assignment through again. Pins: the reset in JoinQueue.
+    C.JoinQueue(
+      TEXT("proxy-1"), TEXT("zone-1"), false, false, FRedwoodTicketingUpdateDelegate()
+    );
+    Test.TestTrue(
+      TEXT("After a new join, an assignment moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentWithoutCharacter)
+    );
+    return true;
+  }
+
+  // Logout and a failed Director re-login close the Realm socket on purpose.
+  // Pins: the FailAll in RequestRealmClose.
+  bool RunPartyInviteOnRequestedClose(FAutomationTestBase &Test) {
+    bool bAnswered = false;
+    FString Error;
+    int32 CloseReports = 0;
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    C.InviteToParty(
+      TEXT("player-2"),
+      FRedwoodErrorOutputDelegate::CreateLambda([&](const FString &InError) {
+        bAnswered = true;
+        Error = InError;
+      })
+    );
+    Test.TestTrue(TEXT("The request reaches the server"), Harness.Server->ReadClientFrame());
+    // The library reports a close we ask for twice: from Disconnect(), and
+    // when the close handshake ends. Its close timer runs until then, so the
+    // test waits for the second report before it frees the socket.
+    TSharedPtr<FSocketIONative> &Realm = FAccess::Realm(C);
+    TFunction<void(const ESIOConnectionCloseReason)> Handler =
+      Realm->OnDisconnectedCallback;
+    Realm->OnDisconnectedCallback =
+      [Handler, &CloseReports](const ESIOConnectionCloseReason Reason) {
+        Handler(Reason);
+        ++CloseReports;
+      };
+
+    FAccess::RequestRealmClose(C);
+    ExpectClearError(Test, TEXT("Party invite at a requested close"), bAnswered, Error);
+    Test.TestTrue(TEXT("Server acknowledges the close"), Harness.Server->CloseNormally());
+    Test.TestTrue(
+      TEXT("The close handshake ends"),
+      PumpGameThreadUntil([&CloseReports]() { return CloseReports >= 2; })
     );
     return true;
   }
@@ -554,4 +615,9 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightOtherCharacterTest,
   "AssignmentForAnotherCharacterDoesNotMove",
   RedwoodInFlightTest::RunAssignmentForAnotherCharacter(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightRequestedCloseTest,
+  "PartyInviteFailsOnRequestedClose",
+  RedwoodInFlightTest::RunPartyInviteOnRequestedClose(*this)
 )

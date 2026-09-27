@@ -523,8 +523,8 @@ private:
   void NoteDirectorReconnected();
   void NoteRealmReconnected();
   // A JoinQueue whose reply was lost: the game went back to character
-  // select, so its assignment must not move the player. Cleared when
-  // LeaveTicketing succeeds or a new JoinQueue starts.
+  // select, so its assignment must not move the player. A new join clears
+  // it.
   bool bAbandonedQueueJoin = false;
   // FORK(hollowed-oath) END
   // The Realm socket dropped and the player is not authenticated on it again
