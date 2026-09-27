@@ -1,6 +1,7 @@
 // Copyright Incanta Games. All Rights Reserved.
 
 #include "RedwoodClientInterface.h"
+#include "UObject/StrongObjectPtr.h" // FORK(hollowed-oath)
 #include "RedwoodClientGameSubsystem.h"
 #include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodGameplayTags.h"
@@ -190,8 +191,16 @@ FRedwoodReplyCallback URedwoodClientInterface::TrackReply(
   return Replies.Track(MoveTemp(OnReply), MakeLostReply(OnOutput));
 }
 
+// A join replaces any ticket the server kept, so a leave owed for it would
+// cancel the new one.
+void URedwoodClientInterface::NoteJoinSent() {
+  bAssignmentExpected = true;
+  bLeaveTicketingOwed = false;
+}
+
 void URedwoodClientInterface::FailTicketingJoin() {
   bAbandonedQueueJoin = true;
+  bAssignmentExpected = false;
   bLeaveTicketingOwed = true;
   FRedwoodTicketingUpdate Update;
   Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
@@ -560,6 +569,7 @@ void URedwoodClientInterface::Logout() {
     // player who left.
     if (Realm.IsValid()) {
       if (Realm->bIsConnected) {
+        SendOwedLeave(); // FORK(hollowed-oath): HollowedOath#2886.
         Realm->Emit(TEXT("realm:auth:player:logout"), Payload);
       }
       RequestRealmClose(); // FORK(hollowed-oath)
@@ -572,6 +582,8 @@ void URedwoodClientInterface::Logout() {
     SelectedCharacterId = TEXT("");
     bAssignmentExpected = false;
     bAbandonedQueueJoin = false;
+    // The next login can be another account, whose tickets are not ours.
+    bLeaveTicketingOwed = false;
     // FORK(hollowed-oath): HollowedOath#2854. See HasPlayerSession: both
     // flags, or a later Director drop at the title screen re-logs in with
     // empty ids and reports an authentication failure there.
@@ -3364,8 +3376,16 @@ void URedwoodClientInterface::SetCharacterData(
   USIOJsonObject *CharacterCreatorData,
   FRedwoodGetCharacterOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
-  if (!IsRealmReady()) {
+  // FORK(hollowed-oath): HollowedOath#2886. See GateRealm. The strong pointer
+  // keeps the data alive while the request is held.
+  TStrongObjectPtr<USIOJsonObject> HeldCharacterData(CharacterCreatorData);
+  if (GateRealm([=, this, Data = HeldCharacterData]() {
+        SetCharacterData(CharacterId, Name, Data.Get(), OnOutput);
+      }, OnOutput)) {
+    return;
+  }
+
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodGetCharacterOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3583,9 +3603,10 @@ void URedwoodClientInterface::NoteRealmReconnected() {
 // The server can still hold a ticket whose join reply was lost, and replay
 // its assignment. Leaving deletes both. Sent at the first Realm auth after
 // the loss, whatever came between; the reply to the auth is the first moment
-// the Realm knows the player. The flag stays until a leave succeeds.
+// the Realm knows the player. The flag stays until a leave succeeds or a join
+// replaces the ticket; with a join out, the leave would cancel it.
 void URedwoodClientInterface::SendOwedLeave() {
-  if (!bLeaveTicketingOwed || !IsRealmConnected()) {
+  if (!bLeaveTicketingOwed || bAssignmentExpected || !IsRealmConnected()) {
     return;
   }
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
@@ -3790,8 +3811,8 @@ void URedwoodClientInterface::JoinQueue(
 
   OnTicketingUpdate = OnUpdate;
 
+  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
-  bAssignmentExpected = true; // FORK(hollowed-oath): HollowedOath#2886.
   Realm->Emit(
     TEXT("realm:ticketing:join:queue"),
     Payload,
@@ -3902,8 +3923,8 @@ void URedwoodClientInterface::AttemptJoinCustom() {
   }
   Payload->SetArrayField(TEXT("regions"), DesiredRegions);
 
+  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
-  bAssignmentExpected = true; // FORK(hollowed-oath): HollowedOath#2886.
   Realm->Emit(
     TEXT("realm:ticketing:join:custom"),
     Payload,
@@ -3926,8 +3947,16 @@ void URedwoodClientInterface::AttemptJoinCustom() {
 void URedwoodClientInterface::LeaveTicketing(
   FRedwoodErrorOutputDelegate OnOutput
 ) {
+  // FORK(hollowed-oath): HollowedOath#2886. The game leaves when it gives up
+  // on a join, often because the Realm dropped. Whatever the server does with
+  // the leave, the join's assignment must not move the player, and a leave
+  // that cannot go out now is owed.
+  bAbandonedQueueJoin = true;
+  bAssignmentExpected = false;
+
   // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
   if (!IsRealmReady()) {
+    bLeaveTicketingOwed = true;
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -3940,12 +3969,16 @@ void URedwoodClientInterface::LeaveTicketing(
   Realm->Emit(
     TEXT("realm:ticketing:leave"),
     Payload,
-    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
+    RealmReplies.Track([this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }, OnOutput)
+    }, [this, OnLost = MakeLostReply(OnOutput)]() {
+      // A leave that may not have run is owed.
+      bLeaveTicketingOwed = true;
+      OnLost();
+    })
   );
 }
 
@@ -4126,8 +4159,8 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
     Payload->SetField(TEXT("password"), NullValue);
   }
 
+  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
-  bAssignmentExpected = true; // FORK(hollowed-oath): HollowedOath#2886.
   Realm->Emit(
     TEXT("realm:servers:join-proxy"),
     Payload,
@@ -4243,8 +4276,8 @@ void URedwoodClientInterface::AttemptJoinMatchmaking() {
 
   Payload->SetObjectField(TEXT("data"), MatchmakingData);
 
+  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
-  bAssignmentExpected = true; // FORK(hollowed-oath): HollowedOath#2886.
   Realm->Emit(
     TEXT("realm:ticketing:join:matchmaking"),
     Payload,
@@ -4545,8 +4578,16 @@ void URedwoodClientInterface::SetPartyData(
   USIOJsonObject *PartyData,
   FRedwoodGetPartyOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
-  if (!IsRealmReady()) {
+  // FORK(hollowed-oath): HollowedOath#2886. See GateRealm. The strong pointer
+  // keeps the data alive while the request is held.
+  TStrongObjectPtr<USIOJsonObject> HeldPartyData(PartyData);
+  if (GateRealm([=, this, Data = HeldPartyData]() {
+        SetPartyData(LootType, Data.Get(), OnOutput);
+      }, OnOutput)) {
+    return;
+  }
+
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodGetPartyOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);

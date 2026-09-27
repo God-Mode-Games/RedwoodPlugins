@@ -97,6 +97,9 @@ public:
   static void TrackRealmReply(FClient &C, TFunction<void()> OnLost) {
     C.RealmReplies.Track(FRedwoodReplyCallback(), MoveTemp(OnLost));
   }
+  static void SendOwedLeave(FClient &C) {
+    C.SendOwedLeave();
+  }
   static int32 NumRealmReplies(FClient &C) {
     return C.RealmReplies.Num();
   }
@@ -430,6 +433,7 @@ namespace RedwoodInFlightTest {
   // in the re-login window after it, where no route answers them.
   bool RunRealmReconnectAndReloginWindow(FAutomationTestBase &Test) {
     bool bLost = false;
+    bool bWriteAnswered = false;
     // Before the harness: a request that did go out keeps its callbacks
     // until the teardown fails them.
     bool bJoinAnswered = false;
@@ -508,6 +512,62 @@ namespace RedwoodInFlightTest {
     ExpectFailsAtOnce(TEXT("in the re-login window"));
     Test.TestFalse(
       TEXT("No join was lost, so none is dropped"), FAccess::bAbandonedQueueJoin(C)
+    );
+
+    // Blueprint-only writes wait for the re-login. Pins: GateRealm in
+    // SetCharacterData.
+    C.SetCharacterData(
+      TEXT("character-1"),
+      TEXT("Name"),
+      nullptr,
+      FRedwoodGetCharacterOutputDelegate::CreateLambda(
+        [&bWriteAnswered](const FRedwoodGetCharacterOutput &) { bWriteAnswered = true; }
+      )
+    );
+    Test.TestFalse(TEXT("A character write is not failed"), bWriteAnswered);
+    Test.TestEqual(
+      TEXT("The character write is held for the re-login"),
+      FAccess::NumRealmHeldRequests(C),
+      1
+    );
+
+    // The re-login completes and pays an owed leave. Pins: SendOwedLeave on
+    // the re-auth path.
+    FAccess::bLeaveTicketingOwed(C) = true;
+    FString Request;
+    if (!AnswerRequest(
+          Test,
+          DirectorServer,
+          TEXT("{\"error\":\"\",\"token\":\"realm-token-2\"}"),
+          Request
+        ) ||
+        !Test.TestTrue(
+          TEXT("The re-login asks the Director for a token"),
+          Request.Contains(TEXT("realm:auth:player:connect:client-to-director"))
+        ) ||
+        !Test.TestTrue(
+          TEXT("The token reply sends the Realm auth"),
+          PumpGameThreadUntil([&Harness]() { return Harness.Server->HasClientData(); })
+        ) ||
+        !AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request) ||
+        !Test.TestTrue(
+          TEXT("The Realm got the auth request"),
+          Request.Contains(TEXT("realm:auth:player:connect:client-to-realm"))
+        ) ||
+        !Test.TestTrue(
+          TEXT("The auth reply sends the owed leave"),
+          PumpGameThreadUntil([&Harness]() { return Harness.Server->HasClientData(); })
+        ) ||
+        !AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("The first request after the re-auth is the leave"),
+      Request.Contains(TEXT("realm:ticketing:leave"))
+    );
+    Test.TestTrue(
+      TEXT("A successful leave pays it"),
+      PumpGameThreadUntil([&C]() { return !FAccess::bLeaveTicketingOwed(C); })
     );
     return true;
   }
@@ -824,6 +884,7 @@ namespace RedwoodInFlightTest {
     FAccess::SelectedCharacterId(C) = TEXT("character-1");
     FAccess::bAssignmentExpected(C) = true;
     FAccess::bAbandonedQueueJoin(C) = true;
+    FAccess::bLeaveTicketingOwed(C) = true;
     C.Logout();
     Test.TestTrue(
       TEXT("Logout forgets the character"), FAccess::SelectedCharacterId(C).IsEmpty()
@@ -833,6 +894,9 @@ namespace RedwoodInFlightTest {
     );
     Test.TestFalse(
       TEXT("Logout clears the dropped join"), FAccess::bAbandonedQueueJoin(C)
+    );
+    Test.TestFalse(
+      TEXT("The next account owes no leave"), FAccess::bLeaveTicketingOwed(C)
     );
     return true;
   }
@@ -889,16 +953,94 @@ namespace RedwoodInFlightTest {
           TEXT("The auth reply sends a leave"),
           PumpGameThreadUntil([&C]() { return FAccess::NumRealmReplies(C) == 1; })
         ) ||
-        !AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request)) {
+        !AnswerRequest(
+          Test, *Harness.Server, TEXT("{\"error\":\"Leave failed.\"}"), Request
+        )) {
       return false;
     }
     Test.TestTrue(
       TEXT("The request is the leave"), Request.Contains(TEXT("realm:ticketing:leave"))
     );
     Test.TestTrue(
-      TEXT("A successful leave pays it"),
-      PumpGameThreadUntil([&C]() { return !FAccess::bLeaveTicketingOwed(C); })
+      TEXT("The leave's reply runs"),
+      PumpGameThreadUntil([&C]() { return FAccess::NumRealmReplies(C) == 0; })
     );
+    Test.TestTrue(TEXT("A failed leave is still owed"), FAccess::bLeaveTicketingOwed(C));
+
+    // Pins: the reset in NoteJoinSent.
+    C.JoinQueue(
+      TEXT("proxy-1"), TEXT("zone-1"), false, false, FRedwoodTicketingUpdateDelegate()
+    );
+    Test.TestFalse(
+      TEXT("A new join replaces the owed leave"), FAccess::bLeaveTicketingOwed(C)
+    );
+    return true;
+  }
+
+  // Pins: the bAssignmentExpected check in SendOwedLeave. With a join out,
+  // the leave would cancel its ticket.
+  bool RunOwedLeaveWaitsWhileJoinOut(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bLeaveTicketingOwed(C) = true;
+    FAccess::bAssignmentExpected(C) = true;
+    FAccess::SendOwedLeave(C);
+    Test.TestEqual(
+      TEXT("No leave goes out while a join is out"), FAccess::NumRealmReplies(C), 0
+    );
+    FAccess::bAssignmentExpected(C) = false;
+    FAccess::SendOwedLeave(C);
+    Test.TestEqual(TEXT("With no join out, it goes"), FAccess::NumRealmReplies(C), 1);
+    return true;
+  }
+
+  // The game leaves when the enter-world timer runs out, often because the
+  // Realm dropped. Pins: the flags LeaveTicketing sets.
+  bool RunLeaveTicketingDropsTheJoin(FAutomationTestBase &Test) {
+    bool bAnswered = false;
+    FString Error;
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FRedwoodErrorOutputDelegate OnOutput =
+      FRedwoodErrorOutputDelegate::CreateLambda([&](const FString &InError) {
+        bAnswered = true;
+        Error = InError;
+      });
+
+    // In the re-login window: the leave cannot go out.
+    FAccess::bRealmReauthPending(C) = true;
+    C.LeaveTicketing(OnOutput);
+    Test.TestTrue(TEXT("The leave fails at once"), bAnswered && !Error.IsEmpty());
+    Test.TestTrue(TEXT("The join is dropped"), FAccess::bAbandonedQueueJoin(C));
+    Test.TestFalse(TEXT("No assignment is expected"), FAccess::bAssignmentExpected(C));
+    Test.TestTrue(TEXT("The leave is owed"), FAccess::bLeaveTicketingOwed(C));
+    FAccess::bRealmReauthPending(C) = false;
+    Test.TestFalse(
+      TEXT("An assignment after the leave does not move the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+
+    // Sent, and then lost in a drop: owed again.
+    FAccess::bLeaveTicketingOwed(C) = false;
+    FAccess::bAbandonedQueueJoin(C) = false;
+    FAccess::bAssignmentExpected(C) = true;
+    bAnswered = false;
+    C.LeaveTicketing(OnOutput);
+    Test.TestFalse(TEXT("A sent leave waits for its reply"), bAnswered);
+    Test.TestTrue(TEXT("A sent leave drops the join too"), FAccess::bAbandonedQueueJoin(C));
+    Test.TestFalse(TEXT("A sent leave is not owed"), FAccess::bLeaveTicketingOwed(C));
+    Test.TestTrue(TEXT("The leave reaches the server"), Harness.Server->ReadClientFrame());
+    Test.TestTrue(TEXT("The server drops"), Harness.Close(EClose::NoCloseFrame));
+    Test.TestTrue(
+      TEXT("The drop fails the leave"), PumpGameThreadUntil([&bAnswered]() { return bAnswered; })
+    );
+    Test.TestTrue(TEXT("A lost leave is owed"), FAccess::bLeaveTicketingOwed(C));
     return true;
   }
 }
@@ -995,6 +1137,16 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightOwedLeaveTest,
   "OwedLeaveGoesOutAtNextAuth",
   RedwoodInFlightTest::RunOwedLeaveAtNextAuth(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightOwedLeaveWaitsTest,
+  "OwedLeaveWaitsWhileJoinOut",
+  RedwoodInFlightTest::RunOwedLeaveWaitsWhileJoinOut(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightLeaveTicketingTest,
+  "LeaveTicketingDropsTheJoin",
+  RedwoodInFlightTest::RunLeaveTicketingDropsTheJoin(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,

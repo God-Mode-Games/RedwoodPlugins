@@ -530,6 +530,7 @@ private:
   void NoteRealmReconnected();
   bool IsRealmReady();
   void SendOwedLeave();
+  void NoteJoinSent();
   // A join whose reply was lost: the game went back to character select, so
   // its assignment must not move the player. A new join clears it.
   bool bAbandonedQueueJoin = false;

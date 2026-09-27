@@ -206,6 +206,13 @@ namespace RedwoodFakeSocketIo {
       return ReadSome(Connection, Frame);
     }
 
+    // True when the client sent something, without blocking: the game
+    // thread that sends it must run between the reads.
+    bool HasClientData() const {
+      uint32 Size = 0;
+      return Connection && Connection->HasPendingData(Size);
+    }
+
     // Reads one masked client text frame (RFC 6455 section 5.3), so a test
     // can answer a request by its ack id.
     bool ReadClientText(FString &OutText) {
