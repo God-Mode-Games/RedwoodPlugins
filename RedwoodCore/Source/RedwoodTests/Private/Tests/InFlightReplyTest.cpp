@@ -1256,7 +1256,7 @@ namespace RedwoodInFlightTest {
   // must keep the socket until the library's close timer ran; freed before,
   // the timer runs on freed memory. Pins: RedwoodClosingSockets in
   // ReleaseRealmSocket.
-  bool RunFreeDuringRequestedClose(FAutomationTestBase &Test) {
+  bool RunFreeDuringRequestedClose(FAutomationTestBase &Test, bool bRequestTwice) {
     TWeakPtr<FSocketIONative> Socket;
     FRealmHarness Harness;
     if (!Harness.Open(Test)) {
@@ -1265,6 +1265,11 @@ namespace RedwoodInFlightTest {
     URedwoodClientInterface &C = Harness.Client();
     Socket = FAccess::Realm(C);
     FAccess::RequestRealmClose(C);
+    // A Logout during the re-login, then the re-login's own Logout. Pins:
+    // the early return in RequestRealmClose.
+    if (bRequestTwice) {
+      FAccess::RequestRealmClose(C);
+    }
     C.Deinitialize();
 
     // Well inside the timer.
@@ -1412,7 +1417,12 @@ REDWOOD_IN_FLIGHT_TEST(
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightFreeDuringCloseTest,
   "FreeDuringRequestedCloseKeepsSocket",
-  RedwoodInFlightTest::RunFreeDuringRequestedClose(*this)
+  RedwoodInFlightTest::RunFreeDuringRequestedClose(*this, false)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightFreeDuringSecondCloseTest,
+  "FreeAfterSecondRequestedCloseKeepsSocket",
+  RedwoodInFlightTest::RunFreeDuringRequestedClose(*this, true)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,

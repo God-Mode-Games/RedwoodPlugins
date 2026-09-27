@@ -6,23 +6,19 @@
 
 #include "Async/Async.h"
 #include "Containers/Ticker.h"
-#include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/CoreDelegates.h"
 #include "SocketIOClient.h"
 #include "SocketIONative.h"
 
 namespace {
-  // At exit, the wait past the timer, so its on_close has finished.
-  constexpr double ExitMarginSeconds = 0.25;
-  // One fallback release when the library never reports the close. Longer
-  // than the timer.
-  constexpr float SafetyReleaseSeconds = 5.0f;
+  // One fallback release, counted from the close, when the library never
+  // reports it. Longer than the library's 3 s close timer.
+  constexpr double SafetyReleaseSeconds = 5.0;
 
   struct FClosingSocket {
     uint64 Id = 0;
     TSharedPtr<FSocketIONative> Socket;
-    double TimerDoneAt = 0.0;
     FTSTicker::FDelegateHandle SafetyRelease;
   };
 
@@ -52,16 +48,17 @@ namespace {
     ReleaseNow(MoveTemp(Entry.Socket));
   }
 
-  // Nothing ticks at exit. Each wait ends at its own timer, so the whole
-  // wait is at most one timer long.
-  void ReleaseAllAtExit() {
+  // At exit, a socket still held is never freed. Its close report can be
+  // queued to the game thread and run in a later pump during the exit, and
+  // the timer can still run; either would reach freed memory. The heap
+  // array is leaked on purpose: the process ends the socket thread. It is
+  // never a static TSharedPtr released at atexit, a known crash class.
+  void KeepAllAtExit() {
+    TArray<TSharedPtr<FSocketIONative>> *Kept =
+      new TArray<TSharedPtr<FSocketIONative>>();
     for (FClosingSocket &Entry : ClosingSockets()) {
-      const double Wait = Entry.TimerDoneAt - FPlatformTime::Seconds();
-      if (Wait > 0.0) {
-        FPlatformProcess::Sleep(static_cast<float>(Wait));
-      }
       FTSTicker::GetCoreTicker().RemoveTicker(Entry.SafetyRelease);
-      ReleaseNow(MoveTemp(Entry.Socket));
+      Kept->Add(MoveTemp(Entry.Socket));
     }
     ClosingSockets().Empty();
   }
@@ -81,7 +78,7 @@ void RedwoodClosingSockets::Release(
   static bool bExitHookBound = false;
   if (!bExitHookBound) {
     bExitHookBound = true;
-    FCoreDelegates::OnPreExit.AddStatic(&ReleaseAllAtExit);
+    FCoreDelegates::OnPreExit.AddStatic(&KeepAllAtExit);
   }
 
   static uint64 NextId = 0;
@@ -95,13 +92,15 @@ void RedwoodClosingSockets::Release(
   FClosingSocket Entry;
   Entry.Id = Id;
   Entry.Socket = MoveTemp(Socket);
-  Entry.TimerDoneAt = CloseStartedAt + CloseTimerSeconds + ExitMarginSeconds;
+  const double SafetyDelay = FMath::Max(
+    0.0, CloseStartedAt + SafetyReleaseSeconds - FPlatformTime::Seconds()
+  );
   Entry.SafetyRelease = FTSTicker::GetCoreTicker().AddTicker(
     FTickerDelegate::CreateLambda([Id](float) {
       ReleaseHeld(Id, true);
       return false;
     }),
-    SafetyReleaseSeconds
+    static_cast<float>(SafetyDelay)
   );
   ClosingSockets().Add(MoveTemp(Entry));
 }

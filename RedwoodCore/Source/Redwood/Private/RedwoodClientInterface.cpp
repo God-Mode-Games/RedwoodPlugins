@@ -3568,6 +3568,14 @@ URedwoodClientInterface::MakeUnrequestedCloseHandler(
 // unrequested close scheduled would otherwise fire after this close, and
 // bring back a Realm session that is over.
 void URedwoodClientInterface::RequestRealmClose() {
+  // HollowedOath#2999. A second request on the same socket (a Logout during
+  // the re-login, then the re-login's own Logout) must not close it again:
+  // a second close cancels the running timer, which the library turns into
+  // an early on_close with a new timer still set.
+  if (bRealmCloseRequested) {
+    RealmReplies.FailAll();
+    return;
+  }
   bRealmCloseRequested = true;
   RealmCloseBackoff.Reset(TimerManager);
   // HollowedOath#2999. The library reports the namespace closed when its
