@@ -252,15 +252,21 @@ void URedwoodClientInterface::NoteJoinSent() {
 
 // A join that the server refused gets no assignment, so a replay of an
 // earlier ticket must not move the player. The refusal left no ticket, so no
-// leave is owed. Set before the update runs: the game can join again in it.
-// Only for the latest join: an older join's refusal must not close the guard
-// for a newer one.
-void URedwoodClientInterface::HandleTicketingJoinReply(
+// leave is owed. Call it before the game sees the reply: the game can join
+// again then. Only for the latest join: an older join's refusal must not
+// close the guard for a newer one.
+void URedwoodClientInterface::NoteJoinAnswered(
   const FString &Error, uint32 Sequence
 ) {
   if (!Error.IsEmpty() && Sequence == JoinSequence) {
     bAssignmentExpected = false;
   }
+}
+
+void URedwoodClientInterface::HandleTicketingJoinReply(
+  const FString &Error, uint32 Sequence
+) {
+  NoteJoinAnswered(Error, Sequence);
   FRedwoodTicketingUpdate Update;
   Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
   Update.Message = Error;
@@ -3523,9 +3529,11 @@ void URedwoodClientInterface::SetCharacterData(
 
 void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
   // FORK(hollowed-oath): HollowedOath#2886. A new character is at character
-  // select until it joins.
+  // select until it joins. A dropped join was the old character's; its owed
+  // leave stays, because the old ticket still needs it.
   if (CharacterId != SelectedCharacterId) {
     bAssignmentExpected = false;
+    bAbandonedQueueJoin = false;
     bTravelPending = false;
   }
   SelectedCharacterId = CharacterId;
@@ -4205,11 +4213,16 @@ void URedwoodClientInterface::CreateProxy(
   Realm->Emit(
     TEXT("realm:servers:create-proxy"),
     Payload,
-    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput, bJoinSession, Sequence = JoinSequence](
+      auto Response
+    ) {
       FRedwoodCreateProxyOutput Output;
 
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       Output.Error = MessageObject->GetStringField(TEXT("error"));
+      if (bJoinSession) {
+        NoteJoinAnswered(Output.Error, Sequence); // FORK(hollowed-oath)
+      }
 
       MessageObject->TryGetStringField(
         TEXT("proxyReference"), Output.ProxyReference
@@ -4260,11 +4273,12 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
   Realm->Emit(
     TEXT("realm:servers:join-proxy"),
     Payload,
-    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput, Sequence = JoinSequence](auto Response) {
       FRedwoodJoinServerOutput Output;
 
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       Output.Error = MessageObject->GetStringField(TEXT("error"));
+      NoteJoinAnswered(Output.Error, Sequence); // FORK(hollowed-oath)
 
       MessageObject->TryGetStringField(
         TEXT("connectionUri"), Output.ConnectionUri
