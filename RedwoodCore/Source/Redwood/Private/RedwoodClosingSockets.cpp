@@ -31,7 +31,16 @@ namespace {
     return *Lock;
   }
 
-  // Game thread only. Its sockets move to a leaked array at exit.
+  // Every socket released after the exit started, and every held one then.
+  // Leaked on purpose: the process ends the socket threads, and a static
+  // array would free a closing socket at static destruction.
+  TArray<TSharedPtr<FSocketIONative>> &KeptAtExit() {
+    static TArray<TSharedPtr<FSocketIONative>> *Kept =
+      new TArray<TSharedPtr<FSocketIONative>>();
+    return *Kept;
+  }
+
+  // Game thread only. Its sockets move to KeptAtExit at exit.
   TArray<FClosingSocket> &ClosingSockets() {
     static TArray<FClosingSocket> Sockets;
     return Sockets;
@@ -58,18 +67,15 @@ namespace {
   // run before the process ends: the socket is alive, and with the flag set
   // its close report dispatches nothing to the task graph, which shuts down
   // after this. The callback is not cleared here, because the timer thread
-  // can read it at any time. The heap array is leaked on purpose: the
-  // process ends the socket thread. It is never a static TSharedPtr released
-  // at atexit, a known crash class.
+  // can read it at any time. It is never a static TSharedPtr released at
+  // atexit, a known crash class.
   void KeepAllAtExit() {
     {
       FScopeLock Lock(&ClosingSocketsExitLock());
       bClosingSocketsExiting = true;
     }
-    TArray<TSharedPtr<FSocketIONative>> *Kept =
-      new TArray<TSharedPtr<FSocketIONative>>();
     for (FClosingSocket &Entry : ClosingSockets()) {
-      Kept->Add(MoveTemp(Entry.Socket));
+      KeptAtExit().Add(MoveTemp(Entry.Socket));
     }
     ClosingSockets().Empty();
   }
@@ -81,15 +87,16 @@ void RedwoodClosingSockets::Release(
   if (!Socket.IsValid()) {
     return;
   }
+  // After the exit started (a subsystem deinitialized late), nothing may
+  // reach the static array, and a close report could not release it. Read
+  // without the lock: the game thread is also the one that sets it.
+  if (bClosingSocketsExiting) {
+    KeptAtExit().Add(MoveTemp(Socket));
+    return;
+  }
   if (!bCloseTimerPending) {
     ReleaseNow(MoveTemp(Socket));
     return;
-  }
-
-  static bool bExitHookBound = false;
-  if (!bExitHookBound) {
-    bExitHookBound = true;
-    FCoreDelegates::OnPreExit.AddStatic(&KeepAllAtExit);
   }
 
   static uint64 NextId = 0;
@@ -110,6 +117,10 @@ void RedwoodClosingSockets::Release(
   Entry.Id = Id;
   Entry.Socket = MoveTemp(Socket);
   ClosingSockets().Add(MoveTemp(Entry));
+}
+
+void RedwoodClosingSockets::BindExitHook() {
+  FCoreDelegates::OnPreExit.AddStatic(&KeepAllAtExit);
 }
 
 int32 RedwoodClosingSockets::NumHeld() {

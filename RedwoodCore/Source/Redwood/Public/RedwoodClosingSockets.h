@@ -24,6 +24,10 @@ namespace RedwoodClosingSockets {
     TSharedPtr<FSocketIONative> Socket, bool bCloseTimerPending
   );
 
+  // Keeps every socket from the start of the exit on. Called once, at module
+  // startup, so it is bound before any socket is released.
+  void BindExitHook();
+
   // The sockets held now. For tests.
   REDWOOD_API int32 NumHeld();
 }

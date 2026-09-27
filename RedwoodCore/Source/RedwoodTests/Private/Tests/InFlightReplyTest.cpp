@@ -113,6 +113,15 @@ public:
   static bool &bTravelPending(FClient &C) {
     return C.bTravelPending;
   }
+  static bool &bInWorld(FClient &C) {
+    return C.bInWorld;
+  }
+  static bool &bRealmCloseRequested(FClient &C) {
+    return C.bRealmCloseRequested;
+  }
+  static bool &bRealmCloseTimerPending(FClient &C) {
+    return C.bRealmCloseTimerPending;
+  }
   static bool &bLeaveTicketingOwed(FClient &C) {
     return C.bLeaveTicketingOwed;
   }
@@ -398,6 +407,7 @@ namespace RedwoodInFlightTest {
     // it. Pins: the reset in InitiateRealmHandshake.
     FAccess::SelectedCharacterId(C) = TEXT("character-old");
     FAccess::bAssignmentExpected(C) = true;
+    FAccess::CurrentParty(C).bValid = true;
 
     FRedwoodRealm InRealm;
     InRealm.Id = TEXT("realm-1");
@@ -406,6 +416,9 @@ namespace RedwoodInFlightTest {
     Test.TestTrue(
       TEXT("A new handshake forgets the old character"),
       FAccess::SelectedCharacterId(C).IsEmpty() && !FAccess::bAssignmentExpected(C)
+    );
+    Test.TestFalse(
+      TEXT("A new handshake forgets the old party"), FAccess::CurrentParty(C).bValid
     );
     FAccess::SelectedCharacterId(C) = TEXT("character-1");
 
@@ -931,6 +944,7 @@ namespace RedwoodInFlightTest {
     FRedwoodParty &Party = FAccess::CurrentParty(C);
     Party.bValid = true;
     Party.LeaderId = TEXT("player-2");
+    Party.Members.AddDefaulted_GetRef().PlayerId = TEXT("player-1");
     Test.TestFalse(
       TEXT("A member does not move for another character"),
       AssignmentMoves(
@@ -1097,6 +1111,7 @@ namespace RedwoodInFlightTest {
     FRedwoodParty &Party = FAccess::CurrentParty(C);
     Party.bValid = true;
     Party.LeaderId = TEXT("player-2");
+    Party.Members.AddDefaulted_GetRef().PlayerId = TEXT("player-1");
     Test.TestTrue(
       TEXT("After a character switch, the party's assignment for the new character moves the member"),
       AssignmentMoves(
@@ -1109,6 +1124,23 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
+  // The server drops the socket, and the client reconnects. The re-login
+  // window is closed by hand: no Director runs here.
+  void DropAndComeBack(FAutomationTestBase &Test, FRealmHarness &Harness) {
+    URedwoodClientInterface &C = Harness.Client();
+    Test.TestTrue(TEXT("The server drops"), Harness.Close(EClose::NoCloseFrame));
+    Test.TestTrue(
+      TEXT("The client sees the drop"),
+      PumpGameThreadUntil([&C]() { return FAccess::bRealmDisconnected(C); })
+    );
+    Test.TestTrue(TEXT("The client reconnects"), AcceptReconnect(*Harness.Server));
+    Test.TestTrue(
+      TEXT("The socket is back"),
+      PumpGameThreadUntil([&C]() { return !FAccess::bRealmDisconnected(C); })
+    );
+    FAccess::bRealmReauthPending(C) = false;
+  }
+
   // A proxy join or a create that joins lost in a drop: after the reconnect,
   // a replay must not move the player. Pins: MakeLostProxyJoin.
   bool RunLostProxyJoinDoesNotMove(FAutomationTestBase &Test) {
@@ -1117,25 +1149,16 @@ namespace RedwoodInFlightTest {
       return false;
     }
     URedwoodClientInterface &C = Harness.Client();
-    // Drops the socket with the request out, waits for the failure, and lets
+    // Drops the socket with the request out, checks the failure, and lets
     // the socket come back.
     auto DropAndReconnect = [&Test, &Harness, &C](bool &bAnswered, const TCHAR *What) {
       Test.TestTrue(TEXT("The request reaches the server"), Harness.Server->ReadClientFrame());
-      Test.TestTrue(TEXT("The server drops"), Harness.Close(EClose::NoCloseFrame));
-      Test.TestTrue(
-        *FString::Printf(TEXT("The drop fails the %s"), What),
-        PumpGameThreadUntil([&bAnswered]() { return bAnswered; })
-      );
+      DropAndComeBack(Test, Harness);
+      Test.TestTrue(*FString::Printf(TEXT("The drop fails the %s"), What), bAnswered);
       Test.TestTrue(
         *FString::Printf(TEXT("The lost %s is dropped"), What),
         FAccess::bAbandonedQueueJoin(C)
       );
-      Test.TestTrue(TEXT("The client reconnects"), AcceptReconnect(*Harness.Server));
-      Test.TestTrue(
-        TEXT("The socket is back"),
-        PumpGameThreadUntil([&C]() { return !FAccess::bRealmDisconnected(C); })
-      );
-      FAccess::bRealmReauthPending(C) = false;
     };
 
     FAccess::bAssignmentExpected(C) = false;
@@ -1208,6 +1231,103 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
+  // A player in the world makes a join that is refused, then one whose
+  // ticket ends: the server's zone transfers must still move the player.
+  // Pins: bInWorld in the assignment guard.
+  bool RunInWorldKeepsZoneTransfers(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAssignmentExpected(C) = false;
+    FAccess::bTravelPending(C) = true;
+    C.NoteArrivedInWorld();
+
+    C.JoinQueue(TEXT("proxy-1"), TEXT("zone-1"), false, false, FRedwoodTicketingUpdateDelegate());
+    FString Request;
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"refused\"}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("In the world, after a refused join, a zone transfer moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+
+    C.JoinQueue(TEXT("proxy-1"), TEXT("zone-1"), false, false, FRedwoodTicketingUpdateDelegate());
+    Test.TestTrue(TEXT("The join reaches the server"), Harness.Server->ReadClientFrame());
+    Test.TestTrue(
+      TEXT("The server ends the ticket"),
+      Harness.Server->SendText("42[\"realm:ticketing:ticket-error\",{\"error\":\"ended\"}]")
+    );
+    Test.TestTrue(
+      TEXT("In the world, after a ticket error, a zone transfer moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    return true;
+  }
+
+  // A party left from an earlier session that does not list this player
+  // must not make it a member. Pins: the membership check of the party rule.
+  bool RunStalePartyDoesNotMove(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAssignmentExpected(C) = false;
+    FRedwoodParty &Party = FAccess::CurrentParty(C);
+    Party.bValid = true;
+    Party.LeaderId = TEXT("player-2");
+    Party.Members.AddDefaulted_GetRef().PlayerId = TEXT("player-old");
+    Test.TestFalse(
+      TEXT("A party that does not list the player does not move it"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    return true;
+  }
+
+  // An older join is lost in a drop after a newer join was answered: the
+  // newer join's assignment must still move the player. Pins: the
+  // latest-join check in FailTicketingJoin.
+  bool RunOlderLostJoinKeepsNewerJoin(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAssignmentExpected(C) = false;
+    C.JoinQueue(TEXT("proxy-1"), TEXT("zone-1"), false, false, FRedwoodTicketingUpdateDelegate());
+    Test.TestTrue(TEXT("The older join reaches the server"), Harness.Server->ReadClientFrame());
+    bool bNewerAnswered = false;
+    C.JoinQueue(
+      TEXT("proxy-1"),
+      TEXT("zone-2"),
+      false,
+      false,
+      FRedwoodTicketingUpdateDelegate::CreateLambda(
+        [&bNewerAnswered](const FRedwoodTicketingUpdate &) { bNewerAnswered = true; }
+      )
+    );
+    FString Request;
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("The newer join is answered"),
+      PumpGameThreadUntil([&bNewerAnswered]() { return bNewerAnswered; })
+    );
+    DropAndComeBack(Test, Harness);
+    Test.TestFalse(
+      TEXT("The older join's loss does not drop the newer join"), FAccess::bAbandonedQueueJoin(C)
+    );
+    Test.TestTrue(
+      TEXT("After the reconnect, the newer join's assignment moves the player"),
+      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    );
+    return true;
+  }
+
   // Pins: the resets in Logout.
   bool RunLogoutForgetsCharacter(FAutomationTestBase &Test) {
     FRealmHarness Harness;
@@ -1219,6 +1339,7 @@ namespace RedwoodInFlightTest {
     FAccess::bAssignmentExpected(C) = true;
     FAccess::bAbandonedQueueJoin(C) = true;
     FAccess::bLeaveTicketingOwed(C) = true;
+    FAccess::CurrentParty(C).bValid = true;
     C.Logout();
     Test.TestTrue(
       TEXT("Logout forgets the character"), FAccess::SelectedCharacterId(C).IsEmpty()
@@ -1232,6 +1353,7 @@ namespace RedwoodInFlightTest {
     Test.TestFalse(
       TEXT("The next account owes no leave"), FAccess::bLeaveTicketingOwed(C)
     );
+    Test.TestFalse(TEXT("Logout forgets the party"), FAccess::CurrentParty(C).bValid);
     return true;
   }
 
@@ -1570,6 +1692,38 @@ namespace RedwoodInFlightTest {
   // must keep the socket until the library's close timer ran; freed before,
   // the timer runs on freed memory. Pins: RedwoodClosingSockets in
   // ReleaseRealmSocket.
+  // The socket is still alive well inside the library's close timer, and it
+  // is freed once the timer ran.
+  bool ExpectKeptThenFreed(FAutomationTestBase &Test, TWeakPtr<FSocketIONative> &Socket) {
+    // Well inside the timer.
+    constexpr double TimerRunningSeconds = 1.0;
+    const double Until = FPlatformTime::Seconds() + TimerRunningSeconds;
+    PumpGameThreadUntil([Until]() { return FPlatformTime::Seconds() > Until; });
+    Test.TestTrue(TEXT("The socket is kept while its close timer runs"), Socket.IsValid());
+    Test.TestTrue(
+      TEXT("The socket is freed once its close timer ran"),
+      PumpGameThreadUntil([&Socket]() { return !Socket.IsValid(); })
+    );
+    Test.TestEqual(TEXT("Nothing is held"), RedwoodClosingSockets::NumHeld(), 0);
+    return true;
+  }
+
+  // A close asked while the socket was down, which then connected: no close
+  // timer runs yet, so the release must close the socket again and hold it.
+  // Pins: the timer condition in ReleaseRealmSocket.
+  bool RunCloseWhileDownThenConnected(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    TWeakPtr<FSocketIONative> Socket = FAccess::Realm(C);
+    FAccess::bRealmCloseRequested(C) = true;
+    FAccess::bRealmCloseTimerPending(C) = false;
+    C.Deinitialize();
+    return ExpectKeptThenFreed(Test, Socket);
+  }
+
   bool RunFreeDuringRequestedClose(FAutomationTestBase &Test, bool bRequestTwice) {
     TWeakPtr<FSocketIONative> Socket;
     FRealmHarness Harness;
@@ -1585,18 +1739,7 @@ namespace RedwoodInFlightTest {
       FAccess::RequestRealmClose(C);
     }
     C.Deinitialize();
-
-    // Well inside the timer.
-    constexpr double TimerRunningSeconds = 1.0;
-    const double Until = FPlatformTime::Seconds() + TimerRunningSeconds;
-    PumpGameThreadUntil([Until]() { return FPlatformTime::Seconds() > Until; });
-    Test.TestTrue(TEXT("The socket is kept while its close timer runs"), Socket.IsValid());
-    Test.TestTrue(
-      TEXT("The socket is freed once its close timer ran"),
-      PumpGameThreadUntil([&Socket]() { return !Socket.IsValid(); })
-    );
-    Test.TestEqual(TEXT("Nothing is held"), RedwoodClosingSockets::NumHeld(), 0);
-    return true;
+    return ExpectKeptThenFreed(Test, Socket);
   }
 }
 
@@ -1777,6 +1920,26 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightTicketErrorTest,
   "TicketErrorDoesNotMove",
   RedwoodInFlightTest::RunTicketErrorDoesNotMove(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightInWorldTest,
+  "InWorldKeepsZoneTransfers",
+  RedwoodInFlightTest::RunInWorldKeepsZoneTransfers(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightStalePartyTest,
+  "StalePartyDoesNotMove",
+  RedwoodInFlightTest::RunStalePartyDoesNotMove(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightOlderLostJoinTest,
+  "OlderLostJoinKeepsNewerJoin",
+  RedwoodInFlightTest::RunOlderLostJoinKeepsNewerJoin(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCloseWhileDownTest,
+  "CloseWhileDownThenConnectedKeepsSocket",
+  RedwoodInFlightTest::RunCloseWhileDownThenConnected(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,

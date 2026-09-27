@@ -499,7 +499,7 @@ private:
     FRedwoodReplyCallback OnReply,
     const TDelegate<void(const TOutput &)> &OnOutput
   );
-  void FailTicketingJoin();
+  void FailTicketingJoin(uint32 Sequence);
   void NoteDirectorDrop();
   void NoteFirstDirectorConnect();
   void NoteFirstRealmConnect();
@@ -549,6 +549,10 @@ private:
   // A join is out, or the player is in the world. Otherwise an assignment is
   // a replay for a player at character select.
   bool bAssignmentExpected = false;
+  // The travel of an accepted assignment arrived, and the player has not
+  // left the world since. A refused or ended join does not clear it: the
+  // server's zone transfers must still move the player.
+  bool bInWorld = false;
   // A lost join left a ticket on the server. See SendOwedLeave.
   bool bLeaveTicketingOwed = false;
   // An accepted assignment's travel has not arrived yet. See

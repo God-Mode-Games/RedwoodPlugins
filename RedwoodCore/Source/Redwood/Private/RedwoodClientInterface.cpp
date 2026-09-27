@@ -73,15 +73,15 @@ void URedwoodClientInterface::Deinitialize() {
 // FORK(hollowed-oath) BEGIN: shared by Deinitialize and a new handshake.
 void URedwoodClientInterface::ReleaseRealmSocket() {
   if (Realm.IsValid()) {
-    // HollowedOath#2999. A requested close already started the library's
-    // close timer, and a second close would cancel it, which the library
-    // turns into an early on_close with the timer still set. A connected
-    // socket starts the timer here.
-    const bool bClosing = bRealmCloseRequested;
-    const bool bCloseTimerPending =
-      bClosing ? bRealmCloseTimerPending : Realm->bIsConnected;
+    // HollowedOath#2999. A requested close that started the library's
+    // close timer must not close again: a second close cancels the timer,
+    // which the library turns into an early on_close with the timer still
+    // set. Otherwise (no close asked, or one asked while the socket was down
+    // that connected since) a connected socket starts the timer here.
+    const bool bTimerRunning = bRealmCloseRequested && bRealmCloseTimerPending;
+    const bool bCloseTimerPending = bTimerRunning || Realm->bIsConnected;
     Realm->ClearAllCallbacks();
-    if (!bClosing) {
+    if (!bTimerRunning) {
       Realm->Disconnect();
     }
     RedwoodClosingSockets::Release(Realm, bCloseTimerPending);
@@ -215,6 +215,7 @@ void URedwoodClientInterface::NoteArrivedInWorld() {
     return;
   }
   bTravelPending = false;
+  bInWorld = true;
   // A join sent after this travel's one owns the flags now; its lost reply
   // must keep its dropped assignment and its owed leave. When no leave is
   // owed, that join is still out or was left, and the player, who is in the
@@ -235,6 +236,7 @@ void URedwoodClientInterface::NoteArrivedInWorld() {
 // at character select, where no assignment may move them.
 void URedwoodClientInterface::NoteLeftWorld() {
   bAssignmentExpected = false;
+  bInWorld = false;
   bTravelPending = false;
 }
 
@@ -298,7 +300,11 @@ TFunction<void()> URedwoodClientInterface::MakeLostProxyJoin(
   };
 }
 
-void URedwoodClientInterface::FailTicketingJoin() {
+// Only for the latest join: a newer join owns the flags and the update.
+void URedwoodClientInterface::FailTicketingJoin(uint32 Sequence) {
+  if (Sequence != JoinSequence) {
+    return;
+  }
   NoteJoinLost();
   FRedwoodTicketingUpdate Update;
   Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
@@ -684,10 +690,13 @@ void URedwoodClientInterface::Logout() {
     // assignment kept for the last character; nothing here may accept it.
     SelectedCharacterId = TEXT("");
     bAssignmentExpected = false;
+    bInWorld = false;
     bAbandonedQueueJoin = false;
     bTravelPending = false;
-    // The next login can be another account, whose tickets are not ours.
+    // The next login can be another account, whose tickets and party are
+    // not ours.
     bLeaveTicketingOwed = false;
+    CurrentParty = FRedwoodParty();
     // FORK(hollowed-oath): HollowedOath#2854. See HasPlayerSession: both
     // flags, or a later Director drop at the title screen re-logs in with
     // empty ids and reports an authentication failure there.
@@ -2855,8 +2864,11 @@ void URedwoodClientInterface::InitiateRealmHandshake(
   // assignment kept for the last character; nothing here may accept it.
   SelectedCharacterId = TEXT("");
   bAssignmentExpected = false;
+  bInWorld = false;
   bAbandonedQueueJoin = false;
   bTravelPending = false;
+  // The party of another session or realm; the Realm sends ours again.
+  CurrentParty = FRedwoodParty();
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
@@ -3148,10 +3160,17 @@ void URedwoodClientInterface::BindRealmEvents() {
       // within 60 s is not refused here; the server's login-lineage and
       // unused-token checks still apply. Remove this rule when
       // HollowedOath#3002 ships.
+      // The party must list this player: a party left from another session
+      // must not make this one a member.
       const bool bPartyMemberAssignment = CurrentParty.bValid &&
-        CurrentParty.LeaderId != PlayerId && !AssignedCharacterId.IsEmpty() &&
-        !bForAnotherCharacter;
-      if ((!bAssignmentExpected && !bPartyMemberAssignment) ||
+        CurrentParty.LeaderId != PlayerId &&
+        CurrentParty.Members.ContainsByPredicate(
+          [this](const FRedwoodPartyMember &Member) {
+            return Member.PlayerId == PlayerId;
+          }
+        ) &&
+        !AssignedCharacterId.IsEmpty() && !bForAnotherCharacter;
+      if ((!bAssignmentExpected && !bInWorld && !bPartyMemberAssignment) ||
           bAbandonedQueueJoin || bForAnotherCharacter) {
         UE_LOG(
           LogRedwood,
@@ -3556,6 +3575,7 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
   // leave stays, because the old ticket still needs it.
   if (CharacterId != SelectedCharacterId) {
     bAssignmentExpected = false;
+    bInWorld = false;
     bAbandonedQueueJoin = false;
     bTravelPending = false;
   }
@@ -3957,7 +3977,7 @@ void URedwoodClientInterface::JoinQueue(
       HandleTicketingJoinReply(
         Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
       );
-    }, [this]() { FailTicketingJoin(); })
+    }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
   );
 }
 
@@ -4059,7 +4079,7 @@ void URedwoodClientInterface::AttemptJoinCustom() {
       HandleTicketingJoinReply(
         Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
       );
-    }, [this]() { FailTicketingJoin(); })
+    }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
   );
 }
 
@@ -4419,7 +4439,7 @@ void URedwoodClientInterface::AttemptJoinMatchmaking() {
       HandleTicketingJoinReply(
         Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
       );
-    }, [this]() { FailTicketingJoin(); })
+    }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
   );
 }
 
