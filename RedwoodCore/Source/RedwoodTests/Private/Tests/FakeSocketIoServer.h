@@ -206,6 +206,38 @@ namespace RedwoodFakeSocketIo {
       return ReadSome(Connection, Frame);
     }
 
+    // Reads one masked client text frame (RFC 6455 section 5.3), so a test
+    // can answer a request by its ack id.
+    bool ReadClientText(FString &OutText) {
+      TArray<uint8> Frame;
+      if (!ReadSome(Connection, Frame) || Frame.Num() < 2) {
+        return false;
+      }
+      int32 Length = Frame[1] & 0x7F;
+      int32 Offset = 2;
+      if (Length == SevenBitLengthLimit) {
+        if (Frame.Num() < 4) {
+          return false;
+        }
+        Length = (Frame[2] << 8) | Frame[3];
+        Offset = 4;
+      }
+      constexpr int32 MaskKeyLength = 4;
+      const int32 PayloadStart = Offset + MaskKeyLength;
+      if (Frame.Num() < PayloadStart + Length) {
+        return false;
+      }
+      TArray<uint8> Payload;
+      for (int32 Index = 0; Index < Length; ++Index) {
+        Payload.Add(Frame[PayloadStart + Index] ^ Frame[Offset + Index % MaskKeyLength]);
+      }
+      const FUTF8ToTCHAR Converted(
+        reinterpret_cast<const UTF8CHAR *>(Payload.GetData()), Payload.Num()
+      );
+      OutText = FString(Converted.Length(), Converted.Get());
+      return true;
+    }
+
     // Sends one engine.io/socket.io text packet, e.g. an event: 42["name",{}].
     bool SendText(const char *Packet) {
       return SendAll(Connection, MakeFrame(0x1, AnsiBytes(Packet)));

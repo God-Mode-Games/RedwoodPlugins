@@ -13,6 +13,7 @@
 
 #include "FakeSocketIoServer.h"
 #include "RedwoodClientInterface.h"
+#include "RedwoodSettings.h"
 #include "SocketIOClient.h"
 #include "SocketIONative.h"
 
@@ -90,6 +91,12 @@ public:
   static bool IsRealmReauthRetryPending(FClient &C) {
     return C.TimerManager.IsTimerActive(C.ReauthenticationAttemptTimer);
   }
+  static void InitiateRealmHandshake(FClient &C, const FRedwoodRealm &InRealm) {
+    C.InitiateRealmHandshake(InRealm, FRedwoodSocketConnectedDelegate());
+  }
+  static void TrackDirectorReply(FClient &C, TFunction<void()> OnLost) {
+    C.DirectorReplies.Track(FRedwoodReplyCallback(), MoveTemp(OnLost));
+  }
   static int32 NumDirectorReplies(FClient &C) {
     return C.DirectorReplies.Num();
   }
@@ -110,8 +117,9 @@ namespace RedwoodInFlightTest {
 
   enum class EClose { Normal, ServiceRestart, NoCloseFrame };
 
-  // A Realm socket on the fake server, with the callbacks InitiateRealmHandshake
-  // installs, and a logged-in player so the gates let a request through.
+  // A Realm socket on the fake server, with copies of the callbacks that
+  // InitiateRealmHandshake installs, and a logged-in player so the gates let a
+  // request through. OpenThroughHandshake installs the real callbacks.
   struct FRealmHarness {
     TUniquePtr<FFakeSocketIoServer> Server = MakeUnique<FFakeSocketIoServer>();
     TStrongObjectPtr<URedwoodClientInterface> Interface{
@@ -272,17 +280,124 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
+  // Sets the Director URI that InitializeDirectorConnection reads.
+  struct FDirectorUriOverride {
+    URedwoodSettings *Settings = GetMutableDefault<URedwoodSettings>();
+    const FString OldUri = Settings->DirectorUri;
+    const bool bOldJsonEnabled = Settings->bRedwoodJsonEnabled;
+
+    explicit FDirectorUriOverride(int32 Port) {
+      Settings->DirectorUri = FString::Printf(TEXT("ws://127.0.0.1:%d"), Port);
+      Settings->bRedwoodJsonEnabled = false;
+    }
+    ~FDirectorUriOverride() {
+      Settings->DirectorUri = OldUri;
+      Settings->bRedwoodJsonEnabled = bOldJsonEnabled;
+    }
+  };
+
+  // The production sockets keep ReconnectionDelay (5000 ms), the edge of one
+  // step, so a reconnect gets two.
+  bool AcceptReconnect(FFakeSocketIoServer &Server) {
+    return (Server.WaitForConnection() || Server.WaitForConnection()) &&
+      Server.AcceptSession();
+  }
+
+  // The Director socket with the callbacks of InitializeDirectorConnection.
+  bool OpenProductionDirector(
+    FAutomationTestBase &Test, URedwoodClientInterface &C, FFakeSocketIoServer &Server
+  ) {
+    if (!Test.TestTrue(TEXT("Director server listens"), Server.Listen())) {
+      return false;
+    }
+    {
+      FDirectorUriOverride Uri(Server.Port);
+      C.InitializeDirectorConnection(FRedwoodSocketConnectedDelegate());
+    }
+    return Test.TestTrue(TEXT("Director opens a session"), Server.AcceptSession()) &&
+      Test.TestTrue(
+        TEXT("Director connects"),
+        PumpGameThreadUntil([&C]() { return FAccess::bSentDirectorConnected(C); })
+      );
+  }
+
+  // Runs the real handshake, so the Realm socket has the callbacks that
+  // InitiateRealmHandshake installs. The Director answers the token request.
+  bool OpenThroughHandshake(
+    FAutomationTestBase &Test, FRealmHarness &Harness, FFakeSocketIoServer &DirectorServer
+  ) {
+    Harness.OpenedBy = &Test;
+    URedwoodClientInterface &C = Harness.Client();
+    if (!Test.TestTrue(TEXT("Test server listens"), Harness.Server->Listen()) ||
+        !OpenProductionDirector(Test, C, DirectorServer)) {
+      return false;
+    }
+    FAccess::PlayerId(C) = TEXT("player-1");
+    FAccess::AuthToken(C) = TEXT("token-1");
+    FAccess::SelectedCharacterId(C) = TEXT("character-1");
+    FAccess::bAuthenticated(C) = true;
+
+    FRedwoodRealm InRealm;
+    InRealm.Id = TEXT("realm-1");
+    InRealm.Uri = FString::Printf(TEXT("ws://127.0.0.1:%d"), Harness.Server->Port);
+    FAccess::InitiateRealmHandshake(C, InRealm);
+
+    // An event with an ack: 42<ack id>["name",{...}].
+    FString Request;
+    if (!Test.TestTrue(
+          TEXT("The token request reaches the Director"),
+          DirectorServer.ReadClientText(Request)
+        )) {
+      return false;
+    }
+    const int32 ArgsStart = Request.Find(TEXT("["));
+    const FString AckId = Request.Mid(2, ArgsStart - 2);
+    if (!Test.TestTrue(
+          TEXT("The token request has an ack id"),
+          Request.StartsWith(TEXT("42")) && !AckId.IsEmpty() && AckId.IsNumeric()
+        )) {
+      return false;
+    }
+    const FString Reply = FString::Printf(
+      TEXT("43%s[{\"error\":\"\",\"token\":\"realm-token\"}]"), *AckId
+    );
+    return Test.TestTrue(
+             TEXT("The Director answers"),
+             DirectorServer.SendText(StringCast<ANSICHAR>(*Reply).Get())
+           ) &&
+      // The reply runs on the game thread, which AcceptSession blocks.
+      Test.TestTrue(
+        TEXT("The reply creates the Realm socket"),
+        PumpGameThreadUntil([&C]() { return FAccess::Realm(C).IsValid(); })
+      ) &&
+      Test.TestTrue(TEXT("Realm opens a session"), Harness.Server->AcceptSession()) &&
+      Test.TestTrue(
+        TEXT("Realm connects"),
+        PumpGameThreadUntil([&C]() {
+          return FAccess::bSentRealmConnected(C) && !FAccess::bRealmDisconnected(C);
+        })
+      );
+  }
+
   // Review focus: JoinQueue is not held by a gate, so one sent after the drop
   // was not pending when the drop failed the others. It must fail at the
-  // reconnect. Pins: the FailAll in NoteRealmReconnected.
+  // reconnect. Pins: the NoteRealmReconnected call in the real Realm
+  // connected callback.
   bool RunZoneJoinSentAfterDrop(FAutomationTestBase &Test) {
     bool bAnswered = false;
     FString Error;
     FRealmHarness Harness;
-    if (!Harness.Open(Test)) {
+    // After the harness, so its connection closes before the harness waits
+    // for the sockets, as in DirectorDropDuringRealmRelogin.
+    FFakeSocketIoServer DirectorServer;
+    if (!OpenThroughHandshake(Test, Harness, DirectorServer)) {
       return false;
     }
     URedwoodClientInterface &C = Harness.Client();
+    // The real callback logs the drop as an error.
+    Test.AddExpectedError(
+      TEXT("Lost connection to Realm"), EAutomationExpectedErrorFlags::Contains, 1
+    );
     Test.TestTrue(TEXT("The server closes"), Harness.Close(EClose::ServiceRestart));
     if (!Test.TestTrue(
           TEXT("The client notes the drop"),
@@ -305,12 +420,49 @@ namespace RedwoodInFlightTest {
     );
     Test.TestFalse(TEXT("Nothing answers before the reconnect"), bAnswered);
 
-    Test.TestTrue(TEXT("The client reconnects"), Harness.Server->AcceptSession());
+    Test.TestTrue(TEXT("The client reconnects"), AcceptReconnect(*Harness.Server));
     PumpGameThreadUntil([&bAnswered]() { return bAnswered; });
     ExpectClearError(Test, TEXT("Zone join sent after the drop"), bAnswered, Error);
     Test.TestTrue(
-      TEXT("The lost join is dropped until the queue is left"),
+      TEXT("The lost join is dropped until a new join"),
       FAccess::bAbandonedQueueJoin(C)
+    );
+    return true;
+  }
+
+  // The Director side of the same gap. Pins: the NoteDirectorReconnected call
+  // in the real Director connected callback.
+  bool RunDirectorReconnectFailsPendingReply(FAutomationTestBase &Test) {
+    bool bLost = false;
+    FRealmHarness Harness;
+    // After the harness, so its connection closes before the harness waits
+    // for the sockets, as in DirectorDropDuringRealmRelogin.
+    FFakeSocketIoServer DirectorServer;
+    Harness.OpenedBy = &Test;
+    URedwoodClientInterface &C = Harness.Client();
+    if (!OpenProductionDirector(Test, C, DirectorServer)) {
+      return false;
+    }
+    // The real callback logs the drop as an error.
+    Test.AddExpectedError(
+      TEXT("Lost connection to Director"), EAutomationExpectedErrorFlags::Contains, 1
+    );
+    Test.TestTrue(
+      TEXT("The Director closes"), DirectorServer.CloseWithCode(ServiceRestartCloseCode)
+    );
+    if (!Test.TestTrue(
+          TEXT("The client notes the Director drop"),
+          PumpGameThreadUntil([&C]() { return FAccess::bDirectorDisconnected(C); })
+        )) {
+      return false;
+    }
+
+    // Stands in for a request sent between the drop and the reconnect.
+    FAccess::TrackDirectorReply(C, [&bLost]() { bLost = true; });
+    Test.TestTrue(TEXT("The Director reconnects"), AcceptReconnect(DirectorServer));
+    Test.TestTrue(
+      TEXT("The reconnect fails the pending request"),
+      PumpGameThreadUntil([&bLost]() { return bLost; })
     );
     return true;
   }
@@ -620,4 +772,9 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightRequestedCloseTest,
   "PartyInviteFailsOnRequestedClose",
   RedwoodInFlightTest::RunPartyInviteOnRequestedClose(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightDirectorReconnectTest,
+  "DirectorReconnectFailsPendingReply",
+  RedwoodInFlightTest::RunDirectorReconnectFailsPendingReply(*this)
 )
