@@ -206,6 +206,17 @@ namespace RedwoodInFlightTest {
         }
       }
       Server.Reset();
+      // A socket still connected when Deinitialize closes it starts the
+      // library's 3 s close timer, which can outlive the freed socket. Every
+      // server is gone now, so wait until the sockets see it.
+      const bool bDropped = PumpGameThreadUntil([&Sockets]() {
+        return Algo::AllOf(Sockets, [](const TSharedPtr<FSocketIONative> &S) {
+          return !S->bIsConnected;
+        });
+      });
+      if (OpenedBy) {
+        OpenedBy->TestTrue(TEXT("The sockets see the servers go"), bDropped);
+      }
       Interface->Deinitialize();
       const bool bReleased = PumpGameThreadUntil([&Sockets]() {
         return Algo::AllOf(Sockets, [](const TSharedPtr<FSocketIONative> &S) {
@@ -319,6 +330,10 @@ namespace RedwoodInFlightTest {
     if (!Test.TestTrue(TEXT("Director server listens"), Server.Listen())) {
       return false;
     }
+    // The real callbacks log each drop as an error, the teardown's too.
+    Test.AddExpectedError(
+      TEXT("Lost connection to"), EAutomationExpectedErrorFlags::Contains, 0
+    );
     {
       FDirectorUriOverride Uri(Server.Port);
       C.InitializeDirectorConnection(FRedwoodSocketConnectedDelegate());
@@ -415,6 +430,12 @@ namespace RedwoodInFlightTest {
   // in the re-login window after it, where no route answers them.
   bool RunRealmReconnectAndReloginWindow(FAutomationTestBase &Test) {
     bool bLost = false;
+    // Before the harness: a request that did go out keeps its callbacks
+    // until the teardown fails them.
+    bool bJoinAnswered = false;
+    bool bListAnswered = false;
+    FString JoinError;
+    FString ListError;
     FRealmHarness Harness;
     // After the harness, so its connection closes before the harness waits
     // for the sockets, as in DirectorDropDuringRealmRelogin.
@@ -423,10 +444,6 @@ namespace RedwoodInFlightTest {
       return false;
     }
     URedwoodClientInterface &C = Harness.Client();
-    // The real callback logs the drop as an error.
-    Test.AddExpectedError(
-      TEXT("Lost connection to Realm"), EAutomationExpectedErrorFlags::Contains, 1
-    );
     Test.TestTrue(TEXT("The server closes"), Harness.Close(EClose::ServiceRestart));
     if (!Test.TestTrue(
           TEXT("The client notes the drop"),
@@ -435,11 +452,9 @@ namespace RedwoodInFlightTest {
       return false;
     }
 
-    auto ExpectFailsAtOnce = [&Test, &C](const TCHAR *When) {
-      bool bJoinAnswered = false;
-      bool bListAnswered = false;
-      FString JoinError;
-      FString ListError;
+    auto ExpectFailsAtOnce = [&](const TCHAR *When) {
+      bJoinAnswered = false;
+      bListAnswered = false;
       C.JoinQueue(
         TEXT("proxy-1"),
         TEXT("zone-1"),
@@ -510,10 +525,6 @@ namespace RedwoodInFlightTest {
     if (!OpenProductionDirector(Test, C, DirectorServer)) {
       return false;
     }
-    // The real callback logs the drop as an error.
-    Test.AddExpectedError(
-      TEXT("Lost connection to Director"), EAutomationExpectedErrorFlags::Contains, 1
-    );
     Test.TestTrue(
       TEXT("The Director closes"), DirectorServer.CloseWithCode(ServiceRestartCloseCode)
     );
