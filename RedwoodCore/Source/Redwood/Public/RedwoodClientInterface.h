@@ -456,6 +456,9 @@ private:
   // from a lambda queued to the game thread, which runs after Disconnect()
   // returns, and the flag must still be set then.
   bool bRealmCloseRequested = false;
+  // HollowedOath#2999. When that close started the library's close timer,
+  // until the timer ran; negative otherwise. See RedwoodClosingSockets.
+  double RealmCloseStartedAt = -1.0;
   // FORK(hollowed-oath) END
 
   void InitiateRealmHandshake(

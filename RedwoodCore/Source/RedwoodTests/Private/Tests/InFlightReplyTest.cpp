@@ -13,6 +13,7 @@
 
 #include "FakeSocketIoServer.h"
 #include "RedwoodClientInterface.h"
+#include "RedwoodClosingSockets.h"
 #include "RedwoodSettings.h"
 #include "SocketIOClient.h"
 #include "SocketIONative.h"
@@ -800,12 +801,19 @@ namespace RedwoodInFlightTest {
         Handler(Reason);
         ++CloseReports;
       };
-    // The library's 3 s close timer reports the namespace closed when it
-    // runs. The socket must not be freed before: the timer would run on it.
-    Realm->OnNamespaceDisconnectedCallback =
-      [&bNamespaceClosed](const FString &) { bNamespaceClosed = true; };
 
     FAccess::RequestRealmClose(C);
+    // The library's 3 s close timer reports the namespace closed when it
+    // runs; the interface's own handler for it stays first.
+    TFunction<void(const FString &)> OnNamespaceClosed =
+      Realm->OnNamespaceDisconnectedCallback;
+    Realm->OnNamespaceDisconnectedCallback =
+      [OnNamespaceClosed, &bNamespaceClosed](const FString &Namespace) {
+        if (OnNamespaceClosed) {
+          OnNamespaceClosed(Namespace);
+        }
+        bNamespaceClosed = true;
+      };
     ExpectClearError(Test, TEXT("Party invite at a requested close"), bAnswered, Error);
     Test.TestTrue(TEXT("Server acknowledges the close"), Harness.Server->CloseNormally());
     Test.TestTrue(
@@ -1111,12 +1119,19 @@ namespace RedwoodInFlightTest {
         Handler(Reason);
         ++CloseReports;
       };
-    // The library's 3 s close timer reports the namespace closed when it
-    // runs. The socket must not be freed before: the timer would run on it.
-    Realm->OnNamespaceDisconnectedCallback =
-      [&bNamespaceClosed](const FString &) { bNamespaceClosed = true; };
 
     C.Logout();
+    // The library's 3 s close timer reports the namespace closed when it
+    // runs; the interface's own handler for it stays first.
+    TFunction<void(const FString &)> OnNamespaceClosed =
+      Realm->OnNamespaceDisconnectedCallback;
+    Realm->OnNamespaceDisconnectedCallback =
+      [OnNamespaceClosed, &bNamespaceClosed](const FString &Namespace) {
+        if (OnNamespaceClosed) {
+          OnNamespaceClosed(Namespace);
+        }
+        bNamespaceClosed = true;
+      };
     FString Request;
     Test.TestTrue(TEXT("A request arrives"), Harness.Server->ReadClientText(Request));
     Test.TestTrue(
@@ -1234,6 +1249,34 @@ namespace RedwoodInFlightTest {
       TEXT("A replay does not move the player"),
       AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
     );
+    return true;
+  }
+
+  // HollowedOath#2999. Freeing the interface right after a close we ask for
+  // must keep the socket until the library's close timer ran; freed before,
+  // the timer runs on freed memory. Pins: RedwoodClosingSockets in
+  // ReleaseRealmSocket.
+  bool RunFreeDuringRequestedClose(FAutomationTestBase &Test) {
+    TWeakPtr<FSocketIONative> Socket;
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    Socket = FAccess::Realm(C);
+    FAccess::RequestRealmClose(C);
+    C.Deinitialize();
+
+    // Well inside the timer.
+    constexpr double TimerRunningSeconds = 1.0;
+    const double Until = FPlatformTime::Seconds() + TimerRunningSeconds;
+    PumpGameThreadUntil([Until]() { return FPlatformTime::Seconds() > Until; });
+    Test.TestTrue(TEXT("The socket is kept while its close timer runs"), Socket.IsValid());
+    Test.TestTrue(
+      TEXT("The socket is freed once its close timer ran"),
+      PumpGameThreadUntil([&Socket]() { return !Socket.IsValid(); })
+    );
+    Test.TestEqual(TEXT("Nothing is held"), RedwoodClosingSockets::NumHeld(), 0);
     return true;
   }
 }
@@ -1365,6 +1408,11 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightLeftWorldTest,
   "LeftWorldExpectsNoAssignment",
   RedwoodInFlightTest::RunLeftWorld(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightFreeDuringCloseTest,
+  "FreeDuringRequestedCloseKeepsSocket",
+  RedwoodInFlightTest::RunFreeDuringRequestedClose(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,

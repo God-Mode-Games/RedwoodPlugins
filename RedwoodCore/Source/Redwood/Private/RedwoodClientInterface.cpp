@@ -3,6 +3,7 @@
 #include "RedwoodClientInterface.h"
 #include "UObject/StrongObjectPtr.h" // FORK(hollowed-oath)
 #include "RedwoodClientGameSubsystem.h"
+#include "RedwoodClosingSockets.h" // FORK(hollowed-oath)
 #include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodGameplayTags.h"
 #include "RedwoodSaveGame.h"
@@ -51,9 +52,13 @@ void URedwoodClientInterface::Deinitialize() {
   RealmReplies.Reset();
 
   if (Director.IsValid()) {
+    // FORK(hollowed-oath): HollowedOath#2999. A connected socket starts the
+    // library's close timer here; see RedwoodClosingSockets.
+    const double CloseStartedAt =
+      Director->bIsConnected ? FPlatformTime::Seconds() : -1.0;
     Director->ClearAllCallbacks();
     Director->Disconnect();
-    ISocketIOClientModule::Get().ReleaseNativePointer(Director);
+    RedwoodClosingSockets::Release(Director, CloseStartedAt);
     Director = nullptr;
   }
   DirectorCloseBackoff.Reset(TimerManager); // FORK(hollowed-oath)
@@ -69,9 +74,19 @@ void URedwoodClientInterface::Deinitialize() {
 // FORK(hollowed-oath) BEGIN: shared by Deinitialize and a new handshake.
 void URedwoodClientInterface::ReleaseRealmSocket() {
   if (Realm.IsValid()) {
+    // HollowedOath#2999. A requested close already started the library's
+    // close timer, and a second close would cancel it, which the library
+    // turns into an early on_close with the timer still set. A connected
+    // socket starts the timer here.
+    const bool bClosing = bRealmCloseRequested;
+    const double CloseStartedAt =
+      bClosing ? RealmCloseStartedAt
+               : (Realm->bIsConnected ? FPlatformTime::Seconds() : -1.0);
     Realm->ClearAllCallbacks();
-    Realm->Disconnect();
-    ISocketIOClientModule::Get().ReleaseNativePointer(Realm);
+    if (!bClosing) {
+      Realm->Disconnect();
+    }
+    RedwoodClosingSockets::Release(Realm, CloseStartedAt);
     Realm = nullptr;
     // HollowedOath#2886. No reply comes over a released socket. After the
     // release, so a failure handler cannot reach the old socket.
@@ -3555,6 +3570,15 @@ URedwoodClientInterface::MakeUnrequestedCloseHandler(
 void URedwoodClientInterface::RequestRealmClose() {
   bRealmCloseRequested = true;
   RealmCloseBackoff.Reset(TimerManager);
+  // HollowedOath#2999. The library reports the namespace closed when its
+  // close timer ran; only a connected socket starts one.
+  RealmCloseStartedAt = Realm->bIsConnected ? FPlatformTime::Seconds() : -1.0;
+  Realm->OnNamespaceDisconnectedCallback =
+    [WeakThis = TWeakObjectPtr<URedwoodClientInterface>(this)](const FString &) {
+      if (WeakThis.IsValid()) {
+        WeakThis->RealmCloseStartedAt = -1.0;
+      }
+    };
   Realm->Disconnect();
   // HollowedOath#2886. No reply comes over a closed socket. After the close,
   // so a failure handler cannot reach the socket before it closes.
@@ -3563,6 +3587,7 @@ void URedwoodClientInterface::RequestRealmClose() {
 
 void URedwoodClientInterface::BindRealmCloseHandler() {
   bRealmCloseRequested = false;
+  RealmCloseStartedAt = -1.0;
   Realm->OnDisconnectedCallback = MakeUnrequestedCloseHandler(
     Realm, RealmCloseBackoff, [this]() { return bRealmCloseRequested; }
   );
