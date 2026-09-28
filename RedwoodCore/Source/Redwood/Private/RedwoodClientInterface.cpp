@@ -255,7 +255,7 @@ void URedwoodClientInterface::NoteJoinSent() {
 
 namespace {
   // Keeps the last few ids. Answers false when Id is among them already.
-  bool RememberRecentPartyTicketId(TArray<FString> &Ids, const FString &Id) {
+  bool RememberRecentId(TArray<FString> &Ids, const FString &Id) {
     // A notice is resent within seconds; a few dozen covers any burst.
     constexpr int32 MaxRememberedIds = 32;
     if (Ids.Contains(Id)) {
@@ -283,12 +283,9 @@ void URedwoodClientInterface::HandlePartyQueued(
   Message->TryGetStringField(TEXT("messageId"), MessageId);
   Message->TryGetStringField(TEXT("characterId"), CharacterId);
   Message->TryGetStringField(TEXT("ticketId"), TicketId);
-  if (!MessageId.IsEmpty() &&
-      !RememberRecentPartyTicketId(RecentPartyTicketMessageIds, MessageId)) {
-    return;
-  }
-  if (TicketId.IsEmpty() || CharacterId.IsEmpty() ||
-      EndedPartyTicketIds.Contains(TicketId)) {
+  if ((!MessageId.IsEmpty() &&
+       !RememberRecentId(RecentPartyTicketMessageIds, MessageId)) ||
+      TicketId.IsEmpty() || CharacterId.IsEmpty()) {
     return;
   }
   if (SelectedCharacterId.IsEmpty()) {
@@ -308,10 +305,19 @@ void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
       EndedPartyTicketIds.Contains(TicketId)) {
     return;
   }
-  // As NoteJoinSent, but an owed leave stays: this member's own old ticket
-  // still needs it. The member's leave does not end the leader's ticket, so
-  // it goes now: otherwise the party's travel would erase it, and the old
-  // ticket's assignment could move the player in the world.
+  // This member's own join, still out, keeps its own ticket: leave it, or
+  // its solo assignment could move the player after the party's travel.
+  if (bAssignmentExpected && AcceptedPartyTicketId.IsEmpty() && !bInWorld &&
+      !bTravelPending) {
+    bLeaveTicketingOwed = true;
+  }
+  // A leader has one ticket, so a stale "queued" of the replaced one
+  // (HollowedOath#3031) must not take it back.
+  if (!AcceptedPartyTicketId.IsEmpty()) {
+    EndPartyTicket(AcceptedPartyTicketId);
+  }
+  // As NoteJoinSent, but an owed leave stays and goes now: it cannot end
+  // the leader's ticket, and the party's travel would erase it.
   ++JoinSequence;
   bAssignmentExpected = true;
   bAbandonedQueueJoin = false;
@@ -319,6 +325,15 @@ void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
   if (IsRealmReady()) {
     SendOwedLeave();
   }
+}
+
+bool URedwoodClientInterface::EndPartyTicket(const FString &TicketId) {
+  RememberRecentId(EndedPartyTicketIds, TicketId);
+  if (TicketId != AcceptedPartyTicketId) {
+    return false;
+  }
+  AcceptedPartyTicketId.Reset();
+  return true;
 }
 
 // Only the named ticket: a late "left" of an older ticket must not drop the
@@ -334,18 +349,16 @@ void URedwoodClientInterface::HandlePartyLeft(
   Message->TryGetStringField(TEXT("messageId"), MessageId);
   Message->TryGetStringField(TEXT("ticketId"), TicketId);
   if ((!MessageId.IsEmpty() &&
-       !RememberRecentPartyTicketId(RecentPartyTicketMessageIds, MessageId)) ||
+       !RememberRecentId(RecentPartyTicketMessageIds, MessageId)) ||
       TicketId.IsEmpty()) {
     return;
   }
-  RememberRecentPartyTicketId(EndedPartyTicketIds, TicketId);
   if (TicketId == PendingPartyTicketId) {
     PendingPartyTicketId.Reset();
   }
-  if (TicketId == AcceptedPartyTicketId) {
-    AcceptedPartyTicketId.Reset();
-    // As a ticket error: a player in the world keeps zone transfers through
-    // bInWorld.
+  // As a ticket error: a player in the world keeps zone transfers through
+  // bInWorld.
+  if (EndPartyTicket(TicketId)) {
     bAssignmentExpected = false;
   }
 }
@@ -3311,10 +3324,7 @@ void URedwoodClientInterface::BindRealmEvents() {
       // The ticket is used: a "queued" for it sent again must not arm the
       // guard for a replay of this assignment.
       if (!AssignedTicketId.IsEmpty()) {
-        RememberRecentPartyTicketId(EndedPartyTicketIds, AssignedTicketId);
-        if (AssignedTicketId == AcceptedPartyTicketId) {
-          AcceptedPartyTicketId.Reset();
-        }
+        EndPartyTicket(AssignedTicketId);
       }
 
       bool bShouldStitch = MessageObject->GetBoolField(TEXT("shouldStitch"));
@@ -3701,10 +3711,6 @@ void URedwoodClientInterface::SetCharacterData(
 }
 
 void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
-  // FORK(hollowed-oath): HollowedOath#3002. See PendingPartyTicketId.
-  const FString PendingTicketId =
-    PendingPartyCharacterId == CharacterId ? PendingPartyTicketId : FString();
-  PendingPartyTicketId.Reset();
   // FORK(hollowed-oath): HollowedOath#2886. A new character is at character
   // select until it joins. A dropped join was the old character's; its owed
   // leave stays, because the old ticket still needs it.
@@ -3713,10 +3719,14 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
     bInWorld = false;
     bAbandonedQueueJoin = false;
     bTravelPending = false;
-    ForgetPartyTickets();
+    // HollowedOath#3002. Only the join was the old character's: the ended
+    // tickets stay ended, and a held notice waits for its own character.
+    AcceptedPartyTicketId.Reset();
   }
   SelectedCharacterId = CharacterId;
-  if (!PendingTicketId.IsEmpty() && !CharacterId.IsEmpty()) {
+  if (!PendingPartyTicketId.IsEmpty() && PendingPartyCharacterId == CharacterId) {
+    const FString PendingTicketId = MoveTemp(PendingPartyTicketId);
+    PendingPartyTicketId.Reset();
     AcceptPartyTicket(PendingTicketId);
   }
 

@@ -578,6 +578,8 @@ private:
   FString PendingPartyTicketId;
   FString PendingPartyCharacterId;
   void AcceptPartyTicket(const FString &TicketId);
+  // Answers true when TicketId was the accepted ticket.
+  bool EndPartyTicket(const FString &TicketId);
   void HandlePartyQueued(const TSharedPtr<FJsonObject> &Message);
   void HandlePartyLeft(const TSharedPtr<FJsonObject> &Message);
   void ForgetPartyTickets();

@@ -923,9 +923,12 @@ namespace RedwoodInFlightTest {
       FAccess::bAssignmentExpected(C)
     );
     Test.TestTrue(
-      TEXT("A new character forgets the old character's party tickets"),
-      FAccess::AcceptedPartyTicketId(C).IsEmpty() &&
-        FAccess::EndedPartyTicketIds(C).IsEmpty()
+      TEXT("A new character forgets the old character's party join"),
+      FAccess::AcceptedPartyTicketId(C).IsEmpty()
+    );
+    Test.TestTrue(
+      TEXT("An ended ticket stays ended for a new character"),
+      FAccess::EndedPartyTicketIds(C).Contains(TEXT("ticket-0"))
     );
     return true;
   }
@@ -1096,6 +1099,13 @@ namespace RedwoodInFlightTest {
       FAccess::AcceptedPartyTicketId(C),
       FString(TEXT("ticket-2"))
     );
+    // A stale kept "queued" of the replaced ticket (#3031), with a new id.
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-4")));
+    Test.TestEqual(
+      TEXT("A replaced ticket does not come back"),
+      FAccess::AcceptedPartyTicketId(C),
+      FString(TEXT("ticket-2"))
+    );
     Test.TestTrue(
       TEXT("The newer ticket's assignment moves the member"),
       PartyAssignmentMoves(Test, Harness, TEXT("ticket-2"))
@@ -1221,12 +1231,33 @@ namespace RedwoodInFlightTest {
       TEXT("Another character does not take the held notice"),
       FAccess::bAssignmentExpected(C)
     );
-    C.SetSelectedCharacter(TEXT(""));
-    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-2"), TEXT("m-2")));
     C.SetSelectedCharacter(TEXT("character-1"));
     Test.TestTrue(
       TEXT("Selecting the notice's character moves the member with the party"),
-      PartyAssignmentMoves(Test, Harness, TEXT("ticket-2"))
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    return true;
+  }
+
+  // The member's own join is still out when the party ticket comes: its own
+  // ticket must be left, or its solo assignment could move the player after
+  // the party's travel. Pins: the own-join check in AcceptPartyTicket.
+  bool RunPartyNoticeLeavesOwnJoin(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    C.JoinQueue(
+      TEXT("proxy-1"), TEXT("zone-1"), false, false, FRedwoodTicketingUpdateDelegate()
+    );
+    Test.TestTrue(TEXT("The own join reaches the server"), Harness.Server->ReadClientFrame());
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    FString Request;
+    Test.TestTrue(
+      TEXT("The party notice leaves the member's own ticket"),
+      Harness.Server->ReadClientText(Request) &&
+        Request.Contains(TEXT("realm:ticketing:leave"))
     );
     return true;
   }
@@ -1371,9 +1402,8 @@ namespace RedwoodInFlightTest {
   }
 
   // A member drops a join, then picks another character: after the party
-  // notice for the new character, the leader's whole-party assignment must
-  // move it, and the old ticket's leave is still owed. Pins: the dropped-join reset in
-  // SetSelectedCharacter.
+  // notice, the leader's party assignment moves it and the old leave is
+  // still owed. Pins: the dropped-join reset in SetSelectedCharacter.
   bool RunCharacterSwitchClearsDroppedJoin(FAutomationTestBase &Test) {
     FRealmHarness Harness;
     if (!OpenWithRealmEvents(Test, Harness)) {
@@ -1394,10 +1424,8 @@ namespace RedwoodInFlightTest {
       TEXT("The old ticket's leave is still owed"), FAccess::bLeaveTicketingOwed(C)
     );
     SendEvent(Test, Harness, PartyQueued(TEXT("character-2"), TEXT("ticket-1"), TEXT("m-1")));
-    // The member's leave does not end the leader's ticket, so it goes at
-    // once: the party's travel would erase it, and the old ticket could then
-    // move the player in the world. Pins: AcceptPartyTicket keeps it and
-    // SendOwedLeave does not wait for a party join.
+    // Pins: AcceptPartyTicket keeps the owed leave, and SendOwedLeave does
+    // not wait for a party join.
     Test.TestTrue(
       TEXT("The party notice keeps the old ticket's owed leave"),
       FAccess::bLeaveTicketingOwed(C)
@@ -2214,6 +2242,11 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightPartyQueuedBeforeSelectTest,
   "PartyQueuedBeforeCharacterSelect",
   RedwoodInFlightTest::RunPartyQueuedBeforeCharacterSelect(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyNoticeLeavesOwnJoinTest,
+  "PartyNoticeLeavesOwnJoin",
+  RedwoodInFlightTest::RunPartyNoticeLeavesOwnJoin(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightOwnJoinAfterPartyNoticeTest,
