@@ -11,6 +11,7 @@
 #include "Misc/AutomationTest.h"
 #include "UObject/StrongObjectPtr.h"
 
+#include "CharacterFriendAlertListener.h"
 #include "FakeSocketIoServer.h"
 #include "RedwoodClientInterface.h"
 #include "RedwoodClosingSockets.h"
@@ -1783,6 +1784,50 @@ namespace RedwoodInFlightTest {
     Test.TestEqual(TEXT("An empty realm error is a success"), Error, FString());
     return true;
   }
+
+  // Pins the event name and the listener that InitializeDirectorConnection
+  // binds: a pushed alert reaches OnCharacterFriendAlert once, parsed.
+  bool RunCharacterFriendAlertPush(FAutomationTestBase &Test) {
+    // Before the harness, so it outlives every callback the harness can run.
+    TStrongObjectPtr<URedwoodCharacterFriendAlertListener> Listener(
+      NewObject<URedwoodCharacterFriendAlertListener>()
+    );
+    FRealmHarness Harness;
+    // After the harness, so its connection closes before the harness waits
+    // for the sockets, as in DirectorDropDuringRealmRelogin.
+    FFakeSocketIoServer DirectorServer;
+    Harness.OpenedBy = &Test;
+    URedwoodClientInterface &C = Harness.Client();
+    Listener->Watch(&C);
+    if (!OpenProductionDirector(Test, C, DirectorServer)) {
+      return false;
+    }
+
+    Test.TestTrue(
+      TEXT("The Director pushes an alert"),
+      DirectorServer.SendText(
+        "42[\"director:friends:character-alert\",{\"type\":\"online\","
+        "\"characterId\":\"me-1\",\"otherCharacterId\":\"other-1\","
+        "\"otherCharacterName\":\"Bob\",\"zoneName\":\"zone-1\"}]"
+      )
+    );
+    Test.TestTrue(
+      TEXT("The alert is broadcast"),
+      PumpGameThreadUntil([&Listener]() { return Listener->Count > 0; })
+    );
+    Test.TestEqual(TEXT("The alert is broadcast once"), Listener->Count, 1);
+    const FRedwoodCharacterFriendAlert &Alert = Listener->Last;
+    Test.TestTrue(
+      TEXT("The type"), Alert.Type == ERedwoodCharacterFriendAlertType::Online
+    );
+    Test.TestEqual(TEXT("The character"), Alert.CharacterId, FString(TEXT("me-1")));
+    Test.TestEqual(
+      TEXT("The other character"), Alert.OtherCharacterId, FString(TEXT("other-1"))
+    );
+    Test.TestEqual(TEXT("The name"), Alert.OtherCharacterName, FString(TEXT("Bob")));
+    Test.TestEqual(TEXT("The zone"), Alert.ZoneName, FString(TEXT("zone-1")));
+    return true;
+  }
 }
 
 #define REDWOOD_IN_FLIGHT_TEST(Class, Name, Body)                              \
@@ -1992,4 +2037,9 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightCharacterFriendCancelTest,
   "CharacterFriendCancelIsRequestOnly",
   RedwoodInFlightTest::RunCharacterFriendCancelIsRequestOnly(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCharacterFriendAlertTest,
+  "CharacterFriendAlertPush",
+  RedwoodInFlightTest::RunCharacterFriendAlertPush(*this)
 )
