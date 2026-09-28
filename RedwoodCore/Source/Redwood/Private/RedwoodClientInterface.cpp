@@ -355,21 +355,12 @@ void URedwoodClientInterface::InitializeDirectorConnection(
       if (!URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
             Message, Alert
           )) {
-        // The type word goes in the log as sent: a refused push can have a
-        // type the enum does not hold.
-        FString DroppedType;
-        const TSharedPtr<FJsonObject> *DroppedObject =
-          URedwoodCommonGameSubsystem::TryGetRedwoodObject(Message);
-        if (DroppedObject != nullptr) {
-          (*DroppedObject)->TryGetStringField(TEXT("type"), DroppedType);
-        }
         UE_LOG(
           LogRedwood,
           Warning,
           TEXT(
-            "Dropped a director:friends:character-alert of type \"%s\": the message is not an object, the type is unknown, or a character id is missing. The director and the game may no longer agree on the fields in this message."
-          ),
-          *DroppedType
+            "Dropped a director:friends:character-alert: the message is not an object, the type is unknown, or a character id is missing. The director and the game may no longer agree on the fields in this message."
+          )
         );
         return;
       }
