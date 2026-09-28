@@ -1700,16 +1700,21 @@ void URedwoodClientInterface::EmitCharacterFriendCommand(
     return;
   }
 
-  Realm->Emit(EventName, Payload, [OnOutput](auto Response) {
-    const TSharedPtr<FJsonObject> *MessageObject =
-      URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
-    FString Error;
-    if (MessageObject == nullptr ||
-        !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
-      Error = URedwoodCommonGameSubsystem::BadRealmAnswerError;
-    }
-    OnOutput.ExecuteIfBound(Error);
-  });
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  Realm->Emit(
+    EventName,
+    Payload,
+    TrackReply(RealmReplies, [OnOutput](auto Response) {
+      const TSharedPtr<FJsonObject> *MessageObject =
+        URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+      FString Error;
+      if (MessageObject == nullptr ||
+          !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+        Error = URedwoodCommonGameSubsystem::BadRealmAnswerError;
+      }
+      OnOutput.ExecuteIfBound(Error);
+    }, OnOutput)
+  );
 }
 
 void URedwoodClientInterface::ListCharacterFriends(
@@ -1731,11 +1736,16 @@ void URedwoodClientInterface::ListCharacterFriends(
     return;
   }
 
-  Realm->Emit(TEXT("realm:contacts:list"), Payload, [OnOutput](auto Response) {
-    OnOutput.ExecuteIfBound(
-      URedwoodCommonGameSubsystem::ParseListCharacterFriends(Response)
-    );
-  });
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  Realm->Emit(
+    TEXT("realm:contacts:list"),
+    Payload,
+    TrackReply(RealmReplies, [OnOutput](auto Response) {
+      OnOutput.ExecuteIfBound(
+        URedwoodCommonGameSubsystem::ParseListCharacterFriends(Response)
+      );
+    }, OnOutput)
+  );
 }
 
 void URedwoodClientInterface::RequestCharacterFriend(

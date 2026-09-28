@@ -19,6 +19,7 @@
 #include "UObject/StrongObjectPtr.h"
 
 #include "RedwoodClientInterface.h"
+#include "RedwoodPendingReplies.h"
 #include "SocketIOClient.h"
 #include "Types/RedwoodTypesCharacters.h"
 
@@ -185,6 +186,25 @@ bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
   // The end of a grace after the release runs no call a second time.
   Client->RealmHeldRequests.Expire(Client->TimerManager);
   TestEqual(TEXT("Released: no call runs again"), Errors.Num(), 0);
+
+  // HollowedOath#2886: a sent call waits for its reply, and a drop before the
+  // reply fails it once.
+  TestEqual(
+    TEXT("Every sent call waits for its reply"), Client->RealmReplies.Num(), 4
+  );
+  Client->Realm->bIsConnected = false;
+  Client->NoteRealmDrop();
+  TestEqual(TEXT("The drop answers every sent call once"), Errors.Num(), 4);
+  for (const FString &Error : Errors) {
+    TestEqualSensitive(
+      TEXT("A sent call tells its reply was lost"),
+      *Error,
+      FRedwoodPendingReplies::LostReplyError
+    );
+  }
+  TestEqual(
+    TEXT("No call waits after the drop"), Client->RealmReplies.Num(), 0
+  );
 
   return true;
 }
