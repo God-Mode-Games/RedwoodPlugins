@@ -564,6 +564,18 @@ private:
   uint32 JoinSequence = 0;
   uint32 TravelJoinSequence = 0;
   // FORK(hollowed-oath) END
+  // FORK(hollowed-oath) BEGIN: HollowedOath#3002. A member's client sends no
+  // join when the leader queues the whole party; the server's "party queued"
+  // notice is that member's join. See HandlePartyQueued.
+  FString AcceptedPartyTicketId;
+  // Party tickets that ended: left, or their assignment was accepted. The
+  // server can send "queued" for one again (HollowedOath#3008, #3031).
+  TArray<FString> EndedPartyTicketIds;
+  TArray<FString> RecentPartyTicketMessageIds;
+  void HandlePartyQueued(const TSharedPtr<FJsonObject> &Message);
+  void HandlePartyLeft(const TSharedPtr<FJsonObject> &Message);
+  void ForgetPartyTickets();
+  // FORK(hollowed-oath) END
   // The Realm socket dropped and the player is not authenticated on it again
   // yet; the Director has bAuthenticated for this.
   bool bRealmReauthPending = false;
