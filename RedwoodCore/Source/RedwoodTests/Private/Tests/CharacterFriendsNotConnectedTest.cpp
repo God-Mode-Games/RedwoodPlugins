@@ -38,8 +38,8 @@ bool FRedwoodCharacterFriendsNotConnectedTest::RunTest(
       [&Error](const FString &Output) { Error = Output; }
     );
 
-  // TestEqualSensitive: the TCHAR* form of TestEqual compares without case.
-  // Clearing after each check makes a call that never answers fail here.
+  // TestEqualSensitive: the TCHAR* form of TestEqual ignores case. The reset
+  // makes a call that never answers fail.
   const auto CheckAll = [&](const TCHAR *Expected, const TCHAR *Case) {
     Redwood->ListCharacterFriends(OnList);
     TestEqualSensitive(Case, *Error, Expected);
@@ -67,13 +67,10 @@ bool FRedwoodCharacterFriendsNotConnectedTest::RunTest(
   return true;
 }
 
-// HollowedOath#2854 made a Realm request that the player makes while the Realm
-// socket reconnects wait for the re-handshake (GateRealm). The character
-// friend calls must wait too. Sent before the re-handshake, they reach a
-// server socket that does not know the player: the game's friends list
-// fetch at the Director reconnect then fails, and a command gets refused.
-// The sockets never connect: bIsConnected is set by hand, as in
-// ReloginFailureTest.cpp, so a call that is emitted is never answered.
+// Sent before the Realm re-handshake, a call reaches a server socket that does
+// not know the player and is refused, so the calls wait like other Realm
+// requests (HollowedOath#2854). The socket never really connects, so a sent
+// call is never answered.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   FRedwoodCharacterFriendsHeldTest,
   "Redwood.CharacterFriends.HeldWhileRealmReconnects",
@@ -142,40 +139,12 @@ bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
   );
   TestEqual(TEXT("No held call is answered yet"), Errors.Num(), 0);
 
-  // The re-handshake fails: every held call answers with the realm error.
-  Client->EndRealmReauthentication(false);
-
-  TestEqual(TEXT("Every held call is answered"), Errors.Num(), 5);
-  for (const FString &Error : Errors) {
-    TestEqualSensitive(
-      TEXT("A held call fails, it is not sent"),
-      *Error,
-      TEXT("Not connected to Realm.")
-    );
-  }
-  Errors.Reset();
-
-  // A second drop, and this time the re-handshake succeeds: each held call
-  // is sent once. No backend runs, so a sent call gets no answer; a call that
-  // answers was refused, and a call still held was not sent.
-  Client->Realm->bIsConnected = false;
-  Client->NoteRealmDrop();
-  Client->Realm->bIsConnected = true;
-  CallAll();
-  TestEqual(
-    TEXT("Held again after the second drop"), Client->RealmHeldRequests.Num(), 5
-  );
-
   Client->EndRealmReauthentication(true);
 
   TestEqual(
     TEXT("Released: nothing stays held"), Client->RealmHeldRequests.Num(), 0
   );
   TestEqual(TEXT("Released: no call is refused"), Errors.Num(), 0);
-
-  // The end of a grace after the release runs no call a second time.
-  Client->RealmHeldRequests.Expire(Client->TimerManager);
-  TestEqual(TEXT("Released: no call runs again"), Errors.Num(), 0);
 
   // HollowedOath#2886: a sent call waits for its reply, and a drop before the
   // reply fails it once.

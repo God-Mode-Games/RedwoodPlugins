@@ -1,28 +1,9 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
-// FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart. It
-// pins the null ClientInterface guards added to the social functions of
-// URedwoodClientGameSubsystem for #2445.
-//
-// Initialize() builds ClientInterface only when ShouldUseBackend() is true, but
-// each of these functions tests ShouldUseBackend() again at call time. In the
-// editor that function reads bUseBackendInPIE, and a user can change it while
-// PIE runs. A PIE session that starts with the backend off therefore has no
-// interface, and it takes the backend branch as soon as the setting turns on.
-// Before the guards, the branch read through a null pointer. That PIE toggle is
-// the only way to reach it: a packaged client always builds the interface.
-//
-// This fixture does not use the toggle. It builds the same end state directly,
-// with a subsystem that never ran Initialize() in a world of type Game, because
-// that needs no editor setting and so gives the same result on every machine.
-// The state it asserts is the one the guards answer, not a production path.
-//
-// Every guarded function is a separate call site with its own output type, so
-// each is asserted. An unguarded site crashes the run instead of failing, so a
-// pass here is also the evidence that no site was missed.
-//
-// The friend relay test below uses the same world, but it runs Initialize(),
-// so the subsystem has a client interface and binds its relays.
+// FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart.
+// Pins the null ClientInterface guards of #2445. The fixture builds that state
+// directly (no Initialize() in a Game world), not through the PIE toggle, so
+// it does not depend on editor settings. An unguarded call crashes the run.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -39,17 +20,12 @@
 #include "RedwoodFriendRelayProbe.h"
 
 namespace {
-  // Duplicated from the guards on purpose: the test pins the text the game and
-  // the Blueprint async nodes actually show, rather than comparing the plugin's
-  // own constant with itself.
+  // Not the plugin constant: this pins the text the player sees.
   const TCHAR *const RedwoodExpectedGuardError =
     TEXT("Not connected to the backend.");
 
-  // ShouldUseBackend() reads the world type, so a world of type Game makes the
-  // backend path true without touching the editor's PIE backend setting. That
-  // keeps the fixture independent of how the machine running the suite is set
-  // up. The destructor releases the world, so nothing a test built is left on
-  // the engine for the tests that run after it.
+  // A Game world makes ShouldUseBackend() true with no editor setting. The
+  // destructor releases the world, so later tests do not see it.
   struct FRedwoodClientSubsystemTestWorld {
     UWorld *World = nullptr;
     UGameInstance *GameInstance = nullptr;
@@ -60,10 +36,8 @@ namespace {
         return;
       }
 
-      // A subsystem must live inside a UGameInstance, because
-      // UGameInstanceSubsystem declares Within = GameInstance, and GetWorld()
-      // resolves up that outer chain to the game instance's world context.
-      // The context has to exist first for the game instance to adopt.
+      // The subsystem finds its world through the game instance's world
+      // context, so the context comes first.
       FWorldContext &WorldContext =
         GEngine->CreateNewWorldContext(EWorldType::Game);
       WorldContext.SetCurrentWorld(World);
@@ -72,9 +46,8 @@ namespace {
       WorldContext.OwningGameInstance = GameInstance;
       World->SetGameInstance(GameInstance);
 
-      // Adopting the world this way instead of through InitializeStandalone()
-      // skips UGameInstance::Init(), so the test does not build every other
-      // game instance subsystem in the editor process.
+      // Not InitializeStandalone(): Init() would build every other game
+      // instance subsystem.
       GameInstance->OnWorldChanged(nullptr, World);
     }
 
@@ -105,14 +78,11 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
     return false;
   }
 
-  // Building the subsystem by hand keeps it out of the game instance's
-  // subsystem collection, so Initialize() never runs and ClientInterface stays
-  // null -- the exact state the guards exist for.
+  // Built by hand, so Initialize() never runs and ClientInterface stays null.
   URedwoodClientGameSubsystem *Subsystem =
     NewObject<URedwoodClientGameSubsystem>(TestWorld.GameInstance);
 
-  // These two checks prove the fixture is the broken state. Without them the
-  // calls below could pass for the wrong reason.
+  // Without these, the calls below could pass for the wrong reason.
   TestNull(
     TEXT("Fixture has no client interface"), Subsystem->GetClientInterface()
   );
@@ -151,12 +121,8 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
       }
     );
 
-  // TestEqualSensitive, not TestEqual: the TCHAR* form of TestEqual compares
-  // with Stricmp, so it would accept the text in the wrong case. This pins what
-  // the player actually reads.
-  //
-  // Clearing after each check means a guard that returns without firing its
-  // delegate fails here, instead of passing on the previous call's value.
+  // TestEqualSensitive: the TCHAR* form of TestEqual ignores case. The reset
+  // makes a guard that never answers fail.
   const auto CheckGuard = [this, &Error](const TCHAR *What) {
     TestEqualSensitive(What, *Error, RedwoodExpectedGuardError);
     Error.Reset();

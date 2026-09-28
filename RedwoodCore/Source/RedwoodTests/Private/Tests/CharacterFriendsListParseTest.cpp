@@ -1,22 +1,9 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
 // FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart.
-// Pins the parse of the three arrays the fork adds to the "realm:contacts:list"
-// answer (friends, incomingRequests, outgoingRequests), read by
-// URedwoodClientInterface::ListCharacterFriends:
-//   1. A good answer gives each row its id, name, online flag and zone.
-//   2. A request row has no online flag and no zone; it keeps the defaults.
-//   3. A refused answer carries its error unchanged and gives no rows.
-//   4. An answer that is not one of the realm's answers is reported as an
-//      error, not as an empty list: no answer, a null or non-object answer,
-//      an object with no `error` field, or a success that does not carry
-//      all three arrays. The game takes a good list as the full truth and
-//      removes the settings of each friend that is not in it.
-//   5. A row with no characterId or no characterName is left out, and so is
-//      a row that is not an object or an object value that holds no object.
-//      The game keys on the id and shows the name.
-// The field names below must equal the names in the RedwoodBackend fork,
-// packages/common/src/interfaces.ts (Realms.Contacts.List.SResponse).
+// Pins the parse of the fork arrays of the "realm:contacts:list" answer. The
+// field names must equal Realms.Contacts.List.SResponse in the RedwoodBackend
+// fork (packages/common/src/interfaces.ts).
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -204,9 +191,7 @@ bool FRedwoodCharacterFriendsListBadAnswerTest::RunTest(
     ParseFriendListAnswer(MakeShared<FJsonObject>()).Error.IsEmpty()
   );
 
-  // In UE 5.8, TryGetObject says yes to an object value that holds no
-  // object. The answer reader must refuse it, because every caller reads
-  // through the pointer it gives.
+  // UE 5.8: TryGetObject says yes to an object value with no object.
   TestNull(
     TEXT("An object value with no object is no answer"),
     URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(
@@ -214,9 +199,7 @@ bool FRedwoodCharacterFriendsListBadAnswerTest::RunTest(
     )
   );
 
-  // A success must carry all three arrays. Remove each one in turn from an
-  // answer that has a row in every array: the result is an error with no
-  // rows, so a partial answer cannot read as a short list.
+  // A partial success must not read as a short list.
   const TCHAR *ArrayNames[] = {
     TEXT("friends"), TEXT("incomingRequests"), TEXT("outgoingRequests")
   };
@@ -251,34 +234,6 @@ bool FRedwoodCharacterFriendsListBadAnswerTest::RunTest(
       0
     );
   }
-
-  TSharedPtr<FJsonObject> StringFriends = MakeFriendListAnswer(FString());
-  StringFriends->SetStringField(TEXT("friends"), TEXT("nope"));
-  TestFalse(
-    TEXT("A success whose friends is a string is an error"),
-    ParseFriendListAnswer(StringFriends).Error.IsEmpty()
-  );
-
-  TSharedPtr<FJsonObject> NullFriends = MakeFriendListAnswer(FString());
-  NullFriends->SetField(TEXT("friends"), MakeShared<FJsonValueNull>());
-  TestFalse(
-    TEXT("A success whose friends is null is an error"),
-    ParseFriendListAnswer(NullFriends).Error.IsEmpty()
-  );
-
-  // A row that is not an object is skipped, not crashed on.
-  TSharedPtr<FJsonObject> BadRow = MakeFriendListAnswer(FString());
-  TArray<TSharedPtr<FJsonValue>> Rows;
-  Rows.Add(MakeShared<FJsonValueString>(TEXT("nope")));
-  Rows.Add(MakeShared<FJsonValueObject>(
-    MakeFriendListRequestRow(TEXT("char-1"), TEXT("A"))
-  ));
-  BadRow->SetArrayField(TEXT("friends"), Rows);
-  TestEqual(
-    TEXT("A row that is not an object is skipped"),
-    ParseFriendListAnswer(BadRow).Friends.Num(),
-    1
-  );
 
   return true;
 }

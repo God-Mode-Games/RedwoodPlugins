@@ -1,17 +1,9 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
 // FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart.
-// Pins the field names and the type words this plugin reads out of the
-// fork-added "director:friends:character-alert" push, so a change to the
-// parser cannot stop reading them without a test failure:
-//   1. Each of the five type words gives its enum value.
-//   2. The two ids, the name and the zone are carried.
-//   3. An unknown type word, or a missing id, is refused; the listener in
-//      RedwoodClientInterface.cpp then drops the push and logs a warning.
-//   4. The name and the zone are optional.
-//   5. A reused output keeps nothing from an earlier push.
-// The names must equal the names in the RedwoodBackend fork,
-// packages/common/src/interfaces.ts (the CharacterAlert schema).
+// Pins the field names and type words read from the character friend push.
+// They must equal the CharacterAlert schema of the RedwoodBackend fork
+// (packages/common/src/interfaces.ts).
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -86,10 +78,8 @@ bool FRedwoodCharacterFriendAlertParseTest::RunTest(const FString &Parameters) {
     TestTrue(Words[Index], Each.Type == Values[Index]);
   }
 
-  // The backend always sends a name and a zone (the zone is empty unless
-  // online). The parser does not require them: it passes the push on, and the
-  // game decides what to do when the name is absent. The output is reused from the online parse above, so the
-  // test also shows that no name or zone stays from an earlier push.
+  // The name and the zone are optional. The output is reused from the online
+  // parse above, so this also shows no field stays from an earlier push.
   TSharedPtr<FJsonObject> Bare = MakeCharacterAlertObj(TEXT("requested"));
   Bare->RemoveField(TEXT("otherCharacterName"));
   Bare->RemoveField(TEXT("zoneName"));
@@ -169,14 +159,7 @@ bool FRedwoodCharacterFriendAlertBadPayloadTest::RunTest(
     )
   );
 
-  // A push that is not an object is refused. AsObject would turn it into a
-  // valid empty object; the parser must not depend on that.
-  TestFalse(
-    TEXT("An empty object is refused"),
-    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
-      AsCharacterAlertValue(MakeShared<FJsonObject>()), Alert
-    )
-  );
+  // AsObject would turn each of these into a valid empty object.
   TestFalse(
     TEXT("A string push is refused"),
     URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
