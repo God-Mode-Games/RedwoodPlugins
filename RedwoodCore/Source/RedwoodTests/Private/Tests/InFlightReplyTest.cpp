@@ -131,6 +131,12 @@ public:
   static int32 NumRealmHeldRequests(FClient &C) {
     return C.RealmHeldRequests.Num();
   }
+  static FString &AcceptedPartyTicketId(FClient &C) {
+    return C.AcceptedPartyTicketId;
+  }
+  static TArray<FString> &EndedPartyTicketIds(FClient &C) {
+    return C.EndedPartyTicketIds;
+  }
 };
 
 namespace RedwoodInFlightTest {
@@ -408,6 +414,8 @@ namespace RedwoodInFlightTest {
     FAccess::SelectedCharacterId(C) = TEXT("character-old");
     FAccess::bAssignmentExpected(C) = true;
     FAccess::CurrentParty(C).bValid = true;
+    FAccess::AcceptedPartyTicketId(C) = TEXT("ticket-old");
+    FAccess::EndedPartyTicketIds(C).Add(TEXT("ticket-ended"));
 
     FRedwoodRealm InRealm;
     InRealm.Id = TEXT("realm-1");
@@ -419,6 +427,11 @@ namespace RedwoodInFlightTest {
     );
     Test.TestFalse(
       TEXT("A new handshake forgets the old party"), FAccess::CurrentParty(C).bValid
+    );
+    Test.TestTrue(
+      TEXT("A new handshake forgets the party tickets"),
+      FAccess::AcceptedPartyTicketId(C).IsEmpty() &&
+        FAccess::EndedPartyTicketIds(C).IsEmpty()
     );
     FAccess::SelectedCharacterId(C) = TEXT("character-1");
 
@@ -902,10 +915,20 @@ namespace RedwoodInFlightTest {
 
     // Back at character select with another character. Pins: the reset in
     // SetSelectedCharacter.
+    FAccess::AcceptedPartyTicketId(C) = TEXT("ticket-1");
+    FAccess::EndedPartyTicketIds(C).Add(TEXT("ticket-0"));
     C.SetSelectedCharacter(TEXT("character-2"));
     Test.TestFalse(
       TEXT("A new character expects no assignment until it joins"),
       FAccess::bAssignmentExpected(C)
+    );
+    Test.TestTrue(
+      TEXT("A new character forgets the old character's party join"),
+      FAccess::AcceptedPartyTicketId(C).IsEmpty()
+    );
+    Test.TestTrue(
+      TEXT("An ended ticket stays ended for a new character"),
+      FAccess::EndedPartyTicketIds(C).Contains(TEXT("ticket-0"))
     );
     return true;
   }
@@ -927,48 +950,341 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
-  // A whole-party join sends no join from a member's client. Pins: the
-  // party-member case of the assignment guard.
-  bool RunPartyMemberAssignment(FAutomationTestBase &Test) {
+  // HollowedOath#3002. When the leader queues the whole party, the server
+  // tells each other member with realm:ticketing:party-queued, and the
+  // party ticket's assignment names its ticketId.
+  FString PartyQueued(const TCHAR *CharacterId, const TCHAR *TicketId, const TCHAR *MessageId) {
+    return FString::Printf(
+      TEXT("42[\"realm:ticketing:party-queued\",{\"leaderId\":\"player-2\","
+           "\"characterId\":\"%s\",\"ticketId\":\"%s\",\"messageId\":\"%s\"}]"),
+      CharacterId,
+      TicketId,
+      MessageId
+    );
+  }
+
+  FString PartyLeft(const TCHAR *TicketId, const TCHAR *MessageId) {
+    return FString::Printf(
+      TEXT("42[\"realm:ticketing:party-left\",{\"leaderId\":\"player-2\","
+           "\"ticketId\":\"%s\",\"messageId\":\"%s\"}]"),
+      TicketId,
+      MessageId
+    );
+  }
+
+  // Sends a Realm event and waits until the client handled it: events run
+  // in order, so the marker's handler runs after it.
+  void SendEvent(FAutomationTestBase &Test, FRealmHarness &Harness, const FString &Event) {
+    URedwoodClientInterface &C = Harness.Client();
+    bool bMarkerSeen = false;
+    FAccess::OnTicketingUpdate(C) = FRedwoodTicketingUpdateDelegate::CreateLambda(
+      [&bMarkerSeen](const FRedwoodTicketingUpdate &) { bMarkerSeen = true; }
+    );
+    Test.TestTrue(
+      TEXT("The server sends the event"),
+      Harness.Server->SendText(StringCast<ANSICHAR>(*Event).Get()) &&
+        Harness.Server->SendText("42[\"realm:ticketing:update\",{\"message\":\"m\"}]")
+    );
+    Test.TestTrue(
+      TEXT("The client handles the event"),
+      PumpGameThreadUntil([&bMarkerSeen]() { return bMarkerSeen; })
+    );
+    FAccess::OnTicketingUpdate(C).Unbind();
+  }
+
+  // The party ticket's assignment for the selected character. An empty
+  // TicketId sends a solo assignment.
+  bool PartyAssignmentMoves(
+    FAutomationTestBase &Test, FRealmHarness &Harness, const TCHAR *TicketId
+  ) {
+    const FString TicketField = *TicketId
+      ? FString::Printf(TEXT(",\"ticketId\":\"%s\""), TicketId)
+      : FString();
+    const FString Assignment = FString::Printf(
+      TEXT("42[\"realm:servers:connect-to-instance\",{\"shouldStitch\":false,"
+           "\"connection\":\"x:1\",\"token\":\"t\",\"characterId\":\"character-1\"%s}]"),
+      *TicketField
+    );
+    // The accepted travel stays pending in this harness; clear it, so each
+    // assignment is judged alone.
+    FAccess::bTravelPending(Harness.Client()) = false;
+    return AssignmentMoves(Test, Harness, StringCast<ANSICHAR>(*Assignment).Get());
+  }
+
+  // A member (not the leader) at character select, with no join of its own.
+  bool OpenAsPartyMember(FAutomationTestBase &Test, FRealmHarness &Harness) {
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAssignmentExpected(C) = false;
+    FRedwoodParty &Party = FAccess::CurrentParty(C);
+    Party.bValid = true;
+    Party.LeaderId = TEXT("player-2");
+    Party.Members.AddDefaulted_GetRef().PlayerId = TEXT("player-1");
+    Party.Members.AddDefaulted_GetRef().PlayerId = TEXT("player-2");
+    return true;
+  }
+
+  // A member relaunched its client within 60 s: the fresh client heard no
+  // party notice, so the server's replay of the old party assignment must
+  // not move it, though the party lists it. Pins: no party-member rule.
+  bool RunRelaunchedMemberRefusesReplay(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    Test.TestFalse(
+      TEXT("A replayed party assignment does not move a fresh member"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    Test.TestFalse(
+      TEXT("A replayed assignment with no ticket does not move a fresh member"),
+      PartyAssignmentMoves(Test, Harness, TEXT(""))
+    );
+    return true;
+  }
+
+  // Pins: HandlePartyQueued accepts a new ticket as this member's join, and
+  // an accepted assignment ends its ticket.
+  bool RunPartyQueuedMovesMember(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    Test.TestTrue(
+      TEXT("After the party notice, the party's assignment moves the member at character select"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    // The server sends the kept "queued" again after an admission (#3031).
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-2")));
+    Test.TestFalse(
+      TEXT("A replay of the used assignment does not move the member again"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    return true;
+  }
+
+  // Pins: the repeat checks of HandlePartyQueued (the accepted ticket, and
+  // the messageId).
+  bool RunDuplicatePartyQueuedNoChange(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    // The enter-world timer leaves, in the re-login window so it fails at
+    // once and drops the join.
+    FAccess::bRealmReauthPending(C) = true;
+    C.LeaveTicketing(FRedwoodErrorOutputDelegate());
+    FAccess::bRealmReauthPending(C) = false;
+    // A worker pass sends the same ticket again, with a new messageId.
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-2")));
+    Test.TestTrue(
+      TEXT("A repeat of the accepted ticket keeps the dropped join"),
+      FAccess::bAbandonedQueueJoin(C)
+    );
+    Test.TestFalse(
+      TEXT("After the game left, the party's assignment does not move the member"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-2"), TEXT("m-3")));
+    // Redis sends the first notice again.
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    Test.TestEqual(
+      TEXT("A resent old notice does not replace the newer ticket"),
+      FAccess::AcceptedPartyTicketId(C),
+      FString(TEXT("ticket-2"))
+    );
+    // A stale kept "queued" of the replaced ticket (#3031), with a new id.
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-4")));
+    Test.TestEqual(
+      TEXT("A replaced ticket does not come back"),
+      FAccess::AcceptedPartyTicketId(C),
+      FString(TEXT("ticket-2"))
+    );
+    Test.TestTrue(
+      TEXT("The newer ticket's assignment moves the member"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-2"))
+    );
+    return true;
+  }
+
+  // Pins: the characterId check of HandlePartyQueued.
+  bool RunPartyQueuedForAnotherCharacter(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    SendEvent(Test, Harness, PartyQueued(TEXT("c-2"), TEXT("ticket-1"), TEXT("m-1")));
+    Test.TestFalse(
+      TEXT("A notice for another character expects no assignment"),
+      FAccess::bAssignmentExpected(Harness.Client())
+    );
+    Test.TestFalse(
+      TEXT("After a notice for another character, the assignment does not move the member"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    return true;
+  }
+
+  // Pins: HandlePartyLeft drops the accepted ticket's join.
+  bool RunPartyLeftDropsJoin(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    SendEvent(Test, Harness, PartyLeft(TEXT("ticket-1"), TEXT("m-2")));
+    Test.TestFalse(
+      TEXT("After the party ticket ends, no assignment is expected"),
+      FAccess::bAssignmentExpected(Harness.Client())
+    );
+    Test.TestFalse(
+      TEXT("After the party ticket ends, its assignment does not move the member"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    return true;
+  }
+
+  // Pins: HandlePartyLeft acts only on the ticket it names.
+  bool RunPartyLeftOlderTicketKeepsNewer(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-2"), TEXT("m-2")));
+    SendEvent(Test, Harness, PartyLeft(TEXT("ticket-1"), TEXT("m-3")));
+    Test.TestTrue(
+      TEXT("A late end of an older ticket keeps the newer ticket's assignment"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-2"))
+    );
+    return true;
+  }
+
+  // A stale "queued" after its ticket ended (#3008, #3031). Pins: the ended
+  // set in HandlePartyQueued.
+  bool RunPartyQueuedForEndedTicket(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    SendEvent(Test, Harness, PartyLeft(TEXT("ticket-1"), TEXT("m-1")));
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-2")));
+    Test.TestFalse(
+      TEXT("A notice for an ended ticket expects no assignment"),
+      FAccess::bAssignmentExpected(Harness.Client())
+    );
+    Test.TestFalse(
+      TEXT("An ended ticket's assignment does not move the member"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    return true;
+  }
+
+  // Pins: the party-ticket check of the assignment guard.
+  bool RunOtherTicketAssignmentRefused(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-2"), TEXT("m-1")));
+    Test.TestFalse(
+      TEXT("An older party ticket's assignment does not move the member"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    Test.TestFalse(
+      TEXT("At character select, an assignment with no ticket does not move a member that waits for its party"),
+      PartyAssignmentMoves(Test, Harness, TEXT(""))
+    );
+    FAccess::bInWorld(C) = true;
+    Test.TestTrue(
+      TEXT("In the world, a zone transfer with no ticket moves the member"),
+      PartyAssignmentMoves(Test, Harness, TEXT(""))
+    );
+    FAccess::bInWorld(C) = false;
+    Test.TestTrue(
+      TEXT("The accepted ticket's assignment moves the member"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-2"))
+    );
+    return true;
+  }
+
+  // The server replays the kept "queued" at the realm join, before the
+  // relaunched member selects a character. Pins: PendingPartyTicketId.
+  bool RunPartyQueuedBeforeCharacterSelect(FAutomationTestBase &Test) {
     FRealmHarness Harness;
     if (!OpenWithRealmEvents(Test, Harness)) {
       return false;
     }
     URedwoodClientInterface &C = Harness.Client();
     FAccess::bAssignmentExpected(C) = false;
+    FAccess::SelectedCharacterId(C).Reset();
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    C.SetSelectedCharacter(TEXT("character-2"));
     Test.TestFalse(
-      TEXT("Outside a party, with no join, an assignment does not move the player"),
-      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+      TEXT("Another character does not take the held notice"),
+      FAccess::bAssignmentExpected(C)
     );
+    C.SetSelectedCharacter(TEXT("character-1"));
+    Test.TestTrue(
+      TEXT("Selecting the notice's character moves the member with the party"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    return true;
+  }
 
-    FRedwoodParty &Party = FAccess::CurrentParty(C);
-    Party.bValid = true;
-    Party.LeaderId = TEXT("player-2");
-    Party.Members.AddDefaulted_GetRef().PlayerId = TEXT("player-1");
-    Test.TestFalse(
-      TEXT("A member does not move for another character"),
-      AssignmentMoves(
-        Test,
-        Harness,
-        "42[\"realm:servers:connect-to-instance\",{\"shouldStitch\":false,"
-        "\"connection\":\"x:1\",\"token\":\"t\",\"characterId\":\"c-2\"}]"
-      )
+  // The member's own join is still out when the party ticket comes: its own
+  // ticket must be left, or its solo assignment could move the player after
+  // the party's travel. Pins: the own-join check in AcceptPartyTicket.
+  bool RunPartyNoticeLeavesOwnJoin(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    C.JoinQueue(
+      TEXT("proxy-1"), TEXT("zone-1"), false, false, FRedwoodTicketingUpdateDelegate()
     );
-    Test.TestFalse(
-      TEXT("A member does not move for an assignment with no character"),
-      AssignmentMoves(Test, Harness, AssignmentWithoutCharacter)
+    Test.TestTrue(TEXT("The own join reaches the server"), Harness.Server->ReadClientFrame());
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    FString Request;
+    Test.TestTrue(
+      TEXT("The party notice leaves the member's own ticket"),
+      Harness.Server->ReadClientText(Request) &&
+        Request.Contains(TEXT("realm:ticketing:leave"))
+    );
+    return true;
+  }
+
+  // The player's own join replaces a party notice: a solo assignment has no
+  // ticket, and a leader's names a ticket it was never told of. Pins: the
+  // reset in NoteJoinSent.
+  bool RunOwnJoinAfterPartyNoticeMoves(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    C.JoinQueue(
+      TEXT("proxy-1"), TEXT("zone-1"), false, false, FRedwoodTicketingUpdateDelegate()
     );
     Test.TestTrue(
-      TEXT("A member at character select moves for its selected character"),
-      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+      TEXT("After its own join, a solo assignment moves the player"),
+      PartyAssignmentMoves(Test, Harness, TEXT(""))
     );
-
-    Party.LeaderId = TEXT("player-1");
-    FAccess::bAssignmentExpected(C) = false;
-    FAccess::bTravelPending(C) = false;
-    Test.TestFalse(
-      TEXT("The leader with no join does not move"),
-      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
+    C.JoinQueue(
+      TEXT("proxy-1"), TEXT("zone-1"), true, false, FRedwoodTicketingUpdateDelegate()
+    );
+    Test.TestTrue(
+      TEXT("After its own whole-party join, the leader's party assignment moves it"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-9"))
     );
     return true;
   }
@@ -1085,10 +1401,9 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
-  // A member drops a join, then picks another character: the leader's
-  // whole-party assignment for the new character must move it, and the old
-  // ticket's leave is still owed. Pins: the dropped-join reset in
-  // SetSelectedCharacter.
+  // A member drops a join, then picks another character: after the party
+  // notice, the leader's party assignment moves it and the old leave is
+  // still owed. Pins: the dropped-join reset in SetSelectedCharacter.
   bool RunCharacterSwitchClearsDroppedJoin(FAutomationTestBase &Test) {
     FRealmHarness Harness;
     if (!OpenWithRealmEvents(Test, Harness)) {
@@ -1108,17 +1423,27 @@ namespace RedwoodInFlightTest {
     Test.TestTrue(
       TEXT("The old ticket's leave is still owed"), FAccess::bLeaveTicketingOwed(C)
     );
-    FRedwoodParty &Party = FAccess::CurrentParty(C);
-    Party.bValid = true;
-    Party.LeaderId = TEXT("player-2");
-    Party.Members.AddDefaulted_GetRef().PlayerId = TEXT("player-1");
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-2"), TEXT("ticket-1"), TEXT("m-1")));
+    // Pins: AcceptPartyTicket keeps the owed leave, and SendOwedLeave does
+    // not wait for a party join.
+    Test.TestTrue(
+      TEXT("The party notice keeps the old ticket's owed leave"),
+      FAccess::bLeaveTicketingOwed(C)
+    );
+    FString Request;
+    Test.TestTrue(
+      TEXT("The party notice sends the owed leave"),
+      Harness.Server->ReadClientText(Request) &&
+        Request.Contains(TEXT("realm:ticketing:leave"))
+    );
     Test.TestTrue(
       TEXT("After a character switch, the party's assignment for the new character moves the member"),
       AssignmentMoves(
         Test,
         Harness,
         "42[\"realm:servers:connect-to-instance\",{\"shouldStitch\":false,"
-        "\"connection\":\"x:1\",\"token\":\"t\",\"characterId\":\"character-2\"}]"
+        "\"connection\":\"x:1\",\"token\":\"t\",\"characterId\":\"character-2\","
+        "\"ticketId\":\"ticket-1\"}]"
       )
     );
     return true;
@@ -1267,26 +1592,6 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
-  // A party left from an earlier session that does not list this player
-  // must not make it a member. Pins: the membership check of the party rule.
-  bool RunStalePartyDoesNotMove(FAutomationTestBase &Test) {
-    FRealmHarness Harness;
-    if (!OpenWithRealmEvents(Test, Harness)) {
-      return false;
-    }
-    URedwoodClientInterface &C = Harness.Client();
-    FAccess::bAssignmentExpected(C) = false;
-    FRedwoodParty &Party = FAccess::CurrentParty(C);
-    Party.bValid = true;
-    Party.LeaderId = TEXT("player-2");
-    Party.Members.AddDefaulted_GetRef().PlayerId = TEXT("player-old");
-    Test.TestFalse(
-      TEXT("A party that does not list the player does not move it"),
-      AssignmentMoves(Test, Harness, AssignmentForSelectedCharacter)
-    );
-    return true;
-  }
-
   // An older join is lost in a drop after a newer join was answered: the
   // newer join's assignment must still move the player. Pins: the
   // latest-join check in FailTicketingJoin.
@@ -1340,6 +1645,8 @@ namespace RedwoodInFlightTest {
     FAccess::bAbandonedQueueJoin(C) = true;
     FAccess::bLeaveTicketingOwed(C) = true;
     FAccess::CurrentParty(C).bValid = true;
+    FAccess::AcceptedPartyTicketId(C) = TEXT("ticket-1");
+    FAccess::EndedPartyTicketIds(C).Add(TEXT("ticket-0"));
     C.Logout();
     Test.TestTrue(
       TEXT("Logout forgets the character"), FAccess::SelectedCharacterId(C).IsEmpty()
@@ -1354,6 +1661,11 @@ namespace RedwoodInFlightTest {
       TEXT("The next account owes no leave"), FAccess::bLeaveTicketingOwed(C)
     );
     Test.TestFalse(TEXT("Logout forgets the party"), FAccess::CurrentParty(C).bValid);
+    Test.TestTrue(
+      TEXT("Logout forgets the party tickets"),
+      FAccess::AcceptedPartyTicketId(C).IsEmpty() &&
+        FAccess::EndedPartyTicketIds(C).IsEmpty()
+    );
     return true;
   }
 
@@ -1887,9 +2199,59 @@ REDWOOD_IN_FLIGHT_TEST(
   RedwoodInFlightTest::RunCreateProxyJoinMoves(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
-  FRedwoodInFlightPartyMemberTest,
-  "PartyMemberAssignmentMoves",
-  RedwoodInFlightTest::RunPartyMemberAssignment(*this)
+  FRedwoodInFlightRelaunchedMemberTest,
+  "RelaunchedMemberRefusesReplay",
+  RedwoodInFlightTest::RunRelaunchedMemberRefusesReplay(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyQueuedMovesTest,
+  "PartyQueuedMovesMember",
+  RedwoodInFlightTest::RunPartyQueuedMovesMember(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightDuplicatePartyQueuedTest,
+  "DuplicatePartyQueuedNoChange",
+  RedwoodInFlightTest::RunDuplicatePartyQueuedNoChange(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyQueuedOtherCharacterTest,
+  "PartyQueuedForAnotherCharacterIgnored",
+  RedwoodInFlightTest::RunPartyQueuedForAnotherCharacter(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyLeftTest,
+  "PartyLeftDropsJoin",
+  RedwoodInFlightTest::RunPartyLeftDropsJoin(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyLeftOlderTest,
+  "PartyLeftOlderTicketKeepsNewer",
+  RedwoodInFlightTest::RunPartyLeftOlderTicketKeepsNewer(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyQueuedEndedTest,
+  "PartyQueuedForEndedTicketIgnored",
+  RedwoodInFlightTest::RunPartyQueuedForEndedTicket(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightOtherTicketTest,
+  "OtherTicketAssignmentRefused",
+  RedwoodInFlightTest::RunOtherTicketAssignmentRefused(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyQueuedBeforeSelectTest,
+  "PartyQueuedBeforeCharacterSelect",
+  RedwoodInFlightTest::RunPartyQueuedBeforeCharacterSelect(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyNoticeLeavesOwnJoinTest,
+  "PartyNoticeLeavesOwnJoin",
+  RedwoodInFlightTest::RunPartyNoticeLeavesOwnJoin(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightOwnJoinAfterPartyNoticeTest,
+  "OwnJoinAfterPartyNoticeMoves",
+  RedwoodInFlightTest::RunOwnJoinAfterPartyNoticeMoves(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightCreateProxyAfterDroppedJoinTest,
@@ -1925,11 +2287,6 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightInWorldTest,
   "InWorldKeepsZoneTransfers",
   RedwoodInFlightTest::RunInWorldKeepsZoneTransfers(*this)
-)
-REDWOOD_IN_FLIGHT_TEST(
-  FRedwoodInFlightStalePartyTest,
-  "StalePartyDoesNotMove",
-  RedwoodInFlightTest::RunStalePartyDoesNotMove(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightOlderLostJoinTest,
