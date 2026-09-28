@@ -7,215 +7,25 @@
 // its grace and re-login. URedwoodClientInterface::MakeUnrequestedCloseHandler
 // reports such a close as a drop and connects again after a backoff.
 //
-// The first test runs a minimal websocket server on a raw TCP socket, so the
-// real socket.io client and websocketpp run the whole close handshake.
+// The first test runs the fake server of FakeSocketIoServer.h, so the real
+// socket.io client and websocketpp run the whole close handshake.
 
 #include "CoreMinimal.h"
-#include "Async/TaskGraphInterfaces.h"
 #include "HAL/Event.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/ThreadSafeBool.h"
 #include "Misc/AutomationTest.h"
-#include "Misc/Base64.h"
 #include "Misc/ScopeExit.h"
-#include "Misc/SecureHash.h"
 #include "Templates/Atomic.h"
 #include "UObject/StrongObjectPtr.h"
-#include "Sockets.h"
-#include "SocketSubsystem.h"
 
+#include "FakeSocketIoServer.h"
 #include "RedwoodClientInterface.h"
 #include "SocketIOClient.h"
 #include "SocketIONative.h"
 
 namespace RedwoodServerCloseTest {
-  // Long enough for a loaded build machine, short enough to fail fast.
-  const FTimespan StepTimeout = FTimespan::FromSeconds(5.0);
-  constexpr uint32 StepTimeoutMs = 5000;
-
-  constexpr uint32 LoopbackIp = 0x7F000001;
-  constexpr uint16 NormalCloseCode = 1000;
-
-  // The library queues its reports to the game thread, which a test holds.
-  // The pump runs those tasks at 10 Hz, the fastest this project allows a
-  // wait to check, until the test's condition holds or the step times out.
-  constexpr float PumpIntervalSeconds = 0.1f;
-
-  bool PumpGameThreadUntil(TFunctionRef<bool()> Done) {
-    const double Deadline =
-      FPlatformTime::Seconds() + StepTimeout.GetTotalSeconds();
-    while (true) {
-      FTaskGraphInterface::Get().ProcessThreadUntilIdle(
-        ENamedThreads::GameThread
-      );
-      if (Done()) {
-        return true;
-      }
-      if (FPlatformTime::Seconds() > Deadline) {
-        return false;
-      }
-      FPlatformProcess::Sleep(PumpIntervalSeconds);
-    }
-  }
-
-  // RFC 6455 section 1.3.
-  const TCHAR *WebSocketAcceptGuid = TEXT("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-
-  // An engine.io v4 open packet, so the client starts its socket.io session.
-  const char *EngineIoOpenPacket =
-    "0{\"sid\":\"test\",\"upgrades\":[],\"pingInterval\":25000,"
-    "\"pingTimeout\":20000,\"maxPayload\":1000000}";
-
-  // Accepts the client's "/" namespace. Unanswered, its 20 s connect timer
-  // keeps the socket thread alive, and SyncDisconnect waits for it.
-  const char *SocketIoConnectPacket = "40{\"sid\":\"test\"}";
-
-  TArray<uint8> AnsiBytes(const char *Text) {
-    return TArray<uint8>(
-      reinterpret_cast<const uint8 *>(Text), FCStringAnsi::Strlen(Text)
-    );
-  }
-
-  bool SendAll(FSocket *Socket, const TArray<uint8> &Bytes) {
-    int32 Sent = 0;
-    return Socket->Send(Bytes.GetData(), Bytes.Num(), Sent) &&
-      Sent == Bytes.Num();
-  }
-
-  // Reads whatever arrives next, so the test knows the client has spoken.
-  bool ReadSome(FSocket *Socket, TArray<uint8> &OutBytes) {
-    if (!Socket->Wait(ESocketWaitConditions::WaitForRead, StepTimeout)) {
-      return false;
-    }
-    uint8 Buffer[1024];
-    int32 Read = 0;
-    if (!Socket->Recv(Buffer, sizeof(Buffer), Read) || Read <= 0) {
-      return false;
-    }
-    OutBytes.Append(Buffer, Read);
-    return true;
-  }
-
-  // Server frames are not masked, and these payloads are under 126 bytes.
-  TArray<uint8> MakeFrame(uint8 Opcode, const TArray<uint8> &Payload) {
-    check(Payload.Num() < 126);
-    TArray<uint8> Frame = {
-      static_cast<uint8>(0x80 | Opcode), static_cast<uint8>(Payload.Num())
-    };
-    Frame.Append(Payload);
-    return Frame;
-  }
-
-  struct FFakeSocketIoServer {
-    ISocketSubsystem *Subsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
-    FSocket *Listener = nullptr;
-    FSocket *Connection = nullptr;
-    int32 Port = 0;
-
-    bool Listen() {
-      Listener = Subsystem->CreateSocket(
-        NAME_Stream, TEXT("RedwoodServerCloseTest"), FNetworkProtocolTypes::IPv4
-      );
-      TSharedRef<FInternetAddr> Address =
-        Subsystem->CreateInternetAddr(FNetworkProtocolTypes::IPv4);
-      Address->SetIp(LoopbackIp);
-      Address->SetPort(0);
-      if (!Listener || !Listener->Bind(*Address) || !Listener->Listen(1)) {
-        return false;
-      }
-      Port = Listener->GetPortNo();
-      return true;
-    }
-
-    bool WaitForConnection() const {
-      return Listener->Wait(ESocketWaitConditions::WaitForRead, StepTimeout);
-    }
-
-    // Accepts the websocket upgrade, opens the engine.io session, waits for
-    // the client's namespace connect and accepts it.
-    bool AcceptSession() {
-      if (!WaitForConnection()) {
-        return false;
-      }
-      Connection = Listener->Accept(TEXT("RedwoodServerCloseTestConnection"));
-      if (!Connection) {
-        return false;
-      }
-
-      TArray<uint8> Request;
-      FString RequestText;
-      while (!RequestText.Contains(TEXT("\r\n\r\n"))) {
-        if (!ReadSome(Connection, Request)) {
-          return false;
-        }
-        const FUTF8ToTCHAR Converted(
-          reinterpret_cast<const UTF8CHAR *>(Request.GetData()), Request.Num()
-        );
-        RequestText = FString(Converted.Length(), Converted.Get());
-      }
-
-      const FString KeyHeader = TEXT("Sec-WebSocket-Key:");
-      const int32 KeyStart = RequestText.Find(KeyHeader);
-      if (KeyStart == INDEX_NONE) {
-        return false;
-      }
-      const int32 ValueStart = KeyStart + KeyHeader.Len();
-      const int32 ValueEnd = RequestText.Find(
-        TEXT("\r\n"), ESearchCase::CaseSensitive, ESearchDir::FromStart, ValueStart
-      );
-      const FString Key =
-        RequestText.Mid(ValueStart, ValueEnd - ValueStart).TrimStartAndEnd();
-
-      const FTCHARToUTF8 AcceptSource(*(Key + WebSocketAcceptGuid));
-      uint8 Digest[FSHA1::DigestSize];
-      FSHA1::HashBuffer(AcceptSource.Get(), AcceptSource.Length(), Digest);
-      const FString Response = FString::Printf(
-        TEXT("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n")
-        TEXT("Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n"),
-        *FBase64::Encode(Digest, FSHA1::DigestSize)
-      );
-      const FTCHARToUTF8 ResponseUtf8(*Response);
-      const TArray<uint8> ResponseBytes(
-        reinterpret_cast<const uint8 *>(ResponseUtf8.Get()), ResponseUtf8.Length()
-      );
-
-      TArray<uint8> ClientPacket;
-      return SendAll(Connection, ResponseBytes) &&
-        SendAll(Connection, MakeFrame(0x1, AnsiBytes(EngineIoOpenPacket))) &&
-        ReadSome(Connection, ClientPacket) &&
-        SendAll(Connection, MakeFrame(0x1, AnsiBytes(SocketIoConnectPacket)));
-    }
-
-    // Plays the server side of a close handshake: the close frame, the
-    // client's echo, then the TCP close, which RFC 6455 gives the server.
-    bool CloseNormally() {
-      const TArray<uint8> Code = {
-        static_cast<uint8>(NormalCloseCode >> 8),
-        static_cast<uint8>(NormalCloseCode & 0xFF)
-      };
-      TArray<uint8> Echo;
-      const bool bClosed =
-        SendAll(Connection, MakeFrame(0x8, Code)) && ReadSome(Connection, Echo);
-      DropConnection();
-      return bClosed;
-    }
-
-    void DropConnection() {
-      if (Connection) {
-        Connection->Close();
-        Subsystem->DestroySocket(Connection);
-        Connection = nullptr;
-      }
-    }
-
-    ~FFakeSocketIoServer() {
-      DropConnection();
-      if (Listener) {
-        Listener->Close();
-        Subsystem->DestroySocket(Listener);
-      }
-    }
-  };
+  using namespace RedwoodFakeSocketIo;
 
   // Callbacks run on the socket thread, so the test can block on events
   // instead of pumping the game thread.

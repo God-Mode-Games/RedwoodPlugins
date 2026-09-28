@@ -487,5 +487,7 @@ private:
   );
 
   void HandleOnWorldAdded(UWorld *World, FWorldInitializationValues IVS);
-  void HandleOnWorldBeginPlay(bool bBegunPlay);
+  // FORK(hollowed-oath): HollowedOath#2886. The world that began play is
+  // the payload: in PIE, every instance sees every world.
+  void HandleOnWorldBeginPlay(bool bBegunPlay, TWeakObjectPtr<UWorld> BegunWorld);
 };

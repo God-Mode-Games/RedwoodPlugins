@@ -4,6 +4,7 @@
 
 #include "RedwoodCloseBackoff.h" // FORK(hollowed-oath)
 #include "RedwoodHeldRequests.h" // FORK(hollowed-oath): HollowedOath#2854.
+#include "RedwoodPendingReplies.h" // FORK(hollowed-oath): HollowedOath#2886.
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
 
@@ -46,6 +47,17 @@ public:
   TSharedPtr<FSocketIONative> GetDirectorConnection() const {
     return Director;
   }
+
+  // FORK(hollowed-oath): HollowedOath#2886. The client world of a game
+  // server, or a standalone world (the entry level), began play. See the .cpp.
+  void NoteArrivedInWorld();
+  void NoteLeftWorld();
+
+  // FORK(hollowed-oath): HollowedOath#2886. For a request that another module
+  // sends on GetDirectorConnection(): a Director drop fails it with OnLost.
+  FRedwoodReplyCallback TrackDirectorReply(
+    FRedwoodReplyCallback OnReply, TFunction<void()> OnLost
+  );
 
   TSharedPtr<FSocketIONative> GetRealmConnection() const {
     return Realm;
@@ -480,6 +492,9 @@ private:
   // from a lambda queued to the game thread, which runs after Disconnect()
   // returns, and the flag must still be set then.
   bool bRealmCloseRequested = false;
+  // HollowedOath#2999. That close started the library's close timer, and the
+  // timer has not run yet. See RedwoodClosingSockets.
+  bool bRealmCloseTimerPending = false;
   // FORK(hollowed-oath) END
 
   void InitiateRealmHandshake(
@@ -533,6 +548,14 @@ private:
   bool GateRealm(
     TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
   );
+  // FORK(hollowed-oath): HollowedOath#2886. See the .cpp.
+  template <typename TOutput>
+  FRedwoodReplyCallback TrackReply(
+    FRedwoodPendingReplies &Replies,
+    FRedwoodReplyCallback OnReply,
+    const TDelegate<void(const TOutput &)> &OnOutput
+  );
+  void FailTicketingJoin(uint32 Sequence);
   void NoteDirectorDrop();
   void NoteFirstDirectorConnect();
   void NoteFirstRealmConnect();
@@ -559,12 +582,47 @@ private:
   friend class FRedwoodFailedReloginRealmCloseStaysCleanTest;
   friend class FRedwoodQueuedRequestedCloseStaysCleanTest;
   // FORK(hollowed-oath) END
+  friend class FRedwoodInFlightTestAccess; // FORK(hollowed-oath): HollowedOath#2886.
   bool CanSendToDirector();
   bool CanSendToRealm();
   void EndDirectorReauthentication(bool bSucceeded);
   void EndRealmReauthentication(bool bSucceeded);
   FRedwoodHeldRequests DirectorHeldRequests;
   FRedwoodHeldRequests RealmHeldRequests;
+  // FORK(hollowed-oath) BEGIN: HollowedOath#2886. The requests still waiting
+  // for a reply on each socket; a drop fails them.
+  FRedwoodPendingReplies DirectorReplies;
+  FRedwoodPendingReplies RealmReplies;
+  void NoteDirectorReconnected();
+  void NoteRealmReconnected();
+  bool IsRealmReady();
+  void SendOwedLeave();
+  void NoteJoinSent();
+  void NoteJoinAnswered(const FString &Error, uint32 Sequence);
+  void NoteJoinLost();
+  TFunction<void()> MakeLostProxyJoin(uint32 Sequence, TFunction<void()> OnLost);
+  void HandleTicketingJoinReply(const FString &Error, uint32 Sequence);
+  // A join whose reply was lost: the game went back to character select, so
+  // its assignment must not move the player. A new join clears it.
+  bool bAbandonedQueueJoin = false;
+  // A join is out, or the player is in the world. Otherwise an assignment is
+  // a replay for a player at character select.
+  bool bAssignmentExpected = false;
+  // The travel of an accepted assignment arrived, and the player has not
+  // left the world since. A refused or ended join does not clear it: the
+  // server's zone transfers must still move the player.
+  bool bInWorld = false;
+  // A lost join left a ticket on the server. See SendOwedLeave.
+  bool bLeaveTicketingOwed = false;
+  // An accepted assignment's travel has not arrived yet. See
+  // NoteArrivedInWorld. LeaveTicketing keeps it: the game's timer can fire
+  // during the travel, which can still arrive.
+  bool bTravelPending = false;
+  // Counts the joins sent. The travel keeps the count of its join, so an
+  // arrival does not clear the flags of a newer join.
+  uint32 JoinSequence = 0;
+  uint32 TravelJoinSequence = 0;
+  // FORK(hollowed-oath) END
   // The Realm socket dropped and the player is not authenticated on it again
   // yet; the Director has bAuthenticated for this.
   bool bRealmReauthPending = false;

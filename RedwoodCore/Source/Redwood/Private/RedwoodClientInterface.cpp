@@ -1,7 +1,9 @@
 // Copyright Incanta Games. All Rights Reserved.
 
 #include "RedwoodClientInterface.h"
+#include "UObject/StrongObjectPtr.h" // FORK(hollowed-oath)
 #include "RedwoodClientGameSubsystem.h"
+#include "RedwoodClosingSockets.h" // FORK(hollowed-oath)
 #include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodGameplayTags.h"
 #include "RedwoodSaveGame.h"
@@ -44,10 +46,18 @@ static FString GetDirectorOriginAsHttp() {
 } // namespace
 
 void URedwoodClientInterface::Deinitialize() {
+  // FORK(hollowed-oath): HollowedOath#2886. The callers go away too, so a
+  // request that waits for a reply is dropped, not failed.
+  DirectorReplies.Reset();
+  RealmReplies.Reset();
+
   if (Director.IsValid()) {
+    // FORK(hollowed-oath): HollowedOath#2999. A connected socket starts the
+    // library's close timer here; see RedwoodClosingSockets.
+    const bool bCloseTimerPending = Director->bIsConnected;
     Director->ClearAllCallbacks();
     Director->Disconnect();
-    ISocketIOClientModule::Get().ReleaseNativePointer(Director);
+    RedwoodClosingSockets::Release(Director, bCloseTimerPending);
     Director = nullptr;
   }
   DirectorCloseBackoff.Reset(TimerManager); // FORK(hollowed-oath)
@@ -63,10 +73,22 @@ void URedwoodClientInterface::Deinitialize() {
 // FORK(hollowed-oath) BEGIN: shared by Deinitialize and a new handshake.
 void URedwoodClientInterface::ReleaseRealmSocket() {
   if (Realm.IsValid()) {
+    // HollowedOath#2999. A requested close that started the library's
+    // close timer must not close again: a second close cancels the timer,
+    // which the library turns into an early on_close with the timer still
+    // set. Otherwise (no close asked, or one asked while the socket was down
+    // that connected since) a connected socket starts the timer here.
+    const bool bTimerRunning = bRealmCloseRequested && bRealmCloseTimerPending;
+    const bool bCloseTimerPending = bTimerRunning || Realm->bIsConnected;
     Realm->ClearAllCallbacks();
-    Realm->Disconnect();
-    ISocketIOClientModule::Get().ReleaseNativePointer(Realm);
+    if (!bTimerRunning) {
+      Realm->Disconnect();
+    }
+    RedwoodClosingSockets::Release(Realm, bCloseTimerPending);
     Realm = nullptr;
+    // HollowedOath#2886. No reply comes over a released socket. After the
+    // release, so a failure handler cannot reach the old socket.
+    RealmReplies.FailAll();
   }
   RealmCloseBackoff.Reset(TimerManager);
 }
@@ -80,10 +102,11 @@ void URedwoodClientInterface::ReleaseRealmSocket() {
 // request was held or failed, and the caller returns. When it lets a request
 // through, the socket is connected, so the upstream check after it passes.
 // Not gated: login and the handshakes (they are the re-login), ticketing and
-// proxies (a late join can move a player who has given up waiting), requests
-// that carry a USIOJsonObject (nothing keeps it alive while held), and
-// requests with no reply (a late emote is worse than none; the Director
-// re-login re-sends the online character).
+// proxies (a late join can move a player who has given up waiting),
+// CreateCharacter (the creation screen shows its failure), and requests with
+// no reply (a late emote is worse than none; the Director re-login re-sends
+// the online character). A held request that carries a USIOJsonObject keeps
+// it alive with a TStrongObjectPtr.
 namespace {
   void SetRedwoodGateError(FString &Output, const TCHAR *Error) {
     Output = Error;
@@ -92,6 +115,26 @@ namespace {
   template <typename TOutput>
   void SetRedwoodGateError(TOutput &Output, const TCHAR *Error) {
     Output.Error = Error;
+  }
+
+  // FORK(hollowed-oath): HollowedOath#2886. Register and the OAuth logins
+  // answer with an auth update, which has no Error field.
+  void SetRedwoodGateError(FRedwoodAuthUpdate &Output, const TCHAR *Error) {
+    Output.Type = ERedwoodAuthUpdateType::Error;
+    Output.Message = Error;
+  }
+
+  // FORK(hollowed-oath): HollowedOath#2886. What a request whose reply was
+  // lost tells its caller.
+  template <typename TOutput>
+  TFunction<void()> MakeLostReply(
+    const TDelegate<void(const TOutput &)> &OnOutput
+  ) {
+    return [OnOutput]() {
+      TOutput Output;
+      SetRedwoodGateError(Output, FRedwoodPendingReplies::LostReplyError);
+      OnOutput.ExecuteIfBound(Output);
+    };
   }
 }
 
@@ -147,6 +190,129 @@ bool URedwoodClientInterface::GateRealm(
     OnOutput
   );
 }
+
+// FORK(hollowed-oath) BEGIN: HollowedOath#2886. The reply callback of a
+// request; a drop before the reply fails it through OnOutput, once. Every
+// request with a reply goes through it or through Replies.Track, except the
+// logins and the Realm handshake: the re-login retries a lost reply, and a
+// failure there would end the session.
+template <typename TOutput>
+FRedwoodReplyCallback URedwoodClientInterface::TrackReply(
+  FRedwoodPendingReplies &Replies,
+  FRedwoodReplyCallback OnReply,
+  const TDelegate<void(const TOutput &)> &OnOutput
+) {
+  return Replies.Track(MoveTemp(OnReply), MakeLostReply(OnOutput));
+}
+
+// The travel of an assignment finished, even after the game gave up on it
+// (its enter-world timer can fire during the travel). The player is in the
+// world: later zone transfers must move them, and the ticket is used up.
+// Only the travel of an accepted assignment counts: any other client world
+// (a PIE client, a future lobby) must not open the guard for a replay.
+void URedwoodClientInterface::NoteArrivedInWorld() {
+  if (!bTravelPending) {
+    return;
+  }
+  bTravelPending = false;
+  bInWorld = true;
+  // A join sent after this travel's one owns the flags now; its lost reply
+  // must keep its dropped assignment and its owed leave. When no leave is
+  // owed, that join is still out or was left, and the player, who is in the
+  // world now, must get zone transfers.
+  if (TravelJoinSequence != JoinSequence) {
+    if (!bLeaveTicketingOwed) {
+      bAbandonedQueueJoin = false;
+      bAssignmentExpected = true;
+    }
+    return;
+  }
+  bAbandonedQueueJoin = false;
+  bAssignmentExpected = true;
+  bLeaveTicketingOwed = false;
+}
+
+// Back at the entry level without a Logout or a new character: the player is
+// at character select, where no assignment may move them.
+void URedwoodClientInterface::NoteLeftWorld() {
+  bAssignmentExpected = false;
+  bInWorld = false;
+  bTravelPending = false;
+}
+
+// A join replaces any ticket the server kept, so a leave owed for it would
+// cancel the new one. It also replaces a dropped join, from any entry point
+// (a ticketing join, a create that joins, a proxy join).
+void URedwoodClientInterface::NoteJoinSent() {
+  ++JoinSequence;
+  bAssignmentExpected = true;
+  bAbandonedQueueJoin = false;
+  bLeaveTicketingOwed = false;
+}
+
+// A join that the server refused gets no assignment, so a replay of an
+// earlier ticket must not move the player. The refusal left no ticket, so no
+// leave is owed. Call it before the game sees the reply: the game can join
+// again then. Only for the latest join: an older join's refusal must not
+// close the guard for a newer one.
+void URedwoodClientInterface::NoteJoinAnswered(
+  const FString &Error, uint32 Sequence
+) {
+  if (!Error.IsEmpty() && Sequence == JoinSequence) {
+    bAssignmentExpected = false;
+  }
+}
+
+void URedwoodClientInterface::HandleTicketingJoinReply(
+  const FString &Error, uint32 Sequence
+) {
+  NoteJoinAnswered(Error, Sequence);
+  FRedwoodTicketingUpdate Update;
+  Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
+  Update.Message = Error;
+  OnTicketingUpdate.ExecuteIfBound(Update);
+
+  if (!Error.IsEmpty()) {
+    OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+  }
+}
+
+// A join whose reply was lost: the game gives up on it, so its assignment
+// must not move the player, and the ticket or assignment the server may
+// have kept is left at the next auth.
+void URedwoodClientInterface::NoteJoinLost() {
+  bAbandonedQueueJoin = true;
+  bAssignmentExpected = false;
+  bLeaveTicketingOwed = true;
+}
+
+// A proxy join or a create that joins, lost in a drop. Only for the latest
+// join, as for a refusal. Before the game sees the failure: it can join
+// again then.
+TFunction<void()> URedwoodClientInterface::MakeLostProxyJoin(
+  uint32 Sequence, TFunction<void()> OnLost
+) {
+  return [this, Sequence, OnLost = MoveTemp(OnLost)]() {
+    if (Sequence == JoinSequence) {
+      NoteJoinLost();
+    }
+    OnLost();
+  };
+}
+
+// Only for the latest join: a newer join owns the flags and the update.
+void URedwoodClientInterface::FailTicketingJoin(uint32 Sequence) {
+  if (Sequence != JoinSequence) {
+    return;
+  }
+  NoteJoinLost();
+  FRedwoodTicketingUpdate Update;
+  Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
+  Update.Message = FRedwoodPendingReplies::LostReplyError;
+  OnTicketingUpdate.ExecuteIfBound(Update);
+  OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+}
+// FORK(hollowed-oath) END
 
 void URedwoodClientInterface::Tick(float DeltaTime) {
   TimerManager.Tick(DeltaTime);
@@ -300,6 +466,7 @@ void URedwoodClientInterface::InitializeDirectorConnection(
                                   ) {
     NoteFirstDirectorConnect(); // FORK(hollowed-oath): HollowedOath#2854.
     DirectorCloseBackoff.NoteConnected(TimerManager); // FORK(hollowed-oath)
+    NoteDirectorReconnected(); // FORK(hollowed-oath): HollowedOath#2886.
     bDirectorDisconnected = false;
 
     if (!bSentDirectorConnected) {
@@ -528,10 +695,11 @@ void URedwoodClientInterface::Register(
   Payload->SetStringField(TEXT("username"), Username);
   Payload->SetStringField(TEXT("password"), Password);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("player:register:username"),
     Payload,
-    [this, OnUpdate](auto Response) {
+    TrackReply(DirectorReplies, [this, OnUpdate](auto Response) {
       TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
       PlayerId = MessageStruct->GetStringField(TEXT("playerId"));
       FString Error = MessageStruct->GetStringField(TEXT("error"));
@@ -551,7 +719,7 @@ void URedwoodClientInterface::Register(
       }
 
       OnUpdate.ExecuteIfBound(Update);
-    }
+    }, OnUpdate)
   );
 }
 
@@ -580,6 +748,12 @@ void URedwoodClientInterface::Logout() {
     // player who left.
     if (Realm.IsValid()) {
       if (Realm->bIsConnected) {
+        // FORK(hollowed-oath): HollowedOath#2886. Only a Realm that knows the
+        // player can run the leave. In the re-login window the flag is
+        // dropped below all the same; the server ticket then expires.
+        if (IsRealmReady()) {
+          SendOwedLeave();
+        }
         Realm->Emit(TEXT("realm:auth:player:logout"), Payload);
       }
       RequestRealmClose(); // FORK(hollowed-oath)
@@ -587,6 +761,17 @@ void URedwoodClientInterface::Logout() {
 
     PlayerId = TEXT("");
     AuthToken = TEXT("");
+    // FORK(hollowed-oath): HollowedOath#2886. The server can replay an
+    // assignment kept for the last character; nothing here may accept it.
+    SelectedCharacterId = TEXT("");
+    bAssignmentExpected = false;
+    bInWorld = false;
+    bAbandonedQueueJoin = false;
+    bTravelPending = false;
+    // The next login can be another account, whose tickets and party are
+    // not ours.
+    bLeaveTicketingOwed = false;
+    CurrentParty = FRedwoodParty();
     // FORK(hollowed-oath): HollowedOath#2854. See HasPlayerSession: both
     // flags, or a later Director drop at the title screen re-logs in with
     // empty ids and reports an authentication failure there.
@@ -679,6 +864,8 @@ void URedwoodClientInterface::Login(
     Payload->SetBoolField(TEXT("bypassProviderCheck"), true);
   }
 
+  // FORK(hollowed-oath): HollowedOath#2886. Not tracked (HA plan ruling
+  // C1): the re-login also runs this, and a failure would end the session.
   Director->Emit(
     TEXT("player:login:username"),
     Payload,
@@ -741,10 +928,11 @@ void URedwoodClientInterface::LoginWithDiscord(
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("player:login:discord:initialize"),
     Payload,
-    [this, bRememberMe, OnUpdate](auto Response) {
+    TrackReply(DirectorReplies, [this, bRememberMe, OnUpdate](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -796,47 +984,51 @@ void URedwoodClientInterface::LoginWithDiscord(
           MakeShareable(new FJsonObject);
         FinalizePayload->SetStringField(TEXT("state"), State);
 
+        // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
         Director->Emit(
           TEXT("player:login:discord:finalize"),
           FinalizePayload,
-          [this, bRememberMe, OnUpdate](auto FinalResponse) {
-            TSharedPtr<FJsonObject> FinalMessageObject =
-              FinalResponse[0]->AsObject();
-            FString FinalError =
-              FinalMessageObject->GetStringField(TEXT("error"));
+          DirectorReplies.Track(
+            [this, bRememberMe, OnUpdate](auto FinalResponse) {
+              TSharedPtr<FJsonObject> FinalMessageObject =
+                FinalResponse[0]->AsObject();
+              FString FinalError =
+                FinalMessageObject->GetStringField(TEXT("error"));
 
-            FRedwoodAuthUpdate Update;
+              FRedwoodAuthUpdate Update;
 
-            if (FinalError.IsEmpty()) {
-              Update.Type = ERedwoodAuthUpdateType::Success;
-              Update.Message = TEXT("");
+              if (FinalError.IsEmpty()) {
+                Update.Type = ERedwoodAuthUpdateType::Success;
+                Update.Message = TEXT("");
 
-              bAuthenticated = true;
-              PlayerId = FinalMessageObject->GetStringField(TEXT("playerId"));
-              AuthToken = FinalMessageObject->GetStringField(TEXT("token"));
-              Nickname = FinalMessageObject->GetStringField(TEXT("nickname"));
+                bAuthenticated = true;
+                PlayerId = FinalMessageObject->GetStringField(TEXT("playerId"));
+                AuthToken = FinalMessageObject->GetStringField(TEXT("token"));
+                Nickname = FinalMessageObject->GetStringField(TEXT("nickname"));
 
-              URedwoodSaveGame *SaveGame =
-                Cast<URedwoodSaveGame>(UGameplayStatics::CreateSaveGameObject(
-                  URedwoodSaveGame::StaticClass()
-                ));
+                URedwoodSaveGame *SaveGame =
+                  Cast<URedwoodSaveGame>(UGameplayStatics::CreateSaveGameObject(
+                    URedwoodSaveGame::StaticClass()
+                  ));
 
-              if (bRememberMe) {
-                SaveGame->Username =
-                  FinalMessageObject->GetStringField(TEXT("username"));
-                SaveGame->AuthToken = AuthToken;
+                if (bRememberMe) {
+                  SaveGame->Username =
+                    FinalMessageObject->GetStringField(TEXT("username"));
+                  SaveGame->AuthToken = AuthToken;
+                }
+
+                UGameplayStatics::SaveGameToSlot(
+                  SaveGame, TEXT("RedwoodSaveGame"), 0
+                );
+              } else {
+                Update.Type = ERedwoodAuthUpdateType::Error;
+                Update.Message = FinalError;
               }
 
-              UGameplayStatics::SaveGameToSlot(
-                SaveGame, TEXT("RedwoodSaveGame"), 0
-              );
-            } else {
-              Update.Type = ERedwoodAuthUpdateType::Error;
-              Update.Message = FinalError;
-            }
-
-            OnUpdate.ExecuteIfBound(Update);
-          }
+              OnUpdate.ExecuteIfBound(Update);
+            },
+            MakeLostReply(OnUpdate)
+          )
         );
       } else {
         FRedwoodAuthUpdate Update;
@@ -844,7 +1036,7 @@ void URedwoodClientInterface::LoginWithDiscord(
         Update.Message = Error;
         OnUpdate.ExecuteIfBound(Update);
       }
-    }
+    }, OnUpdate)
   );
 }
 
@@ -861,10 +1053,11 @@ void URedwoodClientInterface::LoginWithTwitch(
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("player:login:twitch:initialize"),
     Payload,
-    [this, bRememberMe, OnUpdate](auto Response) {
+    TrackReply(DirectorReplies, [this, bRememberMe, OnUpdate](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -916,47 +1109,51 @@ void URedwoodClientInterface::LoginWithTwitch(
           MakeShareable(new FJsonObject);
         FinalizePayload->SetStringField(TEXT("state"), State);
 
+        // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
         Director->Emit(
           TEXT("player:login:twitch:finalize"),
           FinalizePayload,
-          [this, bRememberMe, OnUpdate](auto FinalResponse) {
-            TSharedPtr<FJsonObject> FinalMessageObject =
-              FinalResponse[0]->AsObject();
-            FString FinalError =
-              FinalMessageObject->GetStringField(TEXT("error"));
+          DirectorReplies.Track(
+            [this, bRememberMe, OnUpdate](auto FinalResponse) {
+              TSharedPtr<FJsonObject> FinalMessageObject =
+                FinalResponse[0]->AsObject();
+              FString FinalError =
+                FinalMessageObject->GetStringField(TEXT("error"));
 
-            FRedwoodAuthUpdate Update;
+              FRedwoodAuthUpdate Update;
 
-            if (FinalError.IsEmpty()) {
-              Update.Type = ERedwoodAuthUpdateType::Success;
-              Update.Message = TEXT("");
+              if (FinalError.IsEmpty()) {
+                Update.Type = ERedwoodAuthUpdateType::Success;
+                Update.Message = TEXT("");
 
-              bAuthenticated = true;
-              PlayerId = FinalMessageObject->GetStringField(TEXT("playerId"));
-              AuthToken = FinalMessageObject->GetStringField(TEXT("token"));
-              Nickname = FinalMessageObject->GetStringField(TEXT("nickname"));
+                bAuthenticated = true;
+                PlayerId = FinalMessageObject->GetStringField(TEXT("playerId"));
+                AuthToken = FinalMessageObject->GetStringField(TEXT("token"));
+                Nickname = FinalMessageObject->GetStringField(TEXT("nickname"));
 
-              URedwoodSaveGame *SaveGame =
-                Cast<URedwoodSaveGame>(UGameplayStatics::CreateSaveGameObject(
-                  URedwoodSaveGame::StaticClass()
-                ));
+                URedwoodSaveGame *SaveGame =
+                  Cast<URedwoodSaveGame>(UGameplayStatics::CreateSaveGameObject(
+                    URedwoodSaveGame::StaticClass()
+                  ));
 
-              if (bRememberMe) {
-                SaveGame->Username =
-                  FinalMessageObject->GetStringField(TEXT("username"));
-                SaveGame->AuthToken = AuthToken;
+                if (bRememberMe) {
+                  SaveGame->Username =
+                    FinalMessageObject->GetStringField(TEXT("username"));
+                  SaveGame->AuthToken = AuthToken;
+                }
+
+                UGameplayStatics::SaveGameToSlot(
+                  SaveGame, TEXT("RedwoodSaveGame"), 0
+                );
+              } else {
+                Update.Type = ERedwoodAuthUpdateType::Error;
+                Update.Message = FinalError;
               }
 
-              UGameplayStatics::SaveGameToSlot(
-                SaveGame, TEXT("RedwoodSaveGame"), 0
-              );
-            } else {
-              Update.Type = ERedwoodAuthUpdateType::Error;
-              Update.Message = FinalError;
-            }
-
-            OnUpdate.ExecuteIfBound(Update);
-          }
+              OnUpdate.ExecuteIfBound(Update);
+            },
+            MakeLostReply(OnUpdate)
+          )
         );
       } else {
         FRedwoodAuthUpdate Update;
@@ -964,7 +1161,7 @@ void URedwoodClientInterface::LoginWithTwitch(
         Update.Message = Error;
         OnUpdate.ExecuteIfBound(Update);
       }
-    }
+    }, OnUpdate)
   );
 }
 
@@ -1002,10 +1199,11 @@ void URedwoodClientInterface::SearchForPlayers(
   Payload->SetStringField(TEXT("searchText"), UsernameOrNickname);
   Payload->SetBoolField(TEXT("includePartial"), bIncludePartialMatches);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:players:search:name"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodListPlayersOutput Output;
@@ -1053,7 +1251,7 @@ void URedwoodClientInterface::SearchForPlayers(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1078,10 +1276,11 @@ void URedwoodClientInterface::SearchForPlayerById(
   Payload->SetStringField(TEXT("id"), PlayerId);
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:players:search:id"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodPlayerOutput Output;
@@ -1127,7 +1326,7 @@ void URedwoodClientInterface::SearchForPlayerById(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1158,10 +1357,11 @@ void URedwoodClientInterface::ListFriends(
     Payload->SetStringField(TEXT("filter"), RW_ENUM_TO_STRING(Filter));
   }
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:friends:list"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodListPlayersOutput Output;
@@ -1209,7 +1409,7 @@ void URedwoodClientInterface::ListFriends(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1233,16 +1433,17 @@ void URedwoodClientInterface::RequestFriend(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:friends:add"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1266,16 +1467,17 @@ void URedwoodClientInterface::RemoveFriend(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:friends:remove"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1300,16 +1502,17 @@ void URedwoodClientInterface::RespondToFriendRequest(
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
   Payload->SetBoolField(TEXT("accept"), bAccept);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:friends:respond-request"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1334,16 +1537,17 @@ void URedwoodClientInterface::SetPlayerBlocked(
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
   Payload->SetBoolField(TEXT("block"), bBlocked);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:friends:block"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1368,10 +1572,11 @@ void URedwoodClientInterface::ListRealmContacts(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:contacts:list"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodListRealmContactsOutput Output;
@@ -1418,7 +1623,7 @@ void URedwoodClientInterface::ListRealmContacts(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1444,16 +1649,17 @@ void URedwoodClientInterface::AddRealmContact(
   Payload->SetStringField(TEXT("targetCharacterId"), OtherCharacterId);
   Payload->SetBoolField(TEXT("blocked"), bBlocked);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:contacts:add"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1478,16 +1684,17 @@ void URedwoodClientInterface::RemoveRealmContact(
   Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
   Payload->SetStringField(TEXT("targetCharacterId"), OtherCharacterId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:contacts:remove"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1623,10 +1830,11 @@ void URedwoodClientInterface::ListGuilds(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetBoolField(TEXT("onlyPlayersGuilds"), bOnlyPlayersGuilds);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:list"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodListGuildsOutput Output;
@@ -1647,7 +1855,7 @@ void URedwoodClientInterface::ListGuilds(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1675,10 +1883,11 @@ void URedwoodClientInterface::SearchForGuilds(
   Payload->SetStringField(TEXT("searchText"), SearchText);
   Payload->SetBoolField(TEXT("includePartial"), bIncludePartialMatches);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:search"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodListGuildsOutput Output;
@@ -1699,7 +1908,7 @@ void URedwoodClientInterface::SearchForGuilds(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1724,10 +1933,11 @@ void URedwoodClientInterface::GetGuild(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:get"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodGetGuildOutput Output;
@@ -1744,7 +1954,7 @@ void URedwoodClientInterface::GetGuild(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1768,10 +1978,11 @@ void URedwoodClientInterface::GetSelectedGuild(
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:selected:get"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodGetGuildOutput Output;
@@ -1788,7 +1999,7 @@ void URedwoodClientInterface::GetSelectedGuild(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1812,16 +2023,17 @@ void URedwoodClientInterface::SetSelectedGuild(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:selected:set"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1845,16 +2057,17 @@ void URedwoodClientInterface::JoinGuild(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:membership:join"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1879,16 +2092,17 @@ void URedwoodClientInterface::InviteToGuild(
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(TEXT("targetId"), TargetId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:membership:invite"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1912,16 +2126,17 @@ void URedwoodClientInterface::LeaveGuild(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:membership:leave"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -1952,10 +2167,11 @@ void URedwoodClientInterface::ListGuildMembers(
     URedwoodCommonGameSubsystem::SerializeGuildAndAllianceMemberState(State)
   );
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:membership:list"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodListGuildMembersOutput Output;
@@ -1987,7 +2203,7 @@ void URedwoodClientInterface::ListGuildMembers(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2026,10 +2242,11 @@ void URedwoodClientInterface::CreateGuild(
   Payload->SetBoolField(TEXT("listed"), bListed);
   Payload->SetBoolField(TEXT("membershipPublic"), bMembershipPublic);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:admin:create"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodCreateGuildOutput Output;
@@ -2038,7 +2255,7 @@ void URedwoodClientInterface::CreateGuild(
       MessageObject->TryGetStringField(TEXT("guildId"), Output.GuildId);
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2084,16 +2301,17 @@ void URedwoodClientInterface::UpdateGuild(
   Payload->SetBoolField(TEXT("listed"), bListed);
   Payload->SetBoolField(TEXT("membershipPublic"), bMembershipPublic);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:admin:update"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2119,16 +2337,17 @@ void URedwoodClientInterface::KickPlayerFromGuild(
   Payload->SetStringField(TEXT("targetId"), TargetId);
   Payload->SetBoolField(TEXT("ban"), false);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:admin:kick"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2154,16 +2373,17 @@ void URedwoodClientInterface::BanPlayerFromGuild(
   Payload->SetStringField(TEXT("targetId"), TargetId);
   Payload->SetBoolField(TEXT("ban"), true);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:admin:kick"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2194,16 +2414,17 @@ void URedwoodClientInterface::PromotePlayerToGuildAdmin(
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(TEXT("targetId"), TargetId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:admin:promote"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2228,16 +2449,17 @@ void URedwoodClientInterface::DemotePlayerFromGuildAdmin(
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(TEXT("targetId"), TargetId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:admin:demote"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2262,10 +2484,11 @@ void URedwoodClientInterface::ListAlliances(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("guildIdFilter"), GuildIdFilter);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:list"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodListAlliancesOutput Output;
@@ -2296,7 +2519,7 @@ void URedwoodClientInterface::ListAlliances(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2324,10 +2547,11 @@ void URedwoodClientInterface::SearchForAlliances(
   Payload->SetStringField(TEXT("searchText"), SearchText);
   Payload->SetBoolField(TEXT("includePartial"), bIncludePartialMatches);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:search"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodListAlliancesOutput Output;
@@ -2346,7 +2570,7 @@ void URedwoodClientInterface::SearchForAlliances(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2369,16 +2593,17 @@ void URedwoodClientInterface::CanAdminAlliance(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:admin:has-admin-privileges"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2408,10 +2633,11 @@ void URedwoodClientInterface::CreateAlliance(
   Payload->SetStringField(TEXT("name"), AllianceName);
   Payload->SetBoolField(TEXT("inviteOnly"), bInviteOnly);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:admin:create"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodCreateAllianceOutput Output;
@@ -2420,7 +2646,7 @@ void URedwoodClientInterface::CreateAlliance(
       MessageObject->TryGetStringField(TEXT("allianceId"), Output.AllianceId);
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2449,16 +2675,17 @@ void URedwoodClientInterface::UpdateAlliance(
   Payload->SetStringField(TEXT("name"), AllianceName);
   Payload->SetBoolField(TEXT("inviteOnly"), bInviteOnly);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:admin:update"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2484,16 +2711,17 @@ void URedwoodClientInterface::KickGuildFromAlliance(
   Payload->SetStringField(TEXT("targetGuildId"), GuildId);
   Payload->SetBoolField(TEXT("ban"), false);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:admin:kick"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2519,16 +2747,17 @@ void URedwoodClientInterface::BanGuildFromAlliance(
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetBoolField(TEXT("ban"), true);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:admin:kick"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2565,10 +2794,11 @@ void URedwoodClientInterface::ListAllianceGuilds(
     URedwoodCommonGameSubsystem::SerializeGuildAndAllianceMemberState(State)
   );
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:membership:list"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FRedwoodListAllianceGuildsOutput Output;
@@ -2600,7 +2830,7 @@ void URedwoodClientInterface::ListAllianceGuilds(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2625,16 +2855,17 @@ void URedwoodClientInterface::JoinAlliance(
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:membership:join"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2659,16 +2890,17 @@ void URedwoodClientInterface::LeaveAlliance(
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:membership:leave"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2693,16 +2925,17 @@ void URedwoodClientInterface::InviteGuildToAlliance(
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
   Payload->SetStringField(TEXT("targetGuildId"), GuildId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:guilds:alliances:membership:invite"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -2719,23 +2952,28 @@ void URedwoodClientInterface::ListRealms(
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
 
-  Director->Emit(TEXT("realm:list"), Payload, [this, OnOutput](auto Response) {
-    TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  Director->Emit(
+    TEXT("realm:list"),
+    Payload,
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
+      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
-    FRedwoodListRealmsOutput Output;
+      FRedwoodListRealmsOutput Output;
 
-    Output.Error = MessageObject->GetStringField(TEXT("error"));
+      Output.Error = MessageObject->GetStringField(TEXT("error"));
 
-    const TArray<TSharedPtr<FJsonValue>> &Realms =
-      MessageObject->GetArrayField(TEXT("realms"));
+      const TArray<TSharedPtr<FJsonValue>> &Realms =
+        MessageObject->GetArrayField(TEXT("realms"));
 
-    // FORK(hollowed-oath): the loop body moved into ParseRealm so a test can reach it.
-    for (TSharedPtr<FJsonValue> InRealm : Realms) {
-      Output.Realms.Add(ParseRealm(InRealm->AsObject()));
-    }
+      // FORK(hollowed-oath): the loop body moved into ParseRealm so a test can reach it.
+      for (TSharedPtr<FJsonValue> InRealm : Realms) {
+        Output.Realms.Add(ParseRealm(InRealm->AsObject()));
+      }
 
-    OnOutput.ExecuteIfBound(Output);
-  });
+      OnOutput.ExecuteIfBound(Output);
+    }, OnOutput)
+  );
 }
 
 FRedwoodRealm URedwoodClientInterface::ParseRealm(
@@ -2808,11 +3046,22 @@ void URedwoodClientInterface::InitiateRealmHandshake(
 
   CurrentRealm = FRedwoodRealm();
   const uint32 Generation = ++RealmHandshakeGeneration; // FORK(hollowed-oath)
+  // FORK(hollowed-oath): HollowedOath#2886. The server can replay an
+  // assignment kept for the last character; nothing here may accept it.
+  SelectedCharacterId = TEXT("");
+  bAssignmentExpected = false;
+  bInWorld = false;
+  bAbandonedQueueJoin = false;
+  bTravelPending = false;
+  // The party of another session or realm; the Realm sends ours again.
+  CurrentParty = FRedwoodParty();
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("realmId"), InRealm.Id);
 
+  // FORK(hollowed-oath): HollowedOath#2886. Not tracked (HA plan ruling
+  // C1): the re-login also runs this, and a failure would end the session.
   Director->Emit(
     TEXT("realm:auth:player:connect:client-to-director"),
     Payload,
@@ -2886,6 +3135,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
                                    ) {
         NoteFirstRealmConnect(); // FORK(hollowed-oath): HollowedOath#2854.
         RealmCloseBackoff.NoteConnected(TimerManager); // FORK(hollowed-oath)
+        NoteRealmReconnected(); // FORK(hollowed-oath): HollowedOath#2886.
         bRealmDisconnected = false;
 
         if (!bSentRealmConnected) {
@@ -2937,6 +3187,8 @@ void URedwoodClientInterface::BeginRealmReauthentication() {
   Payload->SetStringField(TEXT("realmId"), CurrentRealmId);
 
   const uint32 Generation = RealmHandshakeGeneration; // FORK(hollowed-oath)
+  // FORK(hollowed-oath): HollowedOath#2886. Not tracked (HA plan ruling
+  // C1): the re-login also runs this, and a failure would end the session.
   Director->Emit(
     TEXT("realm:auth:player:connect:client-to-director"),
     Payload,
@@ -3007,6 +3259,8 @@ void URedwoodClientInterface::FinalizeRealmHandshake(
   Payload->SetStringField(TEXT("token"), Token);
 
   const uint32 Generation = RealmHandshakeGeneration; // FORK(hollowed-oath)
+  // FORK(hollowed-oath): HollowedOath#2886. Not tracked (HA plan ruling
+  // C1): the re-login also runs this, and a failure would end the session.
   Realm->Emit(
     TEXT("realm:auth:player:connect:client-to-realm"),
     Payload,
@@ -3018,6 +3272,11 @@ void URedwoodClientInterface::FinalizeRealmHandshake(
 
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
+
+      // FORK(hollowed-oath): HollowedOath#2886. Before the caller can join.
+      if (Error.IsEmpty()) {
+        SendOwedLeave();
+      }
 
       FRedwoodSocketConnected Output;
       Output.Error = Error;
@@ -3054,6 +3313,10 @@ void URedwoodClientInterface::BindRealmEvents() {
       FRedwoodTicketingUpdate Update;
       Update.Type = ERedwoodTicketingUpdateType::TicketError;
       Update.Message = Message->AsObject()->GetStringField(TEXT("error"));
+      // FORK(hollowed-oath): HollowedOath#2886. The ticket ended, so no
+      // assignment comes for it; a replay of an earlier one must not move
+      // the player. No ticket is left, so no leave is owed.
+      bAssignmentExpected = false;
       OnTicketingUpdate.ExecuteIfBound(Update);
 
       OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
@@ -3066,6 +3329,48 @@ void URedwoodClientInterface::BindRealmEvents() {
     TEXT("realm:servers:connect-to-instance"),
     [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
       TSharedPtr<FJsonObject> MessageObject = Message->AsObject();
+
+      // FORK(hollowed-oath): HollowedOath#2886. A zone assignment sent again
+      // after a reconnect can be for a request the game dropped, for a
+      // character the player no longer plays, or reach a player who is at
+      // character select with no join. None may move the player.
+      // An old server sends no characterId; its assignment moves as before.
+      FString AssignedCharacterId;
+      MessageObject->TryGetStringField(TEXT("characterId"), AssignedCharacterId);
+      const bool bForAnotherCharacter = !AssignedCharacterId.IsEmpty() &&
+        AssignedCharacterId != SelectedCharacterId;
+      // When the leader queues the whole party, a member's client sends no
+      // join, and no event names it before the assignment. So a party member
+      // (not the leader) accepts an assignment named for its selected
+      // character. The cost: for a party member, a replay after a relaunch
+      // within 60 s is not refused here; the server's login-lineage and
+      // unused-token checks still apply. Remove this rule when
+      // HollowedOath#3002 ships.
+      // The party must list this player: a party left from another session
+      // must not make this one a member.
+      const bool bPartyMemberAssignment = CurrentParty.bValid &&
+        CurrentParty.LeaderId != PlayerId &&
+        CurrentParty.Members.ContainsByPredicate(
+          [this](const FRedwoodPartyMember &Member) {
+            return Member.PlayerId == PlayerId;
+          }
+        ) &&
+        !AssignedCharacterId.IsEmpty() && !bForAnotherCharacter;
+      if ((!bAssignmentExpected && !bInWorld && !bPartyMemberAssignment) ||
+          bAbandonedQueueJoin || bForAnotherCharacter) {
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT(
+            "Ignoring a zone assignment for a dropped queue request or another character."
+          )
+        );
+        return;
+      }
+
+      // FORK(hollowed-oath): HollowedOath#2886. See NoteArrivedInWorld.
+      bTravelPending = true;
+      TravelJoinSequence = JoinSequence;
 
       bool bShouldStitch = MessageObject->GetBoolField(TEXT("shouldStitch"));
       ServerConnection = MessageObject->GetStringField(TEXT("connection"));
@@ -3152,6 +3457,13 @@ bool URedwoodClientInterface::IsRealmConnected() {
   return Realm.IsValid() && Realm->bIsConnected;
 }
 
+// FORK(hollowed-oath): HollowedOath#2886. For the requests the gates do not
+// hold. In the re-login window the socket is back but does not know the
+// player, and nothing answers a request sent to it.
+bool URedwoodClientInterface::IsRealmReady() {
+  return IsRealmConnected() && !bRealmReauthPending;
+}
+
 TMap<FString, float> URedwoodClientInterface::GetRegions() {
   return PingAverages;
 }
@@ -3176,10 +3488,11 @@ void URedwoodClientInterface::ListCharacters(
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:characters:list"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
       TArray<TSharedPtr<FJsonValue>> Characters =
@@ -3202,7 +3515,7 @@ void URedwoodClientInterface::ListCharacters(
       Output.Error = Error;
       Output.Characters = CharactersStruct;
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -3227,10 +3540,11 @@ void URedwoodClientInterface::ListArchivedCharacters(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetBoolField(TEXT("includeArchived"), true);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:characters:list"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
       TArray<TSharedPtr<FJsonValue>> Characters =
@@ -3251,7 +3565,7 @@ void URedwoodClientInterface::ListArchivedCharacters(
       Output.Error = Error;
       Output.Characters = CharactersStruct;
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -3260,7 +3574,8 @@ void URedwoodClientInterface::CreateCharacter(
   USIOJsonObject *CharacterCreatorData,
   FRedwoodGetCharacterOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodGetCharacterOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3283,10 +3598,11 @@ void URedwoodClientInterface::CreateCharacter(
     TEXT("characterCreatorData"), CharacterCreatorData->GetRootObject()
   );
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:characters:create"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -3300,7 +3616,7 @@ void URedwoodClientInterface::CreateCharacter(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -3325,15 +3641,16 @@ void URedwoodClientInterface::SetCharacterArchived(
   Payload->SetStringField(TEXT("characterId"), CharacterId);
   Payload->SetBoolField(TEXT("archived"), bArchived);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:characters:archive"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -3358,10 +3675,11 @@ void URedwoodClientInterface::GetCharacterData(
   Payload->SetStringField(TEXT("id"), PlayerId);
   Payload->SetStringField(TEXT("characterIdOrName"), CharacterIdOrName);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:characters:get"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -3375,7 +3693,7 @@ void URedwoodClientInterface::GetCharacterData(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -3385,6 +3703,15 @@ void URedwoodClientInterface::SetCharacterData(
   USIOJsonObject *CharacterCreatorData,
   FRedwoodGetCharacterOutputDelegate OnOutput
 ) {
+  // FORK(hollowed-oath): HollowedOath#2886. See GateRealm. The strong pointer
+  // keeps the data alive while the request is held.
+  TStrongObjectPtr<USIOJsonObject> HeldCharacterData(CharacterCreatorData);
+  if (GateRealm([=, this, Data = HeldCharacterData]() {
+        SetCharacterData(CharacterId, Name, Data.Get(), OnOutput);
+      }, OnOutput)) {
+    return;
+  }
+
   if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodGetCharacterOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
@@ -3406,10 +3733,11 @@ void URedwoodClientInterface::SetCharacterData(
     );
   }
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:characters:set:client"),
     Payload,
-    [this, OnOutput, CharacterId](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput, CharacterId](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -3423,11 +3751,20 @@ void URedwoodClientInterface::SetCharacterData(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
 void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
+  // FORK(hollowed-oath): HollowedOath#2886. A new character is at character
+  // select until it joins. A dropped join was the old character's; its owed
+  // leave stays, because the old ticket still needs it.
+  if (CharacterId != SelectedCharacterId) {
+    bAssignmentExpected = false;
+    bInWorld = false;
+    bAbandonedQueueJoin = false;
+    bTravelPending = false;
+  }
   SelectedCharacterId = CharacterId;
 
   if (!CurrentParty.bValid || !Realm.IsValid() || !Realm->bIsConnected) {
@@ -3500,13 +3837,34 @@ URedwoodClientInterface::MakeUnrequestedCloseHandler(
 // unrequested close scheduled would otherwise fire after this close, and
 // bring back a Realm session that is over.
 void URedwoodClientInterface::RequestRealmClose() {
+  // HollowedOath#2999. A second request on the same socket (a Logout during
+  // the re-login, then the re-login's own Logout) must not close it again:
+  // a second close cancels the running timer, which the library turns into
+  // an early on_close with a new timer still set.
+  if (bRealmCloseRequested) {
+    RealmReplies.FailAll();
+    return;
+  }
   bRealmCloseRequested = true;
   RealmCloseBackoff.Reset(TimerManager);
+  // HollowedOath#2999. The library reports the namespace closed when its
+  // close timer ran; only a connected socket starts one.
+  bRealmCloseTimerPending = Realm->bIsConnected;
+  Realm->OnNamespaceDisconnectedCallback =
+    [WeakThis = TWeakObjectPtr<URedwoodClientInterface>(this)](const FString &) {
+      if (WeakThis.IsValid()) {
+        WeakThis->bRealmCloseTimerPending = false;
+      }
+    };
   Realm->Disconnect();
+  // HollowedOath#2886. No reply comes over a closed socket. After the close,
+  // so a failure handler cannot reach the socket before it closes.
+  RealmReplies.FailAll();
 }
 
 void URedwoodClientInterface::BindRealmCloseHandler() {
   bRealmCloseRequested = false;
+  bRealmCloseTimerPending = false;
   Realm->OnDisconnectedCallback = MakeUnrequestedCloseHandler(
     Realm, RealmCloseBackoff, [this]() { return bRealmCloseRequested; }
   );
@@ -3576,7 +3934,55 @@ void URedwoodClientInterface::NoteRealmDrop() {
   } else {
     bLostBeforeFirstRealmConnect = true;
   }
+  // FORK(hollowed-oath): HollowedOath#2886. Last, so a request that a failure
+  // handler sends again is held for the re-login.
+  RealmReplies.FailAll();
 }
+
+// FORK(hollowed-oath) BEGIN: HollowedOath#2886. A request that the gates do
+// not hold (JoinQueue) and that was sent after the drop was not pending when
+// the drop failed the others. The library sent it on the new socket before
+// the re-login, where no route answers it, so it fails here.
+void URedwoodClientInterface::NoteRealmReconnected() {
+  if (bRealmDisconnected) {
+    RealmReplies.FailAll();
+  }
+}
+
+// The server can still hold a ticket whose join reply was lost, and replay
+// its assignment. Leaving deletes both. Sent at the first Realm auth after
+// the loss, whatever came between; the reply to the auth is the first moment
+// the Realm knows the player. The flag stays until a leave succeeds or a join
+// replaces the ticket; with a join out, the leave would cancel it.
+void URedwoodClientInterface::SendOwedLeave() {
+  if (!bLeaveTicketingOwed || bAssignmentExpected || !IsRealmConnected()) {
+    return;
+  }
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Realm->Emit(
+    TEXT("realm:ticketing:leave"),
+    Payload,
+    RealmReplies.Track([this](auto Response) {
+      if (Response[0]->AsObject()->GetStringField(TEXT("error")).IsEmpty()) {
+        bLeaveTicketingOwed = false;
+      }
+    }, []() {})
+  );
+}
+
+FRedwoodReplyCallback URedwoodClientInterface::TrackDirectorReply(
+  FRedwoodReplyCallback OnReply, TFunction<void()> OnLost
+) {
+  return DirectorReplies.Track(MoveTemp(OnReply), MoveTemp(OnLost));
+}
+
+void URedwoodClientInterface::NoteDirectorReconnected() {
+  if (bDirectorDisconnected) {
+    DirectorReplies.FailAll();
+  }
+}
+// FORK(hollowed-oath) END
 
 void URedwoodClientInterface::NoteDirectorDrop() {
   bLostBeforeFirstDirectorConnect = !bSentDirectorConnected;
@@ -3601,6 +4007,10 @@ void URedwoodClientInterface::NoteDirectorDrop() {
       false
     );
   }
+
+  // FORK(hollowed-oath): HollowedOath#2886. Last, so a request that a failure
+  // handler sends again is held for the re-login.
+  DirectorReplies.FailAll();
 }
 
 // Not AuthToken: a failed re-login writes the EMPTY ids of its reply before it
@@ -3716,6 +4126,15 @@ void URedwoodClientInterface::JoinQueue(
     return;
   }
 
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
+    FRedwoodTicketingUpdate Update;
+    Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
+    Update.Message = TEXT("Not connected to Realm.");
+    OnUpdate.ExecuteIfBound(Update);
+    return;
+  }
+
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
@@ -3735,20 +4154,17 @@ void URedwoodClientInterface::JoinQueue(
 
   OnTicketingUpdate = OnUpdate;
 
-  Realm
-    ->Emit(TEXT("realm:ticketing:join:queue"), Payload, [this](auto Response) {
-      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-      FString Error = MessageObject->GetStringField(TEXT("error"));
-
-      FRedwoodTicketingUpdate Update;
-      Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
-      Update.Message = Error;
-      OnTicketingUpdate.ExecuteIfBound(Update);
-
-      if (!Error.IsEmpty()) {
-        OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
-      }
-    });
+  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  Realm->Emit(
+    TEXT("realm:ticketing:join:queue"),
+    Payload,
+    RealmReplies.Track([this, Sequence = JoinSequence](auto Response) {
+      HandleTicketingJoinReply(
+        Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
+      );
+    }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
+  );
 }
 
 void URedwoodClientInterface::JoinCustom(
@@ -3771,7 +4187,8 @@ void URedwoodClientInterface::JoinCustom(
 }
 
 void URedwoodClientInterface::AttemptJoinCustom() {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message = TEXT("Not connected to Realm.");
@@ -3839,26 +4256,32 @@ void URedwoodClientInterface::AttemptJoinCustom() {
   }
   Payload->SetArrayField(TEXT("regions"), DesiredRegions);
 
-  Realm
-    ->Emit(TEXT("realm:ticketing:join:custom"), Payload, [this](auto Response) {
-      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-      FString Error = MessageObject->GetStringField(TEXT("error"));
-
-      FRedwoodTicketingUpdate Update;
-      Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
-      Update.Message = Error;
-      OnTicketingUpdate.ExecuteIfBound(Update);
-
-      if (!Error.IsEmpty()) {
-        OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
-      }
-    });
+  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  Realm->Emit(
+    TEXT("realm:ticketing:join:custom"),
+    Payload,
+    RealmReplies.Track([this, Sequence = JoinSequence](auto Response) {
+      HandleTicketingJoinReply(
+        Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
+      );
+    }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
+  );
 }
 
 void URedwoodClientInterface::LeaveTicketing(
   FRedwoodErrorOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. The game leaves when it gives up
+  // on a join, often because the Realm dropped. Whatever the server does with
+  // the leave, the join's assignment must not move the player, and a leave
+  // that cannot go out now is owed.
+  bAbandonedQueueJoin = true;
+  bAssignmentExpected = false;
+
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
+    bLeaveTicketingOwed = true;
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -3867,15 +4290,23 @@ void URedwoodClientInterface::LeaveTicketing(
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:ticketing:leave"),
     Payload,
-    [this, OnOutput](auto Response) {
+    RealmReplies.Track([this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
+      if (Error.IsEmpty()) {
+        bLeaveTicketingOwed = false;
+      }
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, [this, OnLost = MakeLostReply(OnOutput)]() {
+      // A leave that may not have run is owed.
+      bLeaveTicketingOwed = true;
+      OnLost();
+    })
   );
 }
 
@@ -3883,7 +4314,8 @@ void URedwoodClientInterface::ListProxies(
   TArray<FString> PrivateProxyReferences,
   FRedwoodListProxiesOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodListProxiesOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3903,10 +4335,11 @@ void URedwoodClientInterface::ListProxies(
     TEXT("privateProxyReferences"), PrivateProxyReferencesArray
   );
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:servers:list-proxies"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
       TArray<TSharedPtr<FJsonValue>> Proxies =
@@ -3924,7 +4357,7 @@ void URedwoodClientInterface::ListProxies(
       Output.Error = Error;
       Output.Proxies = ProxiesStruct;
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -3933,7 +4366,8 @@ void URedwoodClientInterface::CreateProxy(
   FRedwoodCreateProxyInput Parameters,
   FRedwoodCreateProxyOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodCreateProxyOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -3999,21 +4433,33 @@ void URedwoodClientInterface::CreateProxy(
 
   Payload->SetBoolField(TEXT("startOnBoot"), Parameters.bStartOnBoot);
 
+  // FORK(hollowed-oath): HollowedOath#2886. A create that joins its session
+  // gets its assignment as a connect-to-instance, like a ticketing join.
+  if (bJoinSession) {
+    NoteJoinSent();
+  }
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:servers:create-proxy"),
     Payload,
-    [this, OnOutput](auto Response) {
+    RealmReplies.Track([this, OnOutput, bJoinSession, Sequence = JoinSequence](
+      auto Response
+    ) {
       FRedwoodCreateProxyOutput Output;
 
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       Output.Error = MessageObject->GetStringField(TEXT("error"));
+      if (bJoinSession) {
+        NoteJoinAnswered(Output.Error, Sequence); // FORK(hollowed-oath)
+      }
 
       MessageObject->TryGetStringField(
         TEXT("proxyReference"), Output.ProxyReference
       );
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, bJoinSession ? MakeLostProxyJoin(JoinSequence, MakeLostReply(OnOutput))
+                    : MakeLostReply(OnOutput))
   );
 }
 
@@ -4022,7 +4468,8 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
   FString Password,
   FRedwoodJoinServerOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodJoinServerOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Output);
@@ -4051,14 +4498,17 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
     Payload->SetField(TEXT("password"), NullValue);
   }
 
+  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:servers:join-proxy"),
     Payload,
-    [this, OnOutput](auto Response) {
+    RealmReplies.Track([this, OnOutput, Sequence = JoinSequence](auto Response) {
       FRedwoodJoinServerOutput Output;
 
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       Output.Error = MessageObject->GetStringField(TEXT("error"));
+      NoteJoinAnswered(Output.Error, Sequence); // FORK(hollowed-oath)
 
       MessageObject->TryGetStringField(
         TEXT("connectionUri"), Output.ConnectionUri
@@ -4066,14 +4516,15 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
       MessageObject->TryGetStringField(TEXT("token"), Output.Token);
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, MakeLostProxyJoin(JoinSequence, MakeLostReply(OnOutput)))
   );
 }
 
 void URedwoodClientInterface::StopProxy(
   FString ServerProxyId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FString Error = TEXT("Not connected to Realm.");
     OnOutput.ExecuteIfBound(Error);
     return;
@@ -4084,19 +4535,21 @@ void URedwoodClientInterface::StopProxy(
 
   Payload->SetStringField(TEXT("proxyId"), ServerProxyId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:servers:stop-proxy"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
 
       OnOutput.ExecuteIfBound(MessageObject->GetStringField(TEXT("error")));
-    }
+    }, OnOutput)
   );
 }
 
 void URedwoodClientInterface::AttemptJoinMatchmaking() {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
+  if (!IsRealmReady()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message = TEXT("Not connected to Realm.");
@@ -4163,22 +4616,16 @@ void URedwoodClientInterface::AttemptJoinMatchmaking() {
 
   Payload->SetObjectField(TEXT("data"), MatchmakingData);
 
+  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:ticketing:join:matchmaking"),
     Payload,
-    [this](auto Response) {
-      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-      FString Error = MessageObject->GetStringField(TEXT("error"));
-
-      FRedwoodTicketingUpdate Update;
-      Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
-      Update.Message = Error;
-      OnTicketingUpdate.ExecuteIfBound(Update);
-
-      if (!Error.IsEmpty()) {
-        OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
-      }
-    }
+    RealmReplies.Track([this, Sequence = JoinSequence](auto Response) {
+      HandleTicketingJoinReply(
+        Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
+      );
+    }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
   );
 }
 
@@ -4211,10 +4658,11 @@ void URedwoodClientInterface::GetOrCreateParty(
   Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
   Payload->SetBoolField(TEXT("createIfNotInParty"), bCreateIfNotInParty);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:parties:get:frontend"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -4230,7 +4678,7 @@ void URedwoodClientInterface::GetOrCreateParty(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -4250,10 +4698,11 @@ void URedwoodClientInterface::LeaveParty(FRedwoodErrorOutputDelegate OnOutput) {
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:parties:leave"),
     Payload,
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -4262,7 +4711,7 @@ void URedwoodClientInterface::LeaveParty(FRedwoodErrorOutputDelegate OnOutput) {
       }
 
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -4285,14 +4734,15 @@ void URedwoodClientInterface::InviteToParty(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:parties:invites:initiate"),
     Payload,
-    [OnOutput](auto Response) {
+    TrackReply(RealmReplies, [OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
       OnOutput.ExecuteIfBound(Error);
-    }
+    }, OnOutput)
   );
 }
 
@@ -4316,10 +4766,11 @@ void URedwoodClientInterface::ListPartyInvites(
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:parties:invites:get"),
     Payload,
-    [OnOutput](auto Response) {
+    TrackReply(RealmReplies, [OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -4334,7 +4785,7 @@ void URedwoodClientInterface::ListPartyInvites(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -4369,10 +4820,11 @@ void URedwoodClientInterface::RespondToPartyInvite(
   Payload->SetStringField(TEXT("partyId"), PartyId);
   Payload->SetBoolField(TEXT("accept"), bAccept);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:parties:invites:respond"),
     Payload,
-    [OnOutput](auto Response) {
+    TrackReply(RealmReplies, [OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -4387,7 +4839,7 @@ void URedwoodClientInterface::RespondToPartyInvite(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -4410,12 +4862,16 @@ void URedwoodClientInterface::PromoteToPartyLeader(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
 
-  Realm
-    ->Emit(TEXT("realm:parties:promote"), Payload, [OnOutput](auto Response) {
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  Realm->Emit(
+    TEXT("realm:parties:promote"),
+    Payload,
+    TrackReply(RealmReplies, [OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
       OnOutput.ExecuteIfBound(Error);
-    });
+    }, OnOutput)
+  );
 }
 
 void URedwoodClientInterface::KickFromParty(
@@ -4437,11 +4893,16 @@ void URedwoodClientInterface::KickFromParty(
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
 
-  Realm->Emit(TEXT("realm:parties:kick"), Payload, [OnOutput](auto Response) {
-    TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-    FString Error = MessageObject->GetStringField(TEXT("error"));
-    OnOutput.ExecuteIfBound(Error);
-  });
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  Realm->Emit(
+    TEXT("realm:parties:kick"),
+    Payload,
+    TrackReply(RealmReplies, [OnOutput](auto Response) {
+      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
+      FString Error = MessageObject->GetStringField(TEXT("error"));
+      OnOutput.ExecuteIfBound(Error);
+    }, OnOutput)
+  );
 }
 
 void URedwoodClientInterface::SetPartyData(
@@ -4449,6 +4910,15 @@ void URedwoodClientInterface::SetPartyData(
   USIOJsonObject *PartyData,
   FRedwoodGetPartyOutputDelegate OnOutput
 ) {
+  // FORK(hollowed-oath): HollowedOath#2886. See GateRealm. The strong pointer
+  // keeps the data alive while the request is held.
+  TStrongObjectPtr<USIOJsonObject> HeldPartyData(PartyData);
+  if (GateRealm([=, this, Data = HeldPartyData]() {
+        SetPartyData(LootType, Data.Get(), OnOutput);
+      }, OnOutput)) {
+    return;
+  }
+
   if (!Realm.IsValid() || !Realm->bIsConnected) {
     FRedwoodGetPartyOutput Output;
     Output.Error = TEXT("Not connected to Realm.");
@@ -4467,22 +4937,27 @@ void URedwoodClientInterface::SetPartyData(
     Payload->SetObjectField(TEXT("data"), PartyData->GetRootObject());
   }
 
-  Realm->Emit(TEXT("realm:parties:set"), Payload, [OnOutput](auto Response) {
-    TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-    FString Error = MessageObject->GetStringField(TEXT("error"));
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  Realm->Emit(
+    TEXT("realm:parties:set"),
+    Payload,
+    TrackReply(RealmReplies, [OnOutput](auto Response) {
+      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
+      FString Error = MessageObject->GetStringField(TEXT("error"));
 
-    FRedwoodGetPartyOutput Output;
-    Output.Error = Error;
+      FRedwoodGetPartyOutput Output;
+      Output.Error = Error;
 
-    if (Error.IsEmpty()) {
-      const TSharedPtr<FJsonObject> *PartyObj;
-      if (MessageObject->TryGetObjectField(TEXT("party"), PartyObj)) {
-        Output.Party = URedwoodCommonGameSubsystem::ParseParty(*PartyObj);
+      if (Error.IsEmpty()) {
+        const TSharedPtr<FJsonObject> *PartyObj;
+        if (MessageObject->TryGetObjectField(TEXT("party"), PartyObj)) {
+          Output.Party = URedwoodCommonGameSubsystem::ParseParty(*PartyObj);
+        }
       }
-    }
 
-    OnOutput.ExecuteIfBound(Output);
-  });
+      OnOutput.ExecuteIfBound(Output);
+    }, OnOutput)
+  );
 }
 
 void URedwoodClientInterface::SendEmoteToParty(FString Emote) {
@@ -4588,9 +5063,10 @@ void URedwoodClientInterface::GetDirectorGlobalData(
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Director->Emit(
     TEXT("director:global-data:get:latest"),
-    [this, OnOutput](auto Response) {
+    TrackReply(DirectorReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -4611,7 +5087,7 @@ void URedwoodClientInterface::GetDirectorGlobalData(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }
 
@@ -4635,9 +5111,10 @@ void URedwoodClientInterface::GetRealmGlobalData(
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
 
+  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
     TEXT("realm:global-data:get:latest"),
-    [this, OnOutput](auto Response) {
+    TrackReply(RealmReplies, [this, OnOutput](auto Response) {
       TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
       FString Error = MessageObject->GetStringField(TEXT("error"));
 
@@ -4658,6 +5135,6 @@ void URedwoodClientInterface::GetRealmGlobalData(
       }
 
       OnOutput.ExecuteIfBound(Output);
-    }
+    }, OnOutput)
   );
 }

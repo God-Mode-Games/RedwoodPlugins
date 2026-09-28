@@ -2,6 +2,8 @@
 
 #include "RedwoodModule.h"
 
+#include "RedwoodClosingSockets.h" // FORK(hollowed-oath)
+
 #if WITH_EDITOR
   #include "Framework/Notifications/NotificationManager.h"
   #include "Widgets/Notifications/SNotificationList.h"
@@ -13,6 +15,9 @@ DEFINE_LOG_CATEGORY(LogRedwood);
 
 void FRedwoodModule::StartupModule() {
   // This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
+  // FORK(hollowed-oath): HollowedOath#2999. Bound before any socket is
+  // released, so a release after the exit starts is kept.
+  RedwoodClosingSockets::BindExitHook();
 }
 
 void FRedwoodModule::ShutdownModule() {
