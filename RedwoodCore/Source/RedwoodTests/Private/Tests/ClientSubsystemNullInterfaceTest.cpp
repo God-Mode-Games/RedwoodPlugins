@@ -7,7 +7,6 @@
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
-#include "Misc/ScopeExit.h"
 
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
@@ -15,9 +14,6 @@
 #include "RedwoodClientGameSubsystem.h"
 #include "RedwoodClientInterface.h"
 #include "RedwoodCommonGameSubsystem.h"
-#include "Subsystems/SubsystemCollection.h"
-
-#include "RedwoodFriendRelayProbe.h"
 
 namespace {
   // Not the plugin constant: this pins the text the player sees.
@@ -175,77 +171,6 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
 
   Subsystem->CancelCharacterFriendRequest(TEXT("character-1"), OnError);
   CheckGuard(TEXT("CancelCharacterFriendRequest reports the error"));
-
-  return true;
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodClientSubsystemFriendRelayTest,
-  "Redwood.ClientSubsystem.FriendRelay",
-  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
-);
-
-// The game binds the subsystem event, so each broadcast of the client
-// interface delegate must reach it once.
-bool FRedwoodClientSubsystemFriendRelayTest::RunTest(
-  const FString &Parameters
-) {
-  FRedwoodClientSubsystemTestWorld TestWorld(TEXT("RedwoodFriendRelayWorld"));
-  if (!TestNotNull(TEXT("Test world was created"), TestWorld.World)) {
-    return false;
-  }
-
-  // Initialize() builds the client interface and binds the relays, as it does
-  // in the game. It opens no socket.
-  URedwoodClientGameSubsystem *Subsystem =
-    NewObject<URedwoodClientGameSubsystem>(TestWorld.GameInstance);
-  FSubsystemCollection<UGameInstanceSubsystem> Collection;
-  Subsystem->Initialize(Collection);
-
-  // Initialize() also listens for each new world, and that handler reads the
-  // world of this test's game instance. The test world is gone after this
-  // test, so the listener must go first.
-  ON_SCOPE_EXIT {
-    FWorldDelegates::OnPostWorldInitialization.RemoveAll(Subsystem);
-    Subsystem->Deinitialize();
-  };
-
-  URedwoodClientInterface *ClientInterface = Subsystem->GetClientInterface();
-  if (!TestNotNull(TEXT("Initialize built the interface"), ClientInterface)) {
-    return false;
-  }
-
-  URedwoodFriendRelayProbe *Probe = NewObject<URedwoodFriendRelayProbe>();
-  Subsystem->OnCharacterFriendAlert.AddDynamic(
-    Probe, &URedwoodFriendRelayProbe::HandleCharacterFriendAlert
-  );
-
-  FRedwoodCharacterFriendAlert Alert;
-  Alert.Type = ERedwoodCharacterFriendAlertType::Online;
-  Alert.CharacterId = TEXT("me-1");
-  Alert.OtherCharacterId = TEXT("other-1");
-  Alert.OtherCharacterName = TEXT("Bob");
-  Alert.ZoneName = TEXT("zone-1");
-  ClientInterface->OnCharacterFriendAlert.Broadcast(Alert);
-
-  TestEqual(
-    TEXT("The character friend alert reached the subsystem once"),
-    Probe->CharacterFriendAlertCount,
-    1
-  );
-  const FRedwoodCharacterFriendAlert &Relayed =
-    Probe->LastCharacterFriendAlert;
-  TestTrue(TEXT("Same type"), Relayed.Type == Alert.Type);
-  TestEqual(TEXT("Same character"), Relayed.CharacterId, Alert.CharacterId);
-  TestEqual(
-    TEXT("Same other character"),
-    Relayed.OtherCharacterId,
-    Alert.OtherCharacterId
-  );
-  TestEqual(
-    TEXT("Same name"), Relayed.OtherCharacterName, Alert.OtherCharacterName
-  );
-  TestEqual(TEXT("Same zone"), Relayed.ZoneName, Alert.ZoneName);
 
   return true;
 }

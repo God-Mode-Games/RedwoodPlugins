@@ -89,10 +89,6 @@ void URedwoodClientGameSubsystem::Initialize(
     ClientInterface->OnRealmAuthFailed.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleOnRealmAuthFailed
     );
-    // FORK(hollowed-oath): character friends.
-    ClientInterface->OnCharacterFriendAlert.AddDynamic(
-      this, &URedwoodClientGameSubsystem::HandleOnCharacterFriendAlert
-    );
     ClientInterface->OnPartyInvited.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleOnPartyInvited
     );
@@ -1418,13 +1414,6 @@ void URedwoodClientGameSubsystem::HandleOnRealmConnectionLost() {
 // (see the bind in Initialize). Whole function is fork-added.
 void URedwoodClientGameSubsystem::HandleOnRealmAuthFailed(FString Message) {
   OnRealmAuthFailed.Broadcast(Message);
-}
-
-// FORK(hollowed-oath): character friends.
-void URedwoodClientGameSubsystem::HandleOnCharacterFriendAlert(
-  const FRedwoodCharacterFriendAlert &Alert
-) {
-  OnCharacterFriendAlert.Broadcast(Alert);
 }
 
 void URedwoodClientGameSubsystem::HandleOnPartyInvited(

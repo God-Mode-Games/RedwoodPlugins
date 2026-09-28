@@ -57,10 +57,6 @@ public:
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodConnectionAuthFailedDynamicDelegate OnRealmAuthFailed;
 
-  // FORK(hollowed-oath): relays the client interface event of the same name.
-  UPROPERTY(BlueprintAssignable, Category = "Redwood")
-  FRedwoodCharacterFriendAlertDynamicDelegate OnCharacterFriendAlert;
-
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodPartyInvitedDynamicDelegate OnPartyInvited;
 
@@ -456,10 +452,6 @@ private:
 
   UFUNCTION()
   void HandleRequestToJoinServer(FString ConsoleCommand);
-
-  // FORK(hollowed-oath): character friends.
-  UFUNCTION()
-  void HandleOnCharacterFriendAlert(const FRedwoodCharacterFriendAlert &Alert);
 
   UFUNCTION()
   void HandleOnPartyInvited(FRedwoodPartyInvite Invite);
