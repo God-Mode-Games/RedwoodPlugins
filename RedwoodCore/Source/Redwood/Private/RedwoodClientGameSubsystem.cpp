@@ -18,39 +18,39 @@
 #include "LatencyCheckerLibrary.h"
 #include "SocketIOClient.h"
 
-// FORK(hollowed-oath): this text is the shared error for the null
-// ClientInterface guards on the social functions below (#2445).
-//
-// Initialize() builds ClientInterface only when ShouldUseBackend() is true.
-// Each function tests ShouldUseBackend() again at call time. In the editor that
-// function reads bUseBackendInPIE, and a user can change that setting while PIE
-// runs. A PIE session that starts with the backend off has no interface. It
-// takes the backend branch as soon as the setting turns on, and before these
-// guards the branch read through a null pointer.
-//
-// Only that PIE toggle reaches the null pointer. A packaged client always gets
-// true from ShouldUseBackend(). Every game instance sets its world before
-// Init(), and nothing clears the pointer later, so a packaged client always has
-// the interface.
-//
-// GetPlayerId() has always tested the pointer. These guards make the social
-// functions do the same test.
-//
-// The wording follows the "Not connected to Director." errors in
-// RedwoodClientInterface, because this error reaches the player through the
-// same output structs. The guards do not reuse the "without using a backend"
-// text of the else branches below, because that text names a different cause.
-// An else branch runs when the backend is off. A guard runs when the backend is
-// on but the interface is missing.
-//
-// Only the social functions have a guard. That was the scope of #2445. The
-// other functions in this file have the same fault, and some of their else
-// branches report success instead of an error, so this guard shape does not fit
-// them. See #2450.
+// FORK(hollowed-oath): #2445. In PIE, bUseBackendInPIE can turn on after
+// Initialize() skipped the client interface, so the social calls answer this
+// error on their backend branch instead of reading a null pointer.
 namespace {
 
 const TCHAR *const RedwoodNoClientInterfaceError =
   TEXT("Not connected to the backend.");
+
+// True when the call was answered because there is no client interface.
+template <typename TOutput>
+bool AnswerNoClientInterface(
+  const URedwoodClientInterface *ClientInterface,
+  const TDelegate<void(const TOutput &)> &OnOutput
+) {
+  if (ClientInterface) {
+    return false;
+  }
+  TOutput Output;
+  Output.Error = RedwoodNoClientInterfaceError;
+  OnOutput.ExecuteIfBound(Output);
+  return true;
+}
+
+bool AnswerNoClientInterface(
+  const URedwoodClientInterface *ClientInterface,
+  const FRedwoodErrorOutputDelegate &OnOutput
+) {
+  if (ClientInterface) {
+    return false;
+  }
+  OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
+  return true;
+}
 
 } // namespace
 
@@ -291,14 +291,7 @@ void URedwoodClientGameSubsystem::SearchForPlayers(
   FRedwoodListPlayersOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): the file header explains this guard (#2445).
-    if (!ClientInterface) {
-      FRedwoodListPlayersOutput Output;
-      Output.Error = RedwoodNoClientInterfaceError;
-      OnOutput.ExecuteIfBound(Output);
-      return;
-    }
-
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
     ClientInterface->SearchForPlayers(
       UsernameOrNickname, bIncludePartialMatches, OnOutput
     );
@@ -313,14 +306,7 @@ void URedwoodClientGameSubsystem::SearchForPlayerById(
   FString TargetPlayerId, FRedwoodPlayerOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): the file header explains this guard (#2445).
-    if (!ClientInterface) {
-      FRedwoodPlayerOutput Output;
-      Output.Error = RedwoodNoClientInterfaceError;
-      OnOutput.ExecuteIfBound(Output);
-      return;
-    }
-
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
     ClientInterface->SearchForPlayerById(TargetPlayerId, OnOutput);
   } else {
     FRedwoodPlayerOutput Output;
@@ -333,14 +319,7 @@ void URedwoodClientGameSubsystem::ListFriends(
   ERedwoodFriendListType Filter, FRedwoodListPlayersOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): the file header explains this guard (#2445).
-    if (!ClientInterface) {
-      FRedwoodListPlayersOutput Output;
-      Output.Error = RedwoodNoClientInterfaceError;
-      OnOutput.ExecuteIfBound(Output);
-      return;
-    }
-
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
     ClientInterface->ListFriends(Filter, OnOutput);
   } else {
     FRedwoodListPlayersOutput Output;
@@ -353,12 +332,7 @@ void URedwoodClientGameSubsystem::RequestFriend(
   FString OtherPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): the file header explains this guard (#2445).
-    if (!ClientInterface) {
-      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
-      return;
-    }
-
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
     ClientInterface->RequestFriend(OtherPlayerId, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(TEXT("Cannot request friend without using a backend"
@@ -370,12 +344,7 @@ void URedwoodClientGameSubsystem::RemoveFriend(
   FString OtherPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): the file header explains this guard (#2445).
-    if (!ClientInterface) {
-      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
-      return;
-    }
-
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
     ClientInterface->RemoveFriend(OtherPlayerId, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(TEXT("Cannot remove friend without using a backend")
@@ -387,12 +356,7 @@ void URedwoodClientGameSubsystem::RespondToFriendRequest(
   FString OtherPlayerId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): the file header explains this guard (#2445).
-    if (!ClientInterface) {
-      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
-      return;
-    }
-
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
     ClientInterface->RespondToFriendRequest(OtherPlayerId, bAccept, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(
@@ -405,12 +369,7 @@ void URedwoodClientGameSubsystem::SetPlayerBlocked(
   FString OtherPlayerId, bool bBlocked, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): the file header explains this guard (#2445).
-    if (!ClientInterface) {
-      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
-      return;
-    }
-
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
     ClientInterface->SetPlayerBlocked(OtherPlayerId, bBlocked, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(TEXT("Cannot block players without using a backend")
@@ -422,14 +381,7 @@ void URedwoodClientGameSubsystem::ListRealmContacts(
   FRedwoodListRealmContactsOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): the file header explains this guard (#2445).
-    if (!ClientInterface) {
-      FRedwoodListRealmContactsOutput Output;
-      Output.Error = RedwoodNoClientInterfaceError;
-      OnOutput.ExecuteIfBound(Output);
-      return;
-    }
-
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
     ClientInterface->ListRealmContacts(OnOutput);
   } else {
     FRedwoodListRealmContactsOutput Output;
@@ -442,12 +394,7 @@ void URedwoodClientGameSubsystem::AddRealmContact(
   FString OtherCharacterId, bool bBlocked, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): the file header explains this guard (#2445).
-    if (!ClientInterface) {
-      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
-      return;
-    }
-
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
     ClientInterface->AddRealmContact(OtherCharacterId, bBlocked, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(
@@ -460,12 +407,7 @@ void URedwoodClientGameSubsystem::RemoveRealmContact(
   FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    // FORK(hollowed-oath): the file header explains this guard (#2445).
-    if (!ClientInterface) {
-      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
-      return;
-    }
-
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
     ClientInterface->RemoveRealmContact(OtherCharacterId, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(
@@ -481,13 +423,9 @@ void URedwoodClientGameSubsystem::ListCharacterFriends(
   FRedwoodListCharacterFriendsOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (!ClientInterface) {
-      FRedwoodListCharacterFriendsOutput Output;
-      Output.Error = RedwoodNoClientInterfaceError;
-      OnOutput.ExecuteIfBound(Output);
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) {
       return;
     }
-
     ClientInterface->ListCharacterFriends(OnOutput);
   } else {
     FRedwoodListCharacterFriendsOutput Output;
@@ -501,11 +439,9 @@ void URedwoodClientGameSubsystem::RequestCharacterFriend(
   FString TargetCharacterId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (!ClientInterface) {
-      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) {
       return;
     }
-
     ClientInterface->RequestCharacterFriend(TargetCharacterId, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(
@@ -518,11 +454,9 @@ void URedwoodClientGameSubsystem::RespondToCharacterFriendRequest(
   FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (!ClientInterface) {
-      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) {
       return;
     }
-
     ClientInterface->RespondToCharacterFriendRequest(
       OtherCharacterId, bAccept, OnOutput
     );
@@ -537,11 +471,9 @@ void URedwoodClientGameSubsystem::RemoveCharacterFriend(
   FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (!ClientInterface) {
-      OnOutput.ExecuteIfBound(RedwoodNoClientInterfaceError);
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) {
       return;
     }
-
     ClientInterface->RemoveCharacterFriend(OtherCharacterId, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(
