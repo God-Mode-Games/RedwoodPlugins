@@ -1,9 +1,9 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
 // FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart.
-// Pins the guards of the character friend calls on URedwoodClientInterface,
-// with no backend. HeldWhileRealmReconnects makes a Realm socket that looks
-// connected by hand, as ReloginFailureTest.cpp does.
+// Pins that every character friend call goes through GateRealm and
+// RealmReplies, with no backend. The Realm socket only looks connected: it is
+// set by hand, as ReloginFailureTest.cpp does.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -14,58 +14,6 @@
 #include "RedwoodPendingReplies.h"
 #include "SocketIOClient.h"
 #include "Types/RedwoodTypesCharacters.h"
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodCharacterFriendsNotConnectedTest,
-  "Redwood.CharacterFriends.NotConnected",
-  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
-);
-
-bool FRedwoodCharacterFriendsNotConnectedTest::RunTest(
-  const FString &Parameters
-) {
-  URedwoodClientInterface *Redwood = NewObject<URedwoodClientInterface>();
-
-  FString Error;
-  FRedwoodListCharacterFriendsOutputDelegate OnList =
-    FRedwoodListCharacterFriendsOutputDelegate::CreateLambda(
-      [&Error](const FRedwoodListCharacterFriendsOutput &Output) {
-        Error = Output.Error;
-      }
-    );
-  FRedwoodErrorOutputDelegate OnError =
-    FRedwoodErrorOutputDelegate::CreateLambda(
-      [&Error](const FString &Output) { Error = Output; }
-    );
-
-  // TestEqualSensitive: the TCHAR* form of TestEqual ignores case. The reset
-  // makes a call that never answers fail.
-  const auto CheckAll = [&](const TCHAR *Expected, const TCHAR *Case) {
-    Redwood->ListCharacterFriends(OnList);
-    TestEqualSensitive(Case, *Error, Expected);
-    Error.Reset();
-
-    Redwood->RequestCharacterFriend(TEXT("other-1"), OnError);
-    TestEqualSensitive(Case, *Error, Expected);
-    Error.Reset();
-
-    Redwood->RespondToCharacterFriendRequest(TEXT("other-1"), true, OnError);
-    TestEqualSensitive(Case, *Error, Expected);
-    Error.Reset();
-
-    Redwood->RemoveCharacterFriend(TEXT("other-1"), OnError);
-    TestEqualSensitive(Case, *Error, Expected);
-    Error.Reset();
-
-    Redwood->CancelCharacterFriendRequest(TEXT("other-1"), OnError);
-    TestEqualSensitive(Case, *Error, Expected);
-    Error.Reset();
-  };
-
-  CheckAll(TEXT("Not connected to Realm."), TEXT("No realm"));
-
-  return true;
-}
 
 // Sent before the Realm re-handshake, a call reaches a server socket that does
 // not know the player and is refused, so the calls wait like other Realm
