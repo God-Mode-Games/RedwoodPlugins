@@ -267,6 +267,13 @@ namespace {
     Ids.Add(Id);
     return true;
   }
+
+  // A Redis resend repeats the messageId; a notice with none is never a repeat.
+  bool IsRepeatedNotice(TArray<FString> &RecentIds, const FJsonObject &Message) {
+    FString MessageId;
+    Message.TryGetStringField(TEXT("messageId"), MessageId);
+    return !MessageId.IsEmpty() && !RememberRecentId(RecentIds, MessageId);
+  }
 }
 
 // The same notice can come again: a Redis resend (same messageId), or a
@@ -277,14 +284,11 @@ void URedwoodClientInterface::HandlePartyQueued(
   if (!Message.IsValid()) {
     return;
   }
-  FString MessageId;
   FString CharacterId;
   FString TicketId;
-  Message->TryGetStringField(TEXT("messageId"), MessageId);
   Message->TryGetStringField(TEXT("characterId"), CharacterId);
   Message->TryGetStringField(TEXT("ticketId"), TicketId);
-  if ((!MessageId.IsEmpty() &&
-       !RememberRecentId(RecentPartyTicketMessageIds, MessageId)) ||
+  if (IsRepeatedNotice(RecentPartyTicketMessageIds, *Message) ||
       TicketId.IsEmpty() || CharacterId.IsEmpty()) {
     return;
   }
@@ -344,12 +348,9 @@ void URedwoodClientInterface::HandlePartyLeft(
   if (!Message.IsValid()) {
     return;
   }
-  FString MessageId;
   FString TicketId;
-  Message->TryGetStringField(TEXT("messageId"), MessageId);
   Message->TryGetStringField(TEXT("ticketId"), TicketId);
-  if ((!MessageId.IsEmpty() &&
-       !RememberRecentId(RecentPartyTicketMessageIds, MessageId)) ||
+  if (IsRepeatedNotice(RecentPartyTicketMessageIds, *Message) ||
       TicketId.IsEmpty()) {
     return;
   }
@@ -3725,9 +3726,8 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
   }
   SelectedCharacterId = CharacterId;
   if (!PendingPartyTicketId.IsEmpty() && PendingPartyCharacterId == CharacterId) {
-    const FString PendingTicketId = MoveTemp(PendingPartyTicketId);
+    AcceptPartyTicket(PendingPartyTicketId);
     PendingPartyTicketId.Reset();
-    AcceptPartyTicket(PendingTicketId);
   }
 
   if (!CurrentParty.bValid || !Realm.IsValid() || !Realm->bIsConnected) {
