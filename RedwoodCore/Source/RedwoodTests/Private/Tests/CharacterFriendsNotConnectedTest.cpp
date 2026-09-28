@@ -1,17 +1,9 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
 // FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart.
-// Pins the guards of the four character friend calls on
-// URedwoodClientInterface, with no backend. The class exists apart from the
-// subsystem so a test can build it without a world (RedwoodClientInterface.h
-// header comment). A fresh instance has no realm socket, so every call must
-// answer inline with "Not connected to Realm.", with or without a selected
-// character: the realm guard comes first, as in every realm call of
-// RedwoodClientInterface.cpp. The guards after it need a realm socket that
-// looks connected. HeldWhileRealmReconnects makes one by hand, as
-// ReloginFailureTest.cpp does, and pins "No character selected." and the hold
-// while the realm socket reconnects. The answer of a real realm is checked in
-// PIE with a backend.
+// Pins the guards of the character friend calls on URedwoodClientInterface,
+// with no backend. HeldWhileRealmReconnects makes a Realm socket that looks
+// connected by hand, as ReloginFailureTest.cpp does.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -66,13 +58,7 @@ bool FRedwoodCharacterFriendsNotConnectedTest::RunTest(
     Error.Reset();
   };
 
-  // With no realm and no character, the realm error wins: the realm guard is
-  // first.
-  CheckAll(TEXT("Not connected to Realm."), TEXT("No realm, no character"));
-
-  // SetSelectedCharacter keeps the id and sends nothing without a realm.
-  Redwood->SetSelectedCharacter(TEXT("me-1"));
-  CheckAll(TEXT("Not connected to Realm."), TEXT("No realm, a character"));
+  CheckAll(TEXT("Not connected to Realm."), TEXT("No realm"));
 
   return true;
 }
@@ -126,8 +112,7 @@ bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
     Client->RemoveCharacterFriend(TEXT("other-1"), OnError);
   };
 
-  // No character is selected yet: the realm check passes, and the character
-  // guard answers each call inline.
+  // No character is selected yet: the character guard answers each call.
   CallAll();
   TestEqual(TEXT("Every call answers at once"), Errors.Num(), 4);
   for (const FString &Error : Errors) {

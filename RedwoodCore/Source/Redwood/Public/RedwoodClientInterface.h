@@ -152,12 +152,8 @@ public:
     FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
   );
 
-  // FORK(hollowed-oath) BEGIN: character friend calls. Fork-added; upstream has
-  // no friendship between characters. Each call names the selected character
-  // and goes to the fork-added "realm:contacts:friends:*" routes of the
-  // RedwoodBackend fork; the list reads the fork fields of the upstream
-  // "realm:contacts:list" answer. A call with no realm, or with no selected
-  // character, answers inline with an error (the realm check first).
+  // FORK(hollowed-oath) BEGIN: character friend calls. Upstream has no
+  // friendship between characters; the routes live in the RedwoodBackend fork.
   void ListCharacterFriends(FRedwoodListCharacterFriendsOutputDelegate OnOutput
   );
 
@@ -496,24 +492,14 @@ private:
   );
   void BindRealmEvents();
 
-  // FORK(hollowed-oath): shared guard and body of the character friend calls
-  // above. PrepareCharacterFriendCall gives the inline error ("Not connected
-  // to Realm." or "No character selected."), or, when the call can go out,
-  // adds playerId and characterId to Payload and gives an empty string.
-  // EmitCharacterFriendCommand and ListCharacterFriends go through GateRealm
-  // first: while the Realm socket of a logged-in player reconnects, the call
-  // is held and sent after the re-handshake, or answers "Not connected to
-  // Realm." when the grace ends or the re-handshake fails. Deinitialize drops
-  // a held call with no answer. Otherwise EmitCharacterFriendCommand answers
-  // once with one of: the inline error; the error string of the realm (empty
-  // for a success); or URedwoodCommonGameSubsystem::BadRealmAnswerError when
-  // the answer cannot be read or has no error field.
-  FString PrepareCharacterFriendCall(const TSharedPtr<FJsonObject> &Payload
-  ) const;
-  void EmitCharacterFriendCommand(
+  // FORK(hollowed-oath): the one path of the character friend calls: gated
+  // like every Realm request, and needs a selected character.
+  template <typename TOutput>
+  void EmitCharacterFriendCall(
     const FString &EventName,
     TSharedPtr<FJsonObject> Payload,
-    FRedwoodErrorOutputDelegate OnOutput
+    TOutput (*ParseAnswer)(const TArray<TSharedPtr<FJsonValue>> &),
+    const TDelegate<void(const TOutput &)> &OnOutput
   );
   void FinalizeRealmHandshake(
     FString Token, FRedwoodSocketConnectedDelegate OnRealmConnected

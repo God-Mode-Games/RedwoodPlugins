@@ -1659,60 +1659,51 @@ void URedwoodClientInterface::RemoveRealmContact(
   );
 }
 
-// FORK(hollowed-oath) BEGIN: character friend calls. The realm check comes
-// first, as in every other realm call in this file; the character check
-// comes after it.
-FString URedwoodClientInterface::PrepareCharacterFriendCall(
-  const TSharedPtr<FJsonObject> &Payload
-) const {
-  if (!Realm.IsValid() || !Realm->bIsConnected) {
-    return TEXT("Not connected to Realm.");
+// FORK(hollowed-oath) BEGIN: character friend calls.
+namespace {
+  // A reply with no error field is not a success: it is a bad answer.
+  FString ParseCharacterFriendCommandAnswer(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  ) {
+    const TSharedPtr<FJsonObject> *MessageObject =
+      URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+    FString Error;
+    if (MessageObject == nullptr ||
+        !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+      return URedwoodCommonGameSubsystem::BadRealmAnswerError;
+    }
+    return Error;
   }
-  if (SelectedCharacterId.IsEmpty()) {
-    return TEXT("No character selected.");
-  }
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
-  return FString();
 }
 
-// The answer is read through TryGetRedwoodAnswerObject, not
-// Response[0]->AsObject(): a missing, null or malformed answer, or one with no
-// error field, must not read as a success. The error is the one
-// ParseListCharacterFriends gives for a bad answer (BadRealmAnswerError).
-void URedwoodClientInterface::EmitCharacterFriendCommand(
+template <typename TOutput>
+void URedwoodClientInterface::EmitCharacterFriendCall(
   const FString &EventName,
   TSharedPtr<FJsonObject> Payload,
-  FRedwoodErrorOutputDelegate OnOutput
+  TOutput (*ParseAnswer)(const TArray<TSharedPtr<FJsonValue>> &),
+  const TDelegate<void(const TOutput &)> &OnOutput
 ) {
-  // FORK(hollowed-oath): character friends. Held while the Realm socket
-  // reconnects, like the other Realm requests; see GateRealm. This gate is
-  // ours, not part of the HollowedOath#2854 work, so it stays if that goes.
   if (GateRealm([=, this]() {
-        EmitCharacterFriendCommand(EventName, Payload, OnOutput);
+        EmitCharacterFriendCall(EventName, Payload, ParseAnswer, OnOutput);
       }, OnOutput)) {
     return;
   }
 
-  const FString GuardError = PrepareCharacterFriendCall(Payload);
-  if (!GuardError.IsEmpty()) {
-    OnOutput.ExecuteIfBound(GuardError);
+  if (SelectedCharacterId.IsEmpty()) {
+    TOutput Output;
+    SetRedwoodGateError(Output, TEXT("No character selected."));
+    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
-  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  // HollowedOath#2886. See TrackReply.
   Realm->Emit(
     EventName,
     Payload,
-    TrackReply(RealmReplies, [OnOutput](auto Response) {
-      const TSharedPtr<FJsonObject> *MessageObject =
-        URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
-      FString Error;
-      if (MessageObject == nullptr ||
-          !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
-        Error = URedwoodCommonGameSubsystem::BadRealmAnswerError;
-      }
-      OnOutput.ExecuteIfBound(Error);
+    TrackReply(RealmReplies, [ParseAnswer, OnOutput](auto Response) {
+      OnOutput.ExecuteIfBound(ParseAnswer(Response));
     }, OnOutput)
   );
 }
@@ -1720,31 +1711,11 @@ void URedwoodClientInterface::EmitCharacterFriendCommand(
 void URedwoodClientInterface::ListCharacterFriends(
   FRedwoodListCharacterFriendsOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): character friends. See EmitCharacterFriendCommand.
-  if (GateRealm([=, this]() {
-        ListCharacterFriends(OnOutput);
-      }, OnOutput)) {
-    return;
-  }
-
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  const FString GuardError = PrepareCharacterFriendCall(Payload);
-  if (!GuardError.IsEmpty()) {
-    FRedwoodListCharacterFriendsOutput Output;
-    Output.Error = GuardError;
-    OnOutput.ExecuteIfBound(Output);
-    return;
-  }
-
-  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
-  Realm->Emit(
+  EmitCharacterFriendCall(
     TEXT("realm:contacts:list"),
-    Payload,
-    TrackReply(RealmReplies, [OnOutput](auto Response) {
-      OnOutput.ExecuteIfBound(
-        URedwoodCommonGameSubsystem::ParseListCharacterFriends(Response)
-      );
-    }, OnOutput)
+    MakeShared<FJsonObject>(),
+    &URedwoodCommonGameSubsystem::ParseListCharacterFriends,
+    OnOutput
   );
 }
 
@@ -1753,8 +1724,11 @@ void URedwoodClientInterface::RequestCharacterFriend(
 ) {
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("targetCharacterId"), TargetCharacterId);
-  EmitCharacterFriendCommand(
-    TEXT("realm:contacts:friends:request"), Payload, OnOutput
+  EmitCharacterFriendCall(
+    TEXT("realm:contacts:friends:request"),
+    Payload,
+    &ParseCharacterFriendCommandAnswer,
+    OnOutput
   );
 }
 
@@ -1764,8 +1738,11 @@ void URedwoodClientInterface::RespondToCharacterFriendRequest(
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
   Payload->SetBoolField(TEXT("accept"), bAccept);
-  EmitCharacterFriendCommand(
-    TEXT("realm:contacts:friends:respond"), Payload, OnOutput
+  EmitCharacterFriendCall(
+    TEXT("realm:contacts:friends:respond"),
+    Payload,
+    &ParseCharacterFriendCommandAnswer,
+    OnOutput
   );
 }
 
@@ -1774,8 +1751,11 @@ void URedwoodClientInterface::RemoveCharacterFriend(
 ) {
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
-  EmitCharacterFriendCommand(
-    TEXT("realm:contacts:friends:remove"), Payload, OnOutput
+  EmitCharacterFriendCall(
+    TEXT("realm:contacts:friends:remove"),
+    Payload,
+    &ParseCharacterFriendCommandAnswer,
+    OnOutput
   );
 }
 // FORK(hollowed-oath) END
