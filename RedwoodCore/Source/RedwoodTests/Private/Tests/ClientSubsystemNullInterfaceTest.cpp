@@ -216,9 +216,8 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// The director listeners broadcast the friend delegates of the client
-// interface. The game binds the events of the same name on the subsystem, so
-// each interface broadcast must reach the subsystem event once.
+// The game binds the subsystem event, so each broadcast of the client
+// interface delegate must reach it once.
 bool FRedwoodClientSubsystemFriendRelayTest::RunTest(
   const FString &Parameters
 ) {
@@ -251,9 +250,6 @@ bool FRedwoodClientSubsystemFriendRelayTest::RunTest(
   Subsystem->OnCharacterFriendAlert.AddDynamic(
     Probe, &URedwoodFriendRelayProbe::HandleCharacterFriendAlert
   );
-  Subsystem->OnFriendRequestReceived.AddDynamic(
-    Probe, &URedwoodFriendRelayProbe::HandleFriendRequestReceived
-  );
 
   FRedwoodCharacterFriendAlert Alert;
   Alert.Type = ERedwoodCharacterFriendAlertType::Online;
@@ -281,19 +277,6 @@ bool FRedwoodClientSubsystemFriendRelayTest::RunTest(
     TEXT("Same name"), Relayed.OtherCharacterName, Alert.OtherCharacterName
   );
   TestEqual(TEXT("Same zone"), Relayed.ZoneName, Alert.ZoneName);
-
-  FRedwoodPlayer Requester;
-  Requester.PlayerId = TEXT("player-1");
-  ClientInterface->OnFriendRequestReceived.Broadcast(Requester);
-
-  TestEqual(
-    TEXT("The friend request reached the subsystem once"),
-    Probe->FriendRequestCount,
-    1
-  );
-  TestEqual(
-    TEXT("Same requester"), Probe->LastRequesterId, Requester.PlayerId
-  );
 
   return true;
 }

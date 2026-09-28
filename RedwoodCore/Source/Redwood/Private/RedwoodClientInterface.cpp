@@ -345,48 +345,9 @@ void URedwoodClientInterface::InitializeDirectorConnection(
     ESIOThreadOverrideOption::USE_GAME_THREAD
   );
 
-  // FORK(hollowed-oath) BEGIN: listen for the fork-added friend request push. The director
-  // sends it to the player who gets the request. Upstream has no such push, so the game had to
-  // ask for the friend list again to see a new request.
-  //
-  // A push that is not an object gives an empty object, because FJsonValue::AsObject returns a
-  // shared empty object and writes to LogJson. The socket layer gives a null value for a null
-  // message, and a null value logs a warning; any other value that is not an object logs an
-  // error. Such a push has no sender, and so does a push in which the director renamed the
-  // fields. The game cannot answer a request with no sender, so it is dropped. The drop is
-  // logged, because without a log line a change to the names of the fields would stop this
-  // feature with no symptom at all.
-  Director->OnEvent(
-    TEXT("director:friends:request-alert"),
-    [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
-      TSharedPtr<FJsonObject> MessageObject = Message->AsObject();
-      FRedwoodPlayer Requester =
-        URedwoodCommonGameSubsystem::ParseFriendRequestAlert(MessageObject);
-
-      if (Requester.PlayerId.IsEmpty()) {
-        UE_LOG(
-          LogRedwood,
-          Warning,
-          TEXT(
-            "Dropped a director:friends:request-alert that names no sender. The director and the game may no longer agree on the names of the fields in this message."
-          )
-        );
-        return;
-      }
-
-      OnFriendRequestReceived.Broadcast(Requester);
-    },
-    TEXT("/"),
-    ESIOThreadOverrideOption::USE_GAME_THREAD
-  );
-  // FORK(hollowed-oath) END
-
-  // FORK(hollowed-oath) BEGIN: listen for the fork-added character friend
-  // push. The director sends it to the player who owns the character it names.
-  // The parser takes the event value as it comes and refuses a value that is
-  // not an object, an unknown type and a push with no character ids. Such a
-  // push is dropped and logged, for the reason given on the request-alert
-  // listener above.
+  // FORK(hollowed-oath) BEGIN: the character friend push. A refused push is
+  // logged, so a field the director renames does not stop the feature with no
+  // symptom.
   Director->OnEvent(
     TEXT("director:friends:character-alert"),
     [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {

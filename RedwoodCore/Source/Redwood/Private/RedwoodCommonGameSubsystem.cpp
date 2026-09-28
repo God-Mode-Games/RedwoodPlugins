@@ -1341,38 +1341,6 @@ TArray<FRedwoodPartyInvite> URedwoodCommonGameSubsystem::ParsePartyInvites(
   return PartyInvites;
 }
 
-// FORK(hollowed-oath) BEGIN: parser for the fork-added "director:friends:request-alert" push.
-// The push tells a player that another player asked to be a friend, so the game can show the
-// request immediately instead of asking the backend for the friend list again. The result is an
-// FRedwoodPlayer, so the game can keep one list of pending requests fed by both the push and
-// ListFriends(PendingReceived).
-//
-// A pushed row holds less than a listed row. This fills PlayerId, Nickname and
-// FriendshipState only. bOnline, bPlaying and OnlineStateRealm keep their default values,
-// because the push carries no onlineState object; ListFriends fills those three fields from
-// it. Do not read presence from a pushed row: the sender is online at that moment, but a
-// pushed row says offline and not playing. Ask for the list again to show presence.
-//
-// The push also has no field that says the request is a received one, so this sets that
-// state. The nickname is optional: a player can have none, and an older backend does not
-// send the field at all.
-FRedwoodPlayer URedwoodCommonGameSubsystem::ParseFriendRequestAlert(
-  const TSharedPtr<FJsonObject> &AlertObject
-) {
-  FRedwoodPlayer Requester;
-  Requester.FriendshipState = ERedwoodFriendListType::PendingReceived;
-
-  if (AlertObject.IsValid()) {
-    AlertObject->TryGetStringField(TEXT("fromPlayerId"), Requester.PlayerId);
-    AlertObject->TryGetStringField(
-      TEXT("fromPlayerNickname"), Requester.Nickname
-    );
-  }
-
-  return Requester;
-}
-// FORK(hollowed-oath) END
-
 // FORK(hollowed-oath) BEGIN: read the answer object out of a socket
 // argument array. Moved here from RedwoodServerGameSubsystem.cpp, where the
 // fork first added it, so that the client parsers use the same rule.

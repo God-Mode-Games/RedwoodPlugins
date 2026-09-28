@@ -89,12 +89,6 @@ void URedwoodClientGameSubsystem::Initialize(
     ClientInterface->OnRealmAuthFailed.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleOnRealmAuthFailed
     );
-    // FORK(hollowed-oath): subscribe the fork-added friend request delegate. Merge must keep
-    // this bind paired with the UPROPERTY delegate and the UFUNCTION handler in
-    // RedwoodClientGameSubsystem.h.
-    ClientInterface->OnFriendRequestReceived.AddDynamic(
-      this, &URedwoodClientGameSubsystem::HandleOnFriendRequestReceived
-    );
     // FORK(hollowed-oath): subscribe the fork-added character friend delegate.
     // Merge must keep this bind paired with the UPROPERTY delegate and the
     // UFUNCTION handler in RedwoodClientGameSubsystem.h.
@@ -1481,14 +1475,6 @@ void URedwoodClientGameSubsystem::HandleOnRealmConnectionLost() {
 // (see the bind in Initialize). Whole function is fork-added.
 void URedwoodClientGameSubsystem::HandleOnRealmAuthFailed(FString Message) {
   OnRealmAuthFailed.Broadcast(Message);
-}
-
-// FORK(hollowed-oath): re-broadcast handler for the fork-added OnFriendRequestReceived
-// delegate (see the bind in Initialize). Whole function is fork-added.
-void URedwoodClientGameSubsystem::HandleOnFriendRequestReceived(
-  FRedwoodPlayer Requester
-) {
-  OnFriendRequestReceived.Broadcast(Requester);
 }
 
 // FORK(hollowed-oath): re-broadcast handler for the fork-added
