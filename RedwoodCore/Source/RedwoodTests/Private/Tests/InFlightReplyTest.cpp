@@ -1205,6 +1205,32 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
+  // The server replays the kept "queued" at the realm join, before the
+  // relaunched member selects a character. Pins: PendingPartyTicketId.
+  bool RunPartyQueuedBeforeCharacterSelect(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenWithRealmEvents(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::bAssignmentExpected(C) = false;
+    FAccess::SelectedCharacterId(C).Reset();
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    C.SetSelectedCharacter(TEXT("character-2"));
+    Test.TestFalse(
+      TEXT("Another character does not take the held notice"),
+      FAccess::bAssignmentExpected(C)
+    );
+    C.SetSelectedCharacter(TEXT(""));
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-2"), TEXT("m-2")));
+    C.SetSelectedCharacter(TEXT("character-1"));
+    Test.TestTrue(
+      TEXT("Selecting the notice's character moves the member with the party"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-2"))
+    );
+    return true;
+  }
+
   // The player's own join replaces a party notice: a solo assignment has no
   // ticket, and a leader's names a ticket it was never told of. Pins: the
   // reset in NoteJoinSent.
@@ -1368,11 +1394,19 @@ namespace RedwoodInFlightTest {
       TEXT("The old ticket's leave is still owed"), FAccess::bLeaveTicketingOwed(C)
     );
     SendEvent(Test, Harness, PartyQueued(TEXT("character-2"), TEXT("ticket-1"), TEXT("m-1")));
-    // The member's leave does not end the leader's ticket, and it waits
-    // while the party's join is out. Pins: HandlePartyQueued keeps it.
+    // The member's leave does not end the leader's ticket, so it goes at
+    // once: the party's travel would erase it, and the old ticket could then
+    // move the player in the world. Pins: AcceptPartyTicket keeps it and
+    // SendOwedLeave does not wait for a party join.
     Test.TestTrue(
       TEXT("The party notice keeps the old ticket's owed leave"),
       FAccess::bLeaveTicketingOwed(C)
+    );
+    FString Request;
+    Test.TestTrue(
+      TEXT("The party notice sends the owed leave"),
+      Harness.Server->ReadClientText(Request) &&
+        Request.Contains(TEXT("realm:ticketing:leave"))
     );
     Test.TestTrue(
       TEXT("After a character switch, the party's assignment for the new character moves the member"),
@@ -2175,6 +2209,11 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightOtherTicketTest,
   "OtherTicketAssignmentRefused",
   RedwoodInFlightTest::RunOtherTicketAssignmentRefused(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyQueuedBeforeSelectTest,
+  "PartyQueuedBeforeCharacterSelect",
+  RedwoodInFlightTest::RunPartyQueuedBeforeCharacterSelect(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightOwnJoinAfterPartyNoticeTest,

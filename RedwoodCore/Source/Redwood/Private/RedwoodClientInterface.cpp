@@ -287,20 +287,38 @@ void URedwoodClientInterface::HandlePartyQueued(
       !RememberRecentPartyTicketId(RecentPartyTicketMessageIds, MessageId)) {
     return;
   }
-  // A repeat of the accepted ticket must not undo a leave the game made
-  // since (bAbandonedQueueJoin). A ticket that ended gets no assignment.
-  if (TicketId.IsEmpty() || SelectedCharacterId.IsEmpty() ||
-      CharacterId != SelectedCharacterId || TicketId == AcceptedPartyTicketId ||
+  if (TicketId.IsEmpty() || CharacterId.IsEmpty() ||
+      EndedPartyTicketIds.Contains(TicketId)) {
+    return;
+  }
+  if (SelectedCharacterId.IsEmpty()) {
+    PendingPartyTicketId = TicketId;
+    PendingPartyCharacterId = CharacterId;
+    return;
+  }
+  if (CharacterId == SelectedCharacterId) {
+    AcceptPartyTicket(TicketId);
+  }
+}
+
+// A repeat of the accepted ticket must not undo a leave the game made since
+// (bAbandonedQueueJoin). A ticket that ended gets no assignment.
+void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
+  if (TicketId == AcceptedPartyTicketId ||
       EndedPartyTicketIds.Contains(TicketId)) {
     return;
   }
   // As NoteJoinSent, but an owed leave stays: this member's own old ticket
-  // still needs it, and the member's leave does not end the leader's ticket.
-  // The leave waits while this join is out (SendOwedLeave).
+  // still needs it. The member's leave does not end the leader's ticket, so
+  // it goes now: otherwise the party's travel would erase it, and the old
+  // ticket's assignment could move the player in the world.
   ++JoinSequence;
   bAssignmentExpected = true;
   bAbandonedQueueJoin = false;
   AcceptedPartyTicketId = TicketId;
+  if (IsRealmReady()) {
+    SendOwedLeave();
+  }
 }
 
 // Only the named ticket: a late "left" of an older ticket must not drop the
@@ -321,6 +339,9 @@ void URedwoodClientInterface::HandlePartyLeft(
     return;
   }
   RememberRecentPartyTicketId(EndedPartyTicketIds, TicketId);
+  if (TicketId == PendingPartyTicketId) {
+    PendingPartyTicketId.Reset();
+  }
   if (TicketId == AcceptedPartyTicketId) {
     AcceptedPartyTicketId.Reset();
     // As a ticket error: a player in the world keeps zone transfers through
@@ -331,6 +352,7 @@ void URedwoodClientInterface::HandlePartyLeft(
 
 void URedwoodClientInterface::ForgetPartyTickets() {
   AcceptedPartyTicketId.Reset();
+  PendingPartyTicketId.Reset();
   EndedPartyTicketIds.Reset();
   RecentPartyTicketMessageIds.Reset();
 }
@@ -3679,6 +3701,10 @@ void URedwoodClientInterface::SetCharacterData(
 }
 
 void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
+  // FORK(hollowed-oath): HollowedOath#3002. See PendingPartyTicketId.
+  const FString PendingTicketId =
+    PendingPartyCharacterId == CharacterId ? PendingPartyTicketId : FString();
+  PendingPartyTicketId.Reset();
   // FORK(hollowed-oath): HollowedOath#2886. A new character is at character
   // select until it joins. A dropped join was the old character's; its owed
   // leave stays, because the old ticket still needs it.
@@ -3690,6 +3716,9 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
     ForgetPartyTickets();
   }
   SelectedCharacterId = CharacterId;
+  if (!PendingTicketId.IsEmpty() && !CharacterId.IsEmpty()) {
+    AcceptPartyTicket(PendingTicketId);
+  }
 
   if (!CurrentParty.bValid || !Realm.IsValid() || !Realm->bIsConnected) {
     return;
@@ -3879,7 +3908,11 @@ void URedwoodClientInterface::NoteRealmReconnected() {
 // the Realm knows the player. The flag stays until a leave succeeds or a join
 // replaces the ticket; with a join out, the leave would cancel it.
 void URedwoodClientInterface::SendOwedLeave() {
-  if (!bLeaveTicketingOwed || bAssignmentExpected || !IsRealmConnected()) {
+  // Only this client's own join would lose its ticket to the leave; a
+  // party join is the leader's ticket (HollowedOath#3002).
+  if (!bLeaveTicketingOwed ||
+      (bAssignmentExpected && AcceptedPartyTicketId.IsEmpty()) ||
+      !IsRealmConnected()) {
     return;
   }
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);

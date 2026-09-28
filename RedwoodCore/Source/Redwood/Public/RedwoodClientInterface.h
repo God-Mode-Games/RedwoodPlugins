@@ -572,6 +572,12 @@ private:
   // server can send "queued" for one again (HollowedOath#3008, #3031).
   TArray<FString> EndedPartyTicketIds;
   TArray<FString> RecentPartyTicketMessageIds;
+  // A "queued" that came before a character was selected: the server
+  // replays it at the realm join, before character select. Selecting that
+  // character accepts it.
+  FString PendingPartyTicketId;
+  FString PendingPartyCharacterId;
+  void AcceptPartyTicket(const FString &TicketId);
   void HandlePartyQueued(const TSharedPtr<FJsonObject> &Message);
   void HandlePartyLeft(const TSharedPtr<FJsonObject> &Message);
   void ForgetPartyTickets();
