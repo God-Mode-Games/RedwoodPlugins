@@ -102,11 +102,11 @@ public:
     const TArray<TSharedPtr<FJsonValue>> &InvitesArray
   );
 
-  // FORK(hollowed-oath): the one way the fork's socket callbacks read the
-  // answer object out of the argument array. Returns null for no usable
-  // answer. Fork-added; moved here from RedwoodServerGameSubsystem.cpp so the
-  // client parsers use it too. The full reason lives under a matching FORK
-  // marker in RedwoodCommonGameSubsystem.cpp.
+  // FORK(hollowed-oath): the one way the fork reads an object out of a socket
+  // value or answer. Null when there is no usable object; see the .cpp.
+  static const TSharedPtr<FJsonObject> *TryGetRedwoodObject(
+    const TSharedPtr<FJsonValue> &Value
+  );
   static const TSharedPtr<FJsonObject> *TryGetRedwoodAnswerObject(
     const TArray<TSharedPtr<FJsonValue>> &Response
   );

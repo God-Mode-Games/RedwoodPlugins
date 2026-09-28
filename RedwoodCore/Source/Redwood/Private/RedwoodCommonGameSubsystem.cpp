@@ -1341,42 +1341,32 @@ TArray<FRedwoodPartyInvite> URedwoodCommonGameSubsystem::ParsePartyInvites(
   return PartyInvites;
 }
 
-// FORK(hollowed-oath) BEGIN: read the answer object out of a socket
-// argument array. Moved here from RedwoodServerGameSubsystem.cpp, where the
-// fork first added it, so that the client parsers use the same rule.
-// TryGetObject, not AsObject: for a value that is not an object, AsObject
-// gives back a VALID empty object, which reads as an answer with no error --
-// that is, as work that never happened. A null or malformed answer must reach
-// the caller as "no usable answer" instead. TryGetObject also says yes to an
-// object value that holds no object, so the pointer it gives is checked too:
-// every caller reads through the result.
-const TSharedPtr<FJsonObject> *
-URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(
-  const TArray<TSharedPtr<FJsonValue>> &Response
+// FORK(hollowed-oath) BEGIN: not AsObject, which turns a value that is not an
+// object into a valid empty object: a malformed answer would read as a
+// success with no error. In UE 5.8, TryGetObject also says yes to an object
+// value that holds no object, so the pointer it gives is checked too.
+const TSharedPtr<FJsonObject> *URedwoodCommonGameSubsystem::TryGetRedwoodObject(
+  const TSharedPtr<FJsonValue> &Value
 ) {
   const TSharedPtr<FJsonObject> *Object = nullptr;
-  if (Response.IsValidIndex(0) && Response[0].IsValid() &&
-      Response[0]->TryGetObject(Object) && Object->IsValid()) {
+  if (Value.IsValid() && Value->TryGetObject(Object) && Object->IsValid()) {
     return Object;
   }
   return nullptr;
 }
+
+const TSharedPtr<FJsonObject> *
+URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  return Response.IsValidIndex(0) ? TryGetRedwoodObject(Response[0]) : nullptr;
+}
 // FORK(hollowed-oath) END
 
-// FORK(hollowed-oath) BEGIN: parser for the character friend list. The
-// "realm:contacts:list" answer gets three arrays from the RedwoodBackend fork:
-// friends, incomingRequests and outgoingRequests. The upstream arrays
-// (contacts, blockedContacts) are read by ListRealmContacts, not here.
-//
-// The error field decides. An answer without one is not one of the realm's
-// answers, and it must not read as "no friends". A refused answer gives no
-// rows. A success must carry all three arrays: the backend always sends
-// them, and the game takes a good list as the full truth (it removes the
-// settings of each friend that is not in it), so a partial answer is an
-// error, not a short list. A row with no characterId or no characterName is
-// left out, because the game keys every row on the id and shows the name.
-// A row that is not an object is left out too. In UE 5.8, TryGetObject says
-// yes to an object value that holds no object, so the pointer is checked.
+// FORK(hollowed-oath) BEGIN: the character friend list. The game takes a good
+// list as the full truth, so an answer with no error field or a missing array
+// is an error, not a short list. The game keys rows on the id and shows the
+// name, so a row without both is left out.
 namespace {
 
 void ParseCharacterFriendRows(
@@ -1384,9 +1374,9 @@ void ParseCharacterFriendRows(
   TArray<FRedwoodCharacterFriend> &OutRows
 ) {
   for (const TSharedPtr<FJsonValue> &RowValue : Rows) {
-    const TSharedPtr<FJsonObject> *RowObject;
-    if (!RowValue.IsValid() || !RowValue->TryGetObject(RowObject) ||
-        !RowObject->IsValid()) {
+    const TSharedPtr<FJsonObject> *RowObject =
+      URedwoodCommonGameSubsystem::TryGetRedwoodObject(RowValue);
+    if (RowObject == nullptr) {
       continue;
     }
 
@@ -1443,27 +1433,17 @@ URedwoodCommonGameSubsystem::ParseListCharacterFriends(
 }
 // FORK(hollowed-oath) END
 
-// FORK(hollowed-oath) BEGIN: parser for the character friend alert. The push
-// tells a character that another character asked to be a friend, accepted a
-// request, ended a friendship or a request (removed), came online or went
-// offline. The type word and the two ids are required: the game selects a
-// handler by the type and keys its cache on the ids, so a push without them
-// is refused and the listener drops it. The name and the zone are optional;
-// only Online carries a zone. The output is cleared first, so a caller that
-// reuses it keeps nothing from an earlier push.
-//
-// TryGetObject, not AsObject: for a value that is not an object, AsObject
-// gives a valid empty object. A null value, a value that is not an object,
-// or an object value that holds no object is refused here.
+// FORK(hollowed-oath) BEGIN: the character friend alert. The game picks a
+// handler by the type and keys its cache on the ids, so those are required;
+// the name and the zone (Online only) are optional.
 bool URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
   const TSharedPtr<FJsonValue> &Message,
   FRedwoodCharacterFriendAlert &OutAlert
 ) {
   OutAlert = FRedwoodCharacterFriendAlert();
 
-  const TSharedPtr<FJsonObject> *AlertObjectPtr = nullptr;
-  if (!Message.IsValid() || !Message->TryGetObject(AlertObjectPtr) ||
-      !AlertObjectPtr->IsValid()) {
+  const TSharedPtr<FJsonObject> *AlertObjectPtr = TryGetRedwoodObject(Message);
+  if (AlertObjectPtr == nullptr) {
     return false;
   }
   const TSharedPtr<FJsonObject> &AlertObject = *AlertObjectPtr;

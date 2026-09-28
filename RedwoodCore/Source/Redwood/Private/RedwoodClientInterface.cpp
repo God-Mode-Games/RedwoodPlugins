@@ -358,9 +358,9 @@ void URedwoodClientInterface::InitializeDirectorConnection(
         // The type word goes in the log as sent: a refused push can have a
         // type the enum does not hold.
         FString DroppedType;
-        const TSharedPtr<FJsonObject> *DroppedObject = nullptr;
-        if (Message.IsValid() && Message->TryGetObject(DroppedObject) &&
-            DroppedObject->IsValid()) {
+        const TSharedPtr<FJsonObject> *DroppedObject =
+          URedwoodCommonGameSubsystem::TryGetRedwoodObject(Message);
+        if (DroppedObject != nullptr) {
           (*DroppedObject)->TryGetStringField(TEXT("type"), DroppedType);
         }
         UE_LOG(
