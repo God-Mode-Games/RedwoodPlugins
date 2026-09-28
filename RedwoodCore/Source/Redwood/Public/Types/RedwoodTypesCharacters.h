@@ -243,14 +243,9 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
   Data
 );
 
-// FORK(hollowed-oath) BEGIN: character friend types. Fork-added; upstream has
-// no friendship between characters. A character friendship is mutual, inside
-// one realm, and kept as two Contact rows by the RedwoodBackend fork. The
-// list comes from the fork fields of the "realm:contacts:list" answer; the
-// alert comes from the fork-added "director:friends:character-alert" push.
-// Parsed in RedwoodCommonGameSubsystem, sent and received in
-// RedwoodClientInterface, relayed to the game by RedwoodClientGameSubsystem.
-// An upstream merge must keep every name here: the game binds to them.
+// FORK(hollowed-oath) BEGIN: character friend types. Upstream has no
+// friendship between characters. A merge must keep every name here: the game
+// binds to them.
 UENUM(BlueprintType)
 enum class ERedwoodCharacterFriendAlertType : uint8 {
   Requested,

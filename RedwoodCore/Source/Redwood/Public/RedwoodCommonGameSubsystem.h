@@ -111,26 +111,18 @@ public:
     const TArray<TSharedPtr<FJsonValue>> &Response
   );
 
-  // FORK(hollowed-oath): the error the character friend calls give when the
-  // realm's answer cannot be read. Fork-added. One text for
-  // ParseListCharacterFriends and the character friend commands in
-  // RedwoodClientInterface.cpp.
+  // FORK(hollowed-oath): one text for every character friend call whose
+  // realm answer cannot be read.
   static constexpr const TCHAR *BadRealmAnswerError =
     TEXT("Bad answer from the realm.");
 
-  // FORK(hollowed-oath): parser for the three fork-added arrays of the
-  // "realm:contacts:list" answer. Fork-added; the definition and the full
-  // reason live under a matching FORK marker in RedwoodCommonGameSubsystem.cpp.
+  // FORK(hollowed-oath): the fork arrays of the "realm:contacts:list" answer.
   static FRedwoodListCharacterFriendsOutput ParseListCharacterFriends(
     const TArray<TSharedPtr<FJsonValue>> &Response
   );
 
-  // FORK(hollowed-oath): parser for the fork-added
-  // "director:friends:character-alert" push. Takes the event value that the
-  // listener gets. Returns false for a push the game cannot act on. When it
-  // returns false, OutAlert has no defined value: it can hold some fields of
-  // the refused push, so do not read it. Fork-added; the definition and the full reason live under a matching
-  // FORK marker in RedwoodCommonGameSubsystem.cpp.
+  // FORK(hollowed-oath): false for a push the game cannot act on. OutAlert
+  // can then hold part of the refused push, so do not read it.
   static bool ParseCharacterFriendAlert(
     const TSharedPtr<FJsonValue> &Message,
     FRedwoodCharacterFriendAlert &OutAlert

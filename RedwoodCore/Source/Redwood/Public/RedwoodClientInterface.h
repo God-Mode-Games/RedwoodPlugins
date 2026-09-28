@@ -404,12 +404,7 @@ public:
   FString GetConnectionConsoleCommand();
   FURL GetConnectionURL();
 
-  // FORK(hollowed-oath): the director tells a character that another character
-  // asked to be a friend, accepted a request, ended a friendship or a
-  // request, came online or went offline.
-  // Fork-added. Broadcast from the "director:friends:character-alert" listener
-  // in RedwoodClientInterface.cpp, relayed to the game by
-  // RedwoodClientGameSubsystem.
+  // FORK(hollowed-oath): the "director:friends:character-alert" push.
   FRedwoodCharacterFriendAlertDynamicDelegate OnCharacterFriendAlert;
 
   FRedwoodPartyInvitedDynamicDelegate OnPartyInvited;

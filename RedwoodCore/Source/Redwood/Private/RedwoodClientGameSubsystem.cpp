@@ -89,9 +89,7 @@ void URedwoodClientGameSubsystem::Initialize(
     ClientInterface->OnRealmAuthFailed.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleOnRealmAuthFailed
     );
-    // FORK(hollowed-oath): subscribe the fork-added character friend delegate.
-    // Merge must keep this bind paired with the UPROPERTY delegate and the
-    // UFUNCTION handler in RedwoodClientGameSubsystem.h.
+    // FORK(hollowed-oath): character friends.
     ClientInterface->OnCharacterFriendAlert.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleOnCharacterFriendAlert
     );
@@ -416,9 +414,7 @@ void URedwoodClientGameSubsystem::RemoveRealmContact(
   }
 }
 
-// FORK(hollowed-oath) BEGIN: character friend calls. Each has the guard the
-// file header explains (#2445), and the same "without using a backend" else
-// branch as the realm contact calls above.
+// FORK(hollowed-oath) BEGIN: character friend calls.
 void URedwoodClientGameSubsystem::ListCharacterFriends(
   FRedwoodListCharacterFriendsOutputDelegate OnOutput
 ) {
@@ -1424,9 +1420,7 @@ void URedwoodClientGameSubsystem::HandleOnRealmAuthFailed(FString Message) {
   OnRealmAuthFailed.Broadcast(Message);
 }
 
-// FORK(hollowed-oath): re-broadcast handler for the fork-added
-// OnCharacterFriendAlert delegate (see the bind in Initialize). Whole function
-// is fork-added.
+// FORK(hollowed-oath): character friends.
 void URedwoodClientGameSubsystem::HandleOnCharacterFriendAlert(
   const FRedwoodCharacterFriendAlert &Alert
 ) {
