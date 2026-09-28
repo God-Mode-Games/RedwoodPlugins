@@ -168,6 +168,12 @@ public:
   void RemoveCharacterFriend(
     FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
   );
+
+  // Removes only the caller's pending request, so a cancel cannot end a
+  // friendship the other side accepted meanwhile.
+  void CancelCharacterFriendRequest(
+    FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
   // FORK(hollowed-oath) END
 
   void ListGuilds(
@@ -553,8 +559,7 @@ private:
   friend class FRedwoodDropAfterLogoutTest;
   friend class FRedwoodLogoutClosesReconnectingRealmTest;
   friend class FRedwoodFailedReloginStopsRealmRetryTest;
-  // FORK(hollowed-oath): character friends. Pins that the four character
-  // friend calls are held like the other Realm requests.
+  // FORK(hollowed-oath): character friends.
   friend class FRedwoodCharacterFriendsHeldTest;
   // FORK(hollowed-oath) BEGIN: the close handler tests.
   friend class FRedwoodUnrequestedCloseBacksOffTest;

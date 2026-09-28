@@ -123,7 +123,7 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
 
   FString Error;
 
-  // Five output shapes cover all fourteen functions.
+  // Five output shapes cover all fifteen functions.
   FRedwoodListPlayersOutputDelegate OnListPlayers =
     FRedwoodListPlayersOutputDelegate::CreateLambda(
       [&Error](const FRedwoodListPlayersOutput &Output) {
@@ -192,7 +192,7 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
   Subsystem->RemoveRealmContact(TEXT("character-1"), OnError);
   CheckGuard(TEXT("RemoveRealmContact reports the error"));
 
-  // The four character friend calls have the same guard.
+  // The character friend calls have the same guard.
   Subsystem->ListCharacterFriends(OnListCharacterFriends);
   CheckGuard(TEXT("ListCharacterFriends reports the error"));
 
@@ -206,6 +206,9 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
 
   Subsystem->RemoveCharacterFriend(TEXT("character-1"), OnError);
   CheckGuard(TEXT("RemoveCharacterFriend reports the error"));
+
+  Subsystem->CancelCharacterFriendRequest(TEXT("character-1"), OnError);
+  CheckGuard(TEXT("CancelCharacterFriendRequest reports the error"));
 
   return true;
 }

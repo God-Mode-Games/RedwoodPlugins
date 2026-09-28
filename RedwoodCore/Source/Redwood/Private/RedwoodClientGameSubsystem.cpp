@@ -481,6 +481,21 @@ void URedwoodClientGameSubsystem::RemoveCharacterFriend(
     );
   }
 }
+
+void URedwoodClientGameSubsystem::CancelCharacterFriendRequest(
+  FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+) {
+  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) {
+      return;
+    }
+    ClientInterface->CancelCharacterFriendRequest(OtherCharacterId, OnOutput);
+  } else {
+    OnOutput.ExecuteIfBound(
+      TEXT("Cannot cancel character friend request without using a backend")
+    );
+  }
+}
 // FORK(hollowed-oath) END
 
 void URedwoodClientGameSubsystem::ListGuilds(

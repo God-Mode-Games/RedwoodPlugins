@@ -56,6 +56,10 @@ bool FRedwoodCharacterFriendsNotConnectedTest::RunTest(
     Redwood->RemoveCharacterFriend(TEXT("other-1"), OnError);
     TestEqualSensitive(Case, *Error, Expected);
     Error.Reset();
+
+    Redwood->CancelCharacterFriendRequest(TEXT("other-1"), OnError);
+    TestEqualSensitive(Case, *Error, Expected);
+    Error.Reset();
   };
 
   CheckAll(TEXT("Not connected to Realm."), TEXT("No realm"));
@@ -110,11 +114,12 @@ bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
     Client->RequestCharacterFriend(TEXT("other-1"), OnError);
     Client->RespondToCharacterFriendRequest(TEXT("other-1"), true, OnError);
     Client->RemoveCharacterFriend(TEXT("other-1"), OnError);
+    Client->CancelCharacterFriendRequest(TEXT("other-1"), OnError);
   };
 
   // No character is selected yet: the character guard answers each call.
   CallAll();
-  TestEqual(TEXT("Every call answers at once"), Errors.Num(), 4);
+  TestEqual(TEXT("Every call answers at once"), Errors.Num(), 5);
   for (const FString &Error : Errors) {
     TestEqualSensitive(
       TEXT("The character guard answers"), *Error, TEXT("No character selected.")
@@ -133,14 +138,14 @@ bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
   TestEqual(
     TEXT("Every character friend call is held"),
     Client->RealmHeldRequests.Num(),
-    4
+    5
   );
   TestEqual(TEXT("No held call is answered yet"), Errors.Num(), 0);
 
   // The re-handshake fails: every held call answers with the realm error.
   Client->EndRealmReauthentication(false);
 
-  TestEqual(TEXT("Every held call is answered"), Errors.Num(), 4);
+  TestEqual(TEXT("Every held call is answered"), Errors.Num(), 5);
   for (const FString &Error : Errors) {
     TestEqualSensitive(
       TEXT("A held call fails, it is not sent"),
@@ -158,7 +163,7 @@ bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
   Client->Realm->bIsConnected = true;
   CallAll();
   TestEqual(
-    TEXT("Held again after the second drop"), Client->RealmHeldRequests.Num(), 4
+    TEXT("Held again after the second drop"), Client->RealmHeldRequests.Num(), 5
   );
 
   Client->EndRealmReauthentication(true);
@@ -175,11 +180,11 @@ bool FRedwoodCharacterFriendsHeldTest::RunTest(const FString &Parameters) {
   // HollowedOath#2886: a sent call waits for its reply, and a drop before the
   // reply fails it once.
   TestEqual(
-    TEXT("Every sent call waits for its reply"), Client->RealmReplies.Num(), 4
+    TEXT("Every sent call waits for its reply"), Client->RealmReplies.Num(), 5
   );
   Client->Realm->bIsConnected = false;
   Client->NoteRealmDrop();
-  TestEqual(TEXT("The drop answers every sent call once"), Errors.Num(), 4);
+  TestEqual(TEXT("The drop answers every sent call once"), Errors.Num(), 5);
   for (const FString &Error : Errors) {
     TestEqualSensitive(
       TEXT("A sent call tells its reply was lost"),

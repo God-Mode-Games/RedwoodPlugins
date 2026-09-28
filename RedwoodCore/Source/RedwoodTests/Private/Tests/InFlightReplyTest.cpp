@@ -1741,6 +1741,48 @@ namespace RedwoodInFlightTest {
     C.Deinitialize();
     return ExpectKeptThenFreed(Test, Socket);
   }
+
+  // A cancel must name the pending request only, so the backend cannot end a
+  // friendship the other side accepted meanwhile. A remove must not.
+  bool RunCharacterFriendCancelIsRequestOnly(FAutomationTestBase &Test) {
+    // Before the harness, so they outlive every callback it can run.
+    int32 Answers = 0;
+    FString Error = TEXT("unanswered");
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    const FRedwoodErrorOutputDelegate OnOutput =
+      FRedwoodErrorOutputDelegate::CreateLambda([&](const FString &InError) {
+        ++Answers;
+        Error = InError;
+      });
+    const TCHAR *const RemoveRoute = TEXT("realm:contacts:friends:remove");
+    const TCHAR *const RequestOnlyField = TEXT("\"requestOnly\":true");
+    const TCHAR *const Success = TEXT("{\"error\":\"\"}");
+
+    FString Request;
+    Harness.Client().RemoveCharacterFriend(TEXT("character-2"), OnOutput);
+    if (!AnswerRequest(Test, *Harness.Server, Success, Request)) {
+      return false;
+    }
+    Test.TestTrue(TEXT("A remove goes to the remove route"), Request.Contains(RemoveRoute));
+    Test.TestFalse(TEXT("A remove is not request-only"), Request.Contains(RequestOnlyField));
+
+    Harness.Client().CancelCharacterFriendRequest(TEXT("character-2"), OnOutput);
+    if (!AnswerRequest(Test, *Harness.Server, Success, Request)) {
+      return false;
+    }
+    Test.TestTrue(TEXT("A cancel goes to the remove route"), Request.Contains(RemoveRoute));
+    Test.TestTrue(TEXT("A cancel is request-only"), Request.Contains(RequestOnlyField));
+
+    Test.TestTrue(
+      TEXT("Both calls are answered"),
+      PumpGameThreadUntil([&Answers]() { return Answers == 2; })
+    );
+    Test.TestEqual(TEXT("An empty realm error is a success"), Error, FString());
+    return true;
+  }
 }
 
 #define REDWOOD_IN_FLIGHT_TEST(Class, Name, Body)                              \
@@ -1945,4 +1987,9 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,
   "DirectorReconnectFailsPendingReply",
   RedwoodInFlightTest::RunDirectorReconnectFailsPendingReply(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCharacterFriendCancelTest,
+  "CharacterFriendCancelIsRequestOnly",
+  RedwoodInFlightTest::RunCharacterFriendCancelIsRequestOnly(*this)
 )

@@ -1758,6 +1758,20 @@ void URedwoodClientInterface::RemoveCharacterFriend(
     OnOutput
   );
 }
+
+void URedwoodClientInterface::CancelCharacterFriendRequest(
+  FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
+  Payload->SetBoolField(TEXT("requestOnly"), true);
+  EmitCharacterFriendCall(
+    TEXT("realm:contacts:friends:remove"),
+    Payload,
+    &ParseCharacterFriendCommandAnswer,
+    OnOutput
+  );
+}
 // FORK(hollowed-oath) END
 
 void URedwoodClientInterface::ListGuilds(

@@ -166,6 +166,10 @@ public:
   void RemoveCharacterFriend(
     FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
   );
+
+  void CancelCharacterFriendRequest(
+    FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
   // FORK(hollowed-oath) END
 
   void ListGuilds(
