@@ -248,6 +248,127 @@ void URedwoodClientInterface::NoteJoinSent() {
   bAssignmentExpected = true;
   bAbandonedQueueJoin = false;
   bLeaveTicketingOwed = false;
+  // This client's own join: its assignment names a ticket it was not told
+  // of, so the party ticket's check must not refuse it.
+  AcceptedPartyTicketId.Reset();
+}
+
+namespace {
+  // Keeps the last few ids. Answers false when Id is among them already.
+  bool RememberRecentId(TArray<FString> &Ids, const FString &Id) {
+    // A notice is resent within seconds; a few dozen covers any burst.
+    constexpr int32 MaxRememberedIds = 32;
+    if (Ids.Contains(Id)) {
+      return false;
+    }
+    if (Ids.Num() >= MaxRememberedIds) {
+      Ids.RemoveAt(0);
+    }
+    Ids.Add(Id);
+    return true;
+  }
+
+  // A Redis resend repeats the messageId; a notice with none is never a repeat.
+  bool IsRepeatedNotice(TArray<FString> &RecentIds, const FJsonObject &Message) {
+    FString MessageId;
+    Message.TryGetStringField(TEXT("messageId"), MessageId);
+    return !MessageId.IsEmpty() && !RememberRecentId(RecentIds, MessageId);
+  }
+}
+
+// The same notice can come again: a Redis resend (same messageId), or a
+// worker pass or rejoin replay (a new messageId, the same ticketId).
+void URedwoodClientInterface::HandlePartyQueued(
+  const TSharedPtr<FJsonObject> &Message
+) {
+  if (!Message.IsValid()) {
+    return;
+  }
+  FString CharacterId;
+  FString TicketId;
+  Message->TryGetStringField(TEXT("characterId"), CharacterId);
+  Message->TryGetStringField(TEXT("ticketId"), TicketId);
+  if (IsRepeatedNotice(RecentPartyTicketMessageIds, *Message) ||
+      TicketId.IsEmpty() || CharacterId.IsEmpty()) {
+    return;
+  }
+  if (SelectedCharacterId.IsEmpty()) {
+    PendingPartyTicketId = TicketId;
+    PendingPartyCharacterId = CharacterId;
+    return;
+  }
+  if (CharacterId == SelectedCharacterId) {
+    AcceptPartyTicket(TicketId);
+  }
+}
+
+// A repeat of the accepted ticket must not undo a leave the game made since
+// (bAbandonedQueueJoin). A ticket that ended gets no assignment.
+void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
+  if (TicketId == AcceptedPartyTicketId ||
+      EndedPartyTicketIds.Contains(TicketId)) {
+    return;
+  }
+  // This member's own join, still out, keeps its own ticket: leave it, or
+  // its solo assignment could move the player after the party's travel.
+  if (bAssignmentExpected && AcceptedPartyTicketId.IsEmpty() && !bInWorld &&
+      !bTravelPending) {
+    bLeaveTicketingOwed = true;
+  }
+  // A leader has one ticket, so a stale "queued" of the replaced one
+  // (HollowedOath#3031) must not take it back.
+  if (!AcceptedPartyTicketId.IsEmpty()) {
+    EndPartyTicket(AcceptedPartyTicketId);
+  }
+  // As NoteJoinSent, but an owed leave stays and goes now: it cannot end
+  // the leader's ticket, and the party's travel would erase it.
+  ++JoinSequence;
+  bAssignmentExpected = true;
+  bAbandonedQueueJoin = false;
+  AcceptedPartyTicketId = TicketId;
+  if (IsRealmReady()) {
+    SendOwedLeave();
+  }
+}
+
+bool URedwoodClientInterface::EndPartyTicket(const FString &TicketId) {
+  RememberRecentId(EndedPartyTicketIds, TicketId);
+  if (TicketId != AcceptedPartyTicketId) {
+    return false;
+  }
+  AcceptedPartyTicketId.Reset();
+  return true;
+}
+
+// Only the named ticket: a late "left" of an older ticket must not drop the
+// join of a newer one.
+void URedwoodClientInterface::HandlePartyLeft(
+  const TSharedPtr<FJsonObject> &Message
+) {
+  if (!Message.IsValid()) {
+    return;
+  }
+  FString TicketId;
+  Message->TryGetStringField(TEXT("ticketId"), TicketId);
+  if (IsRepeatedNotice(RecentPartyTicketMessageIds, *Message) ||
+      TicketId.IsEmpty()) {
+    return;
+  }
+  if (TicketId == PendingPartyTicketId) {
+    PendingPartyTicketId.Reset();
+  }
+  // As a ticket error: a player in the world keeps zone transfers through
+  // bInWorld.
+  if (EndPartyTicket(TicketId)) {
+    bAssignmentExpected = false;
+  }
+}
+
+void URedwoodClientInterface::ForgetPartyTickets() {
+  AcceptedPartyTicketId.Reset();
+  PendingPartyTicketId.Reset();
+  EndedPartyTicketIds.Reset();
+  RecentPartyTicketMessageIds.Reset();
 }
 
 // A join that the server refused gets no assignment, so a replay of an
@@ -724,6 +845,7 @@ void URedwoodClientInterface::Logout() {
     // not ours.
     bLeaveTicketingOwed = false;
     CurrentParty = FRedwoodParty();
+    ForgetPartyTickets();
     // FORK(hollowed-oath): HollowedOath#2854. See HasPlayerSession: both
     // flags, or a later Director drop at the title screen re-logs in with
     // empty ids and reports an authentication failure there.
@@ -3011,6 +3133,7 @@ void URedwoodClientInterface::InitiateRealmHandshake(
   bTravelPending = false;
   // The party of another session or realm; the Realm sends ours again.
   CurrentParty = FRedwoodParty();
+  ForgetPartyTickets();
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
@@ -3281,6 +3404,26 @@ void URedwoodClientInterface::BindRealmEvents() {
     ESIOThreadOverrideOption::USE_GAME_THREAD
   );
 
+  // FORK(hollowed-oath) BEGIN: HollowedOath#3002.
+  Realm->OnEvent(
+    TEXT("realm:ticketing:party-queued"),
+    [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
+      HandlePartyQueued(Message->AsObject());
+    },
+    TEXT("/"),
+    ESIOThreadOverrideOption::USE_GAME_THREAD
+  );
+
+  Realm->OnEvent(
+    TEXT("realm:ticketing:party-left"),
+    [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
+      HandlePartyLeft(Message->AsObject());
+    },
+    TEXT("/"),
+    ESIOThreadOverrideOption::USE_GAME_THREAD
+  );
+  // FORK(hollowed-oath) END
+
   Realm->OnEvent(
     TEXT("realm:servers:connect-to-instance"),
     [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
@@ -3295,25 +3438,19 @@ void URedwoodClientInterface::BindRealmEvents() {
       MessageObject->TryGetStringField(TEXT("characterId"), AssignedCharacterId);
       const bool bForAnotherCharacter = !AssignedCharacterId.IsEmpty() &&
         AssignedCharacterId != SelectedCharacterId;
-      // When the leader queues the whole party, a member's client sends no
-      // join, and no event names it before the assignment. So a party member
-      // (not the leader) accepts an assignment named for its selected
-      // character. The cost: for a party member, a replay after a relaunch
-      // within 60 s is not refused here; the server's login-lineage and
-      // unused-token checks still apply. Remove this rule when
-      // HollowedOath#3002 ships.
-      // The party must list this player: a party left from another session
-      // must not make this one a member.
-      const bool bPartyMemberAssignment = CurrentParty.bValid &&
-        CurrentParty.LeaderId != PlayerId &&
-        CurrentParty.Members.ContainsByPredicate(
-          [this](const FRedwoodPartyMember &Member) {
-            return Member.PlayerId == PlayerId;
-          }
-        ) &&
-        !AssignedCharacterId.IsEmpty() && !bForAnotherCharacter;
-      if ((!bAssignmentExpected && !bInWorld && !bPartyMemberAssignment) ||
-          bAbandonedQueueJoin || bForAnotherCharacter) {
+      // HollowedOath#3002. A party ticket's assignment names it. A member
+      // that the server told of a party ticket takes only that ticket's
+      // assignment; in the world, it still takes a zone transfer with no
+      // ticket. An ended ticket has no valid assignment left.
+      FString AssignedTicketId;
+      MessageObject->TryGetStringField(TEXT("ticketId"), AssignedTicketId);
+      const bool bNotThePartyTicket = !AcceptedPartyTicketId.IsEmpty() &&
+        (AssignedTicketId.IsEmpty() ? !bInWorld
+                                    : AssignedTicketId != AcceptedPartyTicketId);
+      const bool bEndedTicket = !AssignedTicketId.IsEmpty() &&
+        EndedPartyTicketIds.Contains(AssignedTicketId);
+      if ((!bAssignmentExpected && !bInWorld) || bAbandonedQueueJoin ||
+          bForAnotherCharacter || bNotThePartyTicket || bEndedTicket) {
         UE_LOG(
           LogRedwood,
           Warning,
@@ -3327,6 +3464,11 @@ void URedwoodClientInterface::BindRealmEvents() {
       // FORK(hollowed-oath): HollowedOath#2886. See NoteArrivedInWorld.
       bTravelPending = true;
       TravelJoinSequence = JoinSequence;
+      // The ticket is used: a "queued" for it sent again must not arm the
+      // guard for a replay of this assignment.
+      if (!AssignedTicketId.IsEmpty()) {
+        EndPartyTicket(AssignedTicketId);
+      }
 
       bool bShouldStitch = MessageObject->GetBoolField(TEXT("shouldStitch"));
       ServerConnection = MessageObject->GetStringField(TEXT("connection"));
@@ -3720,8 +3862,15 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
     bInWorld = false;
     bAbandonedQueueJoin = false;
     bTravelPending = false;
+    // HollowedOath#3002. Only the join was the old character's: the ended
+    // tickets stay ended, and a held notice waits for its own character.
+    AcceptedPartyTicketId.Reset();
   }
   SelectedCharacterId = CharacterId;
+  if (!PendingPartyTicketId.IsEmpty() && PendingPartyCharacterId == CharacterId) {
+    AcceptPartyTicket(PendingPartyTicketId);
+    PendingPartyTicketId.Reset();
+  }
 
   if (!CurrentParty.bValid || !Realm.IsValid() || !Realm->bIsConnected) {
     return;
@@ -3911,7 +4060,11 @@ void URedwoodClientInterface::NoteRealmReconnected() {
 // the Realm knows the player. The flag stays until a leave succeeds or a join
 // replaces the ticket; with a join out, the leave would cancel it.
 void URedwoodClientInterface::SendOwedLeave() {
-  if (!bLeaveTicketingOwed || bAssignmentExpected || !IsRealmConnected()) {
+  // Only this client's own join would lose its ticket to the leave; a
+  // party join is the leader's ticket (HollowedOath#3002).
+  if (!bLeaveTicketingOwed ||
+      (bAssignmentExpected && AcceptedPartyTicketId.IsEmpty()) ||
+      !IsRealmConnected()) {
     return;
   }
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
