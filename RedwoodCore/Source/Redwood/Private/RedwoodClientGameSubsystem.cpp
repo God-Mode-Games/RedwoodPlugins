@@ -18,9 +18,11 @@
 #include "LatencyCheckerLibrary.h"
 #include "SocketIOClient.h"
 
-// FORK(hollowed-oath): #2445. In PIE, bUseBackendInPIE can turn on after
-// Initialize() skipped the client interface, so the social calls answer this
-// error on their backend branch instead of reading a null pointer.
+// FORK(hollowed-oath): HollowedOath#2445. Upstream reads ClientInterface with
+// no null check on the backend branch of the social calls (SearchForPlayers
+// through RemoveRealmContact). In PIE, bUseBackendInPIE can turn on after
+// Initialize() skipped the client interface, so that read crashed. Each of
+// those calls now starts with one guard line, marked "#2445 null guard".
 namespace {
 
 const TCHAR *const RedwoodNoClientInterfaceError =
@@ -285,7 +287,7 @@ void URedwoodClientGameSubsystem::SearchForPlayers(
   FRedwoodListPlayersOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445 null guard
     ClientInterface->SearchForPlayers(
       UsernameOrNickname, bIncludePartialMatches, OnOutput
     );
@@ -300,7 +302,7 @@ void URedwoodClientGameSubsystem::SearchForPlayerById(
   FString TargetPlayerId, FRedwoodPlayerOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445 null guard
     ClientInterface->SearchForPlayerById(TargetPlayerId, OnOutput);
   } else {
     FRedwoodPlayerOutput Output;
@@ -313,7 +315,7 @@ void URedwoodClientGameSubsystem::ListFriends(
   ERedwoodFriendListType Filter, FRedwoodListPlayersOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445 null guard
     ClientInterface->ListFriends(Filter, OnOutput);
   } else {
     FRedwoodListPlayersOutput Output;
@@ -326,7 +328,7 @@ void URedwoodClientGameSubsystem::RequestFriend(
   FString OtherPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445 null guard
     ClientInterface->RequestFriend(OtherPlayerId, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(TEXT("Cannot request friend without using a backend"
@@ -338,7 +340,7 @@ void URedwoodClientGameSubsystem::RemoveFriend(
   FString OtherPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445 null guard
     ClientInterface->RemoveFriend(OtherPlayerId, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(TEXT("Cannot remove friend without using a backend")
@@ -350,7 +352,7 @@ void URedwoodClientGameSubsystem::RespondToFriendRequest(
   FString OtherPlayerId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445 null guard
     ClientInterface->RespondToFriendRequest(OtherPlayerId, bAccept, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(
@@ -363,7 +365,7 @@ void URedwoodClientGameSubsystem::SetPlayerBlocked(
   FString OtherPlayerId, bool bBlocked, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445 null guard
     ClientInterface->SetPlayerBlocked(OtherPlayerId, bBlocked, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(TEXT("Cannot block players without using a backend")
@@ -375,7 +377,7 @@ void URedwoodClientGameSubsystem::ListRealmContacts(
   FRedwoodListRealmContactsOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445 null guard
     ClientInterface->ListRealmContacts(OnOutput);
   } else {
     FRedwoodListRealmContactsOutput Output;
@@ -388,7 +390,7 @@ void URedwoodClientGameSubsystem::AddRealmContact(
   FString OtherCharacterId, bool bBlocked, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445 null guard
     ClientInterface->AddRealmContact(OtherCharacterId, bBlocked, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(
@@ -401,7 +403,7 @@ void URedwoodClientGameSubsystem::RemoveRealmContact(
   FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return; // FORK(hollowed-oath): #2445 null guard
     ClientInterface->RemoveRealmContact(OtherCharacterId, OnOutput);
   } else {
     OnOutput.ExecuteIfBound(
