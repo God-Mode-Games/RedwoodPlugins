@@ -3892,15 +3892,22 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
     PendingPartyTicketId.Reset();
   }
 
-  if (!CurrentParty.bValid || !Realm.IsValid() || !Realm->bIsConnected) {
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     return;
   }
 
+  // FORK(hollowed-oath): HollowedOath#2448. Upstream sent this only in a
+  // party. A player with no party can have invites out, and the realm makes
+  // the party from them later, so it must know the character now too.
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
 
   Realm->Emit(TEXT("realm:parties:select-character"), Payload);
+
+  if (!CurrentParty.bValid) {
+    return;
+  }
 
   // FORK(hollowed-oath): HollowedOath#2854. Same payload as the re-login path.
   const TSharedPtr<FJsonObject> OnlinePayload =
