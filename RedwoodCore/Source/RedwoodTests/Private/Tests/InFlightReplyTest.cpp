@@ -15,6 +15,7 @@
 #include "FakeSocketIoServer.h"
 #include "RedwoodClientInterface.h"
 #include "RedwoodClosingSockets.h"
+#include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodSettings.h"
 #include "SocketIOClient.h"
 #include "SocketIONative.h"
@@ -2055,6 +2056,12 @@ namespace RedwoodInFlightTest {
     return ExpectKeptThenFreed(Test, Socket);
   }
 
+  // The socket sends condensed JSON, so a field and its value are one run of
+  // text. The backend reads field names case-sensitively.
+  bool HasJsonText(const FString &Request, const TCHAR *Text) {
+    return Request.Contains(Text, ESearchCase::CaseSensitive);
+  }
+
   // A cancel must name the pending request only, so the backend cannot end a
   // friendship the other side accepted meanwhile. A remove must not.
   bool RunCharacterFriendCancelIsRequestOnly(FAutomationTestBase &Test) {
@@ -2079,21 +2086,92 @@ namespace RedwoodInFlightTest {
     if (!AnswerRequest(Test, *Harness.Server, Success, Request)) {
       return false;
     }
-    Test.TestTrue(TEXT("A remove goes to the remove route"), Request.Contains(RemoveRoute));
-    Test.TestFalse(TEXT("A remove is not request-only"), Request.Contains(RequestOnlyField));
+    Test.TestTrue(TEXT("A remove goes to the remove route"), HasJsonText(Request, RemoveRoute));
+    Test.TestTrue(
+      TEXT("A remove names the other character"),
+      HasJsonText(Request, TEXT("\"otherCharacterId\":\"character-2\""))
+    );
+    Test.TestFalse(TEXT("A remove is not request-only"), HasJsonText(Request, RequestOnlyField));
 
     Harness.Client().CancelCharacterFriendRequest(TEXT("character-2"), OnOutput);
     if (!AnswerRequest(Test, *Harness.Server, Success, Request)) {
       return false;
     }
-    Test.TestTrue(TEXT("A cancel goes to the remove route"), Request.Contains(RemoveRoute));
-    Test.TestTrue(TEXT("A cancel is request-only"), Request.Contains(RequestOnlyField));
+    Test.TestTrue(TEXT("A cancel goes to the remove route"), HasJsonText(Request, RemoveRoute));
+    Test.TestTrue(TEXT("A cancel is request-only"), HasJsonText(Request, RequestOnlyField));
 
     Test.TestTrue(
       TEXT("Both calls are answered"),
       PumpGameThreadUntil([&Answers]() { return Answers == 2; })
     );
     Test.TestEqual(TEXT("An empty realm error is a success"), Error, FString());
+    return true;
+  }
+
+  // Pins the fields that the RedwoodBackend fork validates for a request and a
+  // respond (Realms.Contacts.Friends in packages/common/src/interfaces.ts), and
+  // that a reply with no error field, or no object, is an error.
+  bool RunCharacterFriendWireFields(FAutomationTestBase &Test) {
+    // Before the harness, so it outlives every callback the harness can run.
+    TArray<FString> Errors;
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    const FRedwoodErrorOutputDelegate OnOutput =
+      FRedwoodErrorOutputDelegate::CreateLambda([&Errors](const FString &Error) {
+        Errors.Add(Error);
+      });
+
+    FString Request;
+    Harness.Client().RequestCharacterFriend(TEXT("character-2"), OnOutput);
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("{}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("A request goes to the request route"),
+      HasJsonText(Request, TEXT("\"realm:contacts:friends:request\""))
+    );
+    Test.TestTrue(
+      TEXT("A request names the player"),
+      HasJsonText(Request, TEXT("\"playerId\":\"player-1\""))
+    );
+    Test.TestTrue(
+      TEXT("A request names the caller"),
+      HasJsonText(Request, TEXT("\"characterId\":\"character-1\""))
+    );
+    Test.TestTrue(
+      TEXT("A request names the target"),
+      HasJsonText(Request, TEXT("\"targetCharacterId\":\"character-2\""))
+    );
+
+    Harness.Client().RespondToCharacterFriendRequest(TEXT("character-2"), true, OnOutput);
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("\"nope\""), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("A respond goes to the respond route"),
+      HasJsonText(Request, TEXT("\"realm:contacts:friends:respond\""))
+    );
+    Test.TestTrue(
+      TEXT("A respond names the other character"),
+      HasJsonText(Request, TEXT("\"otherCharacterId\":\"character-2\""))
+    );
+    Test.TestTrue(
+      TEXT("A respond carries the accept"), HasJsonText(Request, TEXT("\"accept\":true"))
+    );
+
+    Test.TestTrue(
+      TEXT("Both calls are answered"),
+      PumpGameThreadUntil([&Errors]() { return Errors.Num() == 2; })
+    );
+    for (const FString &Error : Errors) {
+      Test.TestEqualSensitive(
+        TEXT("A reply that is not an answer is an error"),
+        *Error,
+        URedwoodCommonGameSubsystem::BadRealmAnswerError
+      );
+    }
     return true;
   }
 
@@ -2395,6 +2473,11 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightCharacterFriendCancelTest,
   "CharacterFriendCancelIsRequestOnly",
   RedwoodInFlightTest::RunCharacterFriendCancelIsRequestOnly(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCharacterFriendWireFieldsTest,
+  "CharacterFriendWireFields",
+  RedwoodInFlightTest::RunCharacterFriendWireFields(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightCharacterFriendAlertTest,
