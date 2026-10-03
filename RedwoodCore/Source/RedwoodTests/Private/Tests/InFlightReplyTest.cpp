@@ -2330,6 +2330,66 @@ namespace RedwoodInFlightTest {
     );
     return true;
   }
+
+  // The realm makes the party from the invite's character when it is
+  // accepted. Pins: a held invite goes out for the character that made it,
+  // and is refused when another character is selected before it goes.
+  bool RunHeldPartyInviteKeepsCharacter(FAutomationTestBase &Test) {
+    // Before the harness, so it outlives every callback it can run.
+    TArray<FString> Errors;
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    const FRedwoodErrorOutputDelegate OnOutput =
+      FRedwoodErrorOutputDelegate::CreateLambda([&Errors](const FString &Error) {
+        Errors.Add(Error);
+      });
+
+    FAccess::NoteRealmDrop(C);
+    C.InviteToParty(TEXT("player-2"), OnOutput);
+    if (!Test.TestEqual(TEXT("The invite is held"), FAccess::NumRealmHeldRequests(C), 1)) {
+      return false;
+    }
+    FAccess::EndRealmReauthentication(C, true);
+    FString Request;
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("A held invite names the character that made it"),
+      HasJsonText(Request, TEXT("\"characterId\":\"character-1\""))
+    );
+    Test.TestTrue(
+      TEXT("The held invite is answered"),
+      PumpGameThreadUntil([&Errors]() { return Errors.Num() == 1; })
+    );
+
+    FAccess::NoteRealmDrop(C);
+    C.InviteToParty(TEXT("player-2"), OnOutput);
+    if (!Test.TestEqual(
+          TEXT("The second invite is held"), FAccess::NumRealmHeldRequests(C), 1
+        )) {
+      return false;
+    }
+    FAccess::SelectedCharacterId(C) = TEXT("character-2");
+    FAccess::EndRealmReauthentication(C, true);
+    Test.TestEqual(
+      TEXT("An invite held across a character change is not sent"),
+      FAccess::NumRealmReplies(C),
+      0
+    );
+    if (!Test.TestEqual(TEXT("The changed invite is answered"), Errors.Num(), 2)) {
+      return false;
+    }
+    Test.TestEqualSensitive(
+      TEXT("The changed invite tells the character changed"),
+      *Errors[1],
+      URedwoodCommonGameSubsystem::CharacterChangedError
+    );
+    return true;
+  }
 }
 
 #define REDWOOD_IN_FLIGHT_TEST(Class, Name, Body)                              \
@@ -2599,4 +2659,9 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightCharacterFriendListAfterSwitchTest,
   "CharacterFriendListAfterSwitch",
   RedwoodInFlightTest::RunCharacterFriendListAfterSwitch(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightHeldPartyInviteKeepsCharacterTest,
+  "HeldPartyInviteKeepsCharacter",
+  RedwoodInFlightTest::RunHeldPartyInviteKeepsCharacter(*this)
 )

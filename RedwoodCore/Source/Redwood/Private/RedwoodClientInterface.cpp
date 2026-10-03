@@ -4885,8 +4885,17 @@ void URedwoodClientInterface::LeaveParty(FRedwoodErrorOutputDelegate OnOutput) {
 void URedwoodClientInterface::InviteToParty(
   FString TargetPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
+  // FORK(hollowed-oath): HollowedOath#2448. The invite names the inviter's
+  // character, so a held invite must not go out for one selected after it.
+  const FString InviterCharacterId = SelectedCharacterId;
   // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
   if (GateRealm([=, this]() {
+        if (InviterCharacterId != SelectedCharacterId) {
+          OnOutput.ExecuteIfBound(
+            URedwoodCommonGameSubsystem::CharacterChangedError
+          );
+          return;
+        }
         InviteToParty(TargetPlayerId, OnOutput);
       }, OnOutput)) {
     return;

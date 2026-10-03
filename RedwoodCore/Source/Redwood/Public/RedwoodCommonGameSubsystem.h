@@ -116,8 +116,9 @@ public:
   static constexpr const TCHAR *BadRealmAnswerError =
     TEXT("Bad answer from the realm.");
 
-  // FORK(hollowed-oath): a character friend call is not sent, or its answer
-  // is not given, when the player selected another character meanwhile.
+  // FORK(hollowed-oath): a held call that acts for a character (a character
+  // friend call, a party invite) is not sent, and a character friend answer is
+  // not given, when the player selected another character meanwhile.
   static constexpr const TCHAR *CharacterChangedError =
     TEXT("The character changed before the call was answered.");
 
