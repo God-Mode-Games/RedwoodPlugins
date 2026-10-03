@@ -4862,6 +4862,9 @@ void URedwoodClientInterface::InviteToParty(
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
+  // FORK(hollowed-oath): HollowedOath#2448. The realm makes a party only when
+  // an invite is accepted, so it needs the inviter's character from the invite.
+  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(
