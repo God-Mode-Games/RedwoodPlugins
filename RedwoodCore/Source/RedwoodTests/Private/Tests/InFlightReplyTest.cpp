@@ -1428,6 +1428,13 @@ namespace RedwoodInFlightTest {
     Test.TestTrue(
       TEXT("The old ticket's leave is still owed"), FAccess::bLeaveTicketingOwed(C)
     );
+    // Read now, so the leave below is the next request.
+    FString Request;
+    Test.TestTrue(
+      TEXT("The switch tells the realm the character"),
+      Harness.Server->ReadClientText(Request) &&
+        Request.Contains(TEXT("realm:parties:select-character"))
+    );
     SendEvent(Test, Harness, PartyQueued(TEXT("character-2"), TEXT("ticket-1"), TEXT("m-1")));
     // Pins: AcceptPartyTicket keeps the owed leave, and SendOwedLeave does
     // not wait for a party join.
@@ -1435,7 +1442,6 @@ namespace RedwoodInFlightTest {
       TEXT("The party notice keeps the old ticket's owed leave"),
       FAccess::bLeaveTicketingOwed(C)
     );
-    FString Request;
     Test.TestTrue(
       TEXT("The party notice sends the owed leave"),
       Harness.Server->ReadClientText(Request) &&
