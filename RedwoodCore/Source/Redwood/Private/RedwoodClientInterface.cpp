@@ -3910,18 +3910,17 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
     PendingPartyTicketId.Reset();
   }
 
+  // FORK(hollowed-oath): HollowedOath#2448. EndRealmReauthentication sends
+  // what a Realm that does not know the player cannot take now.
+  bSelectCharacterOwedToRealm = !IsRealmReady();
+
   if (!Realm.IsValid() || !Realm->bIsConnected) {
     return;
   }
 
-  // FORK(hollowed-oath): HollowedOath#2448. Upstream sent this only in a
-  // party. A player with no party can have invites out, and the realm makes
-  // the party from them later, so it must know the character now too.
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
-
-  Realm->Emit(TEXT("realm:parties:select-character"), Payload);
+  if (!bSelectCharacterOwedToRealm) {
+    SendSelectCharacter();
+  }
 
   if (!CurrentParty.bValid) {
     return;
@@ -4048,6 +4047,19 @@ FRedwoodParty URedwoodClientInterface::PartyAfterChange(
     return Changed;
   }
   return Changed.Id == Held.Id ? FRedwoodParty() : Held;
+}
+
+// FORK(hollowed-oath): HollowedOath#2448. Upstream sent this only in a party.
+// A player with no party can have invites out, and the realm makes the party
+// from them later, so it must know the character then too.
+void URedwoodClientInterface::SendSelectCharacter() {
+  bSelectCharacterOwedToRealm = false;
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+
+  Realm->Emit(TEXT("realm:parties:select-character"), Payload);
 }
 
 // FORK(hollowed-oath): HollowedOath#2854. A director re-login writes an online
@@ -4251,6 +4263,11 @@ void URedwoodClientInterface::EndRealmReauthentication(bool bSucceeded) {
       ResendOnlineCharacter();
     }
     bOnlineCharacterOwedAfterRealm = false;
+    // FORK(hollowed-oath): HollowedOath#2448. Before the held requests, which
+    // can act for the character.
+    if (bSelectCharacterOwedToRealm && !SelectedCharacterId.IsEmpty()) {
+      SendSelectCharacter();
+    }
     RealmHeldRequests.Release(TimerManager);
   } else {
     RealmHeldRequests.Expire(TimerManager);

@@ -520,6 +520,8 @@ private:
 
   // FORK(hollowed-oath): HollowedOath#2854. See the .cpp.
   void ResendOnlineCharacter();
+  // FORK(hollowed-oath): HollowedOath#2448. See the .cpp.
+  void SendSelectCharacter();
   template <typename TOutput>
   bool Gate(
     FRedwoodHeldRequests &Held,
@@ -641,6 +643,9 @@ private:
   // A Director re-login could not restore the online character because the
   // Realm re-handshake was still pending.
   bool bOnlineCharacterOwedAfterRealm = false;
+  // FORK(hollowed-oath): HollowedOath#2448. A character was selected while
+  // the Realm did not know the player, so the Realm did not learn it.
+  bool bSelectCharacterOwedToRealm = false;
   // Set by Logout, cleared when a re-login starts: a re-login reply after it
   // must not log the player back in.
   bool bLoggedOutDuringRelogin = false;

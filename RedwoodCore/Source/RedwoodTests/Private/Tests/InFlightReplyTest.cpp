@@ -2390,6 +2390,41 @@ namespace RedwoodInFlightTest {
     );
     return true;
   }
+
+  // The realm moves a player's pending invites to the character they select.
+  // Pins: a selection made while the Realm transport is down reaches the
+  // Realm when its re-handshake ends.
+  bool RunSelectCharacterAfterRealmRelogin(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::NoteRealmDrop(C);
+    // Down for the selection only: the socket stays open, so the test can
+    // read what the end of the re-handshake sends.
+    FAccess::Realm(C)->bIsConnected = false;
+    C.SetSelectedCharacter(TEXT("character-2"));
+    FAccess::Realm(C)->bIsConnected = true;
+    FAccess::EndRealmReauthentication(C, true);
+
+    FString Request;
+    if (!Test.TestTrue(
+          TEXT("The end of the re-handshake sends the selection"),
+          Harness.Server->ReadClientText(Request)
+        )) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("It is the character selection"),
+      HasJsonText(Request, TEXT("\"realm:parties:select-character\""))
+    );
+    Test.TestTrue(
+      TEXT("It names the selected character"),
+      HasJsonText(Request, TEXT("\"characterId\":\"character-2\""))
+    );
+    return true;
+  }
 }
 
 #define REDWOOD_IN_FLIGHT_TEST(Class, Name, Body)                              \
@@ -2664,4 +2699,9 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightHeldPartyInviteKeepsCharacterTest,
   "HeldPartyInviteKeepsCharacter",
   RedwoodInFlightTest::RunHeldPartyInviteKeepsCharacter(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightSelectCharacterAfterRealmReloginTest,
+  "SelectCharacterAfterRealmRelogin",
+  RedwoodInFlightTest::RunSelectCharacterAfterRealmRelogin(*this)
 )
