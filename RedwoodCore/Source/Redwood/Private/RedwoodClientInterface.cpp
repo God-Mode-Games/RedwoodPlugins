@@ -1794,17 +1794,20 @@ namespace {
 template <typename TOutput>
 void URedwoodClientInterface::EmitCharacterFriendCall(
   const FString &EventName,
+  const FString &CharacterId,
   TSharedPtr<FJsonObject> Payload,
   TOutput (*ParseAnswer)(const TArray<TSharedPtr<FJsonValue>> &),
   const TDelegate<void(const TOutput &)> &OnOutput
 ) {
   if (GateRealm([=, this]() {
-        EmitCharacterFriendCall(EventName, Payload, ParseAnswer, OnOutput);
+        EmitCharacterFriendCall(
+          EventName, CharacterId, Payload, ParseAnswer, OnOutput
+        );
       }, OnOutput)) {
     return;
   }
 
-  if (SelectedCharacterId.IsEmpty()) {
+  if (CharacterId.IsEmpty()) {
     TOutput Output;
     SetRedwoodGateError(Output, NoCharacterSelectedError);
     OnOutput.ExecuteIfBound(Output);
@@ -1812,7 +1815,7 @@ void URedwoodClientInterface::EmitCharacterFriendCall(
   }
 
   Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("characterId"), CharacterId);
   // HollowedOath#2886. See TrackReply.
   Realm->Emit(
     EventName,
@@ -1828,6 +1831,7 @@ void URedwoodClientInterface::ListCharacterFriends(
 ) {
   EmitCharacterFriendCall(
     TEXT("realm:contacts:list"),
+    SelectedCharacterId,
     MakeShared<FJsonObject>(),
     &URedwoodCommonGameSubsystem::ParseListCharacterFriends,
     OnOutput
@@ -1841,6 +1845,7 @@ void URedwoodClientInterface::RequestCharacterFriend(
   Payload->SetStringField(TEXT("targetCharacterId"), TargetCharacterId);
   EmitCharacterFriendCall(
     TEXT("realm:contacts:friends:request"),
+    SelectedCharacterId,
     Payload,
     &ParseCharacterFriendCommandAnswer,
     OnOutput
@@ -1855,6 +1860,7 @@ void URedwoodClientInterface::RespondToCharacterFriendRequest(
   Payload->SetBoolField(TEXT("accept"), bAccept);
   EmitCharacterFriendCall(
     TEXT("realm:contacts:friends:respond"),
+    SelectedCharacterId,
     Payload,
     &ParseCharacterFriendCommandAnswer,
     OnOutput
@@ -1868,6 +1874,7 @@ void URedwoodClientInterface::RemoveCharacterFriend(
   Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
   EmitCharacterFriendCall(
     TEXT("realm:contacts:friends:remove"),
+    SelectedCharacterId,
     Payload,
     &ParseCharacterFriendCommandAnswer,
     OnOutput
@@ -1882,6 +1889,7 @@ void URedwoodClientInterface::CancelCharacterFriendRequest(
   Payload->SetBoolField(TEXT("requestOnly"), true);
   EmitCharacterFriendCall(
     TEXT("realm:contacts:friends:remove"),
+    SelectedCharacterId,
     Payload,
     &ParseCharacterFriendCommandAnswer,
     OnOutput
