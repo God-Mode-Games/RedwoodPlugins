@@ -3532,7 +3532,13 @@ void URedwoodClientInterface::BindRealmEvents() {
       TSharedPtr<FJsonObject> PartyObject =
         MessageObject->GetObjectField(TEXT("party"));
       CurrentParty = URedwoodCommonGameSubsystem::ParseParty(PartyObject);
-      OnPartyUpdated.Broadcast(CurrentParty);
+      // FORK(hollowed-oath): HollowedOath#2448. The realm sends an empty
+      // roster when a party dissolves; that leaves no party, not a valid one.
+      const FRedwoodParty Broadcast = CurrentParty;
+      if (CurrentParty.Members.IsEmpty()) {
+        CurrentParty = FRedwoodParty();
+      }
+      OnPartyUpdated.Broadcast(Broadcast);
     },
     TEXT("/"),
     ESIOThreadOverrideOption::USE_GAME_THREAD
