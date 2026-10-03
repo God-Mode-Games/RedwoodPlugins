@@ -139,6 +139,9 @@ public:
   static TArray<FString> &EndedPartyTicketIds(FClient &C) {
     return C.EndedPartyTicketIds;
   }
+  static void EndRealmReauthentication(FClient &C, bool bSucceeded) {
+    C.EndRealmReauthentication(bSucceeded);
+  }
 };
 
 namespace RedwoodInFlightTest {
@@ -2109,8 +2112,9 @@ namespace RedwoodInFlightTest {
   }
 
   // Pins the fields that the RedwoodBackend fork validates for a request and a
-  // respond (Realms.Contacts.Friends in packages/common/src/interfaces.ts), and
-  // that a reply with no error field, or no object, is an error.
+  // respond (Realms.Contacts.Friends in packages/common/src/interfaces.ts),
+  // that a reply with no error field, or no object, is an error, and that a
+  // held call is sent for the character that made it.
   bool RunCharacterFriendWireFields(FAutomationTestBase &Test) {
     // Before the harness, so it outlives every callback the harness can run.
     TArray<FString> Errors;
@@ -2172,6 +2176,28 @@ namespace RedwoodInFlightTest {
         URedwoodCommonGameSubsystem::BadRealmAnswerError
       );
     }
+
+    // The re-login is pending, so the call is held; another character is
+    // selected before the re-login ends.
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::NoteRealmDrop(C);
+    C.RequestCharacterFriend(TEXT("character-2"), OnOutput);
+    if (!Test.TestEqual(TEXT("The call is held"), FAccess::NumRealmHeldRequests(C), 1)) {
+      return false;
+    }
+    FAccess::SelectedCharacterId(C) = TEXT("character-3");
+    FAccess::EndRealmReauthentication(C, true);
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("A held call names the character that made it"),
+      HasJsonText(Request, TEXT("\"characterId\":\"character-1\""))
+    );
+    Test.TestTrue(
+      TEXT("The held call is answered"),
+      PumpGameThreadUntil([&Errors]() { return Errors.Num() == 3; })
+    );
     return true;
   }
 
