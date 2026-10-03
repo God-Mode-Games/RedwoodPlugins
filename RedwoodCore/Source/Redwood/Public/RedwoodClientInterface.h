@@ -500,8 +500,8 @@ private:
 
   // FORK(hollowed-oath): the one path of the character friend calls: gated
   // like every Realm request, and needs a selected character. CharacterId is
-  // read at call time, so a call held over a reconnect is not sent for a
-  // character selected after it.
+  // read at call time, so a call held over a reconnect is not sent, and an
+  // answer is not given, for a character selected after it.
   template <typename TOutput>
   void EmitCharacterFriendCall(
     const FString &EventName,

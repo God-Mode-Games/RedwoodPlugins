@@ -1830,9 +1830,23 @@ void URedwoodClientInterface::EmitCharacterFriendCall(
   Realm->Emit(
     EventName,
     Payload,
-    TrackReply(RealmReplies, [ParseAnswer, OnOutput](auto Response) {
-      OnOutput.ExecuteIfBound(ParseAnswer(Response));
-    }, OnOutput)
+    TrackReply(
+      RealmReplies,
+      [this, CharacterId, ParseAnswer, OnOutput](auto Response) {
+        // A list answer names no character, so after a switch it would fill
+        // the new character's friends with the old one's.
+        if (CharacterId != SelectedCharacterId) {
+          TOutput Output;
+          SetRedwoodGateError(
+            Output, URedwoodCommonGameSubsystem::CharacterChangedError
+          );
+          OnOutput.ExecuteIfBound(Output);
+          return;
+        }
+        OnOutput.ExecuteIfBound(ParseAnswer(Response));
+      },
+      OnOutput
+    )
   );
 }
 

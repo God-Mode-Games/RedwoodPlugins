@@ -2271,6 +2271,65 @@ namespace RedwoodInFlightTest {
     Test.TestEqualSensitive(TEXT("The zone"), *Alert.ZoneName, TEXT("zone-1"));
     return true;
   }
+
+  // A list answer names no character. Pins: the answer of a character friend
+  // call is refused when the selection changed while the call was out.
+  bool RunCharacterFriendListAfterSwitch(FAutomationTestBase &Test) {
+    // Before the harness, so they outlive every callback it can run.
+    TArray<FRedwoodListCharacterFriendsOutput> Outputs;
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    const FRedwoodListCharacterFriendsOutputDelegate OnList =
+      FRedwoodListCharacterFriendsOutputDelegate::CreateLambda(
+        [&Outputs](const FRedwoodListCharacterFriendsOutput &Output) {
+          Outputs.Add(Output);
+        }
+      );
+    const TCHAR *const ListAnswer =
+      TEXT("{\"error\":\"\",\"friends\":[{\"characterId\":\"friend-1\",")
+      TEXT("\"characterName\":\"Bob\"}],\"incomingRequests\":[],")
+      TEXT("\"outgoingRequests\":[]}");
+
+    FString Request;
+    C.ListCharacterFriends(OnList);
+    if (!AnswerRequest(Test, *Harness.Server, ListAnswer, Request) ||
+        !Test.TestTrue(
+          TEXT("The answer for the same character arrives"),
+          PumpGameThreadUntil([&Outputs]() { return Outputs.Num() == 1; })
+        )) {
+      return false;
+    }
+    Test.TestEqual(
+      TEXT("The answer for the same character is given"), Outputs[0].Friends.Num(), 1
+    );
+
+    // The call is out for character-1 when the player selects another.
+    C.ListCharacterFriends(OnList);
+    FAccess::SelectedCharacterId(C) = TEXT("character-2");
+    if (!AnswerRequest(Test, *Harness.Server, ListAnswer, Request) ||
+        !Test.TestTrue(
+          TEXT("The answer after the switch arrives"),
+          PumpGameThreadUntil([&Outputs]() { return Outputs.Num() == 2; })
+        )) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("The call was sent for the old character"),
+      HasJsonText(Request, TEXT("\"characterId\":\"character-1\""))
+    );
+    Test.TestEqualSensitive(
+      TEXT("The answer after the switch tells the character changed"),
+      *Outputs[1].Error,
+      URedwoodCommonGameSubsystem::CharacterChangedError
+    );
+    Test.TestEqual(
+      TEXT("The old character's friends are not given"), Outputs[1].Friends.Num(), 0
+    );
+    return true;
+  }
 }
 
 #define REDWOOD_IN_FLIGHT_TEST(Class, Name, Body)                              \
@@ -2535,4 +2594,9 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightCharacterFriendAlertTest,
   "CharacterFriendAlertPush",
   RedwoodInFlightTest::RunCharacterFriendAlertPush(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCharacterFriendListAfterSwitchTest,
+  "CharacterFriendListAfterSwitch",
+  RedwoodInFlightTest::RunCharacterFriendListAfterSwitch(*this)
 )
