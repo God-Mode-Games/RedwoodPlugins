@@ -106,29 +106,30 @@ bool FRedwoodCharacterFriendsListParseTest::RunTest(const FString &Parameters) {
     Output.Friends.Num(),
     2
   );
+  // TestEqualSensitive: the string forms of TestEqual ignore case.
   if (Output.Friends.Num() == 2) {
-    TestEqual(TEXT("Friend id"), Output.Friends[0].CharacterId, TEXT("char-online"));
-    TestEqual(TEXT("Friend name"), Output.Friends[0].CharacterName, TEXT("Alpha"));
+    TestEqualSensitive(TEXT("Friend id"), *Output.Friends[0].CharacterId, TEXT("char-online"));
+    TestEqualSensitive(TEXT("Friend name"), *Output.Friends[0].CharacterName, TEXT("Alpha"));
     TestTrue(TEXT("Friend online"), Output.Friends[0].bOnline);
-    TestEqual(TEXT("Friend zone"), Output.Friends[0].ZoneName, TEXT("L_Freewind"));
-    TestEqual(TEXT("Second friend id"), Output.Friends[1].CharacterId, TEXT("char-offline"));
-    TestEqual(TEXT("Second friend name"), Output.Friends[1].CharacterName, TEXT("Bravo"));
+    TestEqualSensitive(TEXT("Friend zone"), *Output.Friends[0].ZoneName, TEXT("L_Freewind"));
+    TestEqualSensitive(TEXT("Second friend id"), *Output.Friends[1].CharacterId, TEXT("char-offline"));
+    TestEqualSensitive(TEXT("Second friend name"), *Output.Friends[1].CharacterName, TEXT("Bravo"));
     TestFalse(TEXT("Offline friend"), Output.Friends[1].bOnline);
     TestEqual(TEXT("Offline friend zone"), Output.Friends[1].ZoneName, FString());
   }
 
   TestEqual(TEXT("One incoming request"), Output.IncomingRequests.Num(), 1);
   if (Output.IncomingRequests.Num() == 1) {
-    TestEqual(TEXT("Incoming id"), Output.IncomingRequests[0].CharacterId, TEXT("char-in"));
-    TestEqual(TEXT("Incoming name"), Output.IncomingRequests[0].CharacterName, TEXT("Charlie"));
+    TestEqualSensitive(TEXT("Incoming id"), *Output.IncomingRequests[0].CharacterId, TEXT("char-in"));
+    TestEqualSensitive(TEXT("Incoming name"), *Output.IncomingRequests[0].CharacterName, TEXT("Charlie"));
     TestFalse(TEXT("A request row is not online"), Output.IncomingRequests[0].bOnline);
     TestEqual(TEXT("A request row has no zone"), Output.IncomingRequests[0].ZoneName, FString());
   }
 
   TestEqual(TEXT("One outgoing request"), Output.OutgoingRequests.Num(), 1);
   if (Output.OutgoingRequests.Num() == 1) {
-    TestEqual(TEXT("Outgoing id"), Output.OutgoingRequests[0].CharacterId, TEXT("char-out"));
-    TestEqual(TEXT("Outgoing name"), Output.OutgoingRequests[0].CharacterName, TEXT("Delta"));
+    TestEqualSensitive(TEXT("Outgoing id"), *Output.OutgoingRequests[0].CharacterId, TEXT("char-out"));
+    TestEqualSensitive(TEXT("Outgoing name"), *Output.OutgoingRequests[0].CharacterName, TEXT("Delta"));
   }
 
   return true;
@@ -155,9 +156,9 @@ bool FRedwoodCharacterFriendsListBadAnswerTest::RunTest(
   );
   const FRedwoodListCharacterFriendsOutput FromRefused =
     ParseFriendListAnswer(Refused);
-  TestEqual(
+  TestEqualSensitive(
     TEXT("The backend words are not changed"),
-    FromRefused.Error,
+    *FromRefused.Error,
     TEXT("Invalid target character")
   );
   TestEqual(TEXT("A refusal gives no friends"), FromRefused.Friends.Num(), 0);

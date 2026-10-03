@@ -2132,12 +2132,13 @@ namespace RedwoodInFlightTest {
     Test.TestTrue(
       TEXT("The type"), Alert.Type == ERedwoodCharacterFriendAlertType::Online
     );
-    Test.TestEqual(TEXT("The character"), Alert.CharacterId, FString(TEXT("me-1")));
-    Test.TestEqual(
-      TEXT("The other character"), Alert.OtherCharacterId, FString(TEXT("other-1"))
+    // TestEqualSensitive: the string forms of TestEqual ignore case.
+    Test.TestEqualSensitive(TEXT("The character"), *Alert.CharacterId, TEXT("me-1"));
+    Test.TestEqualSensitive(
+      TEXT("The other character"), *Alert.OtherCharacterId, TEXT("other-1")
     );
-    Test.TestEqual(TEXT("The name"), Alert.OtherCharacterName, FString(TEXT("Bob")));
-    Test.TestEqual(TEXT("The zone"), Alert.ZoneName, FString(TEXT("zone-1")));
+    Test.TestEqualSensitive(TEXT("The name"), *Alert.OtherCharacterName, TEXT("Bob"));
+    Test.TestEqualSensitive(TEXT("The zone"), *Alert.ZoneName, TEXT("zone-1"));
     return true;
   }
 }

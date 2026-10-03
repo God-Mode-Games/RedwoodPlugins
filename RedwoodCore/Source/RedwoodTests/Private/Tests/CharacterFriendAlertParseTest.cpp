@@ -50,10 +50,11 @@ bool FRedwoodCharacterFriendAlertParseTest::RunTest(const FString &Parameters) {
     TEXT("The type is Online"),
     Alert.Type == ERedwoodCharacterFriendAlertType::Online
   );
-  TestEqual(TEXT("The recipient id"), Alert.CharacterId, TEXT("me-1"));
-  TestEqual(TEXT("The other id"), Alert.OtherCharacterId, TEXT("other-1"));
-  TestEqual(TEXT("The other name"), Alert.OtherCharacterName, TEXT("Other"));
-  TestEqual(TEXT("The zone"), Alert.ZoneName, TEXT("L_Freewind"));
+  // TestEqualSensitive: the string forms of TestEqual ignore case.
+  TestEqualSensitive(TEXT("The recipient id"), *Alert.CharacterId, TEXT("me-1"));
+  TestEqualSensitive(TEXT("The other id"), *Alert.OtherCharacterId, TEXT("other-1"));
+  TestEqualSensitive(TEXT("The other name"), *Alert.OtherCharacterName, TEXT("Other"));
+  TestEqualSensitive(TEXT("The zone"), *Alert.ZoneName, TEXT("L_Freewind"));
 
   const TCHAR *Words[] = {
     TEXT("requested"), TEXT("accepted"), TEXT("removed"), TEXT("offline")
