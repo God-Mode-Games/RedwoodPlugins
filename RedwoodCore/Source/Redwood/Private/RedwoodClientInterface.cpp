@@ -1841,7 +1841,7 @@ void URedwoodClientInterface::ListCharacterFriends(
 void URedwoodClientInterface::RequestCharacterFriend(
   FString TargetCharacterId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
   Payload->SetStringField(TEXT("targetCharacterId"), TargetCharacterId);
   EmitCharacterFriendCall(
     TEXT("realm:contacts:friends:request"),
@@ -1855,7 +1855,7 @@ void URedwoodClientInterface::RequestCharacterFriend(
 void URedwoodClientInterface::RespondToCharacterFriendRequest(
   FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
   Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
   Payload->SetBoolField(TEXT("accept"), bAccept);
   EmitCharacterFriendCall(
@@ -1870,7 +1870,7 @@ void URedwoodClientInterface::RespondToCharacterFriendRequest(
 void URedwoodClientInterface::RemoveCharacterFriend(
   FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
   Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
   EmitCharacterFriendCall(
     TEXT("realm:contacts:friends:remove"),
@@ -1884,7 +1884,7 @@ void URedwoodClientInterface::RemoveCharacterFriend(
 void URedwoodClientInterface::CancelCharacterFriendRequest(
   FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
 ) {
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
   Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
   Payload->SetBoolField(TEXT("requestOnly"), true);
   EmitCharacterFriendCall(
