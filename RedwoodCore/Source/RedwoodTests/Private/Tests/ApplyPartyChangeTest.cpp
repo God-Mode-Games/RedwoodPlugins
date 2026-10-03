@@ -1,12 +1,13 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
 // FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart.
-// Pins the party the client holds after a realm:parties:changed roster
+// Pins how a realm:parties:changed roster changes the held party
 // (HollowedOath#2448). A party never has one member: the realm dissolves it
 // and sends the last member the roster with no members.
-//   1. A roster with members is held.
-//   2. An empty roster of the held party leaves no party.
-//   3. An empty roster of another party keeps the held one.
+//   1. A roster with members is held and broadcast.
+//   2. An empty roster of the held party leaves no party, and is broadcast.
+//   3. An empty roster of another party keeps the held one, and is not
+//      broadcast, so the game does not see the held party end.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -14,7 +15,7 @@
 #include "RedwoodClientInterface.h"
 
 namespace {
-  FRedwoodParty MakePartyAfterChangeRoster(
+  FRedwoodParty MakeApplyPartyChangeRoster(
     const TCHAR *Id, const TArray<FString> &MemberIds
   ) {
     FRedwoodParty Party;
@@ -30,31 +31,44 @@ namespace {
 } // namespace
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodPartyAfterChangeTest,
-  "Redwood.Parties.PartyAfterChange",
+  FRedwoodApplyPartyChangeTest,
+  "Redwood.Parties.ApplyPartyChange",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-bool FRedwoodPartyAfterChangeTest::RunTest(const FString &Parameters) {
+bool FRedwoodApplyPartyChangeTest::RunTest(const FString &Parameters) {
   const FRedwoodParty Held =
-    MakePartyAfterChangeRoster(TEXT("party-1"), {TEXT("p1"), TEXT("p2")});
+    MakeApplyPartyChangeRoster(TEXT("party-1"), {TEXT("p1"), TEXT("p2")});
 
-  const FRedwoodParty Larger = MakePartyAfterChangeRoster(
-    TEXT("party-1"), {TEXT("p1"), TEXT("p2"), TEXT("p3")}
+  FRedwoodParty AfterLarger = Held;
+  TestTrue(
+    TEXT("A roster with members is broadcast"),
+    URedwoodClientInterface::ApplyPartyChange(
+      AfterLarger,
+      MakeApplyPartyChangeRoster(
+        TEXT("party-1"), {TEXT("p1"), TEXT("p2"), TEXT("p3")}
+      )
+    )
   );
-  const FRedwoodParty AfterLarger =
-    URedwoodClientInterface::PartyAfterChange(Held, Larger);
   TestTrue(TEXT("A roster with members is held"), AfterLarger.bValid);
   TestEqual(TEXT("with all its members"), AfterLarger.Members.Num(), 3);
 
-  const FRedwoodParty AfterDissolve = URedwoodClientInterface::PartyAfterChange(
-    Held, MakePartyAfterChangeRoster(TEXT("party-1"), {})
+  FRedwoodParty AfterDissolve = Held;
+  TestTrue(
+    TEXT("An empty roster of the held party is broadcast"),
+    URedwoodClientInterface::ApplyPartyChange(
+      AfterDissolve, MakeApplyPartyChangeRoster(TEXT("party-1"), {})
+    )
   );
   TestFalse(TEXT("An empty roster of the held party leaves no party"), AfterDissolve.bValid);
   TestEqual(TEXT("and no members"), AfterDissolve.Members.Num(), 0);
 
-  const FRedwoodParty AfterOther = URedwoodClientInterface::PartyAfterChange(
-    Held, MakePartyAfterChangeRoster(TEXT("party-2"), {})
+  FRedwoodParty AfterOther = Held;
+  TestFalse(
+    TEXT("An empty roster of another party is not broadcast"),
+    URedwoodClientInterface::ApplyPartyChange(
+      AfterOther, MakeApplyPartyChangeRoster(TEXT("party-2"), {})
+    )
   );
   TestTrue(TEXT("An empty roster of another party keeps the held one"), AfterOther.bValid);
   // TestEqualSensitive: the string forms of TestEqual ignore case.
