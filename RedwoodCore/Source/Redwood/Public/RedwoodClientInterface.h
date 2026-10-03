@@ -414,6 +414,11 @@ public:
   FRedwoodParty GetCachedParty() {
     return CurrentParty;
   }
+  // FORK(hollowed-oath): HollowedOath#2448. The party held after a
+  // realm:parties:changed roster, given the party held before it. See the .cpp.
+  static FRedwoodParty PartyAfterChange(
+    const FRedwoodParty &Held, const FRedwoodParty &Changed
+  );
   void GetOrCreateParty(
     bool bCreateIfNotInParty, FRedwoodGetPartyOutputDelegate OnOutput
   );

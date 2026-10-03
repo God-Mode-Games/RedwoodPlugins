@@ -3531,13 +3531,11 @@ void URedwoodClientInterface::BindRealmEvents() {
 
       TSharedPtr<FJsonObject> PartyObject =
         MessageObject->GetObjectField(TEXT("party"));
-      CurrentParty = URedwoodCommonGameSubsystem::ParseParty(PartyObject);
-      // FORK(hollowed-oath): HollowedOath#2448. The realm sends an empty
-      // roster when a party dissolves; that leaves no party, not a valid one.
-      const FRedwoodParty Parsed = CurrentParty;
-      if (CurrentParty.Members.IsEmpty()) {
-        CurrentParty = FRedwoodParty();
-      }
+      // FORK(hollowed-oath): HollowedOath#2448. Upstream held every roster.
+      // See PartyAfterChange.
+      const FRedwoodParty Parsed =
+        URedwoodCommonGameSubsystem::ParseParty(PartyObject);
+      CurrentParty = PartyAfterChange(CurrentParty, Parsed);
       OnPartyUpdated.Broadcast(Parsed);
     },
     TEXT("/"),
@@ -4023,6 +4021,19 @@ TSharedPtr<FJsonObject> URedwoodClientInterface::MakeOnlineCharacterPayload(
   Payload->SetStringField(TEXT("characterId"), InCharacterId);
   Payload->SetStringField(TEXT("realmId"), InRealmId);
   return Payload;
+}
+
+// FORK(hollowed-oath): HollowedOath#2448. A party never has one member: the
+// realm dissolves it and sends the last member the roster with no members.
+// That leaves no party, not a valid party with no one in it. It dissolves only
+// the party it names, so a late one for an earlier party keeps the held one.
+FRedwoodParty URedwoodClientInterface::PartyAfterChange(
+  const FRedwoodParty &Held, const FRedwoodParty &Changed
+) {
+  if (!Changed.Members.IsEmpty()) {
+    return Changed;
+  }
+  return Changed.Id == Held.Id ? FRedwoodParty() : Held;
 }
 
 // FORK(hollowed-oath): HollowedOath#2854. A director re-login writes an online
