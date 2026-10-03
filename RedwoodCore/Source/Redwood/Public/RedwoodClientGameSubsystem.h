@@ -144,6 +144,27 @@ public:
     FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
   );
 
+  // FORK(hollowed-oath) BEGIN: character friend calls.
+  void ListCharacterFriends(FRedwoodListCharacterFriendsOutputDelegate OnOutput
+  );
+
+  void RequestCharacterFriend(
+    FString TargetCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void RespondToCharacterFriendRequest(
+    FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void RemoveCharacterFriend(
+    FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void CancelCharacterFriendRequest(
+    FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+  // FORK(hollowed-oath) END
+
   void ListGuilds(
     bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
   );

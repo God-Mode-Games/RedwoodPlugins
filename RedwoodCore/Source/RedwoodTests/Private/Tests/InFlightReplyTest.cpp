@@ -11,9 +11,11 @@
 #include "Misc/AutomationTest.h"
 #include "UObject/StrongObjectPtr.h"
 
+#include "CharacterFriendAlertListener.h"
 #include "FakeSocketIoServer.h"
 #include "RedwoodClientInterface.h"
 #include "RedwoodClosingSockets.h"
+#include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodSettings.h"
 #include "SocketIOClient.h"
 #include "SocketIONative.h"
@@ -136,6 +138,9 @@ public:
   }
   static TArray<FString> &EndedPartyTicketIds(FClient &C) {
     return C.EndedPartyTicketIds;
+  }
+  static void EndRealmReauthentication(FClient &C, bool bSucceeded) {
+    C.EndRealmReauthentication(bSucceeded);
   }
 };
 
@@ -1423,6 +1428,13 @@ namespace RedwoodInFlightTest {
     Test.TestTrue(
       TEXT("The old ticket's leave is still owed"), FAccess::bLeaveTicketingOwed(C)
     );
+    // Read now, so the leave below is the next request.
+    FString Request;
+    Test.TestTrue(
+      TEXT("The switch tells the realm the character"),
+      Harness.Server->ReadClientText(Request) &&
+        Request.Contains(TEXT("realm:parties:select-character"))
+    );
     SendEvent(Test, Harness, PartyQueued(TEXT("character-2"), TEXT("ticket-1"), TEXT("m-1")));
     // Pins: AcceptPartyTicket keeps the owed leave, and SendOwedLeave does
     // not wait for a party join.
@@ -1430,7 +1442,6 @@ namespace RedwoodInFlightTest {
       TEXT("The party notice keeps the old ticket's owed leave"),
       FAccess::bLeaveTicketingOwed(C)
     );
-    FString Request;
     Test.TestTrue(
       TEXT("The party notice sends the owed leave"),
       Harness.Server->ReadClientText(Request) &&
@@ -2053,6 +2064,373 @@ namespace RedwoodInFlightTest {
     C.Deinitialize();
     return ExpectKeptThenFreed(Test, Socket);
   }
+
+  // The socket sends condensed JSON, so a field and its value are one run of
+  // text. The backend reads field names case-sensitively.
+  bool HasJsonText(const FString &Request, const TCHAR *Text) {
+    return Request.Contains(Text, ESearchCase::CaseSensitive);
+  }
+
+  // A cancel must name the pending request only, so the backend cannot end a
+  // friendship the other side accepted meanwhile. A remove must not.
+  bool RunCharacterFriendCancelIsRequestOnly(FAutomationTestBase &Test) {
+    // Before the harness, so they outlive every callback it can run.
+    int32 Answers = 0;
+    FString Error = TEXT("unanswered");
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    const FRedwoodErrorOutputDelegate OnOutput =
+      FRedwoodErrorOutputDelegate::CreateLambda([&](const FString &InError) {
+        ++Answers;
+        Error = InError;
+      });
+    const TCHAR *const RemoveRoute = TEXT("realm:contacts:friends:remove");
+    const TCHAR *const RequestOnlyField = TEXT("\"requestOnly\":true");
+    const TCHAR *const Success = TEXT("{\"error\":\"\"}");
+
+    FString Request;
+    Harness.Client().RemoveCharacterFriend(TEXT("character-2"), OnOutput);
+    if (!AnswerRequest(Test, *Harness.Server, Success, Request)) {
+      return false;
+    }
+    Test.TestTrue(TEXT("A remove goes to the remove route"), HasJsonText(Request, RemoveRoute));
+    Test.TestTrue(
+      TEXT("A remove names the other character"),
+      HasJsonText(Request, TEXT("\"otherCharacterId\":\"character-2\""))
+    );
+    Test.TestFalse(TEXT("A remove is not request-only"), HasJsonText(Request, RequestOnlyField));
+
+    Harness.Client().CancelCharacterFriendRequest(TEXT("character-2"), OnOutput);
+    if (!AnswerRequest(Test, *Harness.Server, Success, Request)) {
+      return false;
+    }
+    Test.TestTrue(TEXT("A cancel goes to the remove route"), HasJsonText(Request, RemoveRoute));
+    Test.TestTrue(TEXT("A cancel is request-only"), HasJsonText(Request, RequestOnlyField));
+
+    Test.TestTrue(
+      TEXT("Both calls are answered"),
+      PumpGameThreadUntil([&Answers]() { return Answers == 2; })
+    );
+    Test.TestEqual(TEXT("An empty realm error is a success"), Error, FString());
+    return true;
+  }
+
+  // Pins the fields that the RedwoodBackend fork validates
+  // (Realms.Contacts.Friends in packages/common/src/interfaces.ts): playerId,
+  // characterId and targetCharacterId on a request, otherCharacterId and
+  // accept on a respond. Also pins that a reply with no error field, or no
+  // object, is an error, that a held call is sent for the character that made
+  // it, and that a held call is not sent when the character changed.
+  bool RunCharacterFriendWireFields(FAutomationTestBase &Test) {
+    // Before the harness, so it outlives every callback the harness can run.
+    TArray<FString> Errors;
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    const FRedwoodErrorOutputDelegate OnOutput =
+      FRedwoodErrorOutputDelegate::CreateLambda([&Errors](const FString &Error) {
+        Errors.Add(Error);
+      });
+
+    FString Request;
+    Harness.Client().RequestCharacterFriend(TEXT("character-2"), OnOutput);
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("{}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("A request goes to the request route"),
+      HasJsonText(Request, TEXT("\"realm:contacts:friends:request\""))
+    );
+    Test.TestTrue(
+      TEXT("A request names the player"),
+      HasJsonText(Request, TEXT("\"playerId\":\"player-1\""))
+    );
+    Test.TestTrue(
+      TEXT("A request names the caller"),
+      HasJsonText(Request, TEXT("\"characterId\":\"character-1\""))
+    );
+    Test.TestTrue(
+      TEXT("A request names the target"),
+      HasJsonText(Request, TEXT("\"targetCharacterId\":\"character-2\""))
+    );
+
+    Harness.Client().RespondToCharacterFriendRequest(TEXT("character-2"), true, OnOutput);
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("\"nope\""), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("A respond goes to the respond route"),
+      HasJsonText(Request, TEXT("\"realm:contacts:friends:respond\""))
+    );
+    Test.TestTrue(
+      TEXT("A respond names the other character"),
+      HasJsonText(Request, TEXT("\"otherCharacterId\":\"character-2\""))
+    );
+    Test.TestTrue(
+      TEXT("A respond carries the accept"), HasJsonText(Request, TEXT("\"accept\":true"))
+    );
+
+    Test.TestTrue(
+      TEXT("Both calls are answered"),
+      PumpGameThreadUntil([&Errors]() { return Errors.Num() == 2; })
+    );
+    for (const FString &Error : Errors) {
+      Test.TestEqualSensitive(
+        TEXT("A reply that is not an answer is an error"),
+        *Error,
+        URedwoodCommonGameSubsystem::BadRealmAnswerError
+      );
+    }
+
+    // The re-login is pending, so the call is held; the selection does not
+    // change before the re-login ends.
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::NoteRealmDrop(C);
+    C.RequestCharacterFriend(TEXT("character-2"), OnOutput);
+    if (!Test.TestEqual(TEXT("The call is held"), FAccess::NumRealmHeldRequests(C), 1)) {
+      return false;
+    }
+    FAccess::EndRealmReauthentication(C, true);
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("A held call names the character that made it"),
+      HasJsonText(Request, TEXT("\"characterId\":\"character-1\""))
+    );
+    Test.TestTrue(
+      TEXT("The held call is answered"),
+      PumpGameThreadUntil([&Errors]() { return Errors.Num() == 3; })
+    );
+
+    // Held again, and another character is selected before the re-login
+    // ends: the call must not act for the character the player left.
+    FAccess::NoteRealmDrop(C);
+    C.RequestCharacterFriend(TEXT("character-2"), OnOutput);
+    if (!Test.TestEqual(
+          TEXT("The second call is held"), FAccess::NumRealmHeldRequests(C), 1
+        )) {
+      return false;
+    }
+    FAccess::SelectedCharacterId(C) = TEXT("character-3");
+    FAccess::EndRealmReauthentication(C, true);
+    Test.TestEqual(
+      TEXT("A call held across a character change is not sent"),
+      FAccess::NumRealmReplies(C),
+      0
+    );
+    if (!Test.TestEqual(TEXT("The changed call is answered"), Errors.Num(), 4)) {
+      return false;
+    }
+    Test.TestEqualSensitive(
+      TEXT("The changed call tells the character changed"),
+      *Errors[3],
+      URedwoodCommonGameSubsystem::CharacterChangedError
+    );
+    return true;
+  }
+
+  // Pins the event name and the listener that InitializeDirectorConnection
+  // binds: a pushed alert reaches OnCharacterFriendAlert once, parsed.
+  bool RunCharacterFriendAlertPush(FAutomationTestBase &Test) {
+    // Before the harness, so it outlives every callback the harness can run.
+    TStrongObjectPtr<URedwoodCharacterFriendAlertListener> Listener(
+      NewObject<URedwoodCharacterFriendAlertListener>()
+    );
+    FRealmHarness Harness;
+    // After the harness, so its connection closes before the harness waits
+    // for the sockets, as in DirectorDropDuringRealmRelogin.
+    FFakeSocketIoServer DirectorServer;
+    Harness.OpenedBy = &Test;
+    URedwoodClientInterface &C = Harness.Client();
+    Listener->Watch(&C);
+    if (!OpenProductionDirector(Test, C, DirectorServer)) {
+      return false;
+    }
+
+    Test.TestTrue(
+      TEXT("The Director pushes an alert"),
+      DirectorServer.SendText(
+        "42[\"director:friends:character-alert\",{\"type\":\"online\","
+        "\"characterId\":\"me-1\",\"otherCharacterId\":\"other-1\","
+        "\"otherCharacterName\":\"Bob\",\"zoneName\":\"zone-1\"}]"
+      )
+    );
+    Test.TestTrue(
+      TEXT("The alert is broadcast"),
+      PumpGameThreadUntil([&Listener]() { return Listener->Count > 0; })
+    );
+    Test.TestEqual(TEXT("The alert is broadcast once"), Listener->Count, 1);
+    const FRedwoodCharacterFriendAlert &Alert = Listener->Last;
+    Test.TestTrue(
+      TEXT("The type"), Alert.Type == ERedwoodCharacterFriendAlertType::Online
+    );
+    // TestEqualSensitive: the string forms of TestEqual ignore case.
+    Test.TestEqualSensitive(TEXT("The character"), *Alert.CharacterId, TEXT("me-1"));
+    Test.TestEqualSensitive(
+      TEXT("The other character"), *Alert.OtherCharacterId, TEXT("other-1")
+    );
+    Test.TestEqualSensitive(TEXT("The name"), *Alert.OtherCharacterName, TEXT("Bob"));
+    Test.TestEqualSensitive(TEXT("The zone"), *Alert.ZoneName, TEXT("zone-1"));
+    return true;
+  }
+
+  // A list answer names no character. Pins: the answer of a character friend
+  // call is refused when the selection changed while the call was out.
+  bool RunCharacterFriendListAfterSwitch(FAutomationTestBase &Test) {
+    // Before the harness, so they outlive every callback it can run.
+    TArray<FRedwoodListCharacterFriendsOutput> Outputs;
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    const FRedwoodListCharacterFriendsOutputDelegate OnList =
+      FRedwoodListCharacterFriendsOutputDelegate::CreateLambda(
+        [&Outputs](const FRedwoodListCharacterFriendsOutput &Output) {
+          Outputs.Add(Output);
+        }
+      );
+    const TCHAR *const ListAnswer =
+      TEXT("{\"error\":\"\",\"friends\":[{\"characterId\":\"friend-1\",")
+      TEXT("\"characterName\":\"Bob\"}],\"incomingRequests\":[],")
+      TEXT("\"outgoingRequests\":[]}");
+
+    FString Request;
+    C.ListCharacterFriends(OnList);
+    if (!AnswerRequest(Test, *Harness.Server, ListAnswer, Request) ||
+        !Test.TestTrue(
+          TEXT("The answer for the same character arrives"),
+          PumpGameThreadUntil([&Outputs]() { return Outputs.Num() == 1; })
+        )) {
+      return false;
+    }
+    Test.TestEqual(
+      TEXT("The answer for the same character is given"), Outputs[0].Friends.Num(), 1
+    );
+
+    // The call is out for character-1 when the player selects another.
+    C.ListCharacterFriends(OnList);
+    FAccess::SelectedCharacterId(C) = TEXT("character-2");
+    if (!AnswerRequest(Test, *Harness.Server, ListAnswer, Request) ||
+        !Test.TestTrue(
+          TEXT("The answer after the switch arrives"),
+          PumpGameThreadUntil([&Outputs]() { return Outputs.Num() == 2; })
+        )) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("The call was sent for the old character"),
+      HasJsonText(Request, TEXT("\"characterId\":\"character-1\""))
+    );
+    Test.TestEqualSensitive(
+      TEXT("The answer after the switch tells the character changed"),
+      *Outputs[1].Error,
+      URedwoodCommonGameSubsystem::CharacterChangedError
+    );
+    Test.TestEqual(
+      TEXT("The old character's friends are not given"), Outputs[1].Friends.Num(), 0
+    );
+    return true;
+  }
+
+  // The realm makes the party from the invite's character when it is
+  // accepted. Pins: a held invite goes out for the character that made it,
+  // and is refused when another character is selected before it goes.
+  bool RunHeldPartyInviteKeepsCharacter(FAutomationTestBase &Test) {
+    // Before the harness, so it outlives every callback it can run.
+    TArray<FString> Errors;
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    const FRedwoodErrorOutputDelegate OnOutput =
+      FRedwoodErrorOutputDelegate::CreateLambda([&Errors](const FString &Error) {
+        Errors.Add(Error);
+      });
+
+    FAccess::NoteRealmDrop(C);
+    C.InviteToParty(TEXT("player-2"), OnOutput);
+    if (!Test.TestEqual(TEXT("The invite is held"), FAccess::NumRealmHeldRequests(C), 1)) {
+      return false;
+    }
+    FAccess::EndRealmReauthentication(C, true);
+    FString Request;
+    if (!AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request)) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("A held invite names the character that made it"),
+      HasJsonText(Request, TEXT("\"characterId\":\"character-1\""))
+    );
+    Test.TestTrue(
+      TEXT("The held invite is answered"),
+      PumpGameThreadUntil([&Errors]() { return Errors.Num() == 1; })
+    );
+
+    FAccess::NoteRealmDrop(C);
+    C.InviteToParty(TEXT("player-2"), OnOutput);
+    if (!Test.TestEqual(
+          TEXT("The second invite is held"), FAccess::NumRealmHeldRequests(C), 1
+        )) {
+      return false;
+    }
+    FAccess::SelectedCharacterId(C) = TEXT("character-2");
+    FAccess::EndRealmReauthentication(C, true);
+    Test.TestEqual(
+      TEXT("An invite held across a character change is not sent"),
+      FAccess::NumRealmReplies(C),
+      0
+    );
+    if (!Test.TestEqual(TEXT("The changed invite is answered"), Errors.Num(), 2)) {
+      return false;
+    }
+    Test.TestEqualSensitive(
+      TEXT("The changed invite tells the character changed"),
+      *Errors[1],
+      URedwoodCommonGameSubsystem::CharacterChangedError
+    );
+    return true;
+  }
+
+  // The realm moves a player's pending invites to the character they select.
+  // Pins: a selection made while the Realm transport is down reaches the
+  // Realm when its re-handshake ends.
+  bool RunSelectCharacterAfterRealmRelogin(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!Harness.Open(Test)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    FAccess::NoteRealmDrop(C);
+    // Down for the selection only: the socket stays open, so the test can
+    // read what the end of the re-handshake sends.
+    FAccess::Realm(C)->bIsConnected = false;
+    C.SetSelectedCharacter(TEXT("character-2"));
+    FAccess::Realm(C)->bIsConnected = true;
+    FAccess::EndRealmReauthentication(C, true);
+
+    FString Request;
+    if (!Test.TestTrue(
+          TEXT("The end of the re-handshake sends the selection"),
+          Harness.Server->ReadClientText(Request)
+        )) {
+      return false;
+    }
+    Test.TestTrue(
+      TEXT("It is the character selection"),
+      HasJsonText(Request, TEXT("\"realm:parties:select-character\""))
+    );
+    Test.TestTrue(
+      TEXT("It names the selected character"),
+      HasJsonText(Request, TEXT("\"characterId\":\"character-2\""))
+    );
+    return true;
+  }
 }
 
 #define REDWOOD_IN_FLIGHT_TEST(Class, Name, Body)                              \
@@ -2302,4 +2680,34 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightDirectorReconnectTest,
   "DirectorReconnectFailsPendingReply",
   RedwoodInFlightTest::RunDirectorReconnectFailsPendingReply(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCharacterFriendCancelTest,
+  "CharacterFriendCancelIsRequestOnly",
+  RedwoodInFlightTest::RunCharacterFriendCancelIsRequestOnly(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCharacterFriendWireFieldsTest,
+  "CharacterFriendWireFields",
+  RedwoodInFlightTest::RunCharacterFriendWireFields(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCharacterFriendAlertTest,
+  "CharacterFriendAlertPush",
+  RedwoodInFlightTest::RunCharacterFriendAlertPush(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightCharacterFriendListAfterSwitchTest,
+  "CharacterFriendListAfterSwitch",
+  RedwoodInFlightTest::RunCharacterFriendListAfterSwitch(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightHeldPartyInviteKeepsCharacterTest,
+  "HeldPartyInviteKeepsCharacter",
+  RedwoodInFlightTest::RunHeldPartyInviteKeepsCharacter(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightSelectCharacterAfterRealmReloginTest,
+  "SelectCharacterAfterRealmRelogin",
+  RedwoodInFlightTest::RunSelectCharacterAfterRealmRelogin(*this)
 )

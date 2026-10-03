@@ -152,6 +152,30 @@ public:
     FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
   );
 
+  // FORK(hollowed-oath) BEGIN: character friend calls. Upstream has no
+  // friendship between characters; the routes live in the RedwoodBackend fork.
+  void ListCharacterFriends(FRedwoodListCharacterFriendsOutputDelegate OnOutput
+  );
+
+  void RequestCharacterFriend(
+    FString TargetCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void RespondToCharacterFriendRequest(
+    FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  void RemoveCharacterFriend(
+    FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  // Removes only the caller's pending request, so a cancel cannot end a
+  // friendship the other side accepted meanwhile.
+  void CancelCharacterFriendRequest(
+    FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+  );
+  // FORK(hollowed-oath) END
+
   void ListGuilds(
     bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
   );
@@ -380,6 +404,9 @@ public:
   FString GetConnectionConsoleCommand();
   FURL GetConnectionURL();
 
+  // FORK(hollowed-oath): the "director:friends:character-alert" push.
+  FRedwoodCharacterFriendAlertDynamicDelegate OnCharacterFriendAlert;
+
   FRedwoodPartyInvitedDynamicDelegate OnPartyInvited;
   FRedwoodPartyUpdatedDynamicDelegate OnPartyUpdated;
   FRedwoodDynamicDelegate OnPartyKicked;
@@ -387,6 +414,12 @@ public:
   FRedwoodParty GetCachedParty() {
     return CurrentParty;
   }
+  // FORK(hollowed-oath): HollowedOath#2448. Applies a realm:parties:changed
+  // roster to the held party. False when the roster is stale and must not be
+  // broadcast. See the .cpp.
+  static bool ApplyPartyChange(
+    FRedwoodParty &InOutHeld, const FRedwoodParty &Changed
+  );
   void GetOrCreateParty(
     bool bCreateIfNotInParty, FRedwoodGetPartyOutputDelegate OnOutput
   );
@@ -465,6 +498,19 @@ private:
     FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected
   );
   void BindRealmEvents();
+
+  // FORK(hollowed-oath): the one path of the character friend calls: gated
+  // like every Realm request, and needs a selected character. CharacterId is
+  // read at call time, so a call held over a reconnect is not sent, and an
+  // answer is not given, for a character selected after it.
+  template <typename TOutput>
+  void EmitCharacterFriendCall(
+    const FString &EventName,
+    const FString &CharacterId,
+    TSharedPtr<FJsonObject> Payload,
+    TOutput (*ParseAnswer)(const TArray<TSharedPtr<FJsonValue>> &),
+    const TDelegate<void(const TOutput &)> &OnOutput
+  );
   void FinalizeRealmHandshake(
     FString Token, FRedwoodSocketConnectedDelegate OnRealmConnected
   );
@@ -475,6 +521,8 @@ private:
 
   // FORK(hollowed-oath): HollowedOath#2854. See the .cpp.
   void ResendOnlineCharacter();
+  // FORK(hollowed-oath): HollowedOath#2448. See the .cpp.
+  void SendSelectCharacter();
   template <typename TOutput>
   bool Gate(
     FRedwoodHeldRequests &Held,
@@ -517,6 +565,8 @@ private:
   friend class FRedwoodDropAfterLogoutTest;
   friend class FRedwoodLogoutClosesReconnectingRealmTest;
   friend class FRedwoodFailedReloginStopsRealmRetryTest;
+  // FORK(hollowed-oath): character friends.
+  friend class FRedwoodCharacterFriendsHeldTest;
   // FORK(hollowed-oath) BEGIN: the close handler tests.
   friend class FRedwoodUnrequestedCloseBacksOffTest;
   friend class FRedwoodLogoutRealmCloseStaysCleanTest;
@@ -594,6 +644,9 @@ private:
   // A Director re-login could not restore the online character because the
   // Realm re-handshake was still pending.
   bool bOnlineCharacterOwedAfterRealm = false;
+  // FORK(hollowed-oath): HollowedOath#2448. A character was selected while
+  // the Realm did not know the player, so the Realm did not learn it.
+  bool bSelectCharacterOwedToRealm = false;
   // Set by Logout, cleared when a re-login starts: a re-login reply after it
   // must not log the player back in.
   bool bLoggedOutDuringRelogin = false;

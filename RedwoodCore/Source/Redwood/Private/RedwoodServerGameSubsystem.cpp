@@ -34,21 +34,6 @@
 #include "SIOJsonValue.h"
 #include "SocketIOClient.h"
 
-// FORK(hollowed-oath): the one way the fork's request callbacks read an answer.
-// TryGetObject, not AsObject: for a value that is not an object, AsObject
-// gives back a VALID empty object, which reads as an answer with no error --
-// that is, as work that never happened. A null or malformed answer must reach
-// the caller as "no usable answer" instead.
-static const TSharedPtr<FJsonObject> *TryGetRedwoodAnswerObject(
-  const TArray<TSharedPtr<FJsonValue>> &Response
-) {
-  const TSharedPtr<FJsonObject> *Object = nullptr;
-  if (Response.IsValidIndex(0) && Response[0].IsValid()) {
-    Response[0]->TryGetObject(Object);
-  }
-  return Object;
-}
-
 void URedwoodServerGameSubsystem::Initialize(
   FSubsystemCollectionBase &Collection
 ) {
@@ -890,7 +875,7 @@ void URedwoodServerGameSubsystem::EmitTransferZoneRequest(
     Payload,
     [this, WeakPlayerController, EmitGeneration](auto Response) {
       const TSharedPtr<FJsonObject> *ResponseObject =
-        TryGetRedwoodAnswerObject(Response);
+        URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
       HandleTransferZoneResponse(
         ResponseObject ? *ResponseObject : nullptr,
         WeakPlayerController,
@@ -3756,7 +3741,7 @@ void URedwoodServerGameSubsystem::AnswerSetPlayerRole(
   FRedwoodSetPlayerRoleOutputDelegate OnOutput
 ) {
   const TSharedPtr<FJsonObject> *MessageObject =
-    TryGetRedwoodAnswerObject(Response);
+    URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
   if (MessageObject == nullptr) {
     OnOutput.ExecuteIfBound(
       false, 0, TEXT("The backend did not answer the role change")
@@ -3822,7 +3807,7 @@ URedwoodServerGameSubsystem::ParseListOnlineCharacters(
   Output.Error = TEXT("The backend did not answer the online character list");
 
   const TSharedPtr<FJsonObject> *MessageObject =
-    TryGetRedwoodAnswerObject(Response);
+    URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
   FString Error;
   if (MessageObject == nullptr ||
       !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {

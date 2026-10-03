@@ -102,6 +102,38 @@ public:
     const TArray<TSharedPtr<FJsonValue>> &InvitesArray
   );
 
+  // FORK(hollowed-oath): the one way the fork reads an object out of a socket
+  // value or answer. Null when there is no usable object; see the .cpp.
+  static const TSharedPtr<FJsonObject> *TryGetRedwoodObject(
+    const TSharedPtr<FJsonValue> &Value
+  );
+  static const TSharedPtr<FJsonObject> *TryGetRedwoodAnswerObject(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  );
+
+  // FORK(hollowed-oath): one text for every character friend call whose
+  // realm answer cannot be read.
+  static constexpr const TCHAR *BadRealmAnswerError =
+    TEXT("Bad answer from the realm.");
+
+  // FORK(hollowed-oath): a held call that acts for a character (a character
+  // friend call, a party invite) is not sent, and a character friend answer is
+  // not given, when the player selected another character meanwhile.
+  static constexpr const TCHAR *CharacterChangedError =
+    TEXT("The character changed before the call was answered.");
+
+  // FORK(hollowed-oath): the fork arrays of the "realm:contacts:list" answer.
+  static FRedwoodListCharacterFriendsOutput ParseListCharacterFriends(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  );
+
+  // FORK(hollowed-oath): false for a push the game cannot act on. OutAlert
+  // can then hold part of the refused push, so do not read it.
+  static bool ParseCharacterFriendAlert(
+    const TSharedPtr<FJsonValue> &Message,
+    FRedwoodCharacterFriendAlert &OutAlert
+  );
+
   static FRedwoodParty ParseParty(const TSharedPtr<FJsonObject> &PartyObj);
 
   // FORK(hollowed-oath) BEGIN: item wire-format helper declarations. Fork-added; definitions +

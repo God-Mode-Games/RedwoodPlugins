@@ -466,6 +466,33 @@ void URedwoodClientInterface::InitializeDirectorConnection(
     ESIOThreadOverrideOption::USE_GAME_THREAD
   );
 
+  // FORK(hollowed-oath) BEGIN: the character friend push. A refused push is
+  // logged, so a field the director renames does not stop the feature with no
+  // symptom.
+  Director->OnEvent(
+    TEXT("director:friends:character-alert"),
+    [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
+      FRedwoodCharacterFriendAlert Alert;
+      if (!URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+            Message, Alert
+          )) {
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT(
+            "Dropped a director:friends:character-alert: the message is not an object, the type is unknown, or a character id is missing. The director and the game may no longer agree on the fields in this message."
+          )
+        );
+        return;
+      }
+
+      OnCharacterFriendAlert.Broadcast(Alert);
+    },
+    TEXT("/"),
+    ESIOThreadOverrideOption::USE_GAME_THREAD
+  );
+  // FORK(hollowed-oath) END
+
   FString Uri = *URedwoodSettings::GetDirectorUri();
 
   Director->OnReconnectionCallback = [Uri, this](
@@ -1744,6 +1771,155 @@ void URedwoodClientInterface::RemoveRealmContact(
     }, OnOutput)
   );
 }
+
+// FORK(hollowed-oath) BEGIN: character friend calls.
+namespace {
+  const TCHAR *const NoCharacterSelectedError = TEXT("No character selected.");
+
+  // A reply with no error field is not a success: it is a bad answer.
+  FString ParseCharacterFriendCommandAnswer(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  ) {
+    const TSharedPtr<FJsonObject> *MessageObject =
+      URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+    FString Error;
+    if (MessageObject == nullptr ||
+        !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+      return URedwoodCommonGameSubsystem::BadRealmAnswerError;
+    }
+    return Error;
+  }
+}
+
+template <typename TOutput>
+void URedwoodClientInterface::EmitCharacterFriendCall(
+  const FString &EventName,
+  const FString &CharacterId,
+  TSharedPtr<FJsonObject> Payload,
+  TOutput (*ParseAnswer)(const TArray<TSharedPtr<FJsonValue>> &),
+  const TDelegate<void(const TOutput &)> &OnOutput
+) {
+  if (GateRealm([=, this]() {
+        // The backend accepts any character of the player, and a list answer
+        // names no character, so a stale call would act for the wrong one.
+        if (CharacterId != SelectedCharacterId) {
+          TOutput Output;
+          SetRedwoodGateError(
+            Output, URedwoodCommonGameSubsystem::CharacterChangedError
+          );
+          OnOutput.ExecuteIfBound(Output);
+          return;
+        }
+        EmitCharacterFriendCall(
+          EventName, CharacterId, Payload, ParseAnswer, OnOutput
+        );
+      }, OnOutput)) {
+    return;
+  }
+
+  if (CharacterId.IsEmpty()) {
+    TOutput Output;
+    SetRedwoodGateError(Output, NoCharacterSelectedError);
+    OnOutput.ExecuteIfBound(Output);
+    return;
+  }
+
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("characterId"), CharacterId);
+  // HollowedOath#2886. See TrackReply.
+  Realm->Emit(
+    EventName,
+    Payload,
+    TrackReply(
+      RealmReplies,
+      [this, CharacterId, ParseAnswer, OnOutput](auto Response) {
+        // A list answer names no character, so after a switch it would fill
+        // the new character's friends with the old one's.
+        if (CharacterId != SelectedCharacterId) {
+          TOutput Output;
+          SetRedwoodGateError(
+            Output, URedwoodCommonGameSubsystem::CharacterChangedError
+          );
+          OnOutput.ExecuteIfBound(Output);
+          return;
+        }
+        OnOutput.ExecuteIfBound(ParseAnswer(Response));
+      },
+      OnOutput
+    )
+  );
+}
+
+void URedwoodClientInterface::ListCharacterFriends(
+  FRedwoodListCharacterFriendsOutputDelegate OnOutput
+) {
+  EmitCharacterFriendCall(
+    TEXT("realm:contacts:list"),
+    SelectedCharacterId,
+    MakeShared<FJsonObject>(),
+    &URedwoodCommonGameSubsystem::ParseListCharacterFriends,
+    OnOutput
+  );
+}
+
+void URedwoodClientInterface::RequestCharacterFriend(
+  FString TargetCharacterId, FRedwoodErrorOutputDelegate OnOutput
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetStringField(TEXT("targetCharacterId"), TargetCharacterId);
+  EmitCharacterFriendCall(
+    TEXT("realm:contacts:friends:request"),
+    SelectedCharacterId,
+    Payload,
+    &ParseCharacterFriendCommandAnswer,
+    OnOutput
+  );
+}
+
+void URedwoodClientInterface::RespondToCharacterFriendRequest(
+  FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
+  Payload->SetBoolField(TEXT("accept"), bAccept);
+  EmitCharacterFriendCall(
+    TEXT("realm:contacts:friends:respond"),
+    SelectedCharacterId,
+    Payload,
+    &ParseCharacterFriendCommandAnswer,
+    OnOutput
+  );
+}
+
+void URedwoodClientInterface::RemoveCharacterFriend(
+  FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
+  EmitCharacterFriendCall(
+    TEXT("realm:contacts:friends:remove"),
+    SelectedCharacterId,
+    Payload,
+    &ParseCharacterFriendCommandAnswer,
+    OnOutput
+  );
+}
+
+void URedwoodClientInterface::CancelCharacterFriendRequest(
+  FString OtherCharacterId, FRedwoodErrorOutputDelegate OnOutput
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
+  Payload->SetBoolField(TEXT("requestOnly"), true);
+  EmitCharacterFriendCall(
+    TEXT("realm:contacts:friends:remove"),
+    SelectedCharacterId,
+    Payload,
+    &ParseCharacterFriendCommandAnswer,
+    OnOutput
+  );
+}
+// FORK(hollowed-oath) END
 
 void URedwoodClientInterface::ListGuilds(
   bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
@@ -3369,8 +3545,13 @@ void URedwoodClientInterface::BindRealmEvents() {
 
       TSharedPtr<FJsonObject> PartyObject =
         MessageObject->GetObjectField(TEXT("party"));
-      CurrentParty = URedwoodCommonGameSubsystem::ParseParty(PartyObject);
-      OnPartyUpdated.Broadcast(CurrentParty);
+      // FORK(hollowed-oath): HollowedOath#2448. Upstream held and broadcast
+      // every roster. See ApplyPartyChange.
+      const FRedwoodParty Parsed =
+        URedwoodCommonGameSubsystem::ParseParty(PartyObject);
+      if (ApplyPartyChange(CurrentParty, Parsed)) {
+        OnPartyUpdated.Broadcast(Parsed);
+      }
     },
     TEXT("/"),
     ESIOThreadOverrideOption::USE_GAME_THREAD
@@ -3730,15 +3911,21 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
     PendingPartyTicketId.Reset();
   }
 
-  if (!CurrentParty.bValid || !Realm.IsValid() || !Realm->bIsConnected) {
+  // FORK(hollowed-oath): HollowedOath#2448. EndRealmReauthentication sends
+  // what a Realm that does not know the player cannot take now.
+  bSelectCharacterOwedToRealm = !IsRealmReady();
+
+  if (!Realm.IsValid() || !Realm->bIsConnected) {
     return;
   }
 
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  if (!bSelectCharacterOwedToRealm) {
+    SendSelectCharacter();
+  }
 
-  Realm->Emit(TEXT("realm:parties:select-character"), Payload);
+  if (!CurrentParty.bValid) {
+    return;
+  }
 
   // FORK(hollowed-oath): HollowedOath#2854. Same payload as the re-login path.
   const TSharedPtr<FJsonObject> OnlinePayload =
@@ -3848,6 +4035,38 @@ TSharedPtr<FJsonObject> URedwoodClientInterface::MakeOnlineCharacterPayload(
   Payload->SetStringField(TEXT("characterId"), InCharacterId);
   Payload->SetStringField(TEXT("realmId"), InRealmId);
   return Payload;
+}
+
+// FORK(hollowed-oath): HollowedOath#2448. A party never has one member: the
+// realm dissolves it and sends the last member the roster with no members.
+// That leaves no party, not a valid party with no one in it. It dissolves only
+// the party it names, so a late one for an earlier party keeps the held one,
+// and the game must not see that party end.
+bool URedwoodClientInterface::ApplyPartyChange(
+  FRedwoodParty &InOutHeld, const FRedwoodParty &Changed
+) {
+  if (!Changed.Members.IsEmpty()) {
+    InOutHeld = Changed;
+    return true;
+  }
+  if (Changed.Id != InOutHeld.Id) {
+    return false;
+  }
+  InOutHeld = FRedwoodParty();
+  return true;
+}
+
+// FORK(hollowed-oath): HollowedOath#2448. Upstream sent this only in a party.
+// A player with no party can have invites out, and the realm makes the party
+// from them later, so it must know the character then too.
+void URedwoodClientInterface::SendSelectCharacter() {
+  bSelectCharacterOwedToRealm = false;
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+
+  Realm->Emit(TEXT("realm:parties:select-character"), Payload);
 }
 
 // FORK(hollowed-oath): HollowedOath#2854. A director re-login writes an online
@@ -4051,6 +4270,11 @@ void URedwoodClientInterface::EndRealmReauthentication(bool bSucceeded) {
       ResendOnlineCharacter();
     }
     bOnlineCharacterOwedAfterRealm = false;
+    // FORK(hollowed-oath): HollowedOath#2448. Before the held requests, which
+    // can act for the character.
+    if (bSelectCharacterOwedToRealm && !SelectedCharacterId.IsEmpty()) {
+      SendSelectCharacter();
+    }
     RealmHeldRequests.Release(TimerManager);
   } else {
     RealmHeldRequests.Expire(TimerManager);
@@ -4685,8 +4909,17 @@ void URedwoodClientInterface::LeaveParty(FRedwoodErrorOutputDelegate OnOutput) {
 void URedwoodClientInterface::InviteToParty(
   FString TargetPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
+  // FORK(hollowed-oath): HollowedOath#2448. The invite names the inviter's
+  // character, so a held invite must not go out for one selected after it.
+  const FString InviterCharacterId = SelectedCharacterId;
   // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
   if (GateRealm([=, this]() {
+        if (InviterCharacterId != SelectedCharacterId) {
+          OnOutput.ExecuteIfBound(
+            URedwoodCommonGameSubsystem::CharacterChangedError
+          );
+          return;
+        }
         InviteToParty(TargetPlayerId, OnOutput);
       }, OnOutput)) {
     return;
@@ -4700,6 +4933,9 @@ void URedwoodClientInterface::InviteToParty(
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), PlayerId);
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
+  // FORK(hollowed-oath): HollowedOath#2448. The realm makes a party only when
+  // an invite is accepted, so it needs the inviter's character from the invite.
+  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Realm->Emit(

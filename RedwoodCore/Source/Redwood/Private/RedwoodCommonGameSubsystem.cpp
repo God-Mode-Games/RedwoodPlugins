@@ -1341,6 +1341,143 @@ TArray<FRedwoodPartyInvite> URedwoodCommonGameSubsystem::ParsePartyInvites(
   return PartyInvites;
 }
 
+// FORK(hollowed-oath) BEGIN: not AsObject, which turns a value that is not an
+// object into a valid empty object: a malformed answer would read as a
+// success with no error. In UE 5.8, TryGetObject also says yes to an object
+// value that holds no object, so the pointer it gives is checked too.
+const TSharedPtr<FJsonObject> *URedwoodCommonGameSubsystem::TryGetRedwoodObject(
+  const TSharedPtr<FJsonValue> &Value
+) {
+  const TSharedPtr<FJsonObject> *Object = nullptr;
+  if (Value.IsValid() && Value->TryGetObject(Object) && Object->IsValid()) {
+    return Object;
+  }
+  return nullptr;
+}
+
+const TSharedPtr<FJsonObject> *
+URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  return Response.IsValidIndex(0) ? TryGetRedwoodObject(Response[0]) : nullptr;
+}
+// FORK(hollowed-oath) END
+
+// FORK(hollowed-oath) BEGIN: the character friend list. The game takes a good
+// list as the full truth, so an answer with no error field or a missing array
+// is an error, not a short list. The game keys rows on the id and shows the
+// name, so a row without both is left out.
+namespace {
+
+void ParseCharacterFriendRows(
+  const TArray<TSharedPtr<FJsonValue>> &Rows,
+  TArray<FRedwoodCharacterFriend> &OutRows
+) {
+  for (const TSharedPtr<FJsonValue> &RowValue : Rows) {
+    const TSharedPtr<FJsonObject> *RowObject =
+      URedwoodCommonGameSubsystem::TryGetRedwoodObject(RowValue);
+    if (RowObject == nullptr) {
+      continue;
+    }
+
+    FRedwoodCharacterFriend Row;
+    (*RowObject)->TryGetStringField(TEXT("characterId"), Row.CharacterId);
+    (*RowObject)->TryGetStringField(TEXT("characterName"), Row.CharacterName);
+    (*RowObject)->TryGetBoolField(TEXT("online"), Row.bOnline);
+    (*RowObject)->TryGetStringField(TEXT("zoneName"), Row.ZoneName);
+
+    if (!Row.CharacterId.IsEmpty() && !Row.CharacterName.IsEmpty()) {
+      OutRows.Add(Row);
+    }
+  }
+}
+
+} // namespace
+
+FRedwoodListCharacterFriendsOutput
+URedwoodCommonGameSubsystem::ParseListCharacterFriends(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  FRedwoodListCharacterFriendsOutput Output;
+  Output.Error = BadRealmAnswerError;
+
+  const TSharedPtr<FJsonObject> *MessageObject =
+    TryGetRedwoodAnswerObject(Response);
+  FString Error;
+  if (MessageObject == nullptr ||
+      !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+    return Output;
+  }
+
+  if (!Error.IsEmpty()) {
+    Output.Error = Error;
+    return Output;
+  }
+
+  const TArray<TSharedPtr<FJsonValue>> *Friends = nullptr;
+  const TArray<TSharedPtr<FJsonValue>> *IncomingRequests = nullptr;
+  const TArray<TSharedPtr<FJsonValue>> *OutgoingRequests = nullptr;
+  if (!(*MessageObject)->TryGetArrayField(TEXT("friends"), Friends) ||
+      !(*MessageObject)
+         ->TryGetArrayField(TEXT("incomingRequests"), IncomingRequests) ||
+      !(*MessageObject)
+         ->TryGetArrayField(TEXT("outgoingRequests"), OutgoingRequests)) {
+    return Output;
+  }
+
+  Output.Error.Empty();
+  ParseCharacterFriendRows(*Friends, Output.Friends);
+  ParseCharacterFriendRows(*IncomingRequests, Output.IncomingRequests);
+  ParseCharacterFriendRows(*OutgoingRequests, Output.OutgoingRequests);
+  return Output;
+}
+// FORK(hollowed-oath) END
+
+// FORK(hollowed-oath) BEGIN: the character friend alert. The game picks a
+// handler by the type and keys its cache on the ids, so those are required;
+// the name and the zone (Online only) are optional.
+bool URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+  const TSharedPtr<FJsonValue> &Message,
+  FRedwoodCharacterFriendAlert &OutAlert
+) {
+  OutAlert = FRedwoodCharacterFriendAlert();
+
+  const TSharedPtr<FJsonObject> *AlertObjectPtr = TryGetRedwoodObject(Message);
+  if (AlertObjectPtr == nullptr) {
+    return false;
+  }
+  const TSharedPtr<FJsonObject> &AlertObject = *AlertObjectPtr;
+
+  FString Type;
+  AlertObject->TryGetStringField(TEXT("type"), Type);
+  if (Type == TEXT("requested")) {
+    OutAlert.Type = ERedwoodCharacterFriendAlertType::Requested;
+  } else if (Type == TEXT("accepted")) {
+    OutAlert.Type = ERedwoodCharacterFriendAlertType::Accepted;
+  } else if (Type == TEXT("removed")) {
+    OutAlert.Type = ERedwoodCharacterFriendAlertType::Removed;
+  } else if (Type == TEXT("online")) {
+    OutAlert.Type = ERedwoodCharacterFriendAlertType::Online;
+  } else if (Type == TEXT("offline")) {
+    OutAlert.Type = ERedwoodCharacterFriendAlertType::Offline;
+  } else {
+    return false;
+  }
+
+  AlertObject->TryGetStringField(TEXT("characterId"), OutAlert.CharacterId);
+  AlertObject->TryGetStringField(
+    TEXT("otherCharacterId"), OutAlert.OtherCharacterId
+  );
+  AlertObject->TryGetStringField(
+    TEXT("otherCharacterName"), OutAlert.OtherCharacterName
+  );
+  AlertObject->TryGetStringField(TEXT("zoneName"), OutAlert.ZoneName);
+
+  return !OutAlert.CharacterId.IsEmpty() &&
+         !OutAlert.OtherCharacterId.IsEmpty();
+}
+// FORK(hollowed-oath) END
+
 FRedwoodParty URedwoodCommonGameSubsystem::ParseParty(
   const TSharedPtr<FJsonObject> &PartyObj
 ) {
