@@ -1800,6 +1800,16 @@ void URedwoodClientInterface::EmitCharacterFriendCall(
   const TDelegate<void(const TOutput &)> &OnOutput
 ) {
   if (GateRealm([=, this]() {
+        // The backend accepts any character of the player, and a list answer
+        // names no character, so a stale call would act for the wrong one.
+        if (CharacterId != SelectedCharacterId) {
+          TOutput Output;
+          SetRedwoodGateError(
+            Output, URedwoodCommonGameSubsystem::CharacterChangedError
+          );
+          OnOutput.ExecuteIfBound(Output);
+          return;
+        }
         EmitCharacterFriendCall(
           EventName, CharacterId, Payload, ParseAnswer, OnOutput
         );

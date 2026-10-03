@@ -2113,8 +2113,9 @@ namespace RedwoodInFlightTest {
 
   // Pins the fields that the RedwoodBackend fork validates for a request and a
   // respond (Realms.Contacts.Friends in packages/common/src/interfaces.ts),
-  // that a reply with no error field, or no object, is an error, and that a
-  // held call is sent for the character that made it.
+  // that a reply with no error field, or no object, is an error, that a held
+  // call is sent for the character that made it, and that a held call is not
+  // sent when the character changed.
   bool RunCharacterFriendWireFields(FAutomationTestBase &Test) {
     // Before the harness, so it outlives every callback the harness can run.
     TArray<FString> Errors;
@@ -2177,15 +2178,14 @@ namespace RedwoodInFlightTest {
       );
     }
 
-    // The re-login is pending, so the call is held; another character is
-    // selected before the re-login ends.
+    // The re-login is pending, so the call is held; the selection does not
+    // change before the re-login ends.
     URedwoodClientInterface &C = Harness.Client();
     FAccess::NoteRealmDrop(C);
     C.RequestCharacterFriend(TEXT("character-2"), OnOutput);
     if (!Test.TestEqual(TEXT("The call is held"), FAccess::NumRealmHeldRequests(C), 1)) {
       return false;
     }
-    FAccess::SelectedCharacterId(C) = TEXT("character-3");
     FAccess::EndRealmReauthentication(C, true);
     if (!AnswerRequest(Test, *Harness.Server, TEXT("{\"error\":\"\"}"), Request)) {
       return false;
@@ -2197,6 +2197,31 @@ namespace RedwoodInFlightTest {
     Test.TestTrue(
       TEXT("The held call is answered"),
       PumpGameThreadUntil([&Errors]() { return Errors.Num() == 3; })
+    );
+
+    // Held again, and another character is selected before the re-login
+    // ends: the call must not act for the character the player left.
+    FAccess::NoteRealmDrop(C);
+    C.RequestCharacterFriend(TEXT("character-2"), OnOutput);
+    if (!Test.TestEqual(
+          TEXT("The second call is held"), FAccess::NumRealmHeldRequests(C), 1
+        )) {
+      return false;
+    }
+    FAccess::SelectedCharacterId(C) = TEXT("character-3");
+    FAccess::EndRealmReauthentication(C, true);
+    Test.TestEqual(
+      TEXT("A call held across a character change is not sent"),
+      FAccess::NumRealmReplies(C),
+      0
+    );
+    if (!Test.TestEqual(TEXT("The changed call is answered"), Errors.Num(), 4)) {
+      return false;
+    }
+    Test.TestEqualSensitive(
+      TEXT("The changed call tells the character changed"),
+      *Errors[3],
+      URedwoodCommonGameSubsystem::CharacterChangedError
     );
     return true;
   }

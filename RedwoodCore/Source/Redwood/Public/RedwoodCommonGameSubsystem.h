@@ -116,6 +116,11 @@ public:
   static constexpr const TCHAR *BadRealmAnswerError =
     TEXT("Bad answer from the realm.");
 
+  // FORK(hollowed-oath): a held character friend call is not sent when the
+  // player selected another character while it was held.
+  static constexpr const TCHAR *CharacterChangedError =
+    TEXT("The character changed before the call was sent.");
+
   // FORK(hollowed-oath): the fork arrays of the "realm:contacts:list" answer.
   static FRedwoodListCharacterFriendsOutput ParseListCharacterFriends(
     const TArray<TSharedPtr<FJsonValue>> &Response
