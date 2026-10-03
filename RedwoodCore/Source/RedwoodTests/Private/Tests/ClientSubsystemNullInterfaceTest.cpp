@@ -117,7 +117,7 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
       }
     );
 
-  // TestEqualSensitive: the TCHAR* form of TestEqual ignores case. The reset
+  // TestEqualSensitive: the string forms of TestEqual ignore case. The reset
   // makes a guard that never answers fail.
   const auto CheckGuard = [this, &Error](const TCHAR *What) {
     TestEqualSensitive(What, *Error, RedwoodExpectedGuardError);
