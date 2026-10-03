@@ -1774,6 +1774,8 @@ void URedwoodClientInterface::RemoveRealmContact(
 
 // FORK(hollowed-oath) BEGIN: character friend calls.
 namespace {
+  const TCHAR *const NoCharacterSelectedError = TEXT("No character selected.");
+
   // A reply with no error field is not a success: it is a bad answer.
   FString ParseCharacterFriendCommandAnswer(
     const TArray<TSharedPtr<FJsonValue>> &Response
@@ -1804,7 +1806,7 @@ void URedwoodClientInterface::EmitCharacterFriendCall(
 
   if (SelectedCharacterId.IsEmpty()) {
     TOutput Output;
-    SetRedwoodGateError(Output, TEXT("No character selected."));
+    SetRedwoodGateError(Output, NoCharacterSelectedError);
     OnOutput.ExecuteIfBound(Output);
     return;
   }
