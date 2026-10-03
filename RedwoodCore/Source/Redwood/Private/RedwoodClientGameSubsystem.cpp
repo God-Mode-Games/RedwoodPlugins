@@ -21,8 +21,9 @@
 // FORK(hollowed-oath): HollowedOath#2445. Upstream reads ClientInterface with
 // no null check on the backend branch of the social calls (SearchForPlayers
 // through RemoveRealmContact). In PIE, bUseBackendInPIE can turn on after
-// Initialize() skipped the client interface, so that read crashed. Each of
-// those calls now starts with one guard line, marked "#2445 null guard".
+// Initialize() skipped the client interface, so that read crashed. In each of
+// those calls, the backend branch now starts with one guard line, marked
+// "#2445 null guard".
 namespace {
 
 const TCHAR *const RedwoodNoClientInterfaceError =

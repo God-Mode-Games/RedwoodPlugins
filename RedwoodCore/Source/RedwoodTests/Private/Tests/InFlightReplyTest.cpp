@@ -2111,11 +2111,12 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
-  // Pins the fields that the RedwoodBackend fork validates for a request and a
-  // respond (Realms.Contacts.Friends in packages/common/src/interfaces.ts),
-  // that a reply with no error field, or no object, is an error, that a held
-  // call is sent for the character that made it, and that a held call is not
-  // sent when the character changed.
+  // Pins the fields that the RedwoodBackend fork validates
+  // (Realms.Contacts.Friends in packages/common/src/interfaces.ts): playerId,
+  // characterId and targetCharacterId on a request, otherCharacterId and
+  // accept on a respond. Also pins that a reply with no error field, or no
+  // object, is an error, that a held call is sent for the character that made
+  // it, and that a held call is not sent when the character changed.
   bool RunCharacterFriendWireFields(FAutomationTestBase &Test) {
     // Before the harness, so it outlives every callback the harness can run.
     TArray<FString> Errors;
