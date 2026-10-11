@@ -1,10 +1,10 @@
 name: Notify HollowedOath of submodule update
 
-# Fires only after Plugin CI has finished on main with a green build —
-# `workflow_run` runs in the context of the default branch, so it can use the
-# repo's secrets even though the original trigger was a push. Gating here
-# (instead of on: push) means the auto-bump into HollowedOath can never fire
-# from a broken main commit.
+# Starts HollowedOath's redwood-submodule-bump.yml, which opens a pull request
+# that moves the Plugins/RedwoodPlugins pin to main's head. It runs only after
+# Plugin CI passed on a push to main, so a malformed .uplugin never reaches that
+# pull request. workflow_run runs in the context of the default branch, so it
+# can read this repository's secrets.
 
 on:
   workflow_run:
@@ -12,19 +12,29 @@ on:
     types: [completed]
     branches: [main]
 
+permissions: {}
+
 jobs:
   dispatch:
-    name: Send repository_dispatch to HollowedOath
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    name: Start the HollowedOath submodule bump
+    # branches matches a pull request whose head branch is named main, so the
+    # event check is needed too.
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
-      - name: Dispatch redwood-updated event
+      - name: Mint token (GitHub App)
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.HO_SUBMODULE_BUMP_APP_ID }}
+          private-key: ${{ secrets.HO_SUBMODULE_BUMP_APP_PRIVATE_KEY }}
+          owner: God-Mode-Games
+          repositories: HollowedOath
+          permission-actions: write
+
+      - name: Start redwood-submodule-bump.yml
         env:
-          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
-        run: |
-          gh api repos/God-Mode-Games/HollowedOath/dispatches \
-            --method POST \
-            -f event_type=redwood-updated \
-            -f 'client_payload[sha]=${{ github.event.workflow_run.head_sha }}' \
-            -f 'client_payload[ref]=${{ github.event.workflow_run.head_branch }}'
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh workflow run redwood-submodule-bump.yml -R God-Mode-Games/HollowedOath --ref main
