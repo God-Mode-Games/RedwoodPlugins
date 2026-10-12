@@ -355,7 +355,9 @@ public:
   // FORK(hollowed-oath): account-owned camp record. Uses the backend, or
   // Saved/Persistence/Camps/<PlayerId>.json when the backend is off (PIE).
   // OnComplete gets the same result either way. A missing record is not an
-  // error: Camp.bFound is false.
+  // error: Camp.bFound is false. A file or reply that cannot be read is an
+  // error. A put is accepted only if the row is still at ExpectedRevision (0 =
+  // the row must not exist yet); otherwise the output has bConflict set.
   void GetCampLayout(
     const FString &PlayerId, FRedwoodGetCampLayoutOutputDelegate OnComplete
   );
@@ -364,7 +366,8 @@ public:
     int32 SchemaVersion,
     USIOJsonObject *Record,
     USIOJsonObject *Layout,
-    FRedwoodErrorOutputDelegate OnComplete
+    int32 ExpectedRevision,
+    FRedwoodPutCampLayoutOutputDelegate OnComplete
   );
 
   void PutSaveGame(

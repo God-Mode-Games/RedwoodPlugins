@@ -23,6 +23,10 @@ struct FRedwoodCampLayout {
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   int32 SchemaVersion = 0;
 
+  // The row's revision. A put must name the revision it was based on.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  int32 Revision = 0;
+
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   USIOJsonObject *Record = nullptr;
 
@@ -43,6 +47,26 @@ struct FRedwoodGetCampLayoutOutput {
 
 typedef TDelegate<void(const FRedwoodGetCampLayoutOutput &)>
   FRedwoodGetCampLayoutOutputDelegate;
+
+USTRUCT(BlueprintType)
+struct FRedwoodPutCampLayoutOutput {
+  GENERATED_BODY()
+
+  // Set when the put could not be tried or failed. A conflict is not an error.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString Error;
+
+  // True when the row was not at the expected revision, so nothing was written.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  bool bConflict = false;
+
+  // The new revision after a successful put.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  int32 Revision = 0;
+};
+
+typedef TDelegate<void(const FRedwoodPutCampLayoutOutput &)>
+  FRedwoodPutCampLayoutOutputDelegate;
 
 UDELEGATE()
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
