@@ -28,6 +28,8 @@ namespace {
     URedwoodServerGameSubsystem *Subsystem, const FString &PlayerId
   ) {
     FRedwoodGetCampLayoutOutput Result;
+    // A delegate that never runs must fail the test, not read as "no camp".
+    Result.Error = TEXT("delegate not called");
     Subsystem->GetCampLayout(
       PlayerId,
       FRedwoodGetCampLayoutOutputDelegate::CreateLambda(
@@ -93,6 +95,10 @@ bool FRedwoodCampLayoutOfflineTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("Create succeeds"), Created.Error.IsEmpty());
   TestFalse(TEXT("Create is not a conflict"), Created.bConflict);
   TestEqual(TEXT("Create gives revision 1"), Created.Revision, 1);
+  TestFalse(
+    TEXT("The write leaves no temp file"),
+    IFileManager::Get().FileExists(*(CampTestFile() + TEXT(".tmp")))
+  );
 
   FRedwoodGetCampLayoutOutput Found = GetCamp(Subsystem, CampTestPlayerId);
   TestTrue(TEXT("Stored camp has no error"), Found.Error.IsEmpty());
