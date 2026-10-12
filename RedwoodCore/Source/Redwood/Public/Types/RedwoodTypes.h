@@ -8,6 +8,7 @@
 
 #include "RedwoodTypesAuth.h"
 #include "RedwoodTypesBlobs.h"
+#include "RedwoodTypesCamps.h"
 #include "RedwoodTypesCharacters.h"
 #include "RedwoodTypesGlobalData.h"
 #include "RedwoodTypesGuilds.h"

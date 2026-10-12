@@ -352,6 +352,21 @@ public:
   );
   void GetBlob(const FString &Key, FRedwoodGetBlobOutputDelegate OnComplete);
 
+  // FORK(hollowed-oath): account-owned camp record. Uses the backend, or
+  // Saved/Persistence/Camps/<PlayerId>.json when the backend is off (PIE).
+  // OnComplete gets the same result either way. A missing record is not an
+  // error: Camp.bFound is false.
+  void GetCampLayout(
+    const FString &PlayerId, FRedwoodGetCampLayoutOutputDelegate OnComplete
+  );
+  void PutCampLayout(
+    const FString &PlayerId,
+    int32 SchemaVersion,
+    USIOJsonObject *Record,
+    USIOJsonObject *Layout,
+    FRedwoodErrorOutputDelegate OnComplete
+  );
+
   void PutSaveGame(
     const FString &Key, USaveGame *Value, FRedwoodErrorOutputDelegate OnComplete
   );

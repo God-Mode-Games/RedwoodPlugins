@@ -3607,6 +3607,166 @@ void URedwoodServerGameSubsystem::GetBlob(
     });
 }
 
+// FORK(hollowed-oath) BEGIN: camp record calls. The offline path keeps the
+// backend's `camp` JSON shape on disk so both paths fill the same output.
+namespace {
+  // The id becomes a file name, so it must not be able to leave the folder.
+  bool IsValidCampPlayerId(const FString &PlayerId) {
+    if (PlayerId.IsEmpty()) {
+      return false;
+    }
+    for (const TCHAR Character : PlayerId) {
+      if (!FChar::IsAlnum(Character) && Character != TEXT('_') &&
+          Character != TEXT('-')) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  FString GetOfflineCampPath(const FString &PlayerId) {
+    FString SavePath =
+      FPaths::ProjectSavedDir() / TEXT("Persistence") / TEXT("Camps");
+    FPaths::NormalizeFilename(SavePath);
+    return SavePath / (PlayerId + TEXT(".json"));
+  }
+
+  FRedwoodCampLayout ParseCampLayout(const TSharedPtr<FJsonObject> &CampObject) {
+    FRedwoodCampLayout Camp;
+
+    const TSharedPtr<FJsonObject> *RecordObject = nullptr;
+    const TSharedPtr<FJsonObject> *LayoutObject = nullptr;
+    double SchemaVersion = 0;
+    if (!CampObject->TryGetNumberField(TEXT("schemaVersion"), SchemaVersion) ||
+        !CampObject->TryGetObjectField(TEXT("record"), RecordObject) ||
+        !CampObject->TryGetObjectField(TEXT("layout"), LayoutObject)) {
+      return Camp;
+    }
+
+    Camp.bFound = true;
+    Camp.SchemaVersion = static_cast<int32>(SchemaVersion);
+    Camp.Record = NewObject<USIOJsonObject>();
+    Camp.Record->SetRootObject(*RecordObject);
+    Camp.Layout = NewObject<USIOJsonObject>();
+    Camp.Layout->SetRootObject(*LayoutObject);
+    return Camp;
+  }
+} // namespace
+
+void URedwoodServerGameSubsystem::GetCampLayout(
+  const FString &PlayerId, FRedwoodGetCampLayoutOutputDelegate OnComplete
+) {
+  FRedwoodGetCampLayoutOutput Output;
+
+  if (!IsValidCampPlayerId(PlayerId)) {
+    Output.Error = TEXT("Invalid player id");
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  if (!URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    FString FileContents;
+    if (FFileHelper::LoadFileToString(
+          FileContents, *GetOfflineCampPath(PlayerId)
+        )) {
+      TSharedPtr<FJsonObject> CampObject;
+      TSharedRef<TJsonReader<TCHAR>> JsonReader =
+        TJsonReaderFactory<TCHAR>::Create(FileContents);
+      if (FJsonSerializer::Deserialize(JsonReader, CampObject) &&
+          CampObject.IsValid()) {
+        Output.Camp = ParseCampLayout(CampObject);
+      }
+      if (!Output.Camp.bFound) {
+        Output.Error = TEXT("Failed to parse camp file");
+      }
+    }
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    Output.Error = TEXT("Sidecar is not connected");
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+
+  Sidecar->Emit(TEXT("realm:camps:get"), Payload, [OnComplete](auto Response) {
+    FRedwoodGetCampLayoutOutput Result;
+    TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
+
+    Result.Error = MessageStruct->GetStringField(TEXT("error"));
+    if (Result.Error.IsEmpty()) {
+      const TSharedPtr<FJsonObject> *CampObject = nullptr;
+      if (MessageStruct->TryGetObjectField(TEXT("camp"), CampObject)) {
+        Result.Camp = ParseCampLayout(*CampObject);
+        if (!Result.Camp.bFound) {
+          Result.Error = TEXT("Failed to parse camp");
+        }
+      }
+    }
+
+    OnComplete.ExecuteIfBound(Result);
+  });
+}
+
+void URedwoodServerGameSubsystem::PutCampLayout(
+  const FString &PlayerId,
+  int32 SchemaVersion,
+  USIOJsonObject *Record,
+  USIOJsonObject *Layout,
+  FRedwoodErrorOutputDelegate OnComplete
+) {
+  if (!IsValidCampPlayerId(PlayerId)) {
+    OnComplete.ExecuteIfBound(TEXT("Invalid player id"));
+    return;
+  }
+
+  if (!IsValid(Record) || !IsValid(Layout)) {
+    OnComplete.ExecuteIfBound(TEXT("Camp record and layout are required"));
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetNumberField(TEXT("schemaVersion"), SchemaVersion);
+  Payload->SetObjectField(TEXT("record"), Record->GetRootObject());
+  Payload->SetObjectField(TEXT("layout"), Layout->GetRootObject());
+
+  if (!URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    // The file holds what the backend returns as `camp`: no playerId.
+    Payload->RemoveField(TEXT("playerId"));
+
+    FString OutputString;
+    TSharedRef<TJsonWriter<TCHAR>> JsonWriter =
+      TJsonWriterFactory<TCHAR>::Create(&OutputString);
+    FJsonSerializer::Serialize(Payload.ToSharedRef(), JsonWriter);
+
+    const FString FileName = GetOfflineCampPath(PlayerId);
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(FileName), true);
+    if (!FFileHelper::SaveStringToFile(OutputString, *FileName)) {
+      OnComplete.ExecuteIfBound(TEXT("Failed to write camp file"));
+      return;
+    }
+
+    OnComplete.ExecuteIfBound(FString());
+    return;
+  }
+
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    OnComplete.ExecuteIfBound(TEXT("Sidecar is not connected"));
+    return;
+  }
+
+  Sidecar->Emit(TEXT("realm:camps:put"), Payload, [OnComplete](auto Response) {
+    TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
+    OnComplete.ExecuteIfBound(MessageStruct->GetStringField(TEXT("error")));
+  });
+}
+// FORK(hollowed-oath) END
+
 void URedwoodServerGameSubsystem::PutSaveGame(
   const FString &Key, USaveGame *Value, FRedwoodErrorOutputDelegate OnComplete
 ) {
