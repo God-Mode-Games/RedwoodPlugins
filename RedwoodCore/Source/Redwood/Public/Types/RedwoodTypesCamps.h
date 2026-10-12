@@ -63,14 +63,12 @@ struct FRedwoodPutCampLayoutOutput {
   // The new revision after a successful put.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   int32 Revision = 0;
+
+  // True when the backend refused the camp for its size. Retrying the same
+  // camp cannot succeed, so callers branch on this and not on Error's text.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  bool bTooLarge = false;
 };
 
 typedef TDelegate<void(const FRedwoodPutCampLayoutOutput &)>
   FRedwoodPutCampLayoutOutputDelegate;
-
-UDELEGATE()
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
-  FRedwoodGetCampLayoutOutputDynamicDelegate,
-  FRedwoodGetCampLayoutOutput,
-  Data
-);

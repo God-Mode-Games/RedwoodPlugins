@@ -3828,7 +3828,8 @@ void URedwoodServerGameSubsystem::PutCampLayout(
     if (!MessageStruct.IsValid() ||
         !MessageStruct->TryGetStringField(TEXT("error"), Result.Error) ||
         !MessageStruct->TryGetBoolField(TEXT("conflict"), Result.bConflict) ||
-        !MessageStruct->TryGetNumberField(TEXT("revision"), Revision)) {
+        !MessageStruct->TryGetNumberField(TEXT("revision"), Revision) ||
+        !MessageStruct->TryGetBoolField(TEXT("tooLarge"), Result.bTooLarge)) {
       Result = FRedwoodPutCampLayoutOutput();
       Result.Error = TEXT("Malformed camp reply");
     } else {
