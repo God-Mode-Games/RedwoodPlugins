@@ -3631,6 +3631,11 @@ namespace {
     return SavePath / (PlayerId + TEXT(".json"));
   }
 
+  // A put writes this file, then moves it over the camp file.
+  FString GetOfflineCampTempPath(const FString &PlayerId) {
+    return GetOfflineCampPath(PlayerId) + TEXT(".tmp");
+  }
+
   FRedwoodCampLayout ParseCampLayout(const TSharedPtr<FJsonObject> &CampObject) {
     FRedwoodCampLayout Camp;
 
@@ -3655,17 +3660,9 @@ namespace {
     return Camp;
   }
 
-  // A file that is missing is "no camp". A file that exists but cannot be read
-  // or parsed is an error: treating it as missing would let the next put
-  // overwrite a camp that only needs repair.
-  void ReadOfflineCamp(
-    const FString &PlayerId, FRedwoodGetCampLayoutOutput &OutResult
+  void ReadCampFile(
+    const FString &FileName, FRedwoodGetCampLayoutOutput &OutResult
   ) {
-    const FString FileName = GetOfflineCampPath(PlayerId);
-    if (!IFileManager::Get().FileExists(*FileName)) {
-      return;
-    }
-
     FString FileContents;
     if (!FFileHelper::LoadFileToString(FileContents, *FileName)) {
       OutResult.Error = TEXT("Failed to read camp file");
@@ -3681,6 +3678,28 @@ namespace {
     }
     if (!OutResult.Camp.bFound) {
       OutResult.Error = TEXT("Failed to parse camp file");
+    }
+  }
+
+  // A file that is missing is "no camp". A file that exists but cannot be read
+  // or parsed is an error: treating it as missing would let the next put
+  // overwrite a camp that only needs repair.
+  // The move over the camp file deletes the target and
+  // then renames, so a crash in between leaves only the temp file, which holds
+  // the whole new camp. It is used when the camp file is missing.
+  void ReadOfflineCamp(
+    const FString &PlayerId, FRedwoodGetCampLayoutOutput &OutResult
+  ) {
+    const FString FileName = GetOfflineCampPath(PlayerId);
+    const FString TempFileName = GetOfflineCampTempPath(PlayerId);
+    const bool bRecoverFromTemp = !IFileManager::Get().FileExists(*FileName);
+    if (bRecoverFromTemp && !IFileManager::Get().FileExists(*TempFileName)) {
+      return;
+    }
+
+    ReadCampFile(bRecoverFromTemp ? TempFileName : FileName, OutResult);
+    if (bRecoverFromTemp && OutResult.Error.IsEmpty()) {
+      IFileManager::Get().Move(*FileName, *TempFileName, true);
     }
   }
 
@@ -3805,7 +3824,7 @@ void URedwoodServerGameSubsystem::PutCampLayout(
     // a direct write would leave a truncated file, which reads back as a
     // corrupt camp that every later put refuses to overwrite.
     const FString FileName = GetOfflineCampPath(PlayerId);
-    const FString TempFileName = FileName + TEXT(".tmp");
+    const FString TempFileName = GetOfflineCampTempPath(PlayerId);
     IFileManager::Get().MakeDirectory(*FPaths::GetPath(FileName), true);
     if (!FFileHelper::SaveStringToFile(OutputString, *TempFileName) ||
         !IFileManager::Get().Move(*FileName, *TempFileName, true)) {

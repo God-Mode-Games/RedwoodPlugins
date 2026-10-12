@@ -147,6 +147,36 @@ bool FRedwoodCampLayoutOfflineTest::RunTest(const FString &Parameters) {
     );
   }
 
+  // The move over the camp file deletes the target and then renames. A crash
+  // between the two leaves only the temp file, which holds the whole camp.
+  const FString TempFile = CampTestFile() + TEXT(".tmp");
+  IFileManager::Get().Move(*TempFile, *CampTestFile(), true);
+  TestFalse(
+    TEXT("The crash leaves no camp file"),
+    IFileManager::Get().FileExists(*CampTestFile())
+  );
+  FRedwoodGetCampLayoutOutput Recovered = GetCamp(Subsystem, CampTestPlayerId);
+  TestTrue(TEXT("The camp is read from the temp file"), Recovered.Camp.bFound);
+  TestEqual(TEXT("with its revision"), Recovered.Camp.Revision, 2);
+  TestTrue(
+    TEXT("and put back in place"),
+    IFileManager::Get().FileExists(*CampTestFile()) &&
+      !IFileManager::Get().FileExists(*TempFile)
+  );
+
+  // A temp file that cannot be read is an error, not "no camp".
+  IFileManager::Get().Delete(*CampTestFile());
+  FFileHelper::SaveStringToFile(TEXT("{ half"), *TempFile);
+  TestFalse(
+    TEXT("A garbage temp file is an error"),
+    GetCamp(Subsystem, CampTestPlayerId).Error.IsEmpty()
+  );
+  IFileManager::Get().Delete(*TempFile);
+  TestTrue(
+    TEXT("With neither file there is no camp and no error"),
+    GetCamp(Subsystem, CampTestPlayerId).Error.IsEmpty()
+  );
+
   // A file that exists but is garbage is an error, not "no camp", and a put must
   // not overwrite it.
   FFileHelper::SaveStringToFile(TEXT("{ not json"), *CampTestFile());
