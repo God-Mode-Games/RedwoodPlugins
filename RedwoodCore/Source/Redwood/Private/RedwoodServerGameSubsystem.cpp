@@ -3801,9 +3801,15 @@ void URedwoodServerGameSubsystem::PutCampLayout(
       TJsonWriterFactory<TCHAR>::Create(&OutputString);
     FJsonSerializer::Serialize(Payload.ToSharedRef(), JsonWriter);
 
+    // Write a temp file and move it over the target. A crash in the middle of
+    // a direct write would leave a truncated file, which reads back as a
+    // corrupt camp that every later put refuses to overwrite.
     const FString FileName = GetOfflineCampPath(PlayerId);
+    const FString TempFileName = FileName + TEXT(".tmp");
     IFileManager::Get().MakeDirectory(*FPaths::GetPath(FileName), true);
-    if (!FFileHelper::SaveStringToFile(OutputString, *FileName)) {
+    if (!FFileHelper::SaveStringToFile(OutputString, *TempFileName) ||
+        !IFileManager::Get().Move(*FileName, *TempFileName, true)) {
+      IFileManager::Get().Delete(*TempFileName);
       Output.Error = TEXT("Failed to write camp file");
       OnComplete.ExecuteIfBound(Output);
       return;
