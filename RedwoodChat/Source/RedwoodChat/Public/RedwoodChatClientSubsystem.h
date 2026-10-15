@@ -5,7 +5,6 @@
 #include "RedwoodChatModule.h"
 
 #include "CoreMinimal.h"
-#include "SocketIONative.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Types/RedwoodTypes.h"
 #include "Types/RedwoodTypesChat.h"
@@ -151,7 +150,6 @@ private:
     const TSharedRef<FXmppChatMessage> &ChatMsg
   );
 
-  TSharedPtr<FSocketIONative> Director;
   FString PlayerId;
   FString RealmId;
   FString CharacterId;
