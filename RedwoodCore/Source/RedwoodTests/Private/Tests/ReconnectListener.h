@@ -1,7 +1,7 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
-// FORK(hollowed-oath): file is fork-added, for ReloginFailureTest. The
-// reestablished delegates are Blueprint delegates, so only a UFUNCTION on a
+// FORK(hollowed-oath): file is fork-added, for the connection tests. The
+// connection delegates are Blueprint delegates, so only a UFUNCTION on a
 // UObject can listen. The test must hold the listener in a TStrongObjectPtr.
 
 #pragma once
@@ -17,25 +17,36 @@ class URedwoodReconnectListener : public UObject {
   GENERATED_BODY()
 
 public:
-  int32 DirectorCount = 0;
-  int32 RealmCount = 0;
+  int32 LostCount = 0;
+  int32 ReestablishedCount = 0;
+  int32 AuthFailedCount = 0;
+  FString LastAuthFailure;
 
   void Watch(URedwoodClientInterface *Client) {
-    Client->OnDirectorConnectionReestablished.AddDynamic(
-      this, &URedwoodReconnectListener::OnDirectorReestablished
+    Client->OnConnectionLost.AddDynamic(
+      this, &URedwoodReconnectListener::OnLost
     );
-    Client->OnRealmConnectionReestablished.AddDynamic(
-      this, &URedwoodReconnectListener::OnRealmReestablished
+    Client->OnConnectionReestablished.AddDynamic(
+      this, &URedwoodReconnectListener::OnReestablished
+    );
+    Client->OnAuthFailed.AddDynamic(
+      this, &URedwoodReconnectListener::OnAuthFailed
     );
   }
 
   UFUNCTION()
-  void OnDirectorReestablished() {
-    ++DirectorCount;
+  void OnLost() {
+    ++LostCount;
   }
 
   UFUNCTION()
-  void OnRealmReestablished() {
-    ++RealmCount;
+  void OnReestablished() {
+    ++ReestablishedCount;
+  }
+
+  UFUNCTION()
+  void OnAuthFailed(FString Message) {
+    ++AuthFailedCount;
+    LastAuthFailure = Message;
   }
 };
