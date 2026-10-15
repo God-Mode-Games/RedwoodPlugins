@@ -5,14 +5,14 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "TimerManager.h"
 
-// HollowedOath#2854. Holds the requests of one socket while it reconnects, so
-// an action the player takes during a backend move is sent after the re-login
-// instead of failing. A held request is a closure that calls its request
-// function again: when the socket is back it sends, and when the grace runs
-// out it fails through the connection gate of that function, so nothing
-// hangs. That gate must refuse a socket whose re-login is not done.
+// HollowedOath#2854. Holds the requests made while the session is coming
+// back after a drop, so an action the player takes during a backend move is
+// sent after the resume instead of failing. A held request is a closure that
+// calls its request function again: it goes through the request's gate once
+// more, which sends it when the session is back and fails it when the
+// session is over or its grace ran out. FRedwoodClientSession decides which;
+// this is only the queue.
 class REDWOOD_API FRedwoodHeldRequests {
 public:
   // HollowedOath reads this for the grace of its disconnect modal
@@ -22,40 +22,17 @@ public:
   // still worth sending.
   static constexpr float GraceSeconds = 30.0f;
 
-  // The connection gate of a held request. A socket that is back but whose
-  // re-login is not done (or failed) counts as not connected: the server does
-  // not know the player on it, and many routes then answer with an empty
-  // error and do nothing, which reads as a success. With no session there is
-  // no re-login to wait for.
-  static bool CanSend(bool bConnected, bool bAuthenticated, bool bHasSession) {
-    return bConnected && (bAuthenticated || !bHasSession);
-  }
+  void Add(TFunction<void()> Request);
 
-  // True when the request is held and the caller must return. No session
-  // means there is nothing to wait for, so the request fails at once as
-  // before. bSocketReady is connected AND authenticated: a request sent
-  // before the re-login reaches a server socket that does not know the
-  // player, and the server refuses it.
-  bool HoldIfReconnecting(
-    bool bSessionEstablished,
-    bool bSocketReady,
-    TFunction<void()> Request,
-    FTimerManager &TimerManager
-  );
+  // The session is back: every held request runs again, and goes out.
+  void Release();
 
-  // Call at the drop, so that the grace lines up with the game's own. A
-  // request held first starts the grace too.
-  void StartGrace(FTimerManager &TimerManager);
-
-  // The socket is back and authenticated: send every held request.
-  void Release(FTimerManager &TimerManager);
-
-  // The grace ran out or the re-login failed: every held request fails now,
-  // and later requests fail at once until the socket is back.
-  void Expire(FTimerManager &TimerManager);
+  // The grace ran out, or the session ended: every held request runs again,
+  // and fails through its own gate.
+  void Expire();
 
   // The owner is going away: drop the held requests without running them.
-  void Reset(FTimerManager &TimerManager);
+  void Reset();
 
   int32 Num() const {
     return Requests.Num();
@@ -65,6 +42,4 @@ private:
   void RunAll();
 
   TArray<TFunction<void()>> Requests;
-  FTimerHandle GraceTimer;
-  bool bGraceExpired = false;
 };
