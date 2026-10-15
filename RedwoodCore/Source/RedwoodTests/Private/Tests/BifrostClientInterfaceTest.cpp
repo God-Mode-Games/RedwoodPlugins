@@ -1192,12 +1192,14 @@ bool FRedwoodBifrostClientReloginRefusedTest::RunTest(
   );
   TestEqual(TEXT("Nothing is held"), H.HeldCount(), 0);
 
-  // The next socket has nothing to bring back.
+  // The next socket has nothing to bring back. This is the second drop of
+  // the outage for the backoff (the socket between them was not up for the
+  // stable time), so it waits the second delay.
   H.Socket()->Drop();
   TestEqual(
     TEXT("A drop at the title screen is a new loss"), H.Listener->LostCount, 2
   );
-  H.Advance(PastFirstDelaySeconds);
+  H.Advance(PastSecondDelaySeconds);
   H.Accept();
   TestEqual(TEXT("No join goes out"), H.Socket()->Sent.Num(), 0);
   TestEqual(TEXT("Nothing is held"), H.HeldCount(), 0);
