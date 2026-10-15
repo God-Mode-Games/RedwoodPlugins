@@ -11,8 +11,8 @@
 //      when the phase enters an outage; a phase that leaves an outage does so
 //      with exactly one of a reestablished connection, an authentication
 //      failure, or the player's own login, logout or initialize; an
-//      authentication failure only ends a session; a request is held only
-//      while a session is coming back inside its grace.
+//      authentication failure only ends a session; a session that continues
+//      keeps its ids; a session that ends is forgotten on the connection.
 //   3. Gate and the queries, as functions of the phase.
 //   4. Scripts, one per hole the reviews of the flag version found.
 
@@ -366,8 +366,14 @@ namespace RedwoodSessionMachineTest {
       EKind::ForgetSession,
       EKind::SessionCleared,
       EKind::RealmCleared,
-      EKind::ClearCredentials,
     };
+  }
+
+  // A logout also forgets the remember-me credentials.
+  TArray<FExpect> LoggedOutEnd() {
+    TArray<FExpect> Effects = EndSession();
+    Effects.Add(EKind::ClearCredentials);
+    return Effects;
   }
 
   TArray<FExpect> Restored() {
@@ -605,7 +611,7 @@ namespace RedwoodSessionMachineTest {
        )}
     );
     T.Add({EPhase::Relogging, EVariant::LoginLost, EPhase::ReloginPending, {}});
-    for (const EVariant Variant : {EVariant::LoginOk, EVariant::LoginOldSeq}) {
+    for (const EVariant Variant : {EVariant::LoginOk}) {
       T.Add(
         {EPhase::LoggingOut,
          Variant,
@@ -711,15 +717,13 @@ namespace RedwoodSessionMachineTest {
       T.Add({From, EVariant::Login, From, {LoginError(NotConnected)}});
     }
     for (const EPhase From : {EPhase::Suspended, EPhase::ReloginPending}) {
-      T.Add(
-        {From,
-         EVariant::Login,
-         EPhase::Offline,
-         Cat(End, {LoginError(NotConnected)})}
-      );
+      T.Add({From, EVariant::Login, From, {LoginError(NotConnected)}});
     }
     T.Add(
-      {EPhase::Online, EVariant::Login, EPhase::LoggingIn, {EKind::SendLogin}}
+      {EPhase::Online,
+       EVariant::Login,
+       EPhase::LoggingIn,
+       {EKind::RealmCleared, EKind::SendLogin}}
     );
     T.Add(
       {EPhase::LoggingIn,
@@ -755,47 +759,48 @@ namespace RedwoodSessionMachineTest {
        EVariant::Login,
        EPhase::LoggingIn,
        Cat(
-         Cat({EKind::SendLogoutStep, EntryAnswer(LoggedOut)}, End),
+         Cat({EKind::SendLogoutStep, EntryAnswer(NewerLogin)}, End),
          {EKind::SendLogin}
        )}
     );
 
     // Logout
+    const TArray<FExpect> Left = LoggedOutEnd();
     T.Add(
       {EPhase::LoggingIn,
        EVariant::Logout,
        EPhase::LoggingOut,
-       Cat(End, {LoginError(LoggedOut)})}
+       Cat(Left, {LoginError(LoggedOut)})}
     );
     T.Add(
       {EPhase::LoggedIn,
        EVariant::Logout,
        EPhase::Online,
-       Cat({EKind::SendLogoutStep}, End)}
+       Cat({EKind::SendLogoutStep}, Left)}
     );
     T.Add(
       {EPhase::EnteringRealm,
        EVariant::Logout,
        EPhase::Online,
-       Cat({EntryAnswer(LoggedOut), EKind::SendLogoutStep}, End)}
+       Cat({EntryAnswer(LoggedOut), EKind::SendLogoutStep}, Left)}
     );
     T.Add(
       {EPhase::InRealm,
        EVariant::Logout,
        EPhase::Online,
-       Cat({EKind::PayOwedLeave, EKind::SendLogoutStep}, End)}
+       Cat({EKind::PayOwedLeave, EKind::SendLogoutStep}, Left)}
     );
     for (const EPhase From : {EPhase::Suspended, EPhase::ReloginPending}) {
-      T.Add({From, EVariant::Logout, EPhase::Offline, End});
+      T.Add({From, EVariant::Logout, EPhase::Offline, Left});
     }
     for (const EPhase From : {EPhase::Resuming, EPhase::Relogging}) {
-      T.Add({From, EVariant::Logout, EPhase::LoggingOut, End});
+      T.Add({From, EVariant::Logout, EPhase::LoggingOut, Left});
     }
     T.Add(
       {EPhase::Reentering,
        EVariant::Logout,
        EPhase::Online,
-       Cat({EKind::SendLogoutStep}, End)}
+       Cat({EKind::SendLogoutStep}, Left)}
     );
 
     // EnterRealm
@@ -1146,10 +1151,31 @@ bool FRedwoodSessionMachineInvariantsTest::RunTest(const FString &Parameters) {
         LostCount + BackCount + FailCount <= 1
       );
 
-      // A session that ends is forgotten on the connection too.
+      // The grace flag lives only while the session is coming back.
+      if (!S.IsComingBack()) {
+        TestFalse(
+          Cell + TEXT(": no grace flag outside the coming-back phases"),
+          S.IsGraceExpired()
+        );
+      }
+
+      // A session that ends is forgotten on the connection too; one that
+      // continues keeps its ids and is not forgotten.
       const bool bHadSession = FRedwoodClientSession::IsLoggedInPhase(From) ||
         FRedwoodClientSession::IsComingBackPhase(From);
       const bool bHasSession = S.HasPlayerSession();
+      if (bHadSession && bHasSession) {
+        TestEqual(
+          Cell + TEXT(": a session that continues is not forgotten"),
+          Count(Effects, EKind::ForgetSession),
+          0
+        );
+        TestEqual(
+          Cell + TEXT(": a session that continues keeps its player"),
+          S.GetPlayerId(),
+          PlayerA
+        );
+      }
       if (bHadSession && !bHasSession) {
         TestTrue(
           Cell + TEXT(": a session that ends forgets its ids"),
@@ -1391,10 +1417,9 @@ bool FRedwoodSessionMachineHolesTest::RunTest(const FString &Parameters) {
     TestEqual(TEXT("2: no AuthFailed"), T.AuthFailed(), 0);
     T.Up();
     T.Feed(FRedwoodSessionEvent::ResumeAccepted(FString(), RealmA, FString()));
-    TestEqual(
-      TEXT("2: enters the locked realm"),
-      T.Last(EKind::SendEnterRealm)->Text,
-      RealmA
+    const FRedwoodSessionEffect *Enter = T.Last(EKind::SendEnterRealm);
+    TestTrue(
+      TEXT("2: enters the locked realm"), Enter && Enter->Text == RealmA
     );
     T.Entered();
     TestEqual(TEXT("2: one Lost"), T.Lost(), 1);
@@ -1415,10 +1440,9 @@ bool FRedwoodSessionMachineHolesTest::RunTest(const FString &Parameters) {
       )
     );
     TestEqual(TEXT("3: one AuthFailed"), T.AuthFailed(), 1);
-    TestEqual(
-      TEXT("3: with the text"),
-      T.Last(EKind::BroadcastAuthFailed)->Text,
-      TEXT("Token expired")
+    const FRedwoodSessionEffect *Failed = T.Last(EKind::BroadcastAuthFailed);
+    TestTrue(
+      TEXT("3: with the text"), Failed && Failed->Text == TEXT("Token expired")
     );
     TestFalse(TEXT("3: no session"), T.S.HasPlayerSession());
     T.Down();
@@ -1635,6 +1659,59 @@ bool FRedwoodSessionMachineHolesTest::RunTest(const FString &Parameters) {
       0
     );
     TestFalse(TEXT("13: no session"), T.S.HasPlayerSession());
+  }
+
+  // 14. A game caller that joined the re-entry in flight hears the drop that
+  //     takes it, and the resume that follows brings the realm back with no
+  //     caller left waiting.
+  {
+    FScript T;
+    T.InWorld();
+    T.Down();
+    T.Up();
+    T.Feed(FRedwoodSessionEvent::ResumeRefused());
+    T.LoginAccepted(TokenB);
+    T.Enter(9);
+    TestEqual(
+      TEXT("14: the joined caller waits"),
+      Count(T.Log, EKind::AnswerRealmEntry),
+      0
+    );
+    T.Down();
+    const FRedwoodSessionEffect *Answer = T.Last(EKind::AnswerRealmEntry);
+    TestTrue(
+      TEXT("14: the caller hears the drop"),
+      Answer && Answer->RequestId == 9 && Answer->Text == Lost
+    );
+    T.Up();
+    T.Feed(FRedwoodSessionEvent::ResumeAccepted(RealmA, FString(), CharA));
+    TestTrue(TEXT("14: back in the realm"), T.S.IsRealmEntered());
+    TestEqual(
+      TEXT("14: no caller is answered twice"),
+      Count(T.Log, EKind::AnswerRealmEntry),
+      1
+    );
+  }
+
+  // 15. A login attempted while the socket is down fails, and leaves the
+  //     session that is coming back alone.
+  {
+    FScript T;
+    T.InWorld();
+    T.Down();
+    T.LogIn(5);
+    const FRedwoodSessionEffect *Answer = T.Last(EKind::AnswerLogin);
+    TestTrue(
+      TEXT("15: the login fails"),
+      Answer && Answer->RequestId == 5 && Answer->Text == NotConnected
+    );
+    TestTrue(TEXT("15: the session stays"), T.S.HasPlayerSession());
+    TestEqual(
+      TEXT("15: nothing is forgotten"), Count(T.Log, EKind::ForgetSession), 0
+    );
+    T.Up();
+    T.Feed(FRedwoodSessionEvent::ResumeAccepted(RealmA, FString(), CharA));
+    TestEqual(TEXT("15: the session comes back"), T.Reestablished(), 1);
   }
   return true;
 }
