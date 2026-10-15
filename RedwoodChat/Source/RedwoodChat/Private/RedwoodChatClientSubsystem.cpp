@@ -42,106 +42,12 @@ void URedwoodClientChatSubsystem::InitializeChatConnection(
         return;
       }
 
-      Director = ClientInterface->GetDirectorConnection();
-      PlayerId = ClientInterface->GetPlayerId();
-      RealmId = ClientInterface->GetRealmId();
-      CharacterId = ClientInterface->GetCharacterId();
-      Nickname = ClientInterface->GetNickname();
-      CharacterName = ClientInterface->GetCharacterName();
-
-      TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-      Payload->SetStringField(TEXT("playerId"), PlayerId);
-
-      // FORK(hollowed-oath): HollowedOath#2886. See TrackDirectorReply.
-      Director->Emit(
-        TEXT("player:get-text-chat-credentials"),
-        Payload,
-        ClientInterface->TrackDirectorReply([this, OnOutput](auto Response) {
-          TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-
-          FString Error = MessageObject->GetStringField(TEXT("error"));
-
-          if (!Error.IsEmpty()) {
-            OnOutput.ExecuteIfBound(Error);
-            return;
-          }
-
-          XmppPassword = MessageObject->GetStringField(TEXT("xmppPassword"));
-
-          bGuildsScopedToRealm =
-            MessageObject->GetBoolField(TEXT("guildsScopedToRealm"));
-
-          FXmppServer XmppServer;
-          XmppServer.ServerAddr = URedwoodChatSettings::GetXmppServerUri();
-          XmppServer.Domain = XmppServer.ServerAddr;
-
-          FRedwoodXmppModule &Module =
-            FModuleManager::GetModuleChecked<FRedwoodXmppModule>("RedwoodXMPP");
-
-          if (!Module.IsXmppEnabled()) {
-            OnOutput.ExecuteIfBound(
-              TEXT("XMPP is not enabled in the UE XMPP module.")
-            );
-            return;
-          }
-
-          Module.Init();
-
-          XmppPlayerConnection =
-            Module.CreateConnection(PlayerId).ToSharedPtr();
-          XmppCharacterConnection =
-            Module.CreateConnection(CharacterId).ToSharedPtr();
-
-          XmppPlayerConnection->OnLoginComplete().AddLambda(
-            [this, XmppServer, OnOutput](
-              const FXmppUserJid &InUserJid,
-              bool bWasSuccess,
-              const FString &Error
-            ) {
-              if (bWasSuccess) {
-                XmppPlayerConnection->OnLoginComplete().AddLambda(
-                  [this, OnOutput](
-                    const FXmppUserJid &InUserJidCharacter,
-                    bool bWasSuccessCharacter,
-                    const FString &ErrorCharacter
-                  ) {
-                    if (bWasSuccessCharacter) {
-                      bInitialized = true;
-                      OnOutput.ExecuteIfBound(TEXT(""));
-                      InitHandlers();
-
-                      FXmppUserPresence Presence;
-                      Presence.bIsAvailable = true;
-                      Presence.Status = EXmppPresenceStatus::Online;
-                      XmppPlayerConnection->Presence()->UpdatePresence(Presence
-                      );
-                      XmppCharacterConnection->Presence()->UpdatePresence(
-                        Presence
-                      );
-                    } else {
-                      OnOutput.ExecuteIfBound(ErrorCharacter);
-                    }
-
-                    XmppCharacterConnection->OnLoginComplete().Clear();
-                  }
-                );
-
-                XmppCharacterConnection->SetServer(XmppServer);
-                XmppCharacterConnection->Login(CharacterId, XmppPassword);
-              } else {
-                OnOutput.ExecuteIfBound(Error);
-              }
-
-              XmppPlayerConnection->OnLoginComplete().Clear();
-            }
-          );
-
-          XmppPlayerConnection->SetServer(XmppServer);
-          XmppPlayerConnection->Login(PlayerId, XmppPassword);
-        }, [OnOutput]() {
-          OnOutput.ExecuteIfBound(FRedwoodPendingReplies::LostReplyError);
-        })
-      );
+      // FORK(hollowed-oath): the chat credentials rode the Director socket,
+      // which the client no longer has (it holds one connection, to Bifrost,
+      // which carries no text chat event). This XMPP chat was unused and is
+      // retired; the chat of Bifrost replaces it. The widgets that call this
+      // stay loadable until then, and hear that chat is not available.
+      OnOutput.ExecuteIfBound(TEXT("Text chat is not available."));
     } else {
       OnOutput.ExecuteIfBound(TEXT("Redwood Client Interface not found."));
     }
@@ -551,30 +457,8 @@ void URedwoodClientChatSubsystem::CreateCustomRoom(
         return;
       }
 
-      TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-      Payload->SetStringField(TEXT("playerId"), ClientInterface->GetPlayerId());
-      Payload->SetStringField(TEXT("name"), Id);
-
-      if (Password.IsEmpty()) {
-        TSharedPtr<FJsonValue> NullValue = MakeShareable(new FJsonValueNull());
-        Payload->SetField(TEXT("password"), NullValue);
-      } else {
-        Payload->SetStringField(TEXT("password"), Password);
-      }
-
-      // FORK(hollowed-oath): HollowedOath#2886. See TrackDirectorReply.
-      Director->Emit(
-        TEXT("director:text-chat:create-room"),
-        Payload,
-        ClientInterface->TrackDirectorReply([this, OnOutput](auto Response) {
-          TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-
-          FString Error = MessageObject->GetStringField(TEXT("error"));
-          OnOutput.ExecuteIfBound(Error);
-        }, [OnOutput]() {
-          OnOutput.ExecuteIfBound(FRedwoodPendingReplies::LostReplyError);
-        })
-      );
+      // FORK(hollowed-oath): see InitializeChatConnection.
+      OnOutput.ExecuteIfBound(TEXT("Text chat is not available."));
     } else {
       OnOutput.ExecuteIfBound(TEXT("Redwood Client Interface not found."));
     }

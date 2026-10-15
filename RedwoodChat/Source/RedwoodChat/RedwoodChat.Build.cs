@@ -22,7 +22,6 @@ public class RedwoodChat : ModuleRules {
         "ApplicationCore",
         "DeveloperSettings",
         "Redwood",
-        "SocketIOClient",
       }
     );
 
