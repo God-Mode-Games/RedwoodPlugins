@@ -280,6 +280,9 @@ public:
   static bool IsComingBackPhase(ERedwoodSessionPhase InPhase);
   static bool IsLoggedInPhase(ERedwoodSessionPhase InPhase);
   static bool IsSocketUpPhase(ERedwoodSessionPhase InPhase);
+  // What the player reads for a join that Bifrost refused with a reason and
+  // no message of its own (protocol.md, "Join").
+  static FString JoinRefusalText(const FString &Reason);
   static const TCHAR *PhaseName(ERedwoodSessionPhase InPhase);
   static const TCHAR *EventName(ERedwoodSessionEventKind Kind);
   static const TCHAR *EffectName(ERedwoodSessionEffectKind Kind);
@@ -317,8 +320,9 @@ private:
   void Suspend(const FString &RealmToRestore);
   // The session is back on the channel.
   void Restore(ERedwoodSessionPhase To);
-  // Everything of the session goes; the realm with it.
-  void EndSession();
+  // Everything of the session goes; the realm with it. The game's realm
+  // entries still waiting hear EntryError.
+  void EndSession(const FString &EntryError);
   void TakeLogin(const FRedwoodSessionEvent &Event);
   void Ignore(const FRedwoodSessionEvent &Event);
 
