@@ -4,10 +4,10 @@
 // Pins the parse half of URedwoodServerGameSubsystem::RequestOnlineCharacters,
 // the game-server side of the in-game /who all command:
 //   1. A good answer yields every character with its name and zone.
-//   2. An answer that is not an object, has no `error` field, or has no
-//      `characters` array, is reported as an error and not as an empty
-//      roster. AsObject would turn such an answer into a valid EMPTY object,
-//      which reads as "nobody online".
+//   2. An answer that is not an object, has no `error` field or one that is
+//      not a string, or has no `characters` array, is reported as an error
+//      and not as an empty roster. AsObject would turn such an answer into a
+//      valid EMPTY object, which reads as "nobody online".
 //   3. A backend refusal carries its error string through unchanged.
 //   4. An entry with no name is left out rather than shown as a blank line.
 //   5. ListOnlineCharactersEventName still holds the wire name the backend
@@ -130,6 +130,17 @@ bool FRedwoodListOnlineCharactersBadAnswerTest::RunTest(
   TestFalse(
     TEXT("An object with no error field is not one of our answers"),
     ParseOne(MakeShared<FJsonValueObject>(NoErrorField)).Error.IsEmpty()
+  );
+
+  // The engine's TryGetStringField makes "false" out of a boolean, which
+  // would read as a refusal with those words.
+  TSharedPtr<FJsonObject> BoolError = MakeShared<FJsonObject>();
+  BoolError->SetBoolField(TEXT("error"), false);
+  BoolError->SetArrayField(TEXT("characters"), {});
+  TestEqual(
+    TEXT("A boolean in the error field is not one of our answers"),
+    ParseOne(MakeShared<FJsonValueObject>(BoolError)).Error,
+    TEXT("The backend did not answer the online character list")
   );
 
   // A success with no array. The backend puts the array on every answer, so
