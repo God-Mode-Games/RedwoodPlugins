@@ -1129,7 +1129,9 @@ bool FRedwoodBifrostClientReloginRefusedTest::RunTest(
   // The drop of the session's socket, and a drop at the title screen after.
   ExpectDrop(*this, 2);
   ExpectSessionGone(*this);
-  AddExpectedError(TEXT("Could not log in again"), Contains, 1);
+  AddExpectedMessage(
+    TEXT("The session cannot come back"), ELogVerbosity::Warning, Contains, 1
+  );
   FClientHarness H(*this);
   H.EnterSessionWithCharacter();
   H.Socket()->Drop();
@@ -1222,7 +1224,9 @@ bool FRedwoodBifrostClientReentryRefusedTest::RunTest(
   using namespace RedwoodBifrostClientTest;
   ExpectDrop(*this);
   ExpectSessionGone(*this);
-  AddExpectedError(TEXT("Could not enter the realm again"), Contains, 1);
+  AddExpectedMessage(
+    TEXT("The session cannot come back"), ELogVerbosity::Warning, Contains, 1
+  );
   FClientHarness H(*this);
   H.EnterSessionWithCharacter();
   H.Socket()->Drop();
@@ -1544,6 +1548,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FRedwoodBifrostClientReplacedTest::RunTest(const FString &Parameters) {
   using namespace RedwoodBifrostClientTest;
+  AddExpectedMessage(
+    TEXT("The session cannot come back"), ELogVerbosity::Warning, Contains, 1
+  );
   FClientHarness H(*this);
   H.EnterSessionWithCharacter();
   TCapture<FRedwoodListPlayersOutput> InFlight;
