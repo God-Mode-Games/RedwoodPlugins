@@ -232,7 +232,7 @@ void FRedwoodBifrostConnection::HandleSocketClosed(bool bRequested) {
       // The pod is stopping; a sibling takes the resume. The owner holds
       // its requests for the gap. No backoff: this is not a failure.
       if (OnDropped) {
-        OnDropped();
+        OnDropped(true);
       }
       TWeakPtr<FRedwoodBifrostConnection> Weak = AsShared();
       ReconnectNowTimer = TimerManager.SetTimerForNextTick([Weak]() {
@@ -242,15 +242,19 @@ void FRedwoodBifrostConnection::HandleSocketClosed(bool bRequested) {
       });
     } else {
       // Bifrost closed the socket itself after `closed` (it normally keeps
-      // it, see EndChannel). The owner heard the end of the session; the
-      // socket comes back for the next login, and that is not a drop.
+      // it, see EndChannel). The owner heard the end of the session, so
+      // this is no loss to report, but it must know the socket is down
+      // until the reconnect: it comes back for the next login.
+      if (OnDropped) {
+        OnDropped(false);
+      }
       ScheduleReconnect();
     }
     return;
   }
 
   if (OnDropped) {
-    OnDropped();
+    OnDropped(true);
   }
   ScheduleReconnect();
 }
@@ -289,7 +293,7 @@ void FRedwoodBifrostConnection::EndChannel() {
   }
   UE_LOG(LogRedwood, Log, TEXT("The Bifrost pod is stopping; reconnecting."));
   if (OnDropped) {
-    OnDropped();
+    OnDropped(true);
   }
   ReleaseSocket();
   TWeakPtr<FRedwoodBifrostConnection> Weak = AsShared();
@@ -408,6 +412,12 @@ void FRedwoodBifrostConnection::Resume() {
       if (Self->OnResumeRefused) {
         Self->OnResumeRefused();
       }
+      return;
+    }
+    // The join went with its socket, or a newer join replaced it. Either
+    // way this socket is not ours to drop: the close that took the join
+    // is handled where it happened, and a newer join is on this socket.
+    if (Reason == TEXT("not_connected")) {
       return;
     }
     // Any other refusal (rate limit, Bifrost without Redis) is this pod's
