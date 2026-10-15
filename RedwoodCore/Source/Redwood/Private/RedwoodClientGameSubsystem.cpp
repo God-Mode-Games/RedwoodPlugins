@@ -71,26 +71,14 @@ void URedwoodClientGameSubsystem::Initialize(
     ClientInterface->OnRequestToJoinServer.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleRequestToJoinServer
     );
-    ClientInterface->OnDirectorConnectionLost.AddDynamic(
-      this, &URedwoodClientGameSubsystem::HandleOnDirectorConnectionLost
+    ClientInterface->OnConnectionLost.AddDynamic(
+      this, &URedwoodClientGameSubsystem::HandleOnConnectionLost
     );
-    ClientInterface->OnDirectorConnectionReestablished.AddDynamic(
-      this,
-      &URedwoodClientGameSubsystem::HandleOnDirectorConnectionReestablished
+    ClientInterface->OnConnectionReestablished.AddDynamic(
+      this, &URedwoodClientGameSubsystem::HandleOnConnectionReestablished
     );
-    // FORK(hollowed-oath): subscribe the two fork-added auth-failed delegates
-    // (OnDirectorAuthFailed / OnRealmAuthFailed). Upstream surfaces reauth failure only as a log
-    // line; the fork re-broadcasts it as a BlueprintAssignable event so the HollowedOath client
-    // can drive its disconnect/reconnect modal. Merge must keep these binds paired with the
-    // matching UPROPERTY delegates + UFUNCTION handlers in RedwoodClientGameSubsystem.h.
-    ClientInterface->OnDirectorAuthFailed.AddDynamic(
-      this, &URedwoodClientGameSubsystem::HandleOnDirectorAuthFailed
-    );
-    ClientInterface->OnRealmConnectionLost.AddDynamic(
-      this, &URedwoodClientGameSubsystem::HandleOnRealmConnectionLost
-    );
-    ClientInterface->OnRealmAuthFailed.AddDynamic(
-      this, &URedwoodClientGameSubsystem::HandleOnRealmAuthFailed
+    ClientInterface->OnAuthFailed.AddDynamic(
+      this, &URedwoodClientGameSubsystem::HandleOnAuthFailed
     );
     ClientInterface->OnPartyInvited.AddDynamic(
       this, &URedwoodClientGameSubsystem::HandleOnPartyInvited
@@ -230,30 +218,6 @@ void URedwoodClientGameSubsystem::Login(
     ClientInterface->Login(
       Username, PasswordOrToken, Provider, bRememberMe, OnUpdate
     );
-  } else {
-    FRedwoodAuthUpdate Output;
-    Output.Type = ERedwoodAuthUpdateType::Success;
-    OnUpdate.ExecuteIfBound(Output);
-  }
-}
-
-void URedwoodClientGameSubsystem::LoginWithDiscord(
-  bool bRememberMe, FRedwoodAuthUpdateDelegate OnUpdate
-) {
-  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    ClientInterface->LoginWithDiscord(bRememberMe, OnUpdate);
-  } else {
-    FRedwoodAuthUpdate Output;
-    Output.Type = ERedwoodAuthUpdateType::Success;
-    OnUpdate.ExecuteIfBound(Output);
-  }
-}
-
-void URedwoodClientGameSubsystem::LoginWithTwitch(
-  bool bRememberMe, FRedwoodAuthUpdateDelegate OnUpdate
-) {
-  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    ClientInterface->LoginWithTwitch(bRememberMe, OnUpdate);
   } else {
     FRedwoodAuthUpdate Output;
     Output.Type = ERedwoodAuthUpdateType::Success;
@@ -1386,28 +1350,16 @@ void URedwoodClientGameSubsystem::HandleRequestToJoinServer(
   }
 }
 
-void URedwoodClientGameSubsystem::HandleOnDirectorConnectionLost() {
-  OnDirectorConnectionLost.Broadcast();
+void URedwoodClientGameSubsystem::HandleOnConnectionLost() {
+  OnConnectionLost.Broadcast();
 }
 
-void URedwoodClientGameSubsystem::HandleOnDirectorConnectionReestablished() {
-  OnDirectorConnectionReestablished.Broadcast();
+void URedwoodClientGameSubsystem::HandleOnConnectionReestablished() {
+  OnConnectionReestablished.Broadcast();
 }
 
-// FORK(hollowed-oath): re-broadcast handler for the fork-added OnDirectorAuthFailed delegate
-// (see the bind in Initialize). Whole function is fork-added.
-void URedwoodClientGameSubsystem::HandleOnDirectorAuthFailed(FString Message) {
-  OnDirectorAuthFailed.Broadcast(Message);
-}
-
-void URedwoodClientGameSubsystem::HandleOnRealmConnectionLost() {
-  OnRealmConnectionLost.Broadcast();
-}
-
-// FORK(hollowed-oath): re-broadcast handler for the fork-added OnRealmAuthFailed delegate
-// (see the bind in Initialize). Whole function is fork-added.
-void URedwoodClientGameSubsystem::HandleOnRealmAuthFailed(FString Message) {
-  OnRealmAuthFailed.Broadcast(Message);
+void URedwoodClientGameSubsystem::HandleOnAuthFailed(FString Message) {
+  OnAuthFailed.Broadcast(Message);
 }
 
 void URedwoodClientGameSubsystem::HandleOnPartyInvited(

@@ -42,6 +42,9 @@ public class Redwood : ModuleRules {
         "JsonUtilities",
         "Slate",
         "SlateCore",
+        // FORK(hollowed-oath): the player connection to Bifrost. SocketIOClient
+        // above stays for the dedicated server's sidecar socket.
+        "WebSockets",
         // Ed25519 verification for signed config files (e.g. redwood.json)
         // when URedwoodSettings::PublicSigningKey is set.
         "OpenSSL",

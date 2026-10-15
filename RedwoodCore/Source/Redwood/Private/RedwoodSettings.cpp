@@ -362,24 +362,39 @@ TSharedPtr<FJsonObject> LoadSignedRedwoodConfig(
 
 } // namespace
 
+namespace {
+  // FORK(hollowed-oath): one read of a redwood.json field for every setting
+  // that the file can override. Operator kill switch first: with the
+  // override disabled the file is not even looked for, which is also the
+  // lowest-overhead path for a shipped build that wants cooked settings only.
+  FString RedwoodJsonField(const FString &Field, const FString &Default) {
+    URedwoodSettings *Settings = GetMutableDefault<URedwoodSettings>();
+    if (!Settings->bRedwoodJsonEnabled) {
+      return Default;
+    }
+    const FString JsonPath = FPaths::ProjectDir() / TEXT("redwood.json");
+    TSharedPtr<FJsonObject> JsonObject =
+      LoadSignedRedwoodConfig(JsonPath, Settings->PublicSigningKey);
+    FString Value;
+    if (JsonObject.IsValid() && JsonObject->TryGetStringField(Field, Value)) {
+      return Value;
+    }
+    return Default;
+  }
+}
+
 FString URedwoodSettings::GetDirectorUri() {
-  URedwoodSettings *Settings = GetMutableDefault<URedwoodSettings>();
-  FString Uri = Settings->DirectorUri;
+  return RedwoodJsonField(
+    TEXT("directorUri"), GetMutableDefault<URedwoodSettings>()->DirectorUri
+  );
+}
 
-  // Operator kill switch: don't even look for the file if the override
-  // is globally disabled. Skips the file existence check, signature
-  // verification, and any logging — also the lowest-overhead path for
-  // shipped builds that don't want to honor any local config override.
-  if (!Settings->bRedwoodJsonEnabled) {
-    return Uri;
-  }
+FString URedwoodSettings::GetBifrostUri() {
+  return RedwoodJsonField(
+    TEXT("bifrostUri"), GetMutableDefault<URedwoodSettings>()->BifrostUri
+  );
+}
 
-  const FString JsonPath = FPaths::ProjectDir() / TEXT("redwood.json");
-  TSharedPtr<FJsonObject> JsonObject =
-    LoadSignedRedwoodConfig(JsonPath, Settings->PublicSigningKey);
-  if (JsonObject.IsValid() && JsonObject->HasField(TEXT("directorUri"))) {
-    Uri = JsonObject->GetStringField(TEXT("directorUri"));
-  }
-
-  return Uri;
+FString URedwoodSettings::GetChannelName() {
+  return RedwoodJsonField(TEXT("channel"), FString());
 }
