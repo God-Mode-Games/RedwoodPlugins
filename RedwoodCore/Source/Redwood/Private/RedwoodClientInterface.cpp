@@ -1675,7 +1675,9 @@ namespace {
       URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
     FString Error;
     if (MessageObject == nullptr ||
-        !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+        !URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+          *MessageObject, TEXT("error"), Error
+        )) {
       return URedwoodCommonGameSubsystem::BadRealmAnswerError;
     }
     return Error;

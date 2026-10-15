@@ -3882,7 +3882,9 @@ void URedwoodServerGameSubsystem::AnswerSetPlayerRole(
   // and must not be read as an empty error -- that is the same false success
   // an empty object gives, which the test above exists to stop.
   FString Error;
-  if (!(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+  if (!URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+        *MessageObject, TEXT("error"), Error
+      )) {
     OnOutput.ExecuteIfBound(
       false, 0, TEXT("The backend did not answer the role change")
     );
@@ -3938,7 +3940,9 @@ URedwoodServerGameSubsystem::ParseListOnlineCharacters(
     URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
   FString Error;
   if (MessageObject == nullptr ||
-      !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+      !URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+        *MessageObject, TEXT("error"), Error
+      )) {
     return Output;
   }
 
@@ -3953,11 +3957,16 @@ URedwoodServerGameSubsystem::ParseListOnlineCharacters(
   Output.Error = Error;
   Output.Characters.Reserve(Characters->Num());
   for (const TSharedPtr<FJsonValue> &Value : *Characters) {
-    const TSharedPtr<FJsonObject> *Entry = nullptr;
+    const TSharedPtr<FJsonObject> *Entry =
+      URedwoodCommonGameSubsystem::TryGetRedwoodObject(Value);
     FRedwoodOnlineCharacter Character;
-    if (Value.IsValid() && Value->TryGetObject(Entry) &&
-        (*Entry)->TryGetStringField(TEXT("name"), Character.Name)) {
-      (*Entry)->TryGetStringField(TEXT("zoneName"), Character.ZoneName);
+    if (Entry != nullptr &&
+        URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+          *Entry, TEXT("name"), Character.Name
+        )) {
+      URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+        *Entry, TEXT("zoneName"), Character.ZoneName
+      );
       Output.Characters.Add(MoveTemp(Character));
     }
   }
