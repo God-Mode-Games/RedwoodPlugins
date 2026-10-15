@@ -16,7 +16,8 @@
 #include "Kismet/KismetStringLibrary.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "LatencyCheckerLibrary.h"
-#include "SocketIOClient.h"
+// FORK(hollowed-oath): no SocketIOClient.h. The player connection is
+// FRedwoodBifrostConnection; the socket module is for the server's sidecar.
 
 // FORK(hollowed-oath): HollowedOath#2445. Upstream reads ClientInterface with
 // no null check on the backend branch of the social calls (SearchForPlayers
