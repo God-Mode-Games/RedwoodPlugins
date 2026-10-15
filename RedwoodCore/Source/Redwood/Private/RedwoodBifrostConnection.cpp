@@ -452,6 +452,12 @@ void FRedwoodBifrostConnection::Join(
     PendingJoin = nullptr;
     Replaced(false, LostJoinRefusal(TEXT("A newer join replaced this one.")));
   }
+  // The channel this join replaces goes with the steps and requests on it:
+  // their replies would carry the old join_ref and be dropped, so they are
+  // answered as lost now, and a `closed` of that channel is over too.
+  DropPending();
+  bServerCloseExpected = false;
+  bReconnectAtOnce = false;
   JoinRef = NextRef();
   PendingJoinRef = JoinRef;
   PendingJoin = MoveTemp(Callback);
