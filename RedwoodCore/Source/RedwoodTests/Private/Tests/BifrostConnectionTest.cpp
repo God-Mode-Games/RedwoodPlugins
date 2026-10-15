@@ -32,7 +32,9 @@
 //      the queued ones with the lost-reply error.
 //  10. A join sent while one waits replaces it: the old join hears that, and
 //      only the new join's reply makes the session. A reply with no join
-//      pending changes nothing.
+//      pending changes nothing. A join also ends the channel it replaces: a
+//      step that waited on it is answered as lost, the next step of the new
+//      channel goes out, and a `closed` of the old channel is forgotten.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -1245,6 +1247,76 @@ bool FRedwoodBifrostLostResumeKeepsSocketTest::RunTest(
       H.Conn->GetBackoff().IsReconnectPending(H.Timers)
     );
     TestEqual(TEXT("No extra socket yet"), H.Bifrost.Sockets.Num(), 2);
+  }
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostJoinEndsOldChannelTest,
+  "Redwood.Bifrost.Connection.JoinEndsTheOldChannel",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostJoinEndsOldChannelTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodBifrostConnectionTest;
+
+  // A step waits on the old channel when a new login goes out: the step's
+  // reply would carry the old join_ref and be dropped, so the step hears it
+  // is lost now, and the new channel's first step is not stuck behind it.
+  {
+    FHarness H(*this);
+    H.Open();
+    H.LoginOk();
+    TSharedPtr<FJsonObject> StepAnswer;
+    H.Conn->Step(
+      TEXT("session.enter-realm"),
+      nullptr,
+      [&StepAnswer](const TArray<TSharedPtr<FJsonValue>> &Response) {
+        StepAnswer = ResponseObject(Response);
+      }
+    );
+    const FPhoenixMessage Join = H.SendLogin();
+    TestTrue(TEXT("The new join goes out"), Join.IsValid());
+    if (TestNotNull(TEXT("The waiting step is answered"), StepAnswer.Get())) {
+      TestEqual(
+        TEXT("As lost"),
+        StepAnswer->GetStringField(TEXT("code")),
+        TEXT("not_connected")
+      );
+    }
+    H.Socket()->Reply(
+      Join,
+      TEXT("ok"),
+      FFakeBifrost::JoinReply(
+        TEXT("s2"),
+        TEXT("t2"),
+        FFakeBifrost::LoginPlayer(TEXT("p1"), TEXT("tok"))
+      )
+    );
+    H.Conn->Step(TEXT("session.select-character"), nullptr);
+    TestTrue(
+      TEXT("The new channel's first step goes out"),
+      H.Socket()->Last(TEXT("session.select-character")).IsValid()
+    );
+  }
+
+  // `closed` came, and a new login went out before the channel ended: the
+  // old channel's end is filtered by join_ref, so the connection must not
+  // wait for it. The next real drop is a drop, not a quiet close.
+  {
+    FHarness H(*this);
+    H.Open();
+    const FPhoenixMessage First = H.LoginOk();
+    H.Socket()->CloseSession(TEXT("replaced"), First.Ref);
+    H.LoginOk(TEXT("s2"), TEXT("t2"));
+    H.Socket()->EndChannel(First.Ref);
+    TestTrue(
+      TEXT("The old channel's end changes nothing"), H.Conn->HasSession()
+    );
+    ExpectReconnectWarnings(*this);
+    H.Socket()->Drop();
+    TestEqual(TEXT("The drop is announced"), H.Dropped, 1);
+    TestEqual(TEXT("And not quiet"), H.QuietDrops, 0);
   }
   return true;
 }
