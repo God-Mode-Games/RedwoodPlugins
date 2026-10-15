@@ -87,7 +87,10 @@ FRedwoodSessionEvent FRedwoodSessionEvent::LoginOk(
 }
 
 FRedwoodSessionEvent FRedwoodSessionEvent::LoginRefused(
-  uint32 Seq, const FString &Reason, const FString &Message
+  uint32 Seq,
+  const FString &Reason,
+  const FString &Message,
+  const FString &PlayerId
 ) {
   FRedwoodSessionEvent Event;
   Event.Kind = ERedwoodSessionEventKind::LoginReply;
@@ -95,6 +98,7 @@ FRedwoodSessionEvent FRedwoodSessionEvent::LoginRefused(
   Event.Outcome = ERedwoodReplyOutcome::Refused;
   Event.Reason = Reason;
   Event.Message = Message;
+  Event.PlayerId = PlayerId;
   return Event;
 }
 
@@ -449,7 +453,10 @@ void FRedwoodClientSession::OnSocketDown(const FRedwoodSessionEvent &Event) {
       return;
     case ERedwoodSessionPhase::Online:
       // Bifrost closes the socket itself only after `closed`, when the
-      // session is over and the game heard it: that close is no loss.
+      // session is over and the game heard it: that close is no loss. In
+      // any other phase a quiet close counts as announced: a new join went
+      // out inside the instant between `closed` and the close, and the
+      // player waits on that join.
       Go(
         Event.bAnnounced ? ERedwoodSessionPhase::Offline
                          : ERedwoodSessionPhase::OfflineQuiet
@@ -480,9 +487,14 @@ void FRedwoodClientSession::OnSocketDown(const FRedwoodSessionEvent &Event) {
       Suspend(RealmId);
       return;
     case ERedwoodSessionPhase::Resuming:
-    case ERedwoodSessionPhase::Reentering:
       // The same outage: no second loss, the grace runs on.
       Go(ERedwoodSessionPhase::Suspended);
+      return;
+    case ERedwoodSessionPhase::Reentering:
+      // The same outage; a game caller that joined this entry is answered
+      // as lost, as for an entry the socket took.
+      Go(ERedwoodSessionPhase::Suspended);
+      AnswerPendingEntries(FRedwoodPendingReplies::LostReplyError);
       return;
     case ERedwoodSessionPhase::Relogging:
       Go(ERedwoodSessionPhase::ReloginPending);
@@ -587,9 +599,9 @@ void FRedwoodClientSession::OnClosedByServer(
 }
 
 void FRedwoodClientSession::OnLoginReply(const FRedwoodSessionEvent &Event) {
-  // A reply of an old join cannot act. While logging out any outcome of the
-  // join in flight is taken, because the session it may bring must end.
-  if (Phase != ERedwoodSessionPhase::LoggingOut && Event.Seq != JoinSeq) {
+  // A reply of an old join cannot act, in any phase: each join gets exactly
+  // one reply, so the join in flight while logging out is the current one.
+  if (Event.Seq != JoinSeq) {
     Ignore(Event);
     return;
   }
@@ -623,7 +635,9 @@ void FRedwoodClientSession::OnLoginReply(const FRedwoodSessionEvent &Event) {
         return;
       }
       if (Event.Message == MustVerifyMessage) {
-        EmitAnswerLogin(Request, ERedwoodLoginAnswer::MustVerify, FString());
+        EmitAnswerLogin(
+          Request, ERedwoodLoginAnswer::MustVerify, Event.PlayerId
+        );
         return;
       }
       Emit(ERedwoodSessionEffectKind::ClearCredentials);
@@ -801,15 +815,17 @@ void FRedwoodClientSession::OnLogin(const FRedwoodSessionEvent &Event) {
       return;
     case ERedwoodSessionPhase::Suspended:
     case ERedwoodSessionPhase::ReloginPending:
-      // A new login ends the session that was coming back, and there is no
-      // socket to send the new one on.
-      Go(ERedwoodSessionPhase::Offline);
-      EndSession(EntryNotReadyError);
+      // No socket to send it on. The session that is coming back is left
+      // alone: a login that never went out ends nothing.
       EmitAnswerLogin(
         Event.RequestId, ERedwoodLoginAnswer::Error, NotConnectedToDirector
       );
       return;
     case ERedwoodSessionPhase::Online:
+      // A selection made at the title screen is not the new session's.
+      RealmId.Reset();
+      SelectedCharacterId.Reset();
+      Emit(ERedwoodSessionEffectKind::RealmCleared);
       break;
     case ERedwoodSessionPhase::LoggingIn: {
       // The connection replaces the pending join; its caller hears it here.
@@ -829,8 +845,12 @@ void FRedwoodClientSession::OnLogin(const FRedwoodSessionEvent &Event) {
       Emit(ERedwoodSessionEffectKind::SendLogoutStep);
       EndSession(LoggedOutError);
       break;
-    case ERedwoodSessionPhase::LoggedIn:
     case ERedwoodSessionPhase::EnteringRealm:
+      // The entry's callers hear what the login's would: a newer login.
+      Emit(ERedwoodSessionEffectKind::SendLogoutStep);
+      EndSession(NewerLoginError);
+      break;
+    case ERedwoodSessionPhase::LoggedIn:
     case ERedwoodSessionPhase::Reentering:
       Emit(ERedwoodSessionEffectKind::SendLogoutStep);
       EndSession(LoggedOutError);
@@ -855,6 +875,7 @@ void FRedwoodClientSession::OnLogout() {
       PendingLoginRequest = 0;
       Go(ERedwoodSessionPhase::LoggingOut);
       EndSession(LoggedOutError);
+      Emit(ERedwoodSessionEffectKind::ClearCredentials);
       EmitAnswerLogin(Request, ERedwoodLoginAnswer::Error, LoggedOutError);
       return;
     }
@@ -862,12 +883,16 @@ void FRedwoodClientSession::OnLogout() {
       Go(ERedwoodSessionPhase::Online);
       Emit(ERedwoodSessionEffectKind::SendLogoutStep);
       EndSession(LoggedOutError);
+      // A player who leaves forgets the remember-me credentials too.
+      Emit(ERedwoodSessionEffectKind::ClearCredentials);
       return;
     case ERedwoodSessionPhase::EnteringRealm:
       Go(ERedwoodSessionPhase::Online);
       AnswerPendingEntries(LoggedOutError);
       Emit(ERedwoodSessionEffectKind::SendLogoutStep);
       EndSession(LoggedOutError);
+      // A player who leaves forgets the remember-me credentials too.
+      Emit(ERedwoodSessionEffectKind::ClearCredentials);
       return;
     case ERedwoodSessionPhase::InRealm:
       // The owed leave first: only a realm that knows the player runs it.
@@ -875,6 +900,8 @@ void FRedwoodClientSession::OnLogout() {
       Emit(ERedwoodSessionEffectKind::PayOwedLeave);
       Emit(ERedwoodSessionEffectKind::SendLogoutStep);
       EndSession(LoggedOutError);
+      // A player who leaves forgets the remember-me credentials too.
+      Emit(ERedwoodSessionEffectKind::ClearCredentials);
       return;
     case ERedwoodSessionPhase::Suspended:
     case ERedwoodSessionPhase::ReloginPending:
@@ -882,12 +909,16 @@ void FRedwoodClientSession::OnLogout() {
       // ends after its grace, and no resume brings it back.
       Go(ERedwoodSessionPhase::Offline);
       EndSession(LoggedOutError);
+      // A player who leaves forgets the remember-me credentials too.
+      Emit(ERedwoodSessionEffectKind::ClearCredentials);
       return;
     case ERedwoodSessionPhase::Resuming:
     case ERedwoodSessionPhase::Relogging:
       // The join's reply ends the session it brings.
       Go(ERedwoodSessionPhase::LoggingOut);
       EndSession(LoggedOutError);
+      // A player who leaves forgets the remember-me credentials too.
+      Emit(ERedwoodSessionEffectKind::ClearCredentials);
       return;
     case ERedwoodSessionPhase::Reentering:
       // The entry step is in flight; the logout queues behind it, and the
@@ -895,6 +926,8 @@ void FRedwoodClientSession::OnLogout() {
       Go(ERedwoodSessionPhase::Online);
       Emit(ERedwoodSessionEffectKind::SendLogoutStep);
       EndSession(LoggedOutError);
+      // A player who leaves forgets the remember-me credentials too.
+      Emit(ERedwoodSessionEffectKind::ClearCredentials);
       return;
     default:
       // No session: Connecting, ConnectFailed, Online, Offline,
@@ -1041,7 +1074,6 @@ void FRedwoodClientSession::EndSession(const FString &EntryError) {
   Emit(ERedwoodSessionEffectKind::ForgetSession);
   Emit(ERedwoodSessionEffectKind::SessionCleared);
   Emit(ERedwoodSessionEffectKind::RealmCleared);
-  Emit(ERedwoodSessionEffectKind::ClearCredentials);
   PlayerId.Reset();
   AuthToken.Reset();
   Nickname.Reset();
