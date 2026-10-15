@@ -23,24 +23,6 @@ const TCHAR *const FRedwoodClientSession::EntryNotReadyError =
   TEXT("Not connected or authenticated to Director.");
 
 namespace {
-  // What the player reads for a join that Bifrost refused with a reason and
-  // no message of its own (protocol.md, "Join").
-  FString JoinRefusalText(const FString &Reason) {
-    if (Reason == TEXT("rate_limited")) {
-      return TEXT("Too many login attempts. Try again in a minute.");
-    }
-    if (Reason == TEXT("unavailable")) {
-      return TEXT("The login service did not answer. Try again.");
-    }
-    if (Reason == TEXT("replaced")) {
-      return TEXT("A newer login of this account finished first.");
-    }
-    if (Reason == TEXT("invalid_request")) {
-      return TEXT("The client and the server do not speak the same protocol.");
-    }
-    return Reason;
-  }
-
   const TCHAR *const MustVerifyMessage = TEXT("Must verify account");
   const TCHAR *const LocalProvider = TEXT("local");
 }
@@ -1084,6 +1066,24 @@ void FRedwoodClientSession::Ignore(const FRedwoodSessionEvent &Event) {
     EventName(Event.Kind),
     PhaseName(Phase)
   );
+}
+
+// The anonymous namespace of this file would collide with the client
+// interface's copy of this text in a unity build, so it lives on the class.
+FString FRedwoodClientSession::JoinRefusalText(const FString &Reason) {
+  if (Reason == TEXT("rate_limited")) {
+    return TEXT("Too many login attempts. Try again in a minute.");
+  }
+  if (Reason == TEXT("unavailable")) {
+    return TEXT("The login service did not answer. Try again.");
+  }
+  if (Reason == TEXT("replaced")) {
+    return TEXT("A newer login of this account finished first.");
+  }
+  if (Reason == TEXT("invalid_request")) {
+    return TEXT("The client and the server do not speak the same protocol.");
+  }
+  return Reason;
 }
 
 // ── Names ───────────────────────────────────────────────────────────────
