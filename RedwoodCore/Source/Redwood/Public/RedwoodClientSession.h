@@ -233,9 +233,10 @@ public:
   static const TCHAR *const EntryInProgressError;
   static const TCHAR *const EntryNotReadyError;
 
-  // Applies the event: the phase changes, and the effects come back in the
-  // order to run them. A game-facing effect (Answer*, Broadcast*) is last,
-  // so a caller that re-enters from its delegate sees the new phase.
+  // Applies the event: the phase is committed before any effect runs, and
+  // the effects come back in the order to run them. A caller that re-enters
+  // from a game-facing effect (Answer*, Broadcast*) sees the new phase, and
+  // the adapter queues the event it raises until these effects are done.
   TArray<FRedwoodSessionEffect> Handle(const FRedwoodSessionEvent &Event);
 
   ERedwoodSessionPhase GetPhase() const {
