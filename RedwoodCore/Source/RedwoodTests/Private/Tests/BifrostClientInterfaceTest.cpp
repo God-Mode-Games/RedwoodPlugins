@@ -1973,8 +1973,17 @@ bool FRedwoodBifrostClientCharacterFriendAlertTest::RunTest(
 //      not-connected error and does not send it again. A Deinitialize while
 //      a login waits answers nobody: the callers are gone with the
 //      subsystem, and the game may still call in after it.
+//  16. A held call that acts for a character is not sent when the player
+//      selected another character during the hold; one whose character did
+//      not change goes out for it.
+
+// Below the harness, not among the includes at the top: the harness block is
+// moving to a header of its own, and only the tests below need this.
+#include "RedwoodCommonGameSubsystem.h"
+
 namespace RedwoodBifrostClientTest {
   const FString OtherPassword = TEXT("other-secret");
+  const FString OtherCharacterId = TEXT("char-2");
 
   // The phase by its name, so a failed check reads as a row of the machine.
   void TestPhase(
@@ -2524,5 +2533,107 @@ bool FRedwoodBifrostClientDeinitializeDuringLoginTest::RunTest(
     FRedwoodClientSession::NotConnectedToDirector
   );
   TestEqual(TEXT("And opens no socket"), H.Bifrost.Sockets.Num(), 1);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientHeldCallForAnotherCharacterTest,
+  "Redwood.Bifrost.Client.HeldCallForAnotherCharacterIsNotSent",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientHeldCallForAnotherCharacterTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  // One drop in each of the two sessions below.
+  ExpectDrop(*this, 2);
+
+  // The player picks another character while the calls wait. The realm
+  // accepts any character of the player, so a call sent now would act for
+  // the wrong one: it is failed after the resume, and nothing goes out.
+  {
+    FClientHarness H(*this);
+    H.EnterSessionWithCharacter();
+    H.Socket()->Drop();
+    TCapture<FString> Invite;
+    H.Client()->InviteToParty(TEXT("p2"), Invite.Delegate());
+    TCapture<FRedwoodListCharacterFriendsOutput> Friends;
+    H.Client()->ListCharacterFriends(Friends.Delegate());
+    TestEqual(TEXT("Both calls are held"), H.HeldCount(), 2);
+
+    H.Client()->SetSelectedCharacter(OtherCharacterId);
+    TestEqual(TEXT("The held calls still wait"), H.HeldCount(), 2);
+    TestEqual(
+      TEXT("Neither is answered before the session is back"),
+      Invite.Count + Friends.Count,
+      0
+    );
+
+    // Bifrost still has the old character: the selection never reached it.
+    H.Advance(PastFirstDelaySeconds);
+    H.Accept();
+    H.ResumeOk(RealmId, CharacterId);
+    const FPhoenixMessage Select =
+      H.Socket()->Last(TEXT("session.select-character"));
+    TestTrue(
+      TEXT("The new character is selected for the realm"),
+      Select.IsValid() &&
+        Select.Payload->GetStringField(TEXT("characterId")) == OtherCharacterId
+    );
+    TestEqual(TEXT("The held invite is answered once"), Invite.Count, 1);
+    TestEqual(
+      TEXT("That the character changed"),
+      Invite.Last,
+      URedwoodCommonGameSubsystem::CharacterChangedError
+    );
+    TestEqual(
+      TEXT("The invite did not go out"),
+      H.Socket()->CountSent(TEXT("realm:parties:invites:initiate")),
+      0
+    );
+    TestEqual(TEXT("The held friend list is answered once"), Friends.Count, 1);
+    TestEqual(
+      TEXT("That the character changed"),
+      Friends.Last.Error,
+      URedwoodCommonGameSubsystem::CharacterChangedError
+    );
+    TestEqual(
+      TEXT("The friend list did not go out"),
+      H.Socket()->CountSent(TEXT("realm:contacts:list")),
+      0
+    );
+    TestEqual(TEXT("Nothing is held"), H.HeldCount(), 0);
+    TestEqual(
+      TEXT("The client keeps the new character"),
+      H.Client()->GetCharacterId(),
+      OtherCharacterId
+    );
+  }
+
+  // The mirror: a held invite whose character did not change goes out for
+  // it, and waits for the realm's answer.
+  {
+    FClientHarness H(*this);
+    H.EnterSessionWithCharacter();
+    H.Socket()->Drop();
+    TCapture<FString> Invite;
+    H.Client()->InviteToParty(TEXT("p2"), Invite.Delegate());
+    H.Advance(PastFirstDelaySeconds);
+    H.Accept();
+    H.ResumeOk();
+    const FPhoenixMessage Sent =
+      H.Socket()->Last(TEXT("realm:parties:invites:initiate"));
+    if (!TestTrue(TEXT("The held invite goes out"), Sent.IsValid())) {
+      return false;
+    }
+    TestEqual(
+      TEXT("For the character that made it"),
+      Sent.Payload->GetObjectField(TEXT("payload"))
+        ->GetStringField(TEXT("characterId")),
+      CharacterId
+    );
+    TestEqual(TEXT("Its caller waits for the realm"), Invite.Count, 0);
+  }
   return true;
 }
