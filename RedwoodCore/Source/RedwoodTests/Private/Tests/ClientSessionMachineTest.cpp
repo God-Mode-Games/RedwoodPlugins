@@ -756,7 +756,9 @@ namespace RedwoodSessionMachineTest {
        EVariant::Login,
        EPhase::LoggingIn,
        Cat(
-         Cat({EKind::PayOwedLeave, EKind::SendLogoutStep}, End),
+         Cat(
+           {FExpect(EKind::PayOwedLeave, PlayerA), EKind::SendLogoutStep}, End
+         ),
          {EKind::SendLogin}
        )}
     );
@@ -802,7 +804,9 @@ namespace RedwoodSessionMachineTest {
       {EPhase::InRealm,
        EVariant::Logout,
        EPhase::Online,
-       Cat({EKind::PayOwedLeave, EKind::SendLogoutStep}, Left)}
+       Cat(
+         {FExpect(EKind::PayOwedLeave, PlayerA), EKind::SendLogoutStep}, Left
+       )}
     );
     for (const EPhase From : {EPhase::Suspended, EPhase::ReloginPending}) {
       T.Add({From, EVariant::Logout, EPhase::Offline, Left});
