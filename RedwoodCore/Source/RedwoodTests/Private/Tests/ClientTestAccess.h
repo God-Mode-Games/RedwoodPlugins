@@ -52,6 +52,44 @@ public:
     return Client.Connection;
   }
 
+  // The ticketing cluster's flags (HollowedOath#2886, #3002): what a zone
+  // assignment is judged by, and what is owed to the realm.
+  static bool IsAssignmentExpected(const URedwoodClientInterface &Client) {
+    return Client.bAssignmentExpected;
+  }
+
+  static bool IsQueueJoinAbandoned(const URedwoodClientInterface &Client) {
+    return Client.bAbandonedQueueJoin;
+  }
+
+  static bool IsInWorld(const URedwoodClientInterface &Client) {
+    return Client.bInWorld;
+  }
+
+  static bool IsLeaveTicketingOwed(const URedwoodClientInterface &Client) {
+    return Client.bLeaveTicketingOwed;
+  }
+
+  static bool IsTravelPending(const URedwoodClientInterface &Client) {
+    return Client.bTravelPending;
+  }
+
+  static const FString &AcceptedPartyTicketId(
+    const URedwoodClientInterface &Client
+  ) {
+    return Client.AcceptedPartyTicketId;
+  }
+
+  static const FString &PendingPartyTicketId(
+    const URedwoodClientInterface &Client
+  ) {
+    return Client.PendingPartyTicketId;
+  }
+
+  static uint32 JoinSequence(const URedwoodClientInterface &Client) {
+    return Client.JoinSequence;
+  }
+
   // The regions the realm's start answer carried, by name, with the address
   // each one is pinged at. GetRegions() holds only the ping results, which
   // need a network.
