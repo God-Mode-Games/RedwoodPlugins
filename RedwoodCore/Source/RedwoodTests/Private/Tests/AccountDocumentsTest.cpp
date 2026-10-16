@@ -275,7 +275,6 @@ bool FRedwoodAccountDocumentsOfflineTest::RunTest(const FString &Parameters) {
   );
   const FPutCall TooLarge = Put(Subsystem, TestPlayerId, Large, 0);
   TestTrue(TEXT("Too large put calls back"), TooLarge.bCalled);
-  TestTrue(TEXT("A document above the limit is too large"), TooLarge.Output.bTooLarge);
   TestTrue(TEXT("Too large is final"), TooLarge.Output.bRejected);
   TestFalse(TEXT("Too large is not a conflict"), TooLarge.Output.bConflict);
   TestFalse(TEXT("Too large writes nothing"), FileManager.FileExists(*MainFile));
@@ -286,7 +285,6 @@ bool FRedwoodAccountDocumentsOfflineTest::RunTest(const FString &Parameters) {
     Put(Subsystem, TestPlayerId, MakeNested(RedwoodAccountDocumentLimits::MaxDepth + 1), 0);
   TestTrue(TEXT("Too deep put calls back"), TooDeep.bCalled);
   TestTrue(TEXT("A document above the depth limit is final"), TooDeep.Output.bRejected);
-  TestFalse(TEXT("Too deep is not too large"), TooDeep.Output.bTooLarge);
   TestFalse(TEXT("Too deep has an error"), TooDeep.Output.Error.IsEmpty());
   TestFalse(TEXT("Too deep writes nothing"), FileManager.FileExists(*MainFile));
 
@@ -349,43 +347,39 @@ bool FRedwoodAccountDocumentsReplyTest::RunTest(const FString &Parameters) {
   TestFalse(TEXT("An empty get reply is an error"), ParseGetReply({}).Error.IsEmpty());
 
   const FRedwoodPutAccountDocumentOutput Stored = ParsePutReply(
-    MakeReply(TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":5,\"tooLarge\":false,\"rejected\":false}"))
+    MakeReply(TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":5,\"rejected\":false}"))
   );
   TestTrue(TEXT("A good put reply has no error"), Stored.Error.IsEmpty());
   TestEqual(TEXT("A good put reply has the revision"), Stored.Revision, 5);
 
   const FRedwoodPutAccountDocumentOutput Conflict = ParsePutReply(
-    MakeReply(TEXT("{\"error\":\"\",\"conflict\":true,\"revision\":0,\"tooLarge\":false,\"rejected\":false}"))
+    MakeReply(TEXT("{\"error\":\"\",\"conflict\":true,\"revision\":0,\"rejected\":false}"))
   );
   TestTrue(TEXT("A conflict reply is a conflict"), Conflict.bConflict);
   TestTrue(TEXT("A conflict reply is no error"), Conflict.Error.IsEmpty());
 
   const FRedwoodPutAccountDocumentOutput TooLarge = ParsePutReply(MakeReply(
-    TEXT("{\"error\":\"too big\",\"conflict\":false,\"revision\":0,\"tooLarge\":true,\"rejected\":true}")
+    TEXT("{\"error\":\"too big\",\"conflict\":false,\"revision\":0,\"rejected\":true}")
   ));
-  TestTrue(TEXT("A too large reply sets bTooLarge"), TooLarge.bTooLarge);
   TestFalse(TEXT("A too large reply keeps its error"), TooLarge.Error.IsEmpty());
   TestTrue(TEXT("A too large reply is final"), TooLarge.bRejected);
 
   const FRedwoodPutAccountDocumentOutput Rejected = ParsePutReply(MakeReply(
-    TEXT("{\"error\":\"too deep\",\"conflict\":false,\"revision\":0,\"tooLarge\":false,\"rejected\":true}")
+    TEXT("{\"error\":\"too deep\",\"conflict\":false,\"revision\":0,\"rejected\":true}")
   ));
   TestTrue(TEXT("A rejected reply sets bRejected"), Rejected.bRejected);
-  TestFalse(TEXT("A rejected reply is not too large"), Rejected.bTooLarge);
   TestFalse(TEXT("A rejected reply keeps its error"), Rejected.Error.IsEmpty());
 
   const TArray<FString> BadPutReplies = {
     TEXT("[]"),
-    TEXT("{\"conflict\":false,\"revision\":1,\"tooLarge\":false,\"rejected\":false}"),
-    TEXT("{\"error\":\"\",\"revision\":1,\"tooLarge\":false,\"rejected\":false}"),
-    TEXT("{\"error\":\"\",\"conflict\":false,\"tooLarge\":false,\"rejected\":false}"),
-    TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":1,\"rejected\":false}"),
-    TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":1,\"tooLarge\":false}"),
-    TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":1,\"tooLarge\":false,\"rejected\":\"false\"}"),
-    TEXT("{\"error\":\"\",\"conflict\":\"true\",\"revision\":1,\"tooLarge\":false,\"rejected\":false}"),
-    TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":\"1\",\"tooLarge\":false,\"rejected\":false}"),
-    TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":1,\"tooLarge\":1,\"rejected\":false}"),
-    TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":1e12,\"tooLarge\":false,\"rejected\":false}"),
+    TEXT("{\"conflict\":false,\"revision\":1,\"rejected\":false}"),
+    TEXT("{\"error\":\"\",\"revision\":1,\"rejected\":false}"),
+    TEXT("{\"error\":\"\",\"conflict\":false,\"rejected\":false}"),
+    TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":1}"),
+    TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":1,\"rejected\":\"false\"}"),
+    TEXT("{\"error\":\"\",\"conflict\":\"true\",\"revision\":1,\"rejected\":false}"),
+    TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":\"1\",\"rejected\":false}"),
+    TEXT("{\"error\":\"\",\"conflict\":false,\"revision\":1e12,\"rejected\":false}"),
   };
   for (const FString &Reply : BadPutReplies) {
     const FRedwoodPutAccountDocumentOutput Output = ParsePutReply(MakeReply(Reply));

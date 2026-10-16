@@ -29,7 +29,7 @@ namespace RedwoodAccountDocumentLimits {
   // The backend's default `persistence.account-documents.max-bytes`: the
   // document data as compact JSON text, in UTF-8 bytes. It must stay under
   // socket.io's maxHttpBufferSize (1e6), or the socket drops a bigger message
-  // instead of returning tooLarge.
+  // instead of rejecting the put.
   constexpr int32 MaxDataBytes = 524288;
 } // namespace RedwoodAccountDocumentLimits
 
@@ -66,9 +66,6 @@ struct FRedwoodPutAccountDocumentOutput {
 
   // The new revision after a successful put, otherwise 0.
   int32 Revision = 0;
-
-  // True when the document is too large. bRejected is also true then.
-  bool bTooLarge = false;
 
   // True when the put can never succeed as it is (too large, too deep, or
   // another refusal the backend makes final). Retrying the same data cannot

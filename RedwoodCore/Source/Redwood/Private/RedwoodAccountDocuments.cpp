@@ -256,7 +256,6 @@ namespace RedwoodAccountDocuments {
         !TryGetStrictString(Reply, TEXT("error"), Result.Error) ||
         !TryGetStrictBool(Reply, TEXT("conflict"), Result.bConflict) ||
         !TryGetRevision(Reply, TEXT("revision"), Result.Revision) ||
-        !TryGetStrictBool(Reply, TEXT("tooLarge"), Result.bTooLarge) ||
         !TryGetStrictBool(Reply, TEXT("rejected"), Result.bRejected)) {
       Result = FRedwoodPutAccountDocumentOutput();
       Result.Error = MalformedReplyError;

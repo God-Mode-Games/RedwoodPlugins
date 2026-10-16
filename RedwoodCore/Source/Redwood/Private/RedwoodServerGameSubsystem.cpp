@@ -3684,7 +3684,6 @@ void URedwoodServerGameSubsystem::PutAccountDocument(
   // dropped by the socket, and the caller would only see a timeout.
   if (RedwoodAccountDocuments::IsTooLarge(Data.ToSharedRef())) {
     Output.Error = TEXT("Account document is too large");
-    Output.bTooLarge = true;
     Output.bRejected = true;
     OnComplete.ExecuteIfBound(Output);
     return;
