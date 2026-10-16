@@ -1958,3 +1958,571 @@ bool FRedwoodBifrostClientCharacterFriendAlertTest::RunTest(
   );
   return true;
 }
+
+// The holes the reviews of the flag version found, on the real adapter:
+//  13. A drop that takes the token re-login keeps the session: the next
+//      socket logs in again with the same token, and the whole outage is one
+//      lost connection and one reestablished one. A drop that takes the
+//      realm re-entry keeps the new session: the next socket resumes it, and
+//      Bifrost names the realm.
+//  14. A login the player makes during the outage ends it: the join in
+//      flight (resume or re-login) is replaced on the same socket, the old
+//      session's held requests fail, and the game hears no reestablished
+//      connection, because the player ended the outage.
+//  15. A new connection while a login waits answers that login with the
+//      not-connected error and does not send it again. A Deinitialize while
+//      a login waits answers nobody: the callers are gone with the
+//      subsystem, and the game may still call in after it.
+namespace RedwoodBifrostClientTest {
+  const FString OtherPassword = TEXT("other-secret");
+
+  // The phase by its name, so a failed check reads as a row of the machine.
+  void TestPhase(
+    FAutomationTestBase &Test,
+    const TCHAR *What,
+    const FClientHarness &H,
+    ERedwoodSessionPhase Expected
+  ) {
+    Test.TestEqual(
+      What,
+      FRedwoodClientSession::PhaseName(
+        FRedwoodClientTestAccess::Phase(*H.Client())
+      ),
+      FRedwoodClientSession::PhaseName(Expected)
+    );
+  }
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientReloginLostToDropTest,
+  "Redwood.Bifrost.Client.ReloginLostToDropRetries",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientReloginLostToDropTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  // Two sockets go down inside one outage: the session's, and the one that
+  // carried the re-login.
+  AddExpectedMessage(TEXT("reconnecting"), ELogVerbosity::Warning, Contains, 2);
+  AddExpectedError(TEXT("Lost the connection to Bifrost"), Contains, 1);
+  ExpectSessionGone(*this);
+  FClientHarness H(*this);
+  H.EnterSessionWithCharacter();
+  H.DropAndReopen();
+  H.RefuseResume();
+  const FPhoenixMessage Relogin = H.Socket()->Last(TEXT("phx_join"));
+  if (!TestTrue(
+        TEXT("The token re-login is in flight"),
+        Relogin.IsValid() && Relogin.Payload->HasField(TEXT("login"))
+      )) {
+    return false;
+  }
+
+  // The socket goes before the re-login is answered.
+  H.Socket()->Drop();
+  TestEqual(TEXT("No authentication failure"), H.Listener->AuthFailedCount, 0);
+  TestEqual(
+    TEXT("The same outage: one lost connection"), H.Listener->LostCount, 1
+  );
+  TestPhase(
+    *this,
+    TEXT("The session waits for a socket to log in on"),
+    H,
+    ERedwoodSessionPhase::ReloginPending
+  );
+  TestFalse(TEXT("Not logged in"), H.Client()->IsLoggedIn());
+  TestTrue(
+    TEXT("The session is kept"),
+    FRedwoodClientTestAccess::IsReauthPending(*H.Client())
+  );
+
+  // The next socket logs in again with the same token. This is the second
+  // drop of the outage for the backoff, so it waits the second delay.
+  H.Advance(PastSecondDelaySeconds);
+  if (!TestEqual(
+        TEXT("A third socket after the longer delay"),
+        H.Bifrost.Sockets.Num(),
+        3
+      )) {
+    return false;
+  }
+  H.Accept();
+  const FPhoenixMessage Retry = H.Socket()->Last(TEXT("phx_join"));
+  if (!TestTrue(
+        TEXT("The new socket logs in again"),
+        Retry.IsValid() && Retry.Payload->HasField(TEXT("login"))
+      )) {
+    return false;
+  }
+  TestEqual(
+    TEXT("With the same token"),
+    Retry.Payload->GetObjectField(TEXT("login"))
+      ->GetStringField(TEXT("secret")),
+    FirstToken
+  );
+  TestEqual(
+    TEXT("And no resume: the old session is gone"),
+    H.Socket()->CountSent(TEXT("phx_join")),
+    1
+  );
+  TestEqual(
+    TEXT("Nothing is reestablished before the answer"),
+    H.Listener->ReestablishedCount,
+    0
+  );
+
+  H.Socket()->Reply(
+    Retry,
+    TEXT("ok"),
+    FFakeBifrost::JoinReply(
+      TEXT("s2"),
+      TEXT("rt9"),
+      FFakeBifrost::LoginPlayer(PlayerId, TEXT("tok-2"))
+    )
+  );
+  const FPhoenixMessage Enter = H.Socket()->Last(TEXT("session.enter-realm"));
+  if (!TestTrue(
+        TEXT("The new session enters the old realm"), Enter.IsValid()
+      )) {
+    return false;
+  }
+  TestEqual(
+    TEXT("That realm"), Enter.Payload->GetStringField(TEXT("realmId")), RealmId
+  );
+  H.Socket()->ReplyOk(Enter, NoError());
+  TestEqual(TEXT("Reestablished once"), H.Listener->ReestablishedCount, 1);
+  TestEqual(TEXT("Lost once"), H.Listener->LostCount, 1);
+  TestEqual(TEXT("No authentication failure"), H.Listener->AuthFailedCount, 0);
+  TestTrue(TEXT("In the realm"), H.Client()->IsRealmConnected());
+  const FPhoenixMessage Select =
+    H.Socket()->Last(TEXT("session.select-character"));
+  TestTrue(
+    TEXT("The character is selected again"),
+    Select.IsValid() &&
+      Select.Payload->GetStringField(TEXT("characterId")) == CharacterId
+  );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientReentryLostToDropTest,
+  "Redwood.Bifrost.Client.ReentryLostToDropResumes",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientReentryLostToDropTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  // Two sockets go down inside one outage: the session's, and the one that
+  // carried the realm re-entry.
+  AddExpectedMessage(TEXT("reconnecting"), ELogVerbosity::Warning, Contains, 2);
+  AddExpectedError(TEXT("Lost the connection to Bifrost"), Contains, 1);
+  ExpectSessionGone(*this);
+  FClientHarness H(*this);
+  H.EnterSessionWithCharacter();
+  H.DropAndReopen();
+  H.RefuseResume();
+
+  // The re-login makes a new session; its entry of the old realm is in
+  // flight.
+  H.Socket()->Reply(
+    H.Socket()->Last(TEXT("phx_join")),
+    TEXT("ok"),
+    FFakeBifrost::JoinReply(
+      TEXT("s2"),
+      TEXT("rt9"),
+      FFakeBifrost::LoginPlayer(PlayerId, TEXT("tok-2"))
+    )
+  );
+  if (!TestTrue(
+        TEXT("The re-entry is in flight"),
+        H.Socket()->Last(TEXT("session.enter-realm")).IsValid()
+      )) {
+    return false;
+  }
+
+  H.Socket()->Drop();
+  TestEqual(TEXT("No authentication failure"), H.Listener->AuthFailedCount, 0);
+  TestEqual(
+    TEXT("The same outage: one lost connection"), H.Listener->LostCount, 1
+  );
+  TestEqual(
+    TEXT("Nothing is reestablished"), H.Listener->ReestablishedCount, 0
+  );
+  TestPhase(
+    *this,
+    TEXT("The new session waits for a socket to resume on"),
+    H,
+    ERedwoodSessionPhase::Suspended
+  );
+  TestTrue(
+    TEXT("The session is kept"),
+    FRedwoodClientTestAccess::IsReauthPending(*H.Client())
+  );
+
+  // The next socket resumes the new session, with the token the re-login
+  // got. The second drop of the outage waits the second delay.
+  H.Advance(PastSecondDelaySeconds);
+  if (!TestEqual(
+        TEXT("A third socket after the longer delay"),
+        H.Bifrost.Sockets.Num(),
+        3
+      )) {
+    return false;
+  }
+  H.Accept();
+  const FPhoenixMessage Resume = H.Socket()->Last(TEXT("phx_join"));
+  if (!TestTrue(
+        TEXT("The new socket resumes"),
+        Resume.IsValid() && Resume.Payload->HasField(TEXT("resume"))
+      )) {
+    return false;
+  }
+  const TSharedPtr<FJsonObject> ResumePayload =
+    Resume.Payload->GetObjectField(TEXT("resume"));
+  TestEqual(
+    TEXT("The new session"),
+    ResumePayload->GetStringField(TEXT("sessionId")),
+    TEXT("s2")
+  );
+  TestEqual(
+    TEXT("With its token"),
+    ResumePayload->GetStringField(TEXT("resumeToken")),
+    TEXT("rt9")
+  );
+  TestEqual(
+    TEXT("The token login is not sent again"),
+    H.Socket()->CountSent(TEXT("phx_join")),
+    1
+  );
+
+  // Bifrost names the realm the new session is in.
+  H.Socket()->Reply(
+    Resume,
+    TEXT("ok"),
+    FFakeBifrost::JoinReply(
+      TEXT("s2"), TEXT("rt3"), ResumeIdentity(), RealmId, CharacterId
+    )
+  );
+  TestEqual(TEXT("Reestablished once"), H.Listener->ReestablishedCount, 1);
+  TestEqual(TEXT("Lost once"), H.Listener->LostCount, 1);
+  TestEqual(TEXT("No authentication failure"), H.Listener->AuthFailedCount, 0);
+  TestTrue(TEXT("In the realm"), H.Client()->IsRealmConnected());
+  TestEqual(
+    TEXT("The realm the session was in"), H.Client()->GetRealmId(), RealmId
+  );
+  TestEqual(
+    TEXT("The realm is not entered again"),
+    H.Socket()->CountSent(TEXT("session.enter-realm")),
+    0
+  );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientLoginDuringReloginTest,
+  "Redwood.Bifrost.Client.LoginDuringReloginStartsClean",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientLoginDuringReloginTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  ExpectDrop(*this);
+  ExpectSessionGone(*this);
+  FClientHarness H(*this);
+  H.EnterSessionWithCharacter();
+  H.Socket()->Drop();
+  TCapture<FString> Friend;
+  TCapture<FString> Invite;
+  H.Client()->RequestFriend(TEXT("p2"), Friend.Delegate());
+  H.Client()->InviteToParty(TEXT("p2"), Invite.Delegate());
+  H.Advance(PastFirstDelaySeconds);
+  H.Accept();
+  H.RefuseResume();
+  TestEqual(
+    TEXT("The token re-login is in flight"),
+    H.Socket()->CountSent(TEXT("phx_join")),
+    2
+  );
+  TestEqual(TEXT("The held requests wait for it"), H.HeldCount(), 2);
+
+  // The player logs in with a password while the token re-login waits. That
+  // is a new session, not the old one coming back.
+  TCapture<FRedwoodAuthUpdate> Caller;
+  H.Client()->Login(
+    PlayerId, OtherPassword, TEXT("local"), false, Caller.Delegate()
+  );
+  TestEqual(TEXT("No new socket"), H.Bifrost.Sockets.Num(), 2);
+  TestFalse(TEXT("The socket stays open"), H.Socket()->bCloseCalled);
+  TestEqual(TEXT("No drop is reported"), H.Listener->LostCount, 1);
+  const FPhoenixMessage Join = H.Socket()->Last(TEXT("phx_join"));
+  TestEqual(
+    TEXT("The login's join replaces the re-login's on the same socket"),
+    H.Socket()->CountSent(TEXT("phx_join")),
+    3
+  );
+  TestTrue(
+    TEXT("It carries the new credentials"),
+    Join.IsValid() && Join.Payload->HasField(TEXT("login")) &&
+      Join.Payload->GetObjectField(TEXT("login"))
+          ->GetStringField(TEXT("secret")) == OtherPassword
+  );
+  TestEqual(
+    TEXT("The old session's held director request fails"), Friend.Count, 1
+  );
+  TestEqual(
+    TEXT("With the not-connected error"), Friend.Last, NotConnectedToDirector
+  );
+  TestEqual(
+    TEXT("The old session's held realm request fails"), Invite.Count, 1
+  );
+  TestEqual(
+    TEXT("With the not-connected error"), Invite.Last, NotConnectedToRealm
+  );
+  TestEqual(TEXT("Nothing is held"), H.HeldCount(), 0);
+  TestEqual(TEXT("The caller waits for the join"), Caller.Count, 0);
+  TestPhase(
+    *this, TEXT("A login is in flight"), H, ERedwoodSessionPhase::LoggingIn
+  );
+  TestFalse(
+    TEXT("No session is coming back"),
+    FRedwoodClientTestAccess::IsReauthPending(*H.Client())
+  );
+
+  H.Socket()->Reply(
+    Join,
+    TEXT("ok"),
+    FFakeBifrost::JoinReply(
+      TEXT("s2"),
+      TEXT("rt9"),
+      FFakeBifrost::LoginPlayer(PlayerId, TEXT("tok-2"))
+    )
+  );
+  TestEqual(TEXT("The caller is answered once"), Caller.Count, 1);
+  TestEqual(
+    TEXT("As a success"), Caller.Last.Type, ERedwoodAuthUpdateType::Success
+  );
+  TestPhase(
+    *this, TEXT("Logged in, in no realm"), H, ERedwoodSessionPhase::LoggedIn
+  );
+  TestTrue(TEXT("Logged in"), H.Client()->IsLoggedIn());
+  TestTrue(
+    TEXT("The old realm is not the new session's"),
+    H.Client()->GetRealmId().IsEmpty()
+  );
+  TestFalse(TEXT("Not in a realm"), H.Client()->IsRealmConnected());
+  TestTrue(
+    TEXT("Nor the old character"), H.Client()->GetCharacterId().IsEmpty()
+  );
+  // The player ended the outage with a login of their own: the game hears
+  // the login's answer, not a connection that came back.
+  TestEqual(
+    TEXT("Nothing is reestablished"), H.Listener->ReestablishedCount, 0
+  );
+  TestEqual(TEXT("No authentication failure"), H.Listener->AuthFailedCount, 0);
+  TestEqual(TEXT("Lost once"), H.Listener->LostCount, 1);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientLoginDuringResumeTest,
+  "Redwood.Bifrost.Client.LoginDuringResumeReplacesTheJoin",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientLoginDuringResumeTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  ExpectDrop(*this);
+  FClientHarness H(*this);
+  H.EnterSessionWithCharacter();
+  H.DropAndReopen();
+  const FPhoenixMessage Resume = H.Socket()->Last(TEXT("phx_join"));
+  if (!TestTrue(
+        TEXT("The resume is in flight"),
+        Resume.IsValid() && Resume.Payload->HasField(TEXT("resume"))
+      )) {
+    return false;
+  }
+
+  // Another account logs in while the resume waits.
+  TCapture<FRedwoodAuthUpdate> Caller;
+  H.Client()->Login(
+    TEXT("p2"), OtherPassword, TEXT("local"), false, Caller.Delegate()
+  );
+  TestEqual(TEXT("No new socket"), H.Bifrost.Sockets.Num(), 2);
+  TestFalse(TEXT("The socket stays open"), H.Socket()->bCloseCalled);
+  TestEqual(TEXT("No drop is reported"), H.Listener->LostCount, 1);
+  if (!TestEqual(
+        TEXT("The login's join follows the resume's"), H.Socket()->Sent.Num(), 2
+      )) {
+    return false;
+  }
+  const FPhoenixMessage Join = H.Socket()->Sent[1];
+  TestTrue(
+    TEXT("The second join is the login"),
+    Join.IsValid() && Join.Event == TEXT("phx_join") &&
+      Join.Payload->HasField(TEXT("login")) &&
+      Join.Payload->GetObjectField(TEXT("login"))
+          ->GetStringField(TEXT("username")) == TEXT("p2")
+  );
+  TestEqual(TEXT("The caller waits for the join"), Caller.Count, 0);
+  TestPhase(
+    *this, TEXT("A login is in flight"), H, ERedwoodSessionPhase::LoggingIn
+  );
+  TestFalse(TEXT("The connection forgets the old session"), H.HasSession());
+
+  H.Socket()->Reply(
+    Join,
+    TEXT("ok"),
+    FFakeBifrost::JoinReply(
+      TEXT("s2"),
+      TEXT("rt9"),
+      FFakeBifrost::LoginPlayer(TEXT("p2"), TEXT("tok-2"))
+    )
+  );
+  TestEqual(TEXT("The caller is answered once"), Caller.Count, 1);
+  TestEqual(
+    TEXT("As a success"), Caller.Last.Type, ERedwoodAuthUpdateType::Success
+  );
+  TestPhase(*this, TEXT("Logged in"), H, ERedwoodSessionPhase::LoggedIn);
+  TestEqual(
+    TEXT("As the account that logged in"), H.Client()->GetPlayerId(), TEXT("p2")
+  );
+  TestEqual(TEXT("Lost once"), H.Listener->LostCount, 1);
+  TestEqual(
+    TEXT("Nothing is reestablished"), H.Listener->ReestablishedCount, 0
+  );
+  TestEqual(TEXT("No authentication failure"), H.Listener->AuthFailedCount, 0);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientInitializeDuringLoginTest,
+  "Redwood.Bifrost.Client.InitializeDuringLoginAnswersTheCaller",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientInitializeDuringLoginTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  FClientHarness H(*this);
+  H.Open();
+  TCapture<FRedwoodAuthUpdate> Update;
+  const FPhoenixMessage Join = H.SendLogin(Update);
+  if (!TestTrue(
+        TEXT("The login waits for its reply"),
+        Join.IsValid() && Update.Count == 0
+      )) {
+    return false;
+  }
+
+  // The game connects again while the login waits.
+  H.Connect();
+  TestEqual(TEXT("The login is answered once"), Update.Count, 1);
+  TestEqual(
+    TEXT("As an error"), Update.Last.Type, ERedwoodAuthUpdateType::Error
+  );
+  TestEqual(
+    TEXT("That the director is not connected"),
+    Update.Last.Message,
+    FRedwoodClientSession::NotConnectedToDirector
+  );
+  TestTrue(
+    TEXT("The old socket is closed"), H.Bifrost.Sockets[0]->bCloseCalled
+  );
+  if (!TestEqual(TEXT("A new socket opens"), H.Bifrost.Sockets.Num(), 2)) {
+    return false;
+  }
+  TestEqual(
+    TEXT("The first connect is not reported before it connects"),
+    H.ConnectedCalls,
+    1
+  );
+  TestPhase(
+    *this,
+    TEXT("Back to the first connect"),
+    H,
+    ERedwoodSessionPhase::Connecting
+  );
+
+  H.Accept();
+  TestEqual(TEXT("The new socket is the first connect"), H.ConnectedCalls, 2);
+  TestTrue(TEXT("With no error"), H.LastConnectError.IsEmpty());
+  TestPhase(
+    *this, TEXT("At the title screen"), H, ERedwoodSessionPhase::Online
+  );
+  TestEqual(TEXT("The login is not sent again"), H.Socket()->Sent.Num(), 0);
+  TestFalse(TEXT("Not logged in"), H.Client()->IsLoggedIn());
+  // The game asked for the new connection: the machine's Initialize row goes
+  // to Connecting with no word to the game, and Connecting to Online reports
+  // only the first connect. Nothing was lost, so nothing comes back.
+  TestEqual(TEXT("No lost connection"), H.Listener->LostCount, 0);
+  TestEqual(
+    TEXT("No reestablished connection"), H.Listener->ReestablishedCount, 0
+  );
+  TestEqual(TEXT("No authentication failure"), H.Listener->AuthFailedCount, 0);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientDeinitializeDuringLoginTest,
+  "Redwood.Bifrost.Client.DeinitializeWithPendingJoinDropsTheCaller",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientDeinitializeDuringLoginTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  FClientHarness H(*this);
+  H.Open();
+  TCapture<FRedwoodAuthUpdate> Update;
+  const FPhoenixMessage Join = H.SendLogin(Update);
+  if (!TestTrue(
+        TEXT("The login waits for its reply"),
+        Join.IsValid() && Update.Count == 0
+      )) {
+    return false;
+  }
+
+  // The subsystem goes away with the join in flight. Its callers go with
+  // it: the login is dropped, not failed, and the client is as it was made.
+  H.Client()->Deinitialize();
+  TestEqual(TEXT("The caller is not answered"), Update.Count, 0);
+  TestTrue(TEXT("The socket is closed"), H.Socket()->bCloseCalled);
+  TestFalse(TEXT("No connection"), H.Client()->IsDirectorConnected());
+  TestFalse(TEXT("Not logged in"), H.Client()->IsLoggedIn());
+  TestPhase(
+    *this,
+    TEXT("The session is at its initial state"),
+    H,
+    ERedwoodSessionPhase::Connecting
+  );
+
+  // No timer is left behind: nothing opens a socket, nobody is answered.
+  H.Advance(PastGraceSeconds);
+  TestEqual(TEXT("No socket opens later"), H.Bifrost.Sockets.Num(), 1);
+  TestEqual(TEXT("Nobody is answered later"), Update.Count, 0);
+
+  // The game can still call in after the subsystem went down.
+  H.Client()->SetSelectedCharacter(CharacterId);
+  H.Client()->Logout();
+  TCapture<FRedwoodAuthUpdate> Later;
+  H.Client()->Login(PlayerId, Password, TEXT("local"), false, Later.Delegate());
+  TestEqual(TEXT("A login after it fails at once"), Later.Count, 1);
+  TestEqual(
+    TEXT("With the not-connected error"),
+    Later.Last.Message,
+    FRedwoodClientSession::NotConnectedToDirector
+  );
+  TestEqual(TEXT("And opens no socket"), H.Bifrost.Sockets.Num(), 1);
+  return true;
+}
