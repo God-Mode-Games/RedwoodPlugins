@@ -360,8 +360,10 @@ public:
   // it later. A missing document is not an error: bFound is false. A put is
   // accepted only if the document is still at ExpectedRevision (0 = it must
   // not exist yet); otherwise the output has bConflict set. An error after the
-  // send (for example a timeout) can mean the outcome is unknown, so a caller
-  // must Get before it retries.
+  // send can mean the outcome is unknown, so a caller must Get before it
+  // retries. The backend path has no timeout of its own: if the sidecar
+  // socket drops, OnComplete may never be called, so callers must apply their
+  // own timeout.
   void GetAccountDocument(
     const FString &PlayerId,
     const FString &Key,

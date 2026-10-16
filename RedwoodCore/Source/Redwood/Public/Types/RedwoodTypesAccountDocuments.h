@@ -55,8 +55,9 @@ typedef TDelegate<void(const FRedwoodGetAccountDocumentOutput &)>
 
 struct FRedwoodPutAccountDocumentOutput {
   // Set when the put could not be tried or failed. A conflict is not an error.
-  // An error that comes after the request was sent (for example a timeout) can
-  // mean the outcome is unknown: the write may have landed. Get before a retry.
+  // An error that comes after the request was sent (for example the sidecar's
+  // relay to the realm timed out) can mean the outcome is unknown: the write
+  // may have landed. Get before a retry.
   FString Error;
 
   // True when the document was not at the expected revision, so nothing was
