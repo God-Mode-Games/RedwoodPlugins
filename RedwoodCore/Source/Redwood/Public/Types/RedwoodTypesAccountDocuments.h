@@ -4,7 +4,7 @@
 
 // Account documents: small JSON documents that belong to an account (player
 // id), not to a character, stored by the realm `AccountDocument` table. They
-// hold account STATE (camp, flags, achievements, oathline progress). They are
+// hold account STATE. They are
 // NEVER for items or currency: those need atomic transfers that cannot dupe,
 // and items belong in the character item rows.
 //

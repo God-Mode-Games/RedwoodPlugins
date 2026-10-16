@@ -19,7 +19,7 @@ namespace RedwoodAccountDocuments {
 
   // As the backend checks the key: a valid id with no uppercase letter, and
   // not a Windows device name. Offline the key is a file name, and Windows
-  // file names ignore case, so "Camp" and "camp" would be one file.
+  // file names ignore case, so "Save" and "save" would be one file.
   REDWOOD_API bool IsValidKey(const FString &Key);
 
   // True when Data, as compact JSON, is bigger than MaxDataBytes.
