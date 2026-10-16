@@ -517,6 +517,9 @@ void FRedwoodClientSession::OnResumeAccepted(
     case ERedwoodSessionPhase::Resuming: {
       if (!Event.RealmId.IsEmpty()) {
         RealmId = Event.RealmId;
+        // The realm is reached again: a leave owed from the outage goes out
+        // now, not at the next fresh entry.
+        Emit(ERedwoodSessionEffectKind::RealmEntered);
         // The realm selects the character the session names; one this
         // client selected since is sent again.
         if (

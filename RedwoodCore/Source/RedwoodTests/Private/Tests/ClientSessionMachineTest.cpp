@@ -504,13 +504,13 @@ namespace RedwoodSessionMachineTest {
       {EPhase::Resuming,
        EVariant::ResumeAcceptedRealm,
        EPhase::InRealm,
-       Restored()}
+       Cat({EKind::RealmEntered}, Restored())}
     );
     T.Add(
       {EPhase::Resuming,
        EVariant::ResumeAcceptedOtherCharacter,
        EPhase::InRealm,
-       Cat({SelectA}, Restored())}
+       Cat({EKind::RealmEntered, SelectA}, Restored())}
     );
     T.Add(
       {EPhase::Resuming,
