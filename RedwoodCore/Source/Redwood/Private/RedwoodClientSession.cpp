@@ -849,7 +849,7 @@ void FRedwoodClientSession::OnLogin(const FRedwoodSessionEvent &Event) {
       EndSession(EntryNotReadyError);
       break;
     case ERedwoodSessionPhase::InRealm:
-      Emit(ERedwoodSessionEffectKind::PayOwedLeave);
+      EmitText(ERedwoodSessionEffectKind::PayOwedLeave, PlayerId);
       Emit(ERedwoodSessionEffectKind::SendLogoutStep);
       EndSession(LoggedOutError);
       break;
@@ -905,7 +905,7 @@ void FRedwoodClientSession::OnLogout() {
     case ERedwoodSessionPhase::InRealm:
       // The owed leave first: only a realm that knows the player runs it.
       Go(ERedwoodSessionPhase::Online);
-      Emit(ERedwoodSessionEffectKind::PayOwedLeave);
+      EmitText(ERedwoodSessionEffectKind::PayOwedLeave, PlayerId);
       Emit(ERedwoodSessionEffectKind::SendLogoutStep);
       EndSession(LoggedOutError);
       // A player who leaves forgets the remember-me credentials too.

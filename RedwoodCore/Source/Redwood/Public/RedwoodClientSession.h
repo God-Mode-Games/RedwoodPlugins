@@ -189,7 +189,9 @@ enum class ERedwoodSessionEffectKind : uint8 {
   // To the adapter's own state.
   ApplyRegions, // Response
   RealmEntered, // the ticketing cluster sends its owed leave
-  PayOwedLeave, // before a logout step that leaves a realm
+  PayOwedLeave, // Text = player id; before a logout step that leaves a realm.
+  // The ids are cleared before the effects run, so the leave
+  // carries the player it is for.
   RealmCleared, // the ticketing cluster forgets the realm
   SessionCleared, // the adapter forgets what is not the machine's
   SaveCredentials, // Username, Secret = token
