@@ -87,41 +87,55 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
     URedwoodCommonGameSubsystem::ShouldUseBackend(Subsystem->GetWorld())
   );
 
+  // The last answer, and how many answers there were. A guard answers
+  // exactly once: a second answer would reach a caller that moved on.
   FString Error;
+  int32 Answers = 0;
 
   // Five output shapes cover all fifteen functions.
   FRedwoodListPlayersOutputDelegate OnListPlayers =
     FRedwoodListPlayersOutputDelegate::CreateLambda(
-      [&Error](const FRedwoodListPlayersOutput &Output) {
+      [&Error, &Answers](const FRedwoodListPlayersOutput &Output) {
         Error = Output.Error;
+        ++Answers;
       }
     );
   FRedwoodPlayerOutputDelegate OnPlayer =
     FRedwoodPlayerOutputDelegate::CreateLambda(
-      [&Error](const FRedwoodPlayerOutput &Output) { Error = Output.Error; }
+      [&Error, &Answers](const FRedwoodPlayerOutput &Output) {
+        Error = Output.Error;
+        ++Answers;
+      }
     );
   FRedwoodListRealmContactsOutputDelegate OnListRealmContacts =
     FRedwoodListRealmContactsOutputDelegate::CreateLambda(
-      [&Error](const FRedwoodListRealmContactsOutput &Output) {
+      [&Error, &Answers](const FRedwoodListRealmContactsOutput &Output) {
         Error = Output.Error;
+        ++Answers;
       }
     );
   FRedwoodErrorOutputDelegate OnError =
     FRedwoodErrorOutputDelegate::CreateLambda(
-      [&Error](const FString &Output) { Error = Output; }
+      [&Error, &Answers](const FString &Output) {
+        Error = Output;
+        ++Answers;
+      }
     );
   FRedwoodListCharacterFriendsOutputDelegate OnListCharacterFriends =
     FRedwoodListCharacterFriendsOutputDelegate::CreateLambda(
-      [&Error](const FRedwoodListCharacterFriendsOutput &Output) {
+      [&Error, &Answers](const FRedwoodListCharacterFriendsOutput &Output) {
         Error = Output.Error;
+        ++Answers;
       }
     );
 
   // TestEqualSensitive: the string forms of TestEqual ignore case. The reset
   // makes a guard that never answers fail.
-  const auto CheckGuard = [this, &Error](const TCHAR *What) {
+  const auto CheckGuard = [this, &Error, &Answers](const TCHAR *What) {
+    TestEqual(*FString::Printf(TEXT("%s once"), What), Answers, 1);
     TestEqualSensitive(What, *Error, RedwoodExpectedGuardError);
     Error.Reset();
+    Answers = 0;
   };
 
   Subsystem->SearchForPlayers(TEXT("someone"), false, OnListPlayers);

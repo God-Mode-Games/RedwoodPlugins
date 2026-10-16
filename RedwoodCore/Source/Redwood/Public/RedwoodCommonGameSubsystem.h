@@ -102,13 +102,22 @@ public:
     const TArray<TSharedPtr<FJsonValue>> &InvitesArray
   );
 
-  // FORK(hollowed-oath): the one way the fork reads an object out of a socket
-  // value or answer. Null when there is no usable object; see the .cpp.
+  // FORK(hollowed-oath): how the fork's own calls read an object out of a
+  // socket value or answer. Null when there is no usable object; see the .cpp.
   static const TSharedPtr<FJsonObject> *TryGetRedwoodObject(
     const TSharedPtr<FJsonValue> &Value
   );
   static const TSharedPtr<FJsonObject> *TryGetRedwoodAnswerObject(
     const TArray<TSharedPtr<FJsonValue>> &Response
+  );
+  // FORK(hollowed-oath): a string field, and only a string field. The
+  // engine's TryGetStringField also makes text out of a number or a boolean,
+  // so an `error` of 0 or false would read as a refusal, and an id of 7 as a
+  // character.
+  static bool TryGetRedwoodStringField(
+    const TSharedPtr<FJsonObject> &Object,
+    const TCHAR *FieldName,
+    FString &OutValue
   );
 
   // FORK(hollowed-oath): one text for every character friend call whose

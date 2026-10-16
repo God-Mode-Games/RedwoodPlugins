@@ -47,6 +47,8 @@
 //      fails at once.
 //  11. A zone assignment reaches the game once for its push id, and not at
 //      all for a player at character select with no join out.
+//  12. A character friend alert the director pushes reaches the game with
+//      its fields; one the game cannot act on is dropped with a warning.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -55,6 +57,7 @@
 
 #include "Kismet/GameplayStatics.h"
 
+#include "CharacterFriendAlertListener.h"
 #include "ClientTestAccess.h"
 #include "FakeBifrost.h"
 #include "JoinServerListener.h"
@@ -1879,6 +1882,72 @@ bool FRedwoodBifrostClientZoneAssignmentTest::RunTest(
   );
   TestEqual(
     TEXT("The same assignment does not move the player again"), Joins->Count, 1
+  );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientCharacterFriendAlertTest,
+  "Redwood.Bifrost.Client.CharacterFriendAlert",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientCharacterFriendAlertTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  AddExpectedMessage(
+    TEXT("Dropped a director:friends:character-alert"),
+    ELogVerbosity::Warning,
+    Contains,
+    1
+  );
+  FClientHarness H(*this);
+  H.EnterSessionWithCharacter();
+  TStrongObjectPtr<URedwoodCharacterFriendAlertListener> Alerts(
+    NewObject<URedwoodCharacterFriendAlertListener>()
+  );
+  Alerts->Watch(H.Client());
+
+  // The field names are the CharacterAlert schema of the RedwoodBackend fork
+  // (packages/common/src/interfaces.ts).
+  TSharedPtr<FJsonObject> Alert = MakeShared<FJsonObject>();
+  Alert->SetStringField(TEXT("type"), TEXT("requested"));
+  Alert->SetStringField(TEXT("characterId"), CharacterId);
+  Alert->SetStringField(TEXT("otherCharacterId"), TEXT("char-2"));
+  Alert->SetStringField(TEXT("otherCharacterName"), TEXT("Bravo"));
+  H.Socket()->Push(
+    TEXT("alert-1"), TEXT("director:friends:character-alert"), Alert, H.JoinRef
+  );
+  TestEqual(TEXT("The game hears the alert once"), Alerts->Count, 1);
+  TestTrue(
+    TEXT("As a friend request"),
+    Alerts->Last.Type == ERedwoodCharacterFriendAlertType::Requested
+  );
+  // TestEqualSensitive: the string forms of TestEqual ignore case.
+  TestEqualSensitive(
+    TEXT("For the player's character"), *Alerts->Last.CharacterId, *CharacterId
+  );
+  TestEqualSensitive(
+    TEXT("From the other character"),
+    *Alerts->Last.OtherCharacterId,
+    TEXT("char-2")
+  );
+  TestEqualSensitive(
+    TEXT("With that character's name"),
+    *Alerts->Last.OtherCharacterName,
+    TEXT("Bravo")
+  );
+  TestEqual(TEXT("A request names no zone"), Alerts->Last.ZoneName, FString());
+
+  // A request with no sender cannot be shown or answered. The director and
+  // the game would then disagree on the fields, so the drop is logged.
+  Alert->RemoveField(TEXT("otherCharacterId"));
+  H.Socket()->Push(
+    TEXT("alert-2"), TEXT("director:friends:character-alert"), Alert, H.JoinRef
+  );
+  TestEqual(
+    TEXT("An alert with no sender does not reach the game"), Alerts->Count, 1
   );
   return true;
 }

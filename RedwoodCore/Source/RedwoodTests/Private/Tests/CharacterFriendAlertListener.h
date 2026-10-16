@@ -1,8 +1,9 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
-// FORK(hollowed-oath): file is fork-added, for InFlightReplyTest. The alert
-// is a Blueprint delegate, so only a UFUNCTION on a UObject can listen. The
-// test must hold the listener in a TStrongObjectPtr.
+// FORK(hollowed-oath): file is fork-added, for the character friend alert
+// test in BifrostClientInterfaceTest.cpp. The alert is a Blueprint delegate,
+// so only a UFUNCTION on a UObject can listen. The test must hold the
+// listener in a TStrongObjectPtr.
 
 #pragma once
 
