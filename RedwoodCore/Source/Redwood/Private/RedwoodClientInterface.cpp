@@ -262,7 +262,7 @@ void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
   bAbandonedQueueJoin = false;
   AcceptedPartyTicketId = TicketId;
   if (IsRealmReady()) {
-    SendOwedLeave();
+    SendOwedLeave(Session.GetPlayerId());
   }
 }
 
@@ -596,17 +596,18 @@ void URedwoodClientInterface::Execute(const FRedwoodSessionEffect &Effect) {
         ApplyRegions(Effect.Response);
       }
       return;
-    case EKind::RealmEntered:
+    case EKind::RealmEntered: {
       // A resume can reach a realm the game never named to this client (the
       // locked realm after an entry lost with its socket).
       if (CurrentRealm.Id.IsEmpty()) {
         CurrentRealm.Id = Session.GetRealmId();
       }
       // HollowedOath#2886. Before the caller can join.
-      SendOwedLeave();
+      SendOwedLeave(Session.GetPlayerId());
       return;
+    }
     case EKind::PayOwedLeave:
-      SendOwedLeave(true);
+      SendOwedLeave(Effect.Text, true);
       return;
     case EKind::RealmCleared:
       ClearRealmDetails();
@@ -3494,7 +3495,9 @@ void URedwoodClientInterface::SendSelectCharacter() {
 // the loss, whatever came between; the reply to the auth is the first moment
 // the Realm knows the player. The flag stays until a leave succeeds or a join
 // replaces the ticket; with a join out, the leave would cancel it.
-void URedwoodClientInterface::SendOwedLeave(bool bForce) {
+void URedwoodClientInterface::SendOwedLeave(
+  const FString &AsPlayerId, bool bForce
+) {
   // Only this client's own join would lose its ticket to the leave; a
   // party join is the leader's ticket (HollowedOath#3002).
   if (!bLeaveTicketingOwed ||
@@ -3503,7 +3506,7 @@ void URedwoodClientInterface::SendOwedLeave(bool bForce) {
     return;
   }
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
+  Payload->SetStringField(TEXT("playerId"), AsPlayerId);
   Connection->Rpc(
     TEXT("realm:ticketing:leave"),
     Payload,
