@@ -3579,6 +3579,17 @@ void URedwoodClientInterface::JoinQueue(
   bool bFavorLastZone,
   FRedwoodTicketingUpdateDelegate OnUpdate
 ) {
+  // No character needs no connection: the cheaper refusal comes first, and
+  // is not held for the grace.
+  if (Session.GetSelectedCharacterId().IsEmpty()) {
+    FRedwoodTicketingUpdate Update;
+    Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
+    Update.Message =
+      TEXT("Please select a character before joining a server queue.");
+    OnUpdate.ExecuteIfBound(Update);
+    return;
+  }
+
   // FORK(hollowed-oath): HollowedOath#2929. Held while the session comes
   // back, like every realm request; the join goes out, and NoteJoinSent
   // runs, only then.
@@ -3587,15 +3598,6 @@ void URedwoodClientInterface::JoinQueue(
           ProxyId, ZoneName, bTransferWholeParty, bFavorLastZone, OnUpdate
         );
       }, OnUpdate)) {
-    return;
-  }
-
-  if (Session.GetSelectedCharacterId().IsEmpty()) {
-    FRedwoodTicketingUpdate Update;
-    Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
-    Update.Message =
-      TEXT("Please select a character before joining a server queue.");
-    OnUpdate.ExecuteIfBound(Update);
     return;
   }
 
