@@ -580,6 +580,9 @@ private:
   FString ServerToken;
 
   FRedwoodAuthUpdateDelegate OnAccountVerified;
+  // The player whose login waits for its email verification: a refused login
+  // makes no session, so the push that confirms it is matched here.
+  FString MustVerifyPlayerId;
   // The realm the session entered, as the game described it; the session
   // machine holds its id and the player's ids.
   FRedwoodRealm CurrentRealm;
