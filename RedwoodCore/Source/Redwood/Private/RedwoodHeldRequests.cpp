@@ -4,59 +4,19 @@
 
 #include "RedwoodHeldRequests.h"
 
-bool FRedwoodHeldRequests::HoldIfReconnecting(
-  bool bSessionEstablished,
-  bool bSocketReady,
-  TFunction<void()> Request,
-  FTimerManager &TimerManager
-) {
-  if (bSocketReady) {
-    bGraceExpired = false;
-    return false;
-  }
-
-  if (!bSessionEstablished || bGraceExpired) {
-    return false;
-  }
-
+void FRedwoodHeldRequests::Add(TFunction<void()> Request) {
   Requests.Add(MoveTemp(Request));
-  StartGrace(TimerManager);
-  return true;
 }
 
-void FRedwoodHeldRequests::StartGrace(FTimerManager &TimerManager) {
-  if (TimerManager.IsTimerActive(GraceTimer)) {
-    return;
-  }
-
-  // A new drop gets a full grace, even when the last one ran out.
-  bGraceExpired = false;
-
-  TimerManager.SetTimer(
-    GraceTimer,
-    FTimerDelegate::CreateLambda([this, &TimerManager]() {
-      Expire(TimerManager);
-    }),
-    GraceSeconds,
-    false
-  );
-}
-
-void FRedwoodHeldRequests::Release(FTimerManager &TimerManager) {
-  TimerManager.ClearTimer(GraceTimer);
-  bGraceExpired = false;
+void FRedwoodHeldRequests::Release() {
   RunAll();
 }
 
-void FRedwoodHeldRequests::Expire(FTimerManager &TimerManager) {
-  TimerManager.ClearTimer(GraceTimer);
-  bGraceExpired = true;
+void FRedwoodHeldRequests::Expire() {
   RunAll();
 }
 
-void FRedwoodHeldRequests::Reset(FTimerManager &TimerManager) {
-  TimerManager.ClearTimer(GraceTimer);
-  bGraceExpired = false;
+void FRedwoodHeldRequests::Reset() {
   Requests.Reset();
 }
 

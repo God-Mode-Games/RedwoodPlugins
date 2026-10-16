@@ -23,22 +23,27 @@ public:
     return Client.Replies.Num();
   }
 
+  // The session is coming back after a drop: requests are held.
   static bool IsReauthPending(const URedwoodClientInterface &Client) {
-    return Client.bReauthPending;
+    return Client.Session.IsComingBack();
   }
 
   static bool IsRealmEntered(const URedwoodClientInterface &Client) {
-    return Client.bRealmEntered;
+    return Client.Session.IsRealmEntered();
   }
 
   static const FString &SelectedCharacterId(
     const URedwoodClientInterface &Client
   ) {
-    return Client.SelectedCharacterId;
+    return Client.Session.GetSelectedCharacterId();
   }
 
-  static const FString &CurrentRealmId(const URedwoodClientInterface &Client) {
-    return Client.CurrentRealmId;
+  static FString CurrentRealmId(const URedwoodClientInterface &Client) {
+    return Client.Session.GetRealmId();
+  }
+
+  static ERedwoodSessionPhase Phase(const URedwoodClientInterface &Client) {
+    return Client.Session.GetPhase();
   }
 
   static TSharedPtr<FRedwoodBifrostConnection> Connection(
