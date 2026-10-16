@@ -45,12 +45,15 @@ void URedwoodClientInterface::Deinitialize() {
 // held, sent or failed, and FRedwoodHeldRequests is the queue. True means the
 // request was held or failed, and the caller returns. When it lets a request
 // through, the session is live, so the upstream check after it passes.
-// Not gated: login and the handshakes (they are the re-login), ticketing and
-// proxies (a late join can move a player who has given up waiting),
+// Not gated: login and the handshakes (they are the re-login), the proxy
+// joins (a late join can move a player who has given up waiting),
 // CreateCharacter (the creation screen shows its failure), and requests with
 // no reply (a late emote is worse than none; the Director re-login re-sends
-// the online character). A held request that carries a USIOJsonObject keeps
-// it alive with a TStrongObjectPtr.
+// the online character). The ticketing joins, the leave and the proxy list
+// are gated (HollowedOath#2929): Enter World is a proxy list and a queue
+// join, and the game's leave follows a join the game gave up on, in the same
+// order. A held request that carries a USIOJsonObject keeps it alive with a
+// TStrongObjectPtr.
 namespace {
   void SetRedwoodGateError(FString &Output, const TCHAR *Error) {
     Output = Error;
@@ -65,6 +68,16 @@ namespace {
   // answer with an auth update, which has no Error field.
   void SetRedwoodGateError(FRedwoodAuthUpdate &Output, const TCHAR *Error) {
     Output.Type = ERedwoodAuthUpdateType::Error;
+    Output.Message = Error;
+  }
+
+  // FORK(hollowed-oath): HollowedOath#2929. A ticketing join answers with a
+  // ticketing update; a gate failure is a ticket error, which the game
+  // shows as the end of the join.
+  void SetRedwoodGateError(
+    FRedwoodTicketingUpdate &Output, const TCHAR *Error
+  ) {
+    Output.Type = ERedwoodTicketingUpdateType::TicketError;
     Output.Message = Error;
   }
 
@@ -367,6 +380,26 @@ void URedwoodClientInterface::FailTicketingJoin(uint32 Sequence) {
   Update.Message = FRedwoodPendingReplies::LostReplyError;
   OnTicketingUpdate.ExecuteIfBound(Update);
   OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+}
+
+// HollowedOath#2929. The realm gate for a join attempt that answers through
+// OnTicketingUpdate. A held attempt keeps the delegate for its re-run; a
+// failed one is the join's final answer, so the delegate is unbound before
+// the caller hears it, and a join the caller makes from its handler keeps
+// its own.
+bool URedwoodClientInterface::GateTicketingAttempt(
+  TFunction<void()> Attempt
+) {
+  return GateRealm(
+    MoveTemp(Attempt),
+    FRedwoodTicketingUpdateDelegate::CreateLambda(
+      [this](const FRedwoodTicketingUpdate &Update) {
+        const FRedwoodTicketingUpdateDelegate Caller = OnTicketingUpdate;
+        OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+        Caller.ExecuteIfBound(Update);
+      }
+    )
+  );
 }
 // FORK(hollowed-oath) END
 
@@ -3546,20 +3579,22 @@ void URedwoodClientInterface::JoinQueue(
   bool bFavorLastZone,
   FRedwoodTicketingUpdateDelegate OnUpdate
 ) {
+  // FORK(hollowed-oath): HollowedOath#2929. Held while the session comes
+  // back, like every realm request; the join goes out, and NoteJoinSent
+  // runs, only then.
+  if (GateRealm([=, this]() {
+        JoinQueue(
+          ProxyId, ZoneName, bTransferWholeParty, bFavorLastZone, OnUpdate
+        );
+      }, OnUpdate)) {
+    return;
+  }
+
   if (Session.GetSelectedCharacterId().IsEmpty()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message =
       TEXT("Please select a character before joining a server queue.");
-    OnUpdate.ExecuteIfBound(Update);
-    return;
-  }
-
-  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
-  if (!IsRealmReady()) {
-    FRedwoodTicketingUpdate Update;
-    Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
-    Update.Message = TEXT("Not connected to Realm.");
     OnUpdate.ExecuteIfBound(Update);
     return;
   }
@@ -3616,13 +3651,10 @@ void URedwoodClientInterface::JoinCustom(
 }
 
 void URedwoodClientInterface::AttemptJoinCustom() {
-  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
-  if (!IsRealmReady()) {
-    FRedwoodTicketingUpdate Update;
-    Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
-    Update.Message = TEXT("Not connected to Realm.");
-    OnTicketingUpdate.ExecuteIfBound(Update);
-    OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+  // FORK(hollowed-oath): HollowedOath#2929. Held while the session comes
+  // back; the ping wait below keeps its own timer, and an attempt it re-arms
+  // during a drop is held here too.
+  if (GateTicketingAttempt([this]() { AttemptJoinCustom(); })) {
     return;
   }
 
@@ -3708,12 +3740,23 @@ void URedwoodClientInterface::LeaveTicketing(
   bAbandonedQueueJoin = true;
   bAssignmentExpected = false;
 
-  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
-  if (!IsRealmReady()) {
-    bLeaveTicketingOwed = true;
-    FString Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
+  // FORK(hollowed-oath): HollowedOath#2929. Held while the session comes
+  // back, like every realm request, and the held leave pays what was owed:
+  // SendOwedLeave at the realm entry would send a second one. A leave that
+  // cannot go out is owed, and SendOwedLeave pays it at the next entry.
+  switch (Session.Gate(ERedwoodRequestKind::Realm)) {
+    case ERedwoodGateDecision::Hold:
+      bLeaveTicketingOwed = false;
+      HeldRequests.Add([this, OnOutput]() { LeaveTicketing(OnOutput); });
+      return;
+    case ERedwoodGateDecision::Fail: {
+      bLeaveTicketingOwed = true;
+      FString Error = FRedwoodClientSession::NotConnectedToRealm;
+      OnOutput.ExecuteIfBound(Error);
+      return;
+    }
+    default:
+      break;
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
@@ -3743,11 +3786,11 @@ void URedwoodClientInterface::ListProxies(
   TArray<FString> PrivateProxyReferences,
   FRedwoodListProxiesOutputDelegate OnOutput
 ) {
-  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
-  if (!IsRealmReady()) {
-    FRedwoodListProxiesOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
+  // FORK(hollowed-oath): HollowedOath#2929. The first realm call of Enter
+  // World: held while the session comes back, like the join that follows it.
+  if (GateRealm([=, this]() {
+        ListProxies(PrivateProxyReferences, OnOutput);
+      }, OnOutput)) {
     return;
   }
 
@@ -3977,13 +4020,8 @@ void URedwoodClientInterface::StopProxy(
 }
 
 void URedwoodClientInterface::AttemptJoinMatchmaking() {
-  // FORK(hollowed-oath): HollowedOath#2886. See IsRealmReady.
-  if (!IsRealmReady()) {
-    FRedwoodTicketingUpdate Update;
-    Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
-    Update.Message = TEXT("Not connected to Realm.");
-    OnTicketingUpdate.ExecuteIfBound(Update);
-    OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+  // FORK(hollowed-oath): HollowedOath#2929. As AttemptJoinCustom.
+  if (GateTicketingAttempt([this]() { AttemptJoinMatchmaking(); })) {
     return;
   }
 
