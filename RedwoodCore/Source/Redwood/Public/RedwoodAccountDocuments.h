@@ -14,8 +14,13 @@
 // URedwoodServerGameSubsystem::GetAccountDocument.
 namespace RedwoodAccountDocuments {
   // ASCII letters, digits, '_' and '-', 1 to MaxIdLength characters, as the
-  // backend checks the player id and the key.
+  // backend checks the player id.
   REDWOOD_API bool IsValidId(const FString &Id);
+
+  // As the backend checks the key: a valid id with no uppercase letter, and
+  // not a Windows device name. Offline the key is a file name, and Windows
+  // file names ignore case, so "Camp" and "camp" would be one file.
+  REDWOOD_API bool IsValidKey(const FString &Key);
 
   // True when Data, as compact JSON, is bigger than MaxDataBytes.
   REDWOOD_API bool IsTooLarge(const TSharedRef<FJsonObject> &Data);

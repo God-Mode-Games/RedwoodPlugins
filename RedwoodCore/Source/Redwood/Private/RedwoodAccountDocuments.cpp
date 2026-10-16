@@ -152,6 +152,30 @@ namespace RedwoodAccountDocuments {
     return true;
   }
 
+  bool IsValidKey(const FString &Key) {
+    if (!IsValidId(Key)) {
+      return false;
+    }
+    for (const TCHAR Character : Key) {
+      if (Character >= TEXT('A') && Character <= TEXT('Z')) {
+        return false;
+      }
+    }
+    static const TCHAR *const ReservedKeys[] = {
+      TEXT("con"),  TEXT("prn"),  TEXT("aux"),  TEXT("nul"),  TEXT("com1"),
+      TEXT("com2"), TEXT("com3"), TEXT("com4"), TEXT("com5"), TEXT("com6"),
+      TEXT("com7"), TEXT("com8"), TEXT("com9"), TEXT("lpt1"), TEXT("lpt2"),
+      TEXT("lpt3"), TEXT("lpt4"), TEXT("lpt5"), TEXT("lpt6"), TEXT("lpt7"),
+      TEXT("lpt8"), TEXT("lpt9"),
+    };
+    for (const TCHAR *Reserved : ReservedKeys) {
+      if (Key.Equals(Reserved, ESearchCase::CaseSensitive)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool IsTooDeep(const TSharedRef<FJsonObject> &Data) {
     // A loop, not recursion, so a deep document cannot overflow the stack.
     struct FLevel {

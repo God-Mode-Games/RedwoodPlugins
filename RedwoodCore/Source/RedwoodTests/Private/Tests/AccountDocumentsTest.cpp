@@ -240,6 +240,21 @@ bool FRedwoodAccountDocumentsOfflineTest::RunTest(const FString &Parameters) {
     TestTrue(TEXT("Bad key get calls back"), BadKeyGet.bCalled);
     TestFalse(FString::Printf(TEXT("Get rejects key '%s'"), *BadId), BadKeyGet.Output.Error.IsEmpty());
   }
+  // Keys are lowercase and not a device name, so no two keys can be one
+  // file on Windows.
+  const TArray<FString> BadKeys = {
+    TEXT("Camp"), TEXT("CAMP"), TEXT("con"), TEXT("nul"), TEXT("com1"), TEXT("lpt9"),
+  };
+  for (const FString &BadKey : BadKeys) {
+    const FPutCall BadKeyPut = Put(Subsystem, TestPlayerId, MakeData(1), 0, BadKey);
+    TestTrue(TEXT("Bad key put calls back"), BadKeyPut.bCalled);
+    TestFalse(FString::Printf(TEXT("Put rejects key '%s'"), *BadKey), BadKeyPut.Output.Error.IsEmpty());
+    const FGetCall BadKeyGet = Get(Subsystem, TestPlayerId, BadKey);
+    TestTrue(TEXT("Bad key get calls back"), BadKeyGet.bCalled);
+    TestFalse(FString::Printf(TEXT("Get rejects key '%s'"), *BadKey), BadKeyGet.Output.Error.IsEmpty());
+  }
+  TestTrue(TEXT("A key that only starts with a device name is valid"), RedwoodAccountDocuments::IsValidKey(TEXT("con1")));
+
   TestTrue(
     TEXT("An id of the maximum length is valid"),
     RedwoodAccountDocuments::IsValidId(

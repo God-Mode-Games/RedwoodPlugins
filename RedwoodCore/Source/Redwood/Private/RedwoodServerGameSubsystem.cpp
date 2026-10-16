@@ -3616,7 +3616,7 @@ void URedwoodServerGameSubsystem::GetAccountDocument(
   FRedwoodGetAccountDocumentOutputDelegate OnComplete
 ) {
   if (!RedwoodAccountDocuments::IsValidId(PlayerId) ||
-      !RedwoodAccountDocuments::IsValidId(Key)) {
+      !RedwoodAccountDocuments::IsValidKey(Key)) {
     FRedwoodGetAccountDocumentOutput Output;
     Output.Error = TEXT("Invalid player id or key");
     OnComplete.ExecuteIfBound(Output);
@@ -3658,7 +3658,7 @@ void URedwoodServerGameSubsystem::PutAccountDocument(
   FRedwoodPutAccountDocumentOutput Output;
 
   if (!RedwoodAccountDocuments::IsValidId(PlayerId) ||
-      !RedwoodAccountDocuments::IsValidId(Key)) {
+      !RedwoodAccountDocuments::IsValidKey(Key)) {
     Output.Error = TEXT("Invalid player id or key");
     OnComplete.ExecuteIfBound(Output);
     return;
