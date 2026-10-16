@@ -117,8 +117,10 @@ public:
   // OnResumed or OnResumeRefused tells its outcome; without one, this is all.
   TFunction<void()> OnConnected;
   // The socket closed and this client did not ask for it; a reconnect is
-  // scheduled. Requests pending on it are gone.
-  TFunction<void()> OnDropped;
+  // scheduled. Requests pending on it are gone. bAnnounced is false when
+  // Bifrost closed the socket after `closed`: the owner heard the end of
+  // the session already, and this is only the socket going.
+  TFunction<void(bool bAnnounced)> OnDropped;
   // The session was resumed on a new socket. The argument is the join reply:
   // {sessionId, resumeToken, player, realmId?, characterId?}.
   TFunction<void(const TSharedPtr<FJsonObject> &Reply)> OnResumed;

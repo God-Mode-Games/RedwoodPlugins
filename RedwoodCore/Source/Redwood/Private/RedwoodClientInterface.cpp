@@ -431,7 +431,12 @@ void URedwoodClientInterface::InitializeDirectorConnection(
       OnDirectorConnected.ExecuteIfBound(Details);
     }
   };
-  Connection->OnDropped = [WeakThis]() {
+  Connection->OnDropped = [WeakThis](bool bAnnounced) {
+    // A socket Bifrost closed after `closed` goes with a session this
+    // object ended already; nothing is lost that the game must hear of.
+    if (!bAnnounced) {
+      return;
+    }
     if (URedwoodClientInterface *Self = WeakThis.Get()) {
       Self->HandleDropped();
     }
