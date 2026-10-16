@@ -508,7 +508,9 @@ private:
   bool IsRealmReady();
   // bForce: the session machine knows the realm was entered, where the phase
   // has moved on already (a logout pays the leave on its way out).
-  void SendOwedLeave(bool bForce = false);
+  // AsPlayerId is given when the session's own id is already gone (a
+  // logout pays its leave after the machine cleared the session).
+  void SendOwedLeave(const FString &AsPlayerId, bool bForce = false);
   // The invite as the character that asked for it; a held invite keeps that
   // character through the gate.
   void InviteToPartyAs(
