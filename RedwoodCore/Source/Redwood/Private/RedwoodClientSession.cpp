@@ -803,7 +803,12 @@ void FRedwoodClientSession::OnInitialize() {
     );
     PendingLoginRequest = 0;
   }
-  Go(ERedwoodSessionPhase::Connecting);
+  // A loss the game heard is not over until a socket is up: the first
+  // connect of the new socket is also the reestablished connection.
+  Go(
+    IsOutage() ? ERedwoodSessionPhase::ConnectFailed
+               : ERedwoodSessionPhase::Connecting
+  );
 }
 
 void FRedwoodClientSession::OnLogin(const FRedwoodSessionEvent &Event) {

@@ -682,7 +682,13 @@ namespace RedwoodSessionMachineTest {
           EPhase::Online,
           EPhase::Offline,
           EPhase::OfflineQuiet}) {
-      T.Add({From, EVariant::Initialize, EPhase::Connecting, {}});
+      T.Add(
+        {From,
+         EVariant::Initialize,
+         FRedwoodClientSession::IsOutagePhase(From) ? EPhase::ConnectFailed
+                                                    : EPhase::Connecting,
+         {}}
+      );
     }
     T.Add(
       {EPhase::LoggingIn,
@@ -705,7 +711,15 @@ namespace RedwoodSessionMachineTest {
           EPhase::Relogging,
           EPhase::Reentering,
           EPhase::LoggingOut}) {
-      T.Add({From, EVariant::Initialize, EPhase::Connecting, End});
+      // During an outage the game heard a loss; the new socket's first
+      // connect must also reestablish it.
+      T.Add(
+        {From,
+         EVariant::Initialize,
+         FRedwoodClientSession::IsOutagePhase(From) ? EPhase::ConnectFailed
+                                                    : EPhase::Connecting,
+         End}
+      );
     }
 
     // Login: starts clean, from anywhere a socket can carry it.
@@ -1712,6 +1726,29 @@ bool FRedwoodSessionMachineHolesTest::RunTest(const FString &Parameters) {
     T.Up();
     T.Feed(FRedwoodSessionEvent::ResumeAccepted(RealmA, FString(), CharA));
     TestEqual(TEXT("15: the session comes back"), T.Reestablished(), 1);
+  }
+
+  // 16. A new connection asked for during an outage keeps the loss the game
+  //     heard: the first connect of the new socket is also the reestablished
+  //     connection (HollowedOath#2564).
+  {
+    FScript T;
+    T.InWorld();
+    T.Down();
+    T.Feed(FRedwoodSessionEvent::Initialize());
+    TestEqual(
+      TEXT("16: connect failed"),
+      FRedwoodClientSession::PhaseName(T.S.GetPhase()),
+      FRedwoodClientSession::PhaseName(EPhase::ConnectFailed)
+    );
+    TestFalse(TEXT("16: no session"), T.S.HasPlayerSession());
+    T.Up();
+    TestEqual(TEXT("16: one reestablished"), T.Reestablished(), 1);
+    TestEqual(
+      TEXT("16: first connect reported"),
+      Count(T.Log, EKind::ReportFirstConnect),
+      1
+    );
   }
   return true;
 }
