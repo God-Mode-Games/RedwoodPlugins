@@ -1750,5 +1750,50 @@ bool FRedwoodSessionMachineHolesTest::RunTest(const FString &Parameters) {
       1
     );
   }
+
+  // 17. A character is selected in a realm. One selected before the entry
+  //     is not the new realm's, so the entry forgets it, and the realm is
+  //     not asked to select a character it never gave the player.
+  {
+    FScript T;
+    T.Up();
+    T.LogIn();
+    T.LoginAccepted();
+    T.Select();
+    TestEqual(
+      TEXT("17: selected in no realm"), T.S.GetSelectedCharacterId(), CharA
+    );
+    T.Enter();
+    TestTrue(
+      TEXT("17: the entry forgets it"), T.S.GetSelectedCharacterId().IsEmpty()
+    );
+    T.Entered();
+    TestEqual(
+      TEXT("17: the realm is not asked to select it"),
+      Count(T.Log, EKind::SendSelectCharacter),
+      0
+    );
+  }
+
+  // 18. A character selected in the realm survives the drop and the resume:
+  //     the held requests that go out after it act for that character.
+  {
+    FScript T;
+    T.InWorld();
+    T.Down();
+    TestEqual(
+      TEXT("18: kept through the drop"), T.S.GetSelectedCharacterId(), CharA
+    );
+    T.Up();
+    T.Feed(FRedwoodSessionEvent::ResumeAccepted(RealmA, FString(), CharA));
+    TestEqual(
+      TEXT("18: kept through the resume"), T.S.GetSelectedCharacterId(), CharA
+    );
+    TestEqual(
+      TEXT("18: not selected again when the session names it"),
+      Count(T.Log, EKind::SendSelectCharacter),
+      0
+    );
+  }
   return true;
 }
