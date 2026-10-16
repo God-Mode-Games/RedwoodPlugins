@@ -198,7 +198,8 @@ namespace RedwoodAccountDocuments {
           Stack.Add({Child, Level.Depth + 1});
         }
       } else if (const TSharedPtr<FJsonObject> Object = Level.Value->AsObject()) {
-        // auto: the key type of Values differs between engine versions.
+        // auto: the key type of Values is not FString in this engine, and a
+        // TPair<FString, ...> would copy each entry.
         for (const auto &Child : Object->Values) {
           Stack.Add({Child.Value, Level.Depth + 1});
         }
