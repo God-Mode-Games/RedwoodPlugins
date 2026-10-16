@@ -43,8 +43,9 @@ void URedwoodClientInterface::Deinitialize() {
 // did not know the player and be refused. The gate holds it and sends it after
 // the session is back instead; the session machine says when a request is
 // held, sent or failed, and FRedwoodHeldRequests is the queue. True means the
-// request was held or failed, and the caller returns. When it lets a request
-// through, the session is live, so the upstream check after it passes.
+// request was held or failed, and the caller returns. False means the session
+// is live and the request goes out: the gate is the only check a gated
+// request makes, there is no second one after it.
 // Not gated: login and the handshakes (they are the re-login), the proxy
 // joins (a late join can move a player who has given up waiting),
 // CreateCharacter (the creation screen shows its failure), and requests with
@@ -1047,13 +1048,6 @@ void URedwoodClientInterface::SearchForPlayers(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FRedwoodListPlayersOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("searchText"), UsernameOrNickname);
@@ -1125,13 +1119,6 @@ void URedwoodClientInterface::SearchForPlayerById(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FRedwoodPlayerOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("id"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
@@ -1197,13 +1184,6 @@ void URedwoodClientInterface::ListFriends(
   if (GateDirector([=, this]() {
         ListFriends(Filter, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FRedwoodListPlayersOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -1283,12 +1263,6 @@ void URedwoodClientInterface::RequestFriend(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
@@ -1317,12 +1291,6 @@ void URedwoodClientInterface::RemoveFriend(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
@@ -1348,12 +1316,6 @@ void URedwoodClientInterface::RespondToFriendRequest(
   if (GateDirector([=, this]() {
         RespondToFriendRequest(OtherPlayerId, bAccept, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
     return;
   }
 
@@ -1386,12 +1348,6 @@ void URedwoodClientInterface::SetPlayerBlocked(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
@@ -1418,13 +1374,6 @@ void URedwoodClientInterface::ListRealmContacts(
   if (GateRealm([=, this]() {
         ListRealmContacts(OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    FRedwoodListRealmContactsOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -1497,12 +1446,6 @@ void URedwoodClientInterface::AddRealmContact(
     return;
   }
 
-  if (!IsRealmConnected()) {
-    FString Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
@@ -1530,12 +1473,6 @@ void URedwoodClientInterface::RemoveRealmContact(
   if (GateRealm([=, this]() {
         RemoveRealmContact(OtherCharacterId, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    FString Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Error);
     return;
   }
 
@@ -1722,13 +1659,6 @@ void URedwoodClientInterface::ListGuilds(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FRedwoodListGuildsOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetBoolField(TEXT("onlyPlayersGuilds"), bOnlyPlayersGuilds);
@@ -1771,13 +1701,6 @@ void URedwoodClientInterface::SearchForGuilds(
   if (GateDirector([=, this]() {
         SearchForGuilds(SearchText, bIncludePartialMatches, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FRedwoodListGuildsOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -1825,13 +1748,6 @@ void URedwoodClientInterface::GetGuild(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FRedwoodGetGuildOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
@@ -1868,13 +1784,6 @@ void URedwoodClientInterface::GetSelectedGuild(
   if (GateDirector([=, this]() {
         GetSelectedGuild(OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FRedwoodGetGuildOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -1916,12 +1825,6 @@ void URedwoodClientInterface::SetSelectedGuild(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
@@ -1950,12 +1853,6 @@ void URedwoodClientInterface::JoinGuild(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
@@ -1981,12 +1878,6 @@ void URedwoodClientInterface::InviteToGuild(
   if (GateDirector([=, this]() {
         InviteToGuild(GuildId, TargetId, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
     return;
   }
 
@@ -2019,12 +1910,6 @@ void URedwoodClientInterface::LeaveGuild(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
@@ -2052,13 +1937,6 @@ void URedwoodClientInterface::ListGuildMembers(
   if (GateDirector([=, this]() {
         ListGuildMembers(GuildId, State, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FRedwoodListGuildMembersOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -2127,13 +2005,6 @@ void URedwoodClientInterface::CreateGuild(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FRedwoodCreateGuildOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("name"), GuildName);
@@ -2186,12 +2057,6 @@ void URedwoodClientInterface::UpdateGuild(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
@@ -2228,12 +2093,6 @@ void URedwoodClientInterface::KickPlayerFromGuild(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
@@ -2261,12 +2120,6 @@ void URedwoodClientInterface::BanPlayerFromGuild(
   if (GateDirector([=, this]() {
         BanPlayerFromGuild(GuildId, TargetId, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
     return;
   }
 
@@ -2306,12 +2159,6 @@ void URedwoodClientInterface::PromotePlayerToGuildAdmin(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
@@ -2341,12 +2188,6 @@ void URedwoodClientInterface::DemotePlayerFromGuildAdmin(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
@@ -2373,13 +2214,6 @@ void URedwoodClientInterface::ListAlliances(
   if (GateDirector([=, this]() {
         ListAlliances(GuildIdFilter, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FRedwoodListAlliancesOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -2438,13 +2272,6 @@ void URedwoodClientInterface::SearchForAlliances(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FRedwoodListAlliancesOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("searchText"), SearchText);
@@ -2487,11 +2314,6 @@ void URedwoodClientInterface::CanAdminAlliance(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    OnOutput.ExecuteIfBound(TEXT("Not connected to Director."));
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
@@ -2520,13 +2342,6 @@ void URedwoodClientInterface::CreateAlliance(
   if (GateDirector([=, this]() {
         CreateAlliance(AllianceName, GuildId, bInviteOnly, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FRedwoodCreateAllianceOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -2566,12 +2381,6 @@ void URedwoodClientInterface::UpdateAlliance(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
@@ -2602,12 +2411,6 @@ void URedwoodClientInterface::KickGuildFromAlliance(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
@@ -2635,12 +2438,6 @@ void URedwoodClientInterface::BanGuildFromAlliance(
   if (GateDirector([=, this]() {
         BanGuildFromAlliance(AllianceId, GuildId, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
     return;
   }
 
@@ -2679,13 +2476,6 @@ void URedwoodClientInterface::ListAllianceGuilds(
   if (GateDirector([=, this]() {
         ListAllianceGuilds(AllianceId, State, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FRedwoodListAllianceGuildsOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -2747,12 +2537,6 @@ void URedwoodClientInterface::JoinAlliance(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
@@ -2782,12 +2566,6 @@ void URedwoodClientInterface::LeaveAlliance(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
@@ -2814,12 +2592,6 @@ void URedwoodClientInterface::InviteGuildToAlliance(
   if (GateDirector([=, this]() {
         InviteGuildToAlliance(AllianceId, GuildId, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsDirectorConnected()) {
-    FString Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Error);
     return;
   }
 
@@ -3174,13 +2946,6 @@ void URedwoodClientInterface::ListCharacters(
     return;
   }
 
-  if (!IsRealmConnected()) {
-    FRedwoodListCharactersOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
@@ -3222,13 +2987,6 @@ void URedwoodClientInterface::ListArchivedCharacters(
   if (GateRealm([=, this]() {
         ListArchivedCharacters(OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    FRedwoodListCharactersOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -3326,12 +3084,6 @@ void URedwoodClientInterface::SetCharacterArchived(
     return;
   }
 
-  if (!IsRealmConnected()) {
-    FString Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Error);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("id"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("characterId"), CharacterId);
@@ -3357,13 +3109,6 @@ void URedwoodClientInterface::GetCharacterData(
   if (GateRealm([=, this]() {
         GetCharacterData(CharacterIdOrName, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    FRedwoodGetCharacterOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -3405,13 +3150,6 @@ void URedwoodClientInterface::SetCharacterData(
   if (GateRealm([=, this, Data = HeldCharacterData]() {
         SetCharacterData(CharacterId, Name, Data.Get(), OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    FRedwoodGetCharacterOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -4108,13 +3846,6 @@ void URedwoodClientInterface::GetOrCreateParty(
     return;
   }
 
-  if (!IsRealmConnected()) {
-    FRedwoodGetPartyOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
-    return;
-  }
-
   if (Session.GetSelectedCharacterId() == TEXT("")) {
     FRedwoodGetPartyOutput Output;
     Output.Error = TEXT("Please select a character before joining a party.");
@@ -4156,11 +3887,6 @@ void URedwoodClientInterface::LeaveParty(FRedwoodErrorOutputDelegate OnOutput) {
   if (GateRealm([=, this]() {
         LeaveParty(OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
     return;
   }
 
@@ -4212,11 +3938,6 @@ void URedwoodClientInterface::InviteToPartyAs(
     return;
   }
 
-  if (!IsRealmConnected()) {
-    OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
@@ -4243,13 +3964,6 @@ void URedwoodClientInterface::ListPartyInvites(
   if (GateRealm([=, this]() {
         ListPartyInvites(OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    FRedwoodListPartyInvitesOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -4286,13 +4000,6 @@ void URedwoodClientInterface::RespondToPartyInvite(
   if (GateRealm([=, this]() {
         RespondToPartyInvite(PartyId, bAccept, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    FRedwoodGetPartyOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -4343,11 +4050,6 @@ void URedwoodClientInterface::PromoteToPartyLeader(
     return;
   }
 
-  if (!IsRealmConnected()) {
-    OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
@@ -4371,11 +4073,6 @@ void URedwoodClientInterface::KickFromParty(
   if (GateRealm([=, this]() {
         KickFromParty(TargetPlayerId, OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    OnOutput.ExecuteIfBound(TEXT("Not connected to Realm."));
     return;
   }
 
@@ -4406,13 +4103,6 @@ void URedwoodClientInterface::SetPartyData(
   if (GateRealm([=, this, Data = HeldPartyData]() {
         SetPartyData(LootType, Data.Get(), OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    FRedwoodGetPartyOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -4543,13 +4233,6 @@ void URedwoodClientInterface::GetDirectorGlobalData(
     return;
   }
 
-  if (!IsDirectorConnected()) {
-    FRedwoodGetGlobalDataOutput Output;
-    Output.Error = TEXT("Not connected to Director.");
-    OnOutput.ExecuteIfBound(Output);
-    return;
-  }
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
@@ -4589,13 +4272,6 @@ void URedwoodClientInterface::GetRealmGlobalData(
   if (GateRealm([=, this]() {
         GetRealmGlobalData(OnOutput);
       }, OnOutput)) {
-    return;
-  }
-
-  if (!IsRealmConnected()) {
-    FRedwoodGetGlobalDataOutput Output;
-    Output.Error = TEXT("Not connected to Realm.");
-    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
