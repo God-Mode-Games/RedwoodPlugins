@@ -1553,21 +1553,25 @@ void URedwoodClientInterface::EmitCharacterFriendCall(
   TOutput (*ParseAnswer)(const TArray<TSharedPtr<FJsonValue>> &),
   const TDelegate<void(const TOutput &)> &OnOutput
 ) {
+  // A held call passes the gate again first: a session that ended fails it
+  // as not connected, and only a call that would go out is checked for its
+  // character.
   if (GateRealm([=, this]() {
-        // The backend accepts any character of the player, and a list answer
-        // names no character, so a stale call would act for the wrong one.
-        if (CharacterId != Session.GetSelectedCharacterId()) {
-          TOutput Output;
-          SetRedwoodGateError(
-            Output, URedwoodCommonGameSubsystem::CharacterChangedError
-          );
-          OnOutput.ExecuteIfBound(Output);
-          return;
-        }
         EmitCharacterFriendCall(
           EventName, CharacterId, Payload, ParseAnswer, OnOutput
         );
       }, OnOutput)) {
+    return;
+  }
+
+  // The backend accepts any character of the player, and a list answer
+  // names no character, so a stale call would act for the wrong one.
+  if (CharacterId != Session.GetSelectedCharacterId()) {
+    TOutput Output;
+    SetRedwoodGateError(
+      Output, URedwoodCommonGameSubsystem::CharacterChangedError
+    );
+    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -4142,17 +4146,26 @@ void URedwoodClientInterface::InviteToParty(
 ) {
   // FORK(hollowed-oath): HollowedOath#2448. The invite names the inviter's
   // character, so a held invite must not go out for one selected after it.
-  const FString InviterCharacterId = Session.GetSelectedCharacterId();
-  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  InviteToPartyAs(Session.GetSelectedCharacterId(), TargetPlayerId, OnOutput);
+}
+
+void URedwoodClientInterface::InviteToPartyAs(
+  const FString &InviterCharacterId,
+  const FString &TargetPlayerId,
+  FRedwoodErrorOutputDelegate OnOutput
+) {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm. A held invite
+  // passes the gate again first: a session that ended fails it as not
+  // connected, and only an invite that would go out is checked for its
+  // character.
   if (GateRealm([=, this]() {
-        if (InviterCharacterId != Session.GetSelectedCharacterId()) {
-          OnOutput.ExecuteIfBound(
-            URedwoodCommonGameSubsystem::CharacterChangedError
-          );
-          return;
-        }
-        InviteToParty(TargetPlayerId, OnOutput);
+        InviteToPartyAs(InviterCharacterId, TargetPlayerId, OnOutput);
       }, OnOutput)) {
+    return;
+  }
+
+  if (InviterCharacterId != Session.GetSelectedCharacterId()) {
+    OnOutput.ExecuteIfBound(URedwoodCommonGameSubsystem::CharacterChangedError);
     return;
   }
 
@@ -4166,7 +4179,7 @@ void URedwoodClientInterface::InviteToParty(
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
   // FORK(hollowed-oath): HollowedOath#2448. The realm makes a party only when
   // an invite is accepted, so it needs the inviter's character from the invite.
-  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
+  Payload->SetStringField(TEXT("characterId"), InviterCharacterId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(

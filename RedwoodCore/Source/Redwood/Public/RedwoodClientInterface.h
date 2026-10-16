@@ -509,6 +509,13 @@ private:
   // bForce: the session machine knows the realm was entered, where the phase
   // has moved on already (a logout pays the leave on its way out).
   void SendOwedLeave(bool bForce = false);
+  // The invite as the character that asked for it; a held invite keeps that
+  // character through the gate.
+  void InviteToPartyAs(
+    const FString &InviterCharacterId,
+    const FString &TargetPlayerId,
+    FRedwoodErrorOutputDelegate OnOutput
+  );
   void NoteJoinSent();
   void NoteJoinAnswered(const FString &Error, uint32 Sequence);
   void NoteJoinLost();
