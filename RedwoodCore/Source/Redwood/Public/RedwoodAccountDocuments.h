@@ -20,6 +20,11 @@ namespace RedwoodAccountDocuments {
   // True when Data, as compact JSON, is bigger than MaxDataBytes.
   REDWOOD_API bool IsTooLarge(const TSharedRef<FJsonObject> &Data);
 
+  // True when objects and arrays in Data nest deeper than MaxDepth, Data
+  // being level 1. Check it before anything that serializes Data, because
+  // the serializer recurses.
+  REDWOOD_API bool IsTooDeep(const TSharedRef<FJsonObject> &Data);
+
   REDWOOD_API FRedwoodGetAccountDocumentOutput
   ParseGetReply(const TArray<TSharedPtr<FJsonValue>> &Response);
 

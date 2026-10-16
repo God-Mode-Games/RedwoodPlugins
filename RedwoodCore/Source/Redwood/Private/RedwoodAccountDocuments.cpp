@@ -152,6 +152,37 @@ namespace RedwoodAccountDocuments {
     return true;
   }
 
+  bool IsTooDeep(const TSharedRef<FJsonObject> &Data) {
+    // A loop, not recursion, so a deep document cannot overflow the stack.
+    struct FLevel {
+      TSharedPtr<FJsonValue> Value;
+      int32 Depth;
+    };
+    TArray<FLevel> Stack;
+    Stack.Add({MakeShared<FJsonValueObject>(Data), 1});
+    while (Stack.Num() > 0) {
+      const FLevel Level = Stack.Pop(EAllowShrinking::No);
+      if (!Level.Value.IsValid() ||
+          (Level.Value->Type != EJson::Array && Level.Value->Type != EJson::Object)) {
+        continue;
+      }
+      if (Level.Depth > RedwoodAccountDocumentLimits::MaxDepth) {
+        return true;
+      }
+      if (Level.Value->Type == EJson::Array) {
+        for (const TSharedPtr<FJsonValue> &Child : Level.Value->AsArray()) {
+          Stack.Add({Child, Level.Depth + 1});
+        }
+      } else if (const TSharedPtr<FJsonObject> Object = Level.Value->AsObject()) {
+        // auto: the key type of Values differs between engine versions.
+        for (const auto &Child : Object->Values) {
+          Stack.Add({Child.Value, Level.Depth + 1});
+        }
+      }
+    }
+    return false;
+  }
+
   bool IsTooLarge(const TSharedRef<FJsonObject> &Data) {
     // The backend measures JSON.stringify(data) in UTF-8 bytes. This text can
     // differ a little (number format), so the backend check stays the rule;
@@ -200,7 +231,8 @@ namespace RedwoodAccountDocuments {
         !TryGetStrictString(Reply, TEXT("error"), Result.Error) ||
         !TryGetStrictBool(Reply, TEXT("conflict"), Result.bConflict) ||
         !TryGetRevision(Reply, TEXT("revision"), Result.Revision) ||
-        !TryGetStrictBool(Reply, TEXT("tooLarge"), Result.bTooLarge)) {
+        !TryGetStrictBool(Reply, TEXT("tooLarge"), Result.bTooLarge) ||
+        !TryGetStrictBool(Reply, TEXT("rejected"), Result.bRejected)) {
       Result = FRedwoodPutAccountDocumentOutput();
       Result.Error = MalformedReplyError;
     }

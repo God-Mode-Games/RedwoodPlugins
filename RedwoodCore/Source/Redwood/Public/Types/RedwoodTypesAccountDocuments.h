@@ -21,6 +21,11 @@ namespace RedwoodAccountDocumentLimits {
   // let them leave the folder.
   constexpr int32 MaxIdLength = 64;
 
+  // The backend's AccountDocuments.MaxDepth: the deepest nesting of objects
+  // and arrays, the data object being level 1. Deeper data can overflow the
+  // stack of the recursive JSON code (the serializer here, socket.io).
+  constexpr int32 MaxDepth = 64;
+
   // The backend's default `persistence.account-documents.max-bytes`: the
   // document data as compact JSON text, in UTF-8 bytes. It must stay under
   // socket.io's maxHttpBufferSize (1e6), or the socket drops a bigger message
@@ -61,9 +66,14 @@ struct FRedwoodPutAccountDocumentOutput {
   // The new revision after a successful put, otherwise 0.
   int32 Revision = 0;
 
-  // True when the document is too large. Retrying the same data cannot
-  // succeed, so callers branch on this and not on Error's text.
+  // True when the document is too large. bRejected is also true then.
   bool bTooLarge = false;
+
+  // True when the put can never succeed as it is (too large, too deep, or
+  // another refusal the backend makes final). Retrying the same data cannot
+  // succeed, so callers treat it as final and branch on this, not on Error's
+  // text.
+  bool bRejected = false;
 };
 
 typedef TDelegate<void(const FRedwoodPutAccountDocumentOutput &)>

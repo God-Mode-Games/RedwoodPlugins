@@ -3670,11 +3670,22 @@ void URedwoodServerGameSubsystem::PutAccountDocument(
     return;
   }
 
+  // Checked before the size: the size check serializes Data, and the
+  // serializer recurses. Checked here, not only by the backend, so the
+  // offline path refuses the same documents.
+  if (RedwoodAccountDocuments::IsTooDeep(Data.ToSharedRef())) {
+    Output.Error = TEXT("Account document is nested too deep");
+    Output.bRejected = true;
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
   // Checked before the send: a message above socket.io's buffer limit is
   // dropped by the socket, and the caller would only see a timeout.
   if (RedwoodAccountDocuments::IsTooLarge(Data.ToSharedRef())) {
     Output.Error = TEXT("Account document is too large");
     Output.bTooLarge = true;
+    Output.bRejected = true;
     OnComplete.ExecuteIfBound(Output);
     return;
   }
