@@ -352,22 +352,27 @@ public:
   );
   void GetBlob(const FString &Key, FRedwoodGetBlobOutputDelegate OnComplete);
 
-  // FORK(hollowed-oath): account-owned camp record. Uses the backend, or
-  // Saved/Persistence/Camps/<PlayerId>.json when the backend is off (PIE).
-  // OnComplete gets the same result either way. A missing record is not an
-  // error: Camp.bFound is false. A file or reply that cannot be read is an
-  // error. A put is accepted only if the row is still at ExpectedRevision (0 =
-  // the row must not exist yet); otherwise the output has bConflict set.
-  void GetCampLayout(
-    const FString &PlayerId, FRedwoodGetCampLayoutOutputDelegate OnComplete
-  );
-  void PutCampLayout(
+  // FORK(hollowed-oath): account documents (see
+  // Types/RedwoodTypesAccountDocuments.h). Uses the backend, or
+  // Saved/Persistence/AccountDocuments/<PlayerId>/<Key>.json when the backend
+  // is off (PIE). The output has the same shape either way, but the offline
+  // path calls OnComplete before the call returns, and the backend path calls
+  // it later. A missing document is not an error: bFound is false. A put is
+  // accepted only if the document is still at ExpectedRevision (0 = it must
+  // not exist yet); otherwise the output has bConflict set. An error after the
+  // send (for example a timeout) can mean the outcome is unknown, so a caller
+  // must Get before it retries.
+  void GetAccountDocument(
     const FString &PlayerId,
-    int32 SchemaVersion,
-    USIOJsonObject *Record,
-    USIOJsonObject *Layout,
+    const FString &Key,
+    FRedwoodGetAccountDocumentOutputDelegate OnComplete
+  );
+  void PutAccountDocument(
+    const FString &PlayerId,
+    const FString &Key,
+    TSharedPtr<FJsonObject> Data,
     int32 ExpectedRevision,
-    FRedwoodPutCampLayoutOutputDelegate OnComplete
+    FRedwoodPutAccountDocumentOutputDelegate OnComplete
   );
 
   void PutSaveGame(

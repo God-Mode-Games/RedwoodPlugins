@@ -6,9 +6,9 @@
 
 #include "SIOJsonObject.h"
 
+#include "RedwoodTypesAccountDocuments.h" // FORK(hollowed-oath)
 #include "RedwoodTypesAuth.h"
 #include "RedwoodTypesBlobs.h"
-#include "RedwoodTypesCamps.h"
 #include "RedwoodTypesCharacters.h"
 #include "RedwoodTypesGlobalData.h"
 #include "RedwoodTypesGuilds.h"
