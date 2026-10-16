@@ -17,31 +17,34 @@
 #include "TimerManager.h"
 
 void URedwoodClientInterface::Deinitialize() {
-  // FORK(hollowed-oath): HollowedOath#2886. The callers go away too, so a
-  // request that waits for a reply is dropped, not failed.
+  // FORK(hollowed-oath): HollowedOath#2886, HollowedOath#2854. The callers go
+  // away too, so a request that waits for a reply, a held request and a
+  // pending login or entry are dropped, not failed: their callers are
+  // forgotten, and the session is back at its start, before the close
+  // answers what was in flight. Nothing is said to the game.
   Replies.Reset();
-  TimerManager.ClearTimer(GraceTimer);
+  HeldRequests.Reset();
+  LoginCallers.Reset();
+  EntryCallers.Reset();
+  EntryRealms.Reset();
+  FirstConnectCaller.Unbind();
+  Session = FRedwoodClientSession();
 
   if (Connection.IsValid()) {
     Connection->Close();
     Connection.Reset();
   }
-
-  // FORK(hollowed-oath): HollowedOath#2854. The callers are going away too, so
-  // a held request is dropped, not failed.
-  HeldRequests.Reset();
-  LoginCallers.Reset();
-  EntryCallers.Reset();
-  EntryRealms.Reset();
+  TimerManager.ClearTimer(GraceTimer);
 }
 
 // FORK(hollowed-oath): HollowedOath#2854. A backend move drops a socket for a
 // few seconds. A request made then used to fail at once ("Not connected"), or,
 // once the socket was back but before the re-login, reach a server socket that
 // did not know the player and be refused. The gate holds it and sends it after
-// the re-login instead; FRedwoodHeldRequests bounds the wait. True means the
+// the session is back instead; the session machine says when a request is
+// held, sent or failed, and FRedwoodHeldRequests is the queue. True means the
 // request was held or failed, and the caller returns. When it lets a request
-// through, the socket is connected, so the upstream check after it passes.
+// through, the session is live, so the upstream check after it passes.
 // Not gated: login and the handshakes (they are the re-login), ticketing and
 // proxies (a late join can move a player who has given up waiting),
 // CreateCharacter (the creation screen shows its failure), and requests with
@@ -534,7 +537,6 @@ void URedwoodClientInterface::Execute(const FRedwoodSessionEffect &Effect) {
       OnAuthFailed.Broadcast(Effect.Text);
       return;
     case EKind::ReportFirstConnect: {
-      UE_LOG(LogRedwood, Log, TEXT("Connected to Bifrost at %s"), *ConnectionUri);
       FRedwoodSocketConnected Details;
       Details.Error = TEXT("");
       FRedwoodSocketConnectedDelegate Caller = FirstConnectCaller;
@@ -595,6 +597,11 @@ void URedwoodClientInterface::Execute(const FRedwoodSessionEffect &Effect) {
       }
       return;
     case EKind::RealmEntered:
+      // A resume can reach a realm the game never named to this client (the
+      // locked realm after an entry lost with its socket).
+      if (CurrentRealm.Id.IsEmpty()) {
+        CurrentRealm.Id = Session.GetRealmId();
+      }
       // HollowedOath#2886. Before the caller can join.
       SendOwedLeave();
       return;
@@ -758,16 +765,6 @@ void URedwoodClientInterface::BindPushHandlers() {
 
   BindRealmPushHandlers();
 }
-
-
-
-
-
-
-
-
-
-// FORK(hollowed-oath) END
 
 void URedwoodClientInterface::HandleRegionsChanged(
   const FString &Event, const TSharedPtr<FJsonValue> &Message
@@ -2929,7 +2926,6 @@ void URedwoodClientInterface::ClearRealmDetails() {
 }
 
 
-
 // The realm's start answer carries its regions, where upstream's realm
 // socket pushed them at the connect.
 void URedwoodClientInterface::ApplyRegions(
@@ -3514,9 +3510,6 @@ void URedwoodClientInterface::SendOwedLeave(bool bForce) {
     }, []() {})
   );
 }
-
-
-
 
 
 void URedwoodClientInterface::JoinMatchmaking(
