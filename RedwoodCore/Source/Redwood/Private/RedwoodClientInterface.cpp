@@ -563,6 +563,7 @@ void URedwoodClientInterface::Execute(const FRedwoodSessionEffect &Effect) {
         case ERedwoodLoginAnswer::MustVerify:
           // The push `player:account-verified` answers the caller later.
           OnAccountVerified = Caller;
+          MustVerifyPlayerId = Effect.Text;
           Update.Type = ERedwoodAuthUpdateType::MustVerifyAccount;
           break;
         default:
@@ -653,13 +654,17 @@ void URedwoodClientInterface::SendLogin(const FRedwoodSessionEffect &Effect) {
       }
       FString Reason;
       FString Message;
+      FString MustVerifyPlayer;
       Response->TryGetStringField(TEXT("reason"), Reason);
       Response->TryGetStringField(TEXT("message"), Message);
+      Response->TryGetStringField(TEXT("playerId"), MustVerifyPlayer);
       if (Reason == TEXT("not_connected")) {
         Self->Dispatch(FRedwoodSessionEvent::LoginLost(Seq));
         return;
       }
-      Self->Dispatch(FRedwoodSessionEvent::LoginRefused(Seq, Reason, Message));
+      Self->Dispatch(FRedwoodSessionEvent::LoginRefused(
+        Seq, Reason, Message, MustVerifyPlayer
+      ));
     }
   );
 }
@@ -716,7 +721,8 @@ void URedwoodClientInterface::BindPushHandlers() {
       TSharedPtr<FJsonObject> MessageObject = Message->AsObject();
       FString InPlayerId = MessageObject->GetStringField(TEXT("playerId"));
 
-      if (InPlayerId == Session.GetPlayerId()) {
+      if (!InPlayerId.IsEmpty() && InPlayerId == MustVerifyPlayerId) {
+        MustVerifyPlayerId.Reset();
         FRedwoodAuthUpdate Update;
         Update.Type = ERedwoodAuthUpdateType::Success;
         Update.Message = TEXT("");
@@ -992,6 +998,7 @@ FString URedwoodClientInterface::GetNickname() {
 }
 
 void URedwoodClientInterface::CancelWaitingForAccountVerification() {
+  MustVerifyPlayerId.Reset();
   if (OnAccountVerified.IsBound()) {
     OnAccountVerified.Unbind();
   }
