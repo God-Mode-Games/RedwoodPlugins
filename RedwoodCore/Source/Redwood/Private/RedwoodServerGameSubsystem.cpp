@@ -3623,6 +3623,15 @@ void URedwoodServerGameSubsystem::GetAccountDocument(
     return;
   }
 
+  // ShouldUseBackend is false for a null world. Without this check, a call
+  // with no world would use the offline store while the backend never sees it.
+  if (!GetWorld()) {
+    FRedwoodGetAccountDocumentOutput Output;
+    Output.Error = TEXT("No world");
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
   if (!URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
     OnComplete.ExecuteIfBound(RedwoodAccountDocuments::ReadOffline(PlayerId, Key));
     return;
@@ -3685,6 +3694,13 @@ void URedwoodServerGameSubsystem::PutAccountDocument(
   if (RedwoodAccountDocuments::IsTooLarge(Data.ToSharedRef())) {
     Output.Error = TEXT("Account document is too large");
     Output.bRejected = true;
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  // See GetAccountDocument: no world must not fall back to the offline store.
+  if (!GetWorld()) {
+    Output.Error = TEXT("No world");
     OnComplete.ExecuteIfBound(Output);
     return;
   }

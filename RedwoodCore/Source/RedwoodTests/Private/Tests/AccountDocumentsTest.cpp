@@ -13,9 +13,11 @@
 #include "Dom/JsonObject.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
+#include "Engine/World.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "RedwoodAccountDocuments.h"
+#include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodServerGameSubsystem.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -23,6 +25,40 @@
 namespace {
   const FString TestPlayerId = TEXT("redwood-test-account-documents");
   const FString TestKey = TEXT("camp");
+
+  // A PIE world selects the offline store unless bUseBackendInPIE is set (it
+  // is off by default). The destructor releases the world, so later tests do
+  // not see it.
+  struct FPieTestWorld {
+    UWorld *World = nullptr;
+    UGameInstance *GameInstance = nullptr;
+
+    explicit FPieTestWorld(const TCHAR *WorldName) {
+      World = UWorld::CreateWorld(EWorldType::PIE, false, WorldName);
+      if (!World) {
+        return;
+      }
+
+      // The subsystem finds its world through the game instance's world
+      // context, so the context comes first.
+      FWorldContext &WorldContext = GEngine->CreateNewWorldContext(EWorldType::PIE);
+      WorldContext.SetCurrentWorld(World);
+
+      GameInstance = NewObject<UGameInstance>(GEngine);
+      WorldContext.OwningGameInstance = GameInstance;
+      World->SetGameInstance(GameInstance);
+      GameInstance->OnWorldChanged(nullptr, World);
+    }
+
+    ~FPieTestWorld() {
+      if (!World) {
+        return;
+      }
+      GameInstance->OnWorldChanged(World, nullptr);
+      GEngine->DestroyWorldContext(World);
+      World->DestroyWorld(false);
+    }
+  };
 
   struct FGetCall {
     bool bCalled = false;
@@ -138,11 +174,20 @@ bool FRedwoodAccountDocumentsOfflineTest::RunTest(const FString &Parameters) {
   FileManager.Delete(*MainFile);
   FileManager.Delete(*TempFile);
 
-  // A subsystem needs a game instance as outer. With no world, ShouldUseBackend
-  // is false, which selects the offline path.
-  UGameInstance *GameInstance = NewObject<UGameInstance>(GEngine);
+  FPieTestWorld TestWorld(TEXT("RedwoodAccountDocumentsOfflineWorld"));
+  if (!TestNotNull(TEXT("Test world was created"), TestWorld.World)) {
+    return false;
+  }
   URedwoodServerGameSubsystem *Subsystem =
-    NewObject<URedwoodServerGameSubsystem>(GameInstance);
+    NewObject<URedwoodServerGameSubsystem>(TestWorld.GameInstance);
+
+  // Without this, the calls below could pass on the backend path.
+  if (!TestFalse(
+        TEXT("Fixture takes the offline path"),
+        URedwoodCommonGameSubsystem::ShouldUseBackend(Subsystem->GetWorld())
+      )) {
+    return false;
+  }
 
   const FGetCall Missing = Get(Subsystem, TestPlayerId);
   TestTrue(TEXT("Get calls back"), Missing.bCalled);
@@ -296,6 +341,40 @@ bool FRedwoodAccountDocumentsOfflineTest::RunTest(const FString &Parameters) {
 
   FileManager.Delete(*MainFile);
   FileManager.Delete(*TempFile);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodAccountDocumentsNoWorldTest,
+  "Redwood.AccountDocuments.NoWorld",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A call with no world must fail and must not touch the offline store.
+bool FRedwoodAccountDocumentsNoWorldTest::RunTest(const FString &Parameters) {
+  const FString MainFile =
+    RedwoodAccountDocuments::GetOfflinePath(TestPlayerId, TestKey);
+  IFileManager &FileManager = IFileManager::Get();
+  FileManager.Delete(*MainFile);
+
+  UGameInstance *GameInstance = NewObject<UGameInstance>(GEngine);
+  URedwoodServerGameSubsystem *Subsystem =
+    NewObject<URedwoodServerGameSubsystem>(GameInstance);
+  if (!TestNull(TEXT("Fixture has no world"), Subsystem->GetWorld())) {
+    return false;
+  }
+
+  const FGetCall NoWorldGet = Get(Subsystem, TestPlayerId);
+  TestTrue(TEXT("Get calls back"), NoWorldGet.bCalled);
+  TestFalse(TEXT("Get with no world is an error"), NoWorldGet.Output.Error.IsEmpty());
+  TestFalse(TEXT("Get with no world finds nothing"), NoWorldGet.Output.bFound);
+
+  const FPutCall NoWorldPut = Put(Subsystem, TestPlayerId, MakeData(7), 0);
+  TestTrue(TEXT("Put calls back"), NoWorldPut.bCalled);
+  TestFalse(TEXT("Put with no world is an error"), NoWorldPut.Output.Error.IsEmpty());
+  TestFalse(TEXT("Put with no world writes no file"), FileManager.FileExists(*MainFile));
+
+  FileManager.Delete(*MainFile);
   return true;
 }
 
