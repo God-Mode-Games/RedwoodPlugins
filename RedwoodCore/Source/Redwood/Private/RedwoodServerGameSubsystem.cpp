@@ -1,6 +1,7 @@
 // Copyright Incanta Games. All Rights Reserved.
 
 #include "RedwoodServerGameSubsystem.h"
+#include "RedwoodAccountDocuments.h" // FORK(hollowed-oath)
 #include "RedwoodCharacterComponent.h"
 #include "RedwoodClientExecCommand.h"
 #include "RedwoodCommonGameSubsystem.h"
@@ -3606,6 +3607,132 @@ void URedwoodServerGameSubsystem::GetBlob(
       OnComplete.ExecuteIfBound(Output);
     });
 }
+
+// FORK(hollowed-oath) BEGIN: account document calls. The checks, the reply
+// parsing and the offline store are in RedwoodAccountDocuments.cpp.
+void URedwoodServerGameSubsystem::GetAccountDocument(
+  const FString &PlayerId,
+  const FString &Key,
+  FRedwoodGetAccountDocumentOutputDelegate OnComplete
+) {
+  if (!RedwoodAccountDocuments::IsValidId(PlayerId) ||
+      !RedwoodAccountDocuments::IsValidKey(Key)) {
+    FRedwoodGetAccountDocumentOutput Output;
+    Output.Error = TEXT("Invalid player id or key");
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  // ShouldUseBackend is false for a null world. Without this check, a call
+  // with no world would use the offline store while the backend never sees it.
+  if (!GetWorld()) {
+    FRedwoodGetAccountDocumentOutput Output;
+    Output.Error = TEXT("No world");
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  if (!URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    OnComplete.ExecuteIfBound(RedwoodAccountDocuments::ReadOffline(PlayerId, Key));
+    return;
+  }
+
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    FRedwoodGetAccountDocumentOutput Output;
+    Output.Error = TEXT("Sidecar is not connected");
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("key"), Key);
+
+  Sidecar->Emit(
+    TEXT("realm:account-documents:get"),
+    Payload,
+    [OnComplete](auto Response) {
+      OnComplete.ExecuteIfBound(RedwoodAccountDocuments::ParseGetReply(Response));
+    }
+  );
+}
+
+void URedwoodServerGameSubsystem::PutAccountDocument(
+  const FString &PlayerId,
+  const FString &Key,
+  TSharedPtr<FJsonObject> Data,
+  int32 ExpectedRevision,
+  FRedwoodPutAccountDocumentOutputDelegate OnComplete
+) {
+  FRedwoodPutAccountDocumentOutput Output;
+
+  if (!RedwoodAccountDocuments::IsValidId(PlayerId) ||
+      !RedwoodAccountDocuments::IsValidKey(Key)) {
+    Output.Error = TEXT("Invalid player id or key");
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  if (!Data.IsValid() || ExpectedRevision < 0) {
+    Output.Error = TEXT("Account document data and a revision of 0 or more are required");
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  // Checked before the size: the size check serializes Data, and the
+  // serializer recurses. Checked here, not only by the backend, so the
+  // offline path refuses the same documents.
+  if (RedwoodAccountDocuments::IsTooDeep(Data.ToSharedRef())) {
+    Output.Error = TEXT("Account document is nested too deep");
+    Output.bRejected = true;
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  // Checked before the send: a message above socket.io's buffer limit is
+  // dropped by the socket, and the caller would only see a timeout.
+  if (RedwoodAccountDocuments::IsTooLarge(Data.ToSharedRef())) {
+    Output.Error = TEXT("Account document is too large");
+    Output.bRejected = true;
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  // See GetAccountDocument: no world must not fall back to the offline store.
+  if (!GetWorld()) {
+    Output.Error = TEXT("No world");
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  if (!URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    OnComplete.ExecuteIfBound(RedwoodAccountDocuments::WriteOffline(
+      PlayerId, Key, Data.ToSharedRef(), ExpectedRevision
+    ));
+    return;
+  }
+
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    Output.Error = TEXT("Sidecar is not connected");
+    OnComplete.ExecuteIfBound(Output);
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("key"), Key);
+  Payload->SetNumberField(TEXT("expectedRevision"), ExpectedRevision);
+  Payload->SetObjectField(TEXT("data"), Data);
+
+  Sidecar->Emit(
+    TEXT("realm:account-documents:put"),
+    Payload,
+    [OnComplete](auto Response) {
+      OnComplete.ExecuteIfBound(RedwoodAccountDocuments::ParsePutReply(Response));
+    }
+  );
+}
+// FORK(hollowed-oath) END
 
 void URedwoodServerGameSubsystem::PutSaveGame(
   const FString &Key, USaveGame *Value, FRedwoodErrorOutputDelegate OnComplete

@@ -352,6 +352,31 @@ public:
   );
   void GetBlob(const FString &Key, FRedwoodGetBlobOutputDelegate OnComplete);
 
+  // FORK(hollowed-oath): account documents (see
+  // Types/RedwoodTypesAccountDocuments.h). Uses the backend, or
+  // Saved/Persistence/AccountDocuments/<PlayerId>/<Key>.json when the backend
+  // is off (PIE). The output has the same shape either way, but the offline
+  // path calls OnComplete before the call returns, and the backend path calls
+  // it later. A missing document is not an error: bFound is false. A put is
+  // accepted only if the document is still at ExpectedRevision (0 = it must
+  // not exist yet); otherwise the output has bConflict set. An error after the
+  // send can mean the outcome is unknown, so a caller must Get before it
+  // retries. The backend path has no timeout of its own: if the sidecar
+  // socket drops, OnComplete may never be called, so callers must apply their
+  // own timeout.
+  void GetAccountDocument(
+    const FString &PlayerId,
+    const FString &Key,
+    FRedwoodGetAccountDocumentOutputDelegate OnComplete
+  );
+  void PutAccountDocument(
+    const FString &PlayerId,
+    const FString &Key,
+    TSharedPtr<FJsonObject> Data,
+    int32 ExpectedRevision,
+    FRedwoodPutAccountDocumentOutputDelegate OnComplete
+  );
+
   void PutSaveGame(
     const FString &Key, USaveGame *Value, FRedwoodErrorOutputDelegate OnComplete
   );
