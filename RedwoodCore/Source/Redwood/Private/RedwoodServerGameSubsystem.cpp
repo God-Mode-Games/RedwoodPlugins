@@ -3698,9 +3698,23 @@ void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
   int64 Balance = 0;
   TArray<FString> GrantKeys;
   switch (ParseCurrencyReloadReply(Reply, Balance, GrantKeys)) {
-    case ERedwoodCurrencyReloadResult::GiveUp:
+    case ERedwoodCurrencyReloadResult::GiveUp: {
+      // Another session owns the character, as a flush reply's writerFenceLost says. Every
+      // component held here stops sending, exactly as after that flush reply: otherwise each one
+      // still needs its rebase, and every save pass would start this reload again, for the whole
+      // session. Copies: the game's reaction to the lost fence may change the map.
+      TArray<TWeakObjectPtr<URedwoodCharacterComponent>> Components = Reload->CharacterComponents;
+      for (const FRedwoodHeldItemFlush &Held : Reload->HeldFlushes) {
+        Components.AddUnique(Held.CharacterComponent);
+      }
+      for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Components) {
+        if (URedwoodCharacterComponent *Component = WeakComponent.Get()) {
+          Component->MarkWriterFenceLost();
+        }
+      }
       GiveUpCurrencyReload(CharacterId, TEXT("this session no longer owns the character"));
       return;
+    }
     case ERedwoodCurrencyReloadResult::Retry:
       RetryCurrencyReload(CharacterId);
       return;

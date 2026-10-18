@@ -905,7 +905,8 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 // A "not bound" reply is retried, but the realm's writerFenceLost flag (another session owns the
-// character) ends the reload on that reply.
+// character) ends the reload on that reply, and marks the fence lost as a flush reply's flag does:
+// the game hears it once, and no save pass starts the reload again.
 bool FRedwoodCurrencySidecarWriterFenceLostTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
@@ -915,8 +916,9 @@ bool FRedwoodCurrencySidecarWriterFenceLostTest::RunTest(const FString &Paramete
     EAutomationExpectedErrorFlags::Contains,
     1
   );
+  // Logged once, by the lost fence; the give-up does not log it a second time.
   AddExpectedErrorPlain(
-    TEXT("NOT saved: held by a currency reload that gave up (this session no longer owns the character)"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, NOT saved: writer fence lost"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -926,6 +928,8 @@ bool FRedwoodCurrencySidecarWriterFenceLostTest::RunTest(const FString &Paramete
   }
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
+  int32 FenceLostCount = 0;
+  Component->OnWriterFenceLost.AddLambda([&FenceLostCount](const FString &) { ++FenceLostCount; });
 
   int32 SettleCount = 0;
   FRequest Load;
@@ -955,6 +959,17 @@ bool FRedwoodCurrencySidecarWriterFenceLostTest::RunTest(const FString &Paramete
   );
   TestTrue(TEXT("The held attempt settles at once"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
   TestNull(TEXT("No retry is scheduled"), FAccess::Reload(*Harness.Subsystem, CharacterId));
+  TestTrue(TEXT("The component's fence is lost"), Component->IsWriterFenceLost());
+  TestEqual(TEXT("The game hears it once"), FenceLostCount, 1);
+
+  // The next save passes: the component still holds its entry, but no reload or flush goes out.
+  for (int32 Pass = 0; Pass < 2; ++Pass) {
+    Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
+  }
+  TestTrue(TEXT("No further reload goes out"), Harness.IsQuiet());
+  TestNull(TEXT("No reload runs"), FAccess::Reload(*Harness.Subsystem, CharacterId));
+  TestEqual(TEXT("Each later attempt settles at once"), SettleCount, 3);
+  TestEqual(TEXT("The game still heard it only once"), FenceLostCount, 1);
   return true;
 }
 
