@@ -490,6 +490,13 @@ public:
     FString &OutError
   );
 
+  // FORK(hollowed-oath): the lowest balance this character can hold once its unsettled trade
+  // settles: the balance after the trade when it pays, the balance before it when it is paid.
+  // Entries staged meanwhile are re-chained from whichever comes true, so each must fit on the
+  // lower one (QueueCurrency checks). False when no unsettled trade moves this character's
+  // currency.
+  bool GetUnsettledTradeFloorBalance(const FString &CharacterId, int64 &OutFloorBalance) const;
+
   // The only reason the backend takes on a trade entry.
   static constexpr const TCHAR *TradeCurrencyReason = TEXT("Currency.Reason.Trade");
   // The sidecar's replies when its realm request timed out, and when it had no realm to send to

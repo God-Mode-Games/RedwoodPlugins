@@ -920,6 +920,25 @@ bool URedwoodCharacterComponent::QueueCurrency(
     return Entries.Num() == 0 && GrantKeys.Num() == 0;
   }
 
+  // FORK(hollowed-oath): while a trade that moves this character's currency is unsettled, every
+  // entry staged now is re-chained when it settles, from the balance after it or before it. A debit
+  // that would go below zero on the lower one would then be held back for good, so refuse it now,
+  // while the game can still undo the purchase it pays for. Credits always fit.
+  int64 TradeFloorRunning = 0;
+  const bool bTradeFloor = ServerSubsystem &&
+    ServerSubsystem->GetUnsettledTradeFloorBalance(RedwoodCharacterId, TradeFloorRunning);
+  auto AddToTradeFloor = [&TradeFloorRunning](int64 Delta) {
+    // Saturated: an overflowing chain is refused by the re-chain itself.
+    TradeFloorRunning = Delta > 0 && TradeFloorRunning > MAX_int64 - Delta
+      ? MAX_int64
+      : TradeFloorRunning + Delta;
+  };
+  if (bTradeFloor) {
+    for (const FRedwoodCurrencyEntry &Pending : PendingCurrencyEntries) {
+      AddToTradeFloor(Pending.Delta);
+    }
+  }
+
   // Appended, never merged or de-duplicated: the backend checks each BalanceAfter in order, and a
   // repeated grant key must reach the backend so it refuses the second reward instead of the game
   // server quietly paying it without its guard.
@@ -938,6 +957,22 @@ bool URedwoodCharacterComponent::QueueCurrency(
       );
       bAllQueued = false;
       continue;
+    }
+    if (bTradeFloor && Entry.Delta < 0 && TradeFloorRunning + Entry.Delta < 0) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("QueueCurrency: character %s has a trade unsettled and could hold only %lld after it; refused entry %s delta %lld"),
+        *RedwoodCharacterId,
+        TradeFloorRunning,
+        *Entry.Id,
+        Entry.Delta
+      );
+      bAllQueued = false;
+      continue;
+    }
+    if (bTradeFloor) {
+      AddToTradeFloor(Entry.Delta);
     }
     PendingCurrencyEntries.Add(Entry);
   }

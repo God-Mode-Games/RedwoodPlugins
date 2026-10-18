@@ -371,6 +371,8 @@ public:
   //
   // Returns false when anything was refused: every entry and key while the character is frozen or
   // its writer fence is lost, or an entry whose id the backend would refuse. The caller must not count a refused amount.
+  // FORK(hollowed-oath): also a debit that would go below zero when an unsettled trade of this
+  // character settles (URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalance).
   bool QueueCurrency(
     const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
   );

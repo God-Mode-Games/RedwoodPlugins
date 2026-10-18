@@ -4020,6 +4020,20 @@ bool URedwoodServerGameSubsystem::ChainTradeCurrency(
   return true;
 }
 
+bool URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalance(
+  const FString &CharacterId, int64 &OutFloorBalance
+) const {
+  for (const TPair<FString, FRedwoodPendingItemTrade> &Pair : PendingItemTrades) {
+    for (const FRedwoodItemTradeSide *Side : {&Pair.Value.From, &Pair.Value.To}) {
+      if (Side->CharacterId == CharacterId && Side->Entries.Num() > 0) {
+        OutFloorBalance = FMath::Min(Side->BalanceBefore, Side->Entries.Last().BalanceAfter);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 FRedwoodPendingItemTrade *URedwoodServerGameSubsystem::FindItemTradeOfCharacter(
   const FString &CharacterId
 ) {
