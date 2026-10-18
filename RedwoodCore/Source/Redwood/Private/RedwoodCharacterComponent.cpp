@@ -860,6 +860,24 @@ void URedwoodCharacterComponent::ClearSentItemGenerations(
   }
 }
 
+bool URedwoodCharacterComponent::HasGrantKey(const FString &GrantKey) const {
+  if (ContainsGrantKey(PendingGrantKeys, GrantKey)) {
+    return true;
+  }
+  // The snapshot lives on the PlayerState, reached the way hydration reaches it: through the
+  // pawn's controller, or the owner itself when the component sits on the PlayerState.
+  const APawn *Pawn = Cast<APawn>(GetOwner());
+  const AController *Controller = IsValid(Pawn) ? Pawn->GetController() : nullptr;
+  const APlayerState *PlayerState = IsValid(Controller)
+    ? Controller->PlayerState.Get()
+    : Cast<APlayerState>(GetOwner());
+  const URedwoodPlayerStateComponent *PlayerStateComponent = IsValid(PlayerState)
+    ? PlayerState->FindComponentByClass<URedwoodPlayerStateComponent>()
+    : nullptr;
+  return PlayerStateComponent &&
+    ContainsGrantKey(PlayerStateComponent->RedwoodCharacter.GrantKeys, GrantKey);
+}
+
 bool URedwoodCharacterComponent::QueueCurrency(
   const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
 ) {

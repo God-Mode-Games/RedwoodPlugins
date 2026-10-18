@@ -1266,4 +1266,48 @@ bool FRedwoodCurrencySidecarAuthLoadThawsTest::RunTest(const FString &Parameters
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarHasGrantKeyTest,
+  "Redwood.Currency.Sidecar.HasGrantKey",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The check game code runs before it stages a one-time reward. A key counts as used when it is
+// committed (on the PlayerState snapshot), staged, or in flight, and only in its exact case, as
+// the backend compares it.
+bool FRedwoodCurrencySidecarHasGrantKeyTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  const FString CommittedKey = TEXT("quest:Q1");
+  const FString StagedKey = TEXT("quest:Q2");
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyLoadTestPlayerState *PlayerState =
+    Harness.World->SpawnActor<ARedwoodCurrencyLoadTestPlayerState>();
+  if (!TestNotNull(TEXT("The PlayerState spawns"), PlayerState)) {
+    return false;
+  }
+  URedwoodPlayerStateComponent *PlayerStateComponent =
+    NewObject<URedwoodPlayerStateComponent>(PlayerState);
+  PlayerStateComponent->RedwoodCharacter.GrantKeys = {CommittedKey};
+  URedwoodCharacterComponent *Component = NewObject<URedwoodCharacterComponent>(PlayerState);
+  Component->bUseItems = true;
+  Component->RedwoodCharacterId = CharacterId;
+  Component->SeedItemSeqFromCharacter(SeededInventorySeq);
+
+  TestTrue(TEXT("A committed key is used"), Component->HasGrantKey(CommittedKey));
+  TestFalse(TEXT("The same key in another case is not"), Component->HasGrantKey(TEXT("quest:q1")));
+  TestFalse(TEXT("An unknown key is not"), Component->HasGrantKey(StagedKey));
+
+  TestTrue(TEXT("The key is staged"), Component->QueueCurrency({}, {StagedKey}));
+  TestTrue(TEXT("A staged key is used"), Component->HasGrantKey(StagedKey));
+  TestFalse(TEXT("A staged key in another case is not"), Component->HasGrantKey(TEXT("QUEST:Q2")));
+
+  int64 BatchSeq = 0;
+  TestTrue(TEXT("The batch is claimed"), Component->TryBeginItemFlush(BatchSeq));
+  TestTrue(TEXT("A key in flight is used"), Component->HasGrantKey(StagedKey));
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER
