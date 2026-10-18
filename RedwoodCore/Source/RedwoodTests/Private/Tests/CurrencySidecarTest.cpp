@@ -3808,4 +3808,52 @@ bool FRedwoodCurrencySidecarFlushReplyTimeoutTest::RunTest(const FString &Parame
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest,
+  "Redwood.Currency.Sidecar.ComponentGoneFinalRefusalFreezes",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A batch refused for good after its component is gone: the refused entry is logged as NOT saved,
+// and the character freezes, snapshot and all, so the respawned component starts frozen instead of
+// staging on a state the backend refused.
+bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedErrorPlain(
+    TEXT("Failed to flush items (component gone): balance below zero"), EAutomationExpectedErrorFlags::Contains, 1
+  );
+  AddExpectedErrorPlain(
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta -2000 reason Currency.Reason.Loot, NOT saved: its component is gone"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyLoadTestPlayerState *PlayerState = nullptr;
+  URedwoodPlayerStateComponent *PlayerStateComponent = nullptr;
+  if (!MakeSnapshotOwner(Harness, PlayerState, PlayerStateComponent)) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Sender = Harness.MakeComponent(Actor);
+  Sender->QueueCurrency({MakeEntry(EntryIdA, -2000, -1000, LootReason)}, {});
+  Harness.Subsystem->FlushItemsForCharacterComponent(PlayerStateComponent, Sender);
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  Sender->MarkAsGarbage();
+  Harness.Answer(Flush, FinalRefusalReply);
+  TestTrue(
+    TEXT("The character freezes"),
+    Harness.PumpUntil([&Harness]() { return Harness.Subsystem->IsCharacterFrozen(CharacterId); })
+  );
+  TestTrue(TEXT("The snapshot is marked frozen"), PlayerStateComponent->RedwoodCharacter.bFrozenAfterFinalRefusal);
+  URedwoodCharacterComponent *Respawned = HydrateOnPlayerState(PlayerState);
+  TestTrue(TEXT("The respawned component starts frozen"), Respawned->IsFrozenAfterFinalRefusal());
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER
