@@ -2620,6 +2620,18 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     return;
   }
 
+  // FORK(hollowed-oath): while the component needs a currency rebase, hold EVERY flush of this
+  // character, item rows included. A purchase is its item row plus its debit; with the debit held
+  // for the reload, the row alone could commit, and if the debit is then refused for good the item
+  // is free. No batch is in flight here (only a reply sets the rebase flag, and it frees the slot
+  // first), so nothing else would start the reload: start or join it now. Its reply rebases the
+  // held entries and resumes this attempt with its settle, so a detached pawn's barrier waits for
+  // the delivery rather than for the hold.
+  if (CharacterComponent->IsCurrencyRebaseRequired()) {
+    HoldItemFlushForCurrencyReload(PlayerStateComponent, CharacterComponent, OnAckSettled);
+    return;
+  }
+
   // Claim the single-flight slot + the batchSeq this batch must stamp. If a batch is already
   // outstanding, park this tick's flush -- the dirt stays marked and coalesces until the in-flight
   // batch's ack releases the slot. Settle so the detached barrier doesn't wait forever on a parked
@@ -2780,11 +2792,14 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // FORK(hollowed-oath): carried into the ack so the committed seq and balance can be written back
   // onto the PlayerState snapshot -- see ApplyItemsFlushReply for why a stale snapshot loses items.
   TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerStateComponent = PlayerStateComponent;
+  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
 
   Sidecar->Emit(
     TEXT("realm:characters:items:flush"),
     Payload,
-    [WeakCharacterComponent, WeakPlayerStateComponent, Sent, OnAckSettled](auto Response) {
+    [WeakSubsystem, WeakCharacterComponent, WeakPlayerStateComponent, Sent, OnAckSettled](
+      auto Response
+    ) {
       // FORK(hollowed-oath): an unreadable reply parses as an error with no fence: the outcome is
       // unknown, so the batch is kept and re-sent.
       const TSharedPtr<FJsonObject> *ReplyObject =
@@ -2821,6 +2836,19 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
       ApplyItemsFlushReply(
         CharacterComponent, WeakPlayerStateComponent.Get(), Reply, Sent
       );
+
+      // FORK(hollowed-oath): the backend refused the batch for good, or a trade used its seq: the
+      // held entries need a reload before anything is sent. Start it from this reply, and hand
+      // this attempt's settle to it: for a detached pawn the entries are not saved yet, and
+      // releasing the write binding now would refuse the resumed flush that saves them.
+      if (CharacterComponent->IsCurrencyRebaseRequired()) {
+        if (URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get()) {
+          Subsystem->HoldItemFlushForCurrencyReload(
+            WeakPlayerStateComponent.Get(), CharacterComponent, OnAckSettled
+          );
+          return;
+        }
+      }
 
       // Settle AFTER CompleteItemFlush, on both success and error: the release barrier's rule is
       // "the attempt resolved", which is exactly here.
@@ -2939,6 +2967,242 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
 
   if (Reply.Alerts.Num() > 0) {
     CharacterComponent->OnCurrencyAlerts.Broadcast(Reply.Alerts);
+  }
+}
+
+bool URedwoodServerGameSubsystem::ApplyCurrencyReloadReply(
+  URedwoodCharacterComponent *CharacterComponent,
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  const TSharedPtr<FJsonObject> &Reply
+) {
+  // Every error reply also carries a filler balance of "0", so the error is checked first: a
+  // rebase from that filler would chain every held entry from zero.
+  if (!Reply.IsValid() || !Reply->HasField(TEXT("error"))) {
+    UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: unreadable reply"));
+    return false;
+  }
+  // A JSON null error reads as empty: that is the backend's success shape.
+  FString Error;
+  Reply->TryGetStringField(TEXT("error"), Error);
+  if (!Error.IsEmpty()) {
+    UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: %s"), *Error);
+    return false;
+  }
+
+  const TSharedPtr<FJsonObject> *Currency = nullptr;
+  FString AmountText;
+  int64 Amount = 0;
+  // A string only: TryGetStringField also reads a JSON number, which may have been rounded.
+  if (!Reply->TryGetObjectField(TEXT("currency"), Currency) || !Currency ||
+      !(*Currency)->HasTypedField<EJson::String>(TEXT("amount")) ||
+      !(*Currency)->TryGetStringField(TEXT("amount"), AmountText) ||
+      !TryParseCurrencyAmount(AmountText, Amount) || Amount < 0) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("Currency reload failed: the reply has no readable balance ('%s')"),
+      *AmountText
+    );
+    return false;
+  }
+
+  if (CharacterComponent->IsCurrencyRebaseRequired()) {
+    CharacterComponent->RebaseCurrency(Amount);
+    if (CharacterComponent->IsCurrencyRebaseRequired()) {
+      // RebaseCurrency logged why (an overflow). The entries stay held and unchanged.
+      UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: the rebase from %lld did not apply"), Amount);
+      return false;
+    }
+  }
+
+  // The loaded balance is committed, so the snapshot takes it, as it takes a flush's.
+  if (PlayerStateComponent) {
+    PlayerStateComponent->RedwoodCharacter.CurrencyAmount = Amount;
+  }
+  return true;
+}
+
+void URedwoodServerGameSubsystem::HoldItemFlushForCurrencyReload(
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  URedwoodCharacterComponent *CharacterComponent,
+  TFunction<void()> OnAckSettled
+) {
+  const TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent(CharacterComponent);
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(WeakCharacterComponent);
+  const bool bStart = Reload == nullptr;
+  if (bStart) {
+    Reload = &CurrencyReloads.Add(WeakCharacterComponent);
+    Reload->CharacterId = PlayerStateComponent ? PlayerStateComponent->RedwoodCharacter.Id
+                                               : CharacterComponent->RedwoodCharacterId;
+  }
+  if (PlayerStateComponent) {
+    Reload->PlayerStateComponent = PlayerStateComponent;
+  }
+  // A live component's tick flush has no settle; its next tick finds the hold again, so it needs
+  // no place in the queue.
+  if (OnAckSettled) {
+    Reload->HeldSettles.Add(MoveTemp(OnAckSettled));
+  }
+  if (bStart) {
+    SendCurrencyReload(WeakCharacterComponent);
+  }
+}
+
+void URedwoodServerGameSubsystem::SendCurrencyReload(
+  TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent
+) {
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(WeakCharacterComponent);
+  if (!Reload) {
+    return;
+  }
+  URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
+  if (!IsValid(CharacterComponent)) {
+    AbandonCurrencyReload(WeakCharacterComponent);
+    return;
+  }
+
+  ++Reload->Attempts;
+
+  // The load carries the session's writer token, so the realm refuses it once another session owns
+  // the character, instead of handing out a balance this session can no longer write. Without a
+  // token this session's flushes are refused too, so that is a failed load, retried like the rest
+  // (the token is seeded at hydration).
+  const FString &WriterToken = CharacterComponent->GetWriterToken();
+  if (WriterToken.IsEmpty() || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("Currency reload failed for character %s: %s"),
+      *Reload->CharacterId,
+      WriterToken.IsEmpty() ? TEXT("no writer token") : TEXT("sidecar not connected")
+    );
+    RetryCurrencyReload(WeakCharacterComponent);
+    return;
+  }
+
+  // A reply that never comes (the socket dropped) must not hold the flushes forever.
+  GetGameInstance()->GetTimerManager().SetTimer(
+    Reload->RetryTimer,
+    FTimerDelegate::CreateWeakLambda(
+      this,
+      [this, WeakCharacterComponent]() {
+        UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: no reply"));
+        RetryCurrencyReload(WeakCharacterComponent);
+      }
+    ),
+    CurrencyReloadReplyTimeoutSeconds,
+    false // no loop
+  );
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("id"), ItemsEnvelopePlaceholderId);
+  Payload->SetStringField(TEXT("characterId"), Reload->CharacterId);
+  Payload->SetStringField(TEXT("writerToken"), WriterToken);
+
+  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
+  Sidecar->Emit(
+    TEXT("realm:characters:items:load"),
+    Payload,
+    [WeakSubsystem, WeakCharacterComponent](auto Response) {
+      URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
+      if (!Subsystem) {
+        return;
+      }
+      const TSharedPtr<FJsonObject> *ReplyObject =
+        URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+      Subsystem->HandleCurrencyReloadReply(
+        WeakCharacterComponent, ReplyObject ? *ReplyObject : TSharedPtr<FJsonObject>()
+      );
+    }
+  );
+}
+
+void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
+  TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent,
+  const TSharedPtr<FJsonObject> &Reply
+) {
+  // A reply that arrives after the reload ended (a late reply to an attempt that timed out) has
+  // nothing left to resume.
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(WeakCharacterComponent);
+  if (!Reload) {
+    return;
+  }
+  GetGameInstance()->GetTimerManager().ClearTimer(Reload->RetryTimer);
+
+  URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
+  if (!IsValid(CharacterComponent)) {
+    AbandonCurrencyReload(WeakCharacterComponent);
+    return;
+  }
+
+  if (!ApplyCurrencyReloadReply(CharacterComponent, Reload->PlayerStateComponent.Get(), Reply)) {
+    RetryCurrencyReload(WeakCharacterComponent);
+    return;
+  }
+
+  // Taken out of the map before any flush resumes: a resumed flush can find the hold again (a
+  // trade used the new seq too) and must then start a new reload, not join this finished one.
+  FRedwoodCurrencyReload Finished = MoveTemp(*Reload);
+  CurrencyReloads.Remove(WeakCharacterComponent);
+
+  // With no held attempt (a live component), flush once anyway, so the re-chained entries go out
+  // now rather than on the next save pass.
+  if (Finished.HeldSettles.Num() == 0) {
+    Finished.HeldSettles.Add(nullptr);
+  }
+  for (TFunction<void()> &HeldSettle : Finished.HeldSettles) {
+    // Single-flight still holds: the first resumed attempt claims the slot, a second one parks
+    // behind it, and any more settle at once, exactly as un-held attempts would.
+    FlushItemsForCharacterComponent(
+      Finished.PlayerStateComponent.Get(), CharacterComponent, MoveTemp(HeldSettle)
+    );
+  }
+}
+
+void URedwoodServerGameSubsystem::RetryCurrencyReload(
+  TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent
+) {
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(WeakCharacterComponent);
+  if (!Reload) {
+    return;
+  }
+  if (Reload->Attempts >= CurrencyReloadMaxAttempts) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT(
+        "Currency reload for character %s failed %d times; its held flushes settle, and its currency stays held until its next flush"
+      ),
+      *Reload->CharacterId,
+      Reload->Attempts
+    );
+    AbandonCurrencyReload(WeakCharacterComponent);
+    return;
+  }
+  GetGameInstance()->GetTimerManager().SetTimer(
+    Reload->RetryTimer,
+    FTimerDelegate::CreateWeakLambda(
+      this,
+      [this, WeakCharacterComponent]() { SendCurrencyReload(WeakCharacterComponent); }
+    ),
+    CurrencyReloadRetrySeconds,
+    false // no loop
+  );
+}
+
+void URedwoodServerGameSubsystem::AbandonCurrencyReload(
+  TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent
+) {
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(WeakCharacterComponent);
+  if (!Reload) {
+    return;
+  }
+  GetGameInstance()->GetTimerManager().ClearTimer(Reload->RetryTimer);
+  // Out of the map first: a settle can release a binding and start other work that reaches here.
+  FRedwoodCurrencyReload Abandoned = MoveTemp(*Reload);
+  CurrencyReloads.Remove(WeakCharacterComponent);
+  for (TFunction<void()> &HeldSettle : Abandoned.HeldSettles) {
+    HeldSettle();
   }
 }
 

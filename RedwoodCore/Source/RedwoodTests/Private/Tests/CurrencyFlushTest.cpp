@@ -397,3 +397,102 @@ bool FRedwoodCurrencyFlushAlertsBroadcastTest::RunTest(const FString &Parameters
 
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyReloadRebasesTest,
+  "Redwood.Currency.ReloadRebases",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A trade used the batch's seq: the held entries are re-chained from the reloaded balance, and the
+// snapshot takes that balance.
+bool FRedwoodCurrencyReloadRebasesTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyFlushTest;
+  URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(4);
+  URedwoodPlayerStateComponent *PlayerState = Fixture::MakePlayerStateComponent(4, 1000);
+
+  Component->QueueCurrency(
+    {Fixture::MakeEntry(Fixture::EntryIdA, 500, 1500), Fixture::MakeEntry(Fixture::EntryIdB, -200, 1300)},
+    {}
+  );
+  const FRedwoodItemFlushSent Sent = Fixture::ClaimBatch(*this, Component);
+  FRedwoodItemFlushReply Refusal = Fixture::MakeReply(TEXT("batch seq was used by a trade"), Sent.BatchSeq);
+  Refusal.bRebaseRequired = true;
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(Component, PlayerState, Refusal, Sent);
+  TestTrue(TEXT("The refusal holds the entries for a reload"), Component->IsCurrencyRebaseRequired());
+
+  const bool bLoaded = URedwoodServerGameSubsystem::ApplyCurrencyReloadReply(
+    Component,
+    PlayerState,
+    Fixture::ParseJson(TEXT(R"({"error":null,"items":[],"currency":{"amount":"2000","grants":["quest:Q1"]}})"))
+  );
+
+  TestTrue(TEXT("The reload is applied"), bLoaded);
+  TestFalse(TEXT("The hold ends"), Component->IsCurrencyRebaseRequired());
+  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
+  TestEqual(TEXT("No entry is dropped"), Pending.Num(), 2);
+  if (Pending.Num() == 2) {
+    TestEqual(TEXT("A re-chained from the reloaded balance"), Pending[0].BalanceAfter, (int64)2500);
+    TestEqual(TEXT("B re-chained after A"), Pending[1].BalanceAfter, (int64)2300);
+  }
+  TestEqual(TEXT("The snapshot takes the reloaded balance"), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)2000);
+  TestEqual(TEXT("Both entries go in the next batch"), Component->GetCurrencyEntriesToSendCount(), 2);
+
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyReloadFailureHoldsTest,
+  "Redwood.Currency.ReloadFailureHolds",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A reload that lacks a readable balance is a failed load: the entries stay held and unchanged, so
+// the retry can still rebase them. An error reply's filler "0" must never be used.
+bool FRedwoodCurrencyReloadFailureHoldsTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyFlushTest;
+  const TCHAR *FailedReplies[] = {
+    TEXT(R"({"error":"character not bound to this instance","items":[],"currency":{"amount":"0","grants":[]}})"),
+    TEXT(R"({"error":null,"items":[]})"),
+    TEXT(R"({"error":null,"items":[],"currency":{"amount":"1e3","grants":[]}})"),
+    TEXT(R"({"error":null,"items":[],"currency":{"amount":"-5","grants":[]}})"),
+    TEXT(R"({"error":null,"items":[],"currency":{"amount":2000,"grants":[]}})"),
+    TEXT(R"({"items":[],"currency":{"amount":"2000","grants":[]}})"),
+  };
+  // 0 means "at least once": every failed load logs, and the per-case checks below pin each one.
+  AddExpectedError(TEXT("Currency reload failed"), EAutomationExpectedErrorFlags::Contains, 0);
+
+  for (const TCHAR *ReplyText : FailedReplies) {
+    URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(4);
+    URedwoodPlayerStateComponent *PlayerState = Fixture::MakePlayerStateComponent(4, 1000);
+    Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 500, 1500)}, {});
+    const FRedwoodItemFlushSent Sent = Fixture::ClaimBatch(*this, Component);
+    FRedwoodItemFlushReply Refusal = Fixture::MakeReply(TEXT("batch seq was used by a trade"), Sent.BatchSeq);
+    Refusal.bRebaseRequired = true;
+    URedwoodServerGameSubsystem::ApplyItemsFlushReply(Component, PlayerState, Refusal, Sent);
+
+    const bool bLoaded = URedwoodServerGameSubsystem::ApplyCurrencyReloadReply(
+      Component, PlayerState, Fixture::ParseJson(ReplyText)
+    );
+
+    TestFalse(FString::Printf(TEXT("Failed load: %s"), ReplyText), bLoaded);
+    TestTrue(FString::Printf(TEXT("Still held: %s"), ReplyText), Component->IsCurrencyRebaseRequired());
+    const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
+    TestEqual(FString::Printf(TEXT("Entry kept: %s"), ReplyText), Pending.Num(), 1);
+    if (Pending.Num() == 1) {
+      TestEqual(FString::Printf(TEXT("Entry unchanged: %s"), ReplyText), Pending[0].BalanceAfter, (int64)1500);
+    }
+    TestEqual(
+      FString::Printf(TEXT("Snapshot unchanged: %s"), ReplyText), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)1000
+    );
+  }
+
+  // No reply object at all.
+  URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(4);
+  TestFalse(
+    TEXT("An unreadable reply is a failed load"),
+    URedwoodServerGameSubsystem::ApplyCurrencyReloadReply(Component, nullptr, TSharedPtr<FJsonObject>())
+  );
+
+  return true;
+}

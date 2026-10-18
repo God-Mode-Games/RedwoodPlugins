@@ -49,6 +49,16 @@ struct FRedwoodItemFlushSent {
   bool bHasBalanceAfter = false;
   int64 BalanceAfter = 0;
 };
+
+// A currency reload in progress for one character component: the flush attempts held behind it
+// (each one's settle callback) and the retry state.
+struct FRedwoodCurrencyReload {
+  FString CharacterId;
+  TWeakObjectPtr<URedwoodPlayerStateComponent> PlayerStateComponent;
+  TArray<TFunction<void()>> HeldSettles;
+  int32 Attempts = 0;
+  FTimerHandle RetryTimer;
+};
 // FORK(hollowed-oath) END
 
 UCLASS(BlueprintType)
@@ -243,6 +253,10 @@ public:
   // character->instance binding this flush's auth gate needs, so the release must not fire until the
   // flush has settled. Null (the default) for the ordinary tick-flush caller, which needs no
   // completion signal.
+  // FORK(hollowed-oath): while the component needs a currency rebase the attempt is held, and
+  // OnAckSettled fires from the resumed flush after the currency reload, or when the reload gives
+  // up (see CurrencyReloadMaxAttempts). A reply that sets the rebase hands its settle on the same
+  // way.
   //
   // Item LOADING has no counterpart here: item rows arrive in the SAME round trip as the rest of
   // the character (see FRedwoodCharacterBackend::Items), populated directly in
@@ -347,6 +361,26 @@ public:
     const FRedwoodItemFlushSent &Sent
   );
 
+  // Reads a realm:characters:items:load reply and rebases the component's held currency from its
+  // balance. Returns false for a failed load (an error, a missing or malformed balance, or a
+  // rebase that could not apply); the caller then keeps the hold and retries.
+  static bool ApplyCurrencyReloadReply(
+    URedwoodCharacterComponent *CharacterComponent,
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    const TSharedPtr<FJsonObject> &Reply
+  );
+
+  // A failed reload is retried on a timer: a reload fails for a realm hiccup or a sidecar
+  // reconnect, which clear in seconds, and nothing else would re-run it for a detached pawn.
+  static constexpr float CurrencyReloadRetrySeconds = 5.f;
+  // A reload with no reply by then counts as failed. The sidecar answers within its own realm
+  // timeout (10 seconds), so a longer silence means the socket dropped and no reply will come;
+  // without this a detached pawn's barrier would wait on it forever.
+  static constexpr float CurrencyReloadReplyTimeoutSeconds = 30.f;
+  // After this many failed attempts the held flush attempts settle, so a detached pawn's write
+  // binding still releases when the realm stays unreachable. The currency stays held on the
+  // component, and its next flush attempt starts a new reload.
+  static constexpr int32 CurrencyReloadMaxAttempts = 6;
   // FORK(hollowed-oath) END
 
   // FORK(hollowed-oath): fork-added API (with EmitPlayerLeft below), not in
@@ -590,6 +624,30 @@ private:
   );
 
   TSharedPtr<FSocketIONative> Sidecar;
+
+  // FORK(hollowed-oath) BEGIN: the currency reload that a held item flush waits on. While a
+  // component needs a rebase (the backend refused a batch for good, or a trade used its seq), no
+  // flush of that character goes out, items included: an item row must not commit before the debit
+  // that pays for it. One reload per component; its reply rebases the held entries and resumes
+  // every held attempt, settle barrier and all.
+  TMap<TWeakObjectPtr<URedwoodCharacterComponent>, FRedwoodCurrencyReload> CurrencyReloads;
+
+  // Joins the reload for this component, or starts one. OnAckSettled (nullable) is the held flush
+  // attempt's settle; the reload resumes the flush with it.
+  void HoldItemFlushForCurrencyReload(
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    URedwoodCharacterComponent *CharacterComponent,
+    TFunction<void()> OnAckSettled
+  );
+  void SendCurrencyReload(TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent);
+  void HandleCurrencyReloadReply(
+    TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent,
+    const TSharedPtr<FJsonObject> &Reply
+  );
+  void RetryCurrencyReload(TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent);
+  // Ends the reload without a balance: every held attempt settles, and the currency stays held.
+  void AbandonCurrencyReload(TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent);
+  // FORK(hollowed-oath) END
 
   float UpdateSidecarRate = 3.f; // in seconds
   float UpdateSidecarLoadingRate = 0.2f; // in seconds
