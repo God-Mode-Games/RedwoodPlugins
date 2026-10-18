@@ -62,6 +62,7 @@ namespace RedwoodCurrencySidecarTest {
   const FString CharacterId = TEXT("character-1");
   const FString WriterToken = TEXT("writer-token-1");
   const FString EntryIdA = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+  const FString EntryIdB = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
   const FString CreditEntryId = TEXT("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
   const FString LootReason = TEXT("Currency.Reason.Loot");
   const FString SellReason = TEXT("Currency.Reason.Merchant.Sell");
@@ -414,6 +415,7 @@ bool FRedwoodCurrencySidecarResendCarriesNoRowsTest::RunTest(const FString &Para
     return false;
   }
   TestEqual(TEXT("The first attempt carries the row"), CountArray(First.Payload, TEXT("upserts")), 1);
+  TestFalse(TEXT("The first attempt is not a probe"), First.Payload->HasField(TEXT("probe")));
   // The outcome is unknown: no fence.
   Harness.Answer(First, TEXT(R"({"error":"Item flush request timed out."})"));
   Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
@@ -428,6 +430,11 @@ bool FRedwoodCurrencySidecarResendCarriesNoRowsTest::RunTest(const FString &Para
   TestEqual(TEXT("The re-send carries no upserts"), CountArray(Resend.Payload, TEXT("upserts")), 0);
   TestEqual(TEXT("The re-send carries no deletes"), CountArray(Resend.Payload, TEXT("deletes")), 0);
   TestEqual(TEXT("The re-send carries the entry"), CountArray(Resend.Payload, TEXT("currency")), 1);
+  bool bProbe = false;
+  TestTrue(
+    TEXT("The re-send says it is a probe"),
+    Resend.Payload->TryGetBoolField(TEXT("probe"), bProbe) && bProbe
+  );
 
   // The first attempt had committed: the backend acks the replay.
   Harness.Answer(Resend, TEXT(R"({"error":null,"committedSeq":5})"));
@@ -921,6 +928,126 @@ bool FRedwoodCurrencySidecarUnhydratedTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("The attempt settles at once"), SettleCount, 1);
   TestTrue(TEXT("Nothing leaves"), Harness.IsQuiet());
   TestNull(TEXT("No reload under an empty id"), FAccess::Reload(*Harness.Subsystem, FString()));
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarProbeNotAppliedTest,
+  "Redwood.Currency.Sidecar.ProbeNotAppliedSendsNormalBatch",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The backend says a probed batch never committed: its entry is pending again, unchanged, and the
+// next flush is a normal batch at the same seq that carries it WITH the current rows.
+bool FRedwoodCurrencySidecarProbeNotAppliedTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
+  Actor->Items = {MakeRecord(OwnedItemId), MakeRecord(LaterItemId)};
+  Component->MarkItemsDirty({OwnedItemId});
+  Component->QueueCurrency({MakeEntry(EntryIdA, -250, 750, LootReason)}, {});
+
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+  FRequest First;
+  if (!Harness.ReadRequest(FlushEvent, First)) {
+    return false;
+  }
+  Harness.Answer(First, TEXT(R"({"error":"Item flush request timed out."})"));
+  Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+
+  Component->MarkItemsDirty({LaterItemId});
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+  FRequest Probe;
+  if (!Harness.ReadRequest(FlushEvent, Probe)) {
+    return false;
+  }
+  TestTrue(TEXT("The re-send is a probe"), Probe.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("A probe carries no rows"), CountArray(Probe.Payload, TEXT("upserts")), 0);
+
+  Harness.Answer(Probe, TEXT(R"({"error":"batch was never applied","committedSeq":4,"notApplied":true})"));
+  Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
+  if (TestEqual(TEXT("notApplied drops no entry"), Pending.Num(), 1)) {
+    TestEqual(TEXT("The entry is unchanged"), Pending[0].BalanceAfter, (int64)750);
+  }
+
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+  FRequest Normal;
+  if (!Harness.ReadRequest(FlushEvent, Normal)) {
+    return false;
+  }
+  TestFalse(TEXT("The next batch is not a probe"), Normal.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("It goes out at the same seq"), Normal.Payload->GetNumberField(TEXT("batchSeq")), 5.0);
+  TestEqual(TEXT("It carries both dirty rows"), CountArray(Normal.Payload, TEXT("upserts")), 2);
+  TestEqual(TEXT("It carries the entry"), CountArray(Normal.Payload, TEXT("currency")), 1);
+  TestEqual(TEXT("The entry keeps its balance"), FirstBalanceAfter(Normal.Payload), FString(TEXT("750")));
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarFreezeWaitsForReplyTest,
+  "Redwood.Currency.Sidecar.FreezeWaitsForInFlightReply",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The character freezes while another of its components has a batch in flight. That batch's
+// entries are not logged as dropped; its success reply saves them, and only then does the
+// component freeze. Any error log for them fails this test, since none is expected.
+bool FRedwoodCurrencySidecarFreezeWaitsForReplyTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
+  AddExpectedErrorPlain(
+    TEXT("dropped currency entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta -2000 reason Currency.Reason.Loot, NOT saved"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *SavingActor = nullptr;
+  URedwoodCharacterComponent *SavingComponent = Harness.MakeComponent(SavingActor);
+  ARedwoodCurrencyFlushTestActor *RefusedActor = nullptr;
+  URedwoodCharacterComponent *RefusedComponent = Harness.MakeComponent(RefusedActor);
+
+  SavingComponent->QueueCurrency({MakeEntry(EntryIdB, 100, 1100, LootReason)}, {});
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, SavingComponent);
+  FRequest Saving;
+  if (!Harness.ReadRequest(FlushEvent, Saving)) {
+    return false;
+  }
+
+  RefusedComponent->QueueCurrency({MakeEntry(EntryIdA, -2000, -1000, LootReason)}, {});
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, RefusedComponent);
+  FRequest Refused;
+  if (!Harness.ReadRequest(FlushEvent, Refused)) {
+    return false;
+  }
+  Harness.Answer(Refused, FinalRefusalReply);
+  if (!TestTrue(
+        TEXT("The character freezes"),
+        Harness.PumpUntil([RefusedComponent]() { return RefusedComponent->IsFrozenAfterFinalRefusal(); })
+      )) {
+    return false;
+  }
+
+  // A detached flush of the saving component reaches the freeze while its batch is in flight.
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, SavingComponent, [&SettleCount]() { ++SettleCount; });
+  TestEqual(TEXT("The attempt settles"), SettleCount, 1);
+  TestEqual(TEXT("The in-flight entry is not dropped yet"), SavingComponent->GetPendingCurrencyEntries().Num(), 1);
+
+  Harness.Answer(Saving, TEXT(R"({"error":null,"committedSeq":5})"));
+  TestTrue(
+    TEXT("The component freezes after its reply"),
+    Harness.PumpUntil([SavingComponent]() { return SavingComponent->IsFrozenAfterFinalRefusal(); })
+  );
+  TestEqual(TEXT("The saved entry left the queue as saved"), SavingComponent->GetPendingCurrencyEntries().Num(), 0);
   return true;
 }
 

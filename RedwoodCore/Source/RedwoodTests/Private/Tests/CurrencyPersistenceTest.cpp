@@ -502,3 +502,40 @@ bool FRedwoodCurrencyEntryIdShapeTest::RunTest(const FString &Parameters) {
 
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyFreezeMarksUnknownOutcomeTest,
+  "Redwood.Currency.FreezeMarksUnknownOutcome",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A probe is refused for good. Its entry's first attempt may have committed (its ack was lost), so
+// the freeze log must not tell staff it was not saved: a re-grant would pay it twice.
+bool FRedwoodCurrencyFreezeMarksUnknownOutcomeTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyPersistenceTest;
+  AddExpectedErrorPlain(
+    TEXT("dropped currency entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved). A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  AddExpectedErrorPlain(
+    TEXT("dropped currency entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB delta 200 reason Currency.Reason.Loot, NOT saved"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
+  Component->SeedItemSeqFromCharacter(1);
+
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 500, 500)}, {});
+  int64 BatchSeq = 0;
+  TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
+  Component->CompleteItemFlush(TEXT("socket closed"), -1, Fixture::NoItems, Fixture::NoItems, 1, 0);
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 200, 700)}, {});
+
+  TestTrue(TEXT("Probe claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
+  TestTrue(TEXT("The claim is a probe"), Component->IsItemFlushReplayProbe());
+  Component->CompleteItemFlush(TEXT("refused"), 1, Fixture::NoItems, Fixture::NoItems, 1, 0, true);
+
+  TestTrue(TEXT("The component is frozen"), Component->IsFrozenAfterFinalRefusal());
+  return true;
+}

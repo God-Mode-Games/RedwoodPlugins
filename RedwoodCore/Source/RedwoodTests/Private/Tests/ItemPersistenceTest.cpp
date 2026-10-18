@@ -524,6 +524,14 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     TestEqual(
       TEXT("flush: writerToken"), Payload->GetStringField(TEXT("writerToken")), WriterToken
     );
+    TestFalse(TEXT("flush: no probe field on a normal batch"), Payload->HasField(TEXT("probe")));
+    bool bProbe = false;
+    TestTrue(
+      TEXT("flush: a probe says so"),
+      URedwoodServerGameSubsystem::BuildItemsFlushPayload(CharacterId, 7, {}, {}, {Debit}, {}, WriterToken, true)
+          ->TryGetBoolField(TEXT("probe"), bProbe) &&
+        bProbe
+    );
     const TArray<TSharedPtr<FJsonValue>> *Currency = nullptr;
     TestTrue(
       TEXT("flush: currency array present"),
