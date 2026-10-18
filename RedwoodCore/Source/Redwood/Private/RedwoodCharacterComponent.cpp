@@ -976,17 +976,21 @@ void URedwoodCharacterComponent::MarkWriterFenceLost() {
   UE_LOG(
     LogRedwood,
     Warning,
-    TEXT("Character %s: another session owns this character now (writer fence lost); this component stops sending and keeps %d staged entries unsent"),
-    *RedwoodCharacterId,
-    PendingCurrencyEntries.Num()
+    TEXT("Character %s: another session owns this character now (writer fence lost); this component stops sending"),
+    *RedwoodCharacterId
+  );
+  // Kept, not dropped, but never sent from here: the same lines a freeze writes, so staff can tell
+  // what may need a re-grant.
+  LogStagedCurrency(
+    FString::Printf(TEXT("Writer fence lost: character %s left unsent"), *RedwoodCharacterId)
   );
 }
 
-void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) {
-  // One line per dropped entry and key: the backend has the refusal alert, and these lines are
-  // what staff rebuild the rest from. The front of an unconfirmed batch may have committed (its
-  // ack was lost), so it is told apart: re-granting a saved amount would pay it twice. A re-grant
-  // reuses the logged entry id either way, so the backend's duplicate-id check refuses a copy.
+void URedwoodCharacterComponent::LogStagedCurrency(const FString &Lead) const {
+  // The backend has the refusal alert; these lines are what staff rebuild the rest from. The front
+  // of an unconfirmed batch may have committed (its ack was lost), so it is told apart: re-granting
+  // a saved amount would pay it twice. A re-grant reuses the logged entry id either way, so the
+  // backend's duplicate-id check refuses a copy.
   const int32 UnknownEntryCount = bCurrencyBatchUnconfirmed ? UnconfirmedCurrencyCount : 0;
   const int32 UnknownGrantCount = bCurrencyBatchUnconfirmed ? UnconfirmedGrantCount : 0;
   for (int32 Index = 0; Index < PendingCurrencyEntries.Num(); ++Index) {
@@ -994,9 +998,8 @@ void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) 
     UE_LOG(
       LogRedwood,
       Error,
-      TEXT("Final refusal (%s): character %s dropped currency entry %s delta %lld reason %s, %s. A re-grant must reuse entry id %s, so the backend refuses a second copy."),
-      *Reason,
-      *RedwoodCharacterId,
+      TEXT("%s currency entry %s delta %lld reason %s, %s. A re-grant must reuse entry id %s, so the backend refuses a second copy."),
+      *Lead,
       *Entry.Id,
       Entry.Delta,
       *Entry.Reason,
@@ -1008,13 +1011,18 @@ void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) 
     UE_LOG(
       LogRedwood,
       Error,
-      TEXT("Final refusal (%s): character %s dropped grant %s, %s"),
-      *Reason,
-      *RedwoodCharacterId,
+      TEXT("%s grant %s, %s"),
+      *Lead,
       *PendingGrantKeys[Index],
       Index < UnknownGrantCount ? TEXT("outcome UNKNOWN (it may be saved)") : TEXT("NOT saved")
     );
   }
+}
+
+void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) {
+  LogStagedCurrency(FString::Printf(
+    TEXT("Final refusal (%s): character %s dropped"), *Reason, *RedwoodCharacterId
+  ));
   PendingCurrencyEntries.Empty();
   PendingGrantKeys.Empty();
   bCurrencyBatchUnconfirmed = false;

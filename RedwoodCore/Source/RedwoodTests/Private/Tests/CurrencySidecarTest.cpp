@@ -1069,6 +1069,12 @@ bool FRedwoodCurrencySidecarFlushWriterFenceLostTest::RunTest(const FString &Par
     EAutomationExpectedErrorFlags::Contains,
     1
   );
+  // The kept entry is logged once, the way a freeze logs it, for staff.
+  AddExpectedErrorPlain(
+    TEXT("Writer fence lost: character character-1 left unsent currency entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, NOT saved. A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;

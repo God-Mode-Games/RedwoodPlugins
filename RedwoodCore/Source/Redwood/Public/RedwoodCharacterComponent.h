@@ -631,6 +631,9 @@ private:
     const TArray<TPair<FString, uint64>> &SentDeletes
   );
   void RemoveSentCurrency(int32 SentCurrencyCount, int32 SentGrantCount);
+  // One Error line per staged entry and grant key, each starting with Lead ("<Lead> currency entry
+  // ..."), so staff can rebuild what this server will never save.
+  void LogStagedCurrency(const FString &Lead) const;
   void MarkCurrencyBatchUnconfirmed(int32 SentCurrencyCount, int32 SentGrantCount, int64 SentSeq);
   // FORK(hollowed-oath) END
 
