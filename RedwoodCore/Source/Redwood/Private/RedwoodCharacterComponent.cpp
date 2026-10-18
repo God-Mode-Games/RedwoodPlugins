@@ -834,7 +834,25 @@ void URedwoodCharacterComponent::QueueCurrency(
   // Appended, never merged or de-duplicated: the backend checks each BalanceAfter in order, and a
   // repeated grant key must reach the backend so it refuses the second reward instead of the game
   // server quietly paying it without its guard.
-  PendingCurrencyEntries.Append(Entries);
+  for (const FRedwoodCurrencyEntry &Entry : Entries) {
+    // A bad id would make the backend refuse the whole batch for good, taking every valid entry
+    // and item row sent with it. Refuse the one entry here instead, loudly: it is a caller bug.
+    if (!ensureMsgf(
+          IsValidCurrencyEntryId(Entry.Id),
+          TEXT("QueueCurrency: entry id '%s' is not 32 uppercase hex digits"),
+          *Entry.Id
+        )) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("QueueCurrency: refused entry id '%s' (delta %lld): not 32 uppercase hex digits"),
+        *Entry.Id,
+        Entry.Delta
+      );
+      continue;
+    }
+    PendingCurrencyEntries.Add(Entry);
+  }
   PendingGrantKeys.Append(GrantKeys);
 }
 

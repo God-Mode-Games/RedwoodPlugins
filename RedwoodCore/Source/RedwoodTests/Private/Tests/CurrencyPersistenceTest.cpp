@@ -442,3 +442,39 @@ bool FRedwoodCurrencySequenceGapRealignsTest::RunTest(const FString &Parameters)
 
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyEntryIdShapeTest,
+  "Redwood.Currency.EntryIdShape",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodCurrencyEntryIdShapeTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyPersistenceTest;
+  // Each refusal ensures and logs an error on purpose. An ensure fires once per session, so the
+  // count is open.
+  AddExpectedError(TEXT("not 32 uppercase hex digits"), EAutomationExpectedErrorFlags::Contains, 0);
+
+  const FString MadeId = MakeCurrencyEntryId();
+  TestTrue(TEXT("A made id has the shape the backend checks"), IsValidCurrencyEntryId(MadeId));
+  TestNotEqual(TEXT("Two made ids differ"), MadeId, MakeCurrencyEntryId());
+
+  URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
+  Component->QueueCurrency(
+    {
+      Fixture::MakeEntry(TEXT("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), 1, 1),
+      Fixture::MakeEntry(TEXT("AAAA"), 1, 1),
+      Fixture::MakeEntry(TEXT("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"), 1, 1),
+      Fixture::MakeEntry(MadeId, 1, 1),
+    },
+    {}
+  );
+
+  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
+  TestEqual(TEXT("Only the valid entry is queued"), Pending.Num(), 1);
+  if (Pending.Num() == 1) {
+    TestEqual(TEXT("The queued entry is the made one"), Pending[0].Id, MadeId);
+  }
+
+  return true;
+}

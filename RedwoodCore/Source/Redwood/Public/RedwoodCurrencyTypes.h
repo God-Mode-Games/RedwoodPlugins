@@ -44,6 +44,28 @@ struct REDWOOD_API FRedwoodCurrencyEntry {
   FString ActorAccountId;
 };
 
+// The backend refuses any other id shape for good, so the game server refuses it at the queue.
+constexpr int32 CurrencyEntryIdLength = 32;
+
+// A new entry id in the shape the backend checks: 32 uppercase hex digits.
+inline FString MakeCurrencyEntryId() {
+  return FGuid::NewGuid().ToString(EGuidFormats::Digits).ToUpper();
+}
+
+inline bool IsValidCurrencyEntryId(const FString &Id) {
+  if (Id.Len() != CurrencyEntryIdLength) {
+    return false;
+  }
+  for (const TCHAR Character : Id) {
+    const bool bIsDigit = Character >= TEXT('0') && Character <= TEXT('9');
+    const bool bIsUpperHex = Character >= TEXT('A') && Character <= TEXT('F');
+    if (!bIsDigit && !bIsUpperHex) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // A flush the backend refused for good (`final: true`). The sent entries are gone and the backend
 // has raised an alert; the character must reload before its balance can be trusted again.
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnItemFlushRefusedFinal, const FString & /*Error*/);
