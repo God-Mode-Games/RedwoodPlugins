@@ -485,9 +485,17 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     )));
     TArray<TSharedPtr<FJsonValue>> Deletes;
 
+    // FORK(hollowed-oath): one debit with no optional fields, and one grant key.
+    FRedwoodCurrencyEntry Debit;
+    Debit.Id = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    Debit.Delta = -250;
+    Debit.BalanceAfter = 750;
+    Debit.Reason = TEXT("Currency.Reason.Merchant.Buy");
+    const FString WriterToken = TEXT("writer-token-1");
+
     TSharedPtr<FJsonObject> Payload =
       URedwoodServerGameSubsystem::BuildItemsFlushPayload(
-        CharacterId, 7, Upserts, Deletes
+        CharacterId, 7, Upserts, Deletes, {Debit}, {TEXT("quest:Q1")}, WriterToken
       );
     TestEnvelopeId(TEXT("flush"), Payload);
     TestEqual(
@@ -506,6 +514,96 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
       TEXT("flush: deletes array present"),
       Payload->HasTypedField<EJson::Array>(TEXT("deletes"))
     );
+
+    // FORK(hollowed-oath): amounts travel as decimal STRINGS (a JSON number is a double and cannot
+    // hold every int64), empty optional fields are left out (the backend refuses null), and the
+    // writer token rides every flush.
+    TestEqual(
+      TEXT("flush: writerToken"), Payload->GetStringField(TEXT("writerToken")), WriterToken
+    );
+    const TArray<TSharedPtr<FJsonValue>> *Currency = nullptr;
+    TestTrue(
+      TEXT("flush: currency array present"),
+      Payload->TryGetArrayField(TEXT("currency"), Currency)
+    );
+    const TSharedPtr<FJsonObject> *Entry = nullptr;
+    if (Currency && Currency->Num() == 1 && (*Currency)[0]->TryGetObject(Entry)) {
+      TestTrue(
+        TEXT("flush: delta is a string"), (*Entry)->HasTypedField<EJson::String>(TEXT("delta"))
+      );
+      TestEqual(
+        TEXT("flush: currency[0].delta"),
+        (*Entry)->GetStringField(TEXT("delta")),
+        FString(TEXT("-250"))
+      );
+      TestTrue(
+        TEXT("flush: balanceAfter is a string"),
+        (*Entry)->HasTypedField<EJson::String>(TEXT("balanceAfter"))
+      );
+      TestEqual(
+        TEXT("flush: currency[0].balanceAfter"),
+        (*Entry)->GetStringField(TEXT("balanceAfter")),
+        FString(TEXT("750"))
+      );
+      TestEqual(
+        TEXT("flush: currency[0].id"), (*Entry)->GetStringField(TEXT("id")), Debit.Id
+      );
+      TestEqual(
+        TEXT("flush: currency[0].reason"), (*Entry)->GetStringField(TEXT("reason")), Debit.Reason
+      );
+      TestFalse(
+        TEXT("flush: an empty sourceRef is left out, never null"),
+        (*Entry)->HasField(TEXT("sourceRef"))
+      );
+      TestFalse(
+        TEXT("flush: an empty actorAccountId is left out, never null"),
+        (*Entry)->HasField(TEXT("actorAccountId"))
+      );
+    } else {
+      AddError(TEXT("flush: expected exactly one currency entry object"));
+    }
+    const TArray<TSharedPtr<FJsonValue>> *Grants = nullptr;
+    TestTrue(
+      TEXT("flush: grants array present"), Payload->TryGetArrayField(TEXT("grants"), Grants)
+    );
+    if (Grants && Grants->Num() == 1) {
+      TestEqual(
+        TEXT("flush: grants[0]"), (*Grants)[0]->AsString(), FString(TEXT("quest:Q1"))
+      );
+    } else {
+      AddError(TEXT("flush: expected exactly one grant key"));
+    }
+
+    // A filled optional field goes out as a string, and a large amount keeps every digit.
+    FRedwoodCurrencyEntry Grant = Debit;
+    Grant.Delta = MAX_int64;
+    Grant.SourceRef = TEXT("npc:merchant-1");
+    Grant.ActorAccountId = TEXT("account-gm");
+    TSharedPtr<FJsonObject> GrantPayload = URedwoodServerGameSubsystem::BuildItemsFlushPayload(
+      CharacterId, 8, {}, {}, {Grant}, {}, WriterToken
+    );
+    const TArray<TSharedPtr<FJsonValue>> *GrantCurrency = nullptr;
+    const TSharedPtr<FJsonObject> *GrantEntry = nullptr;
+    if (GrantPayload->TryGetArrayField(TEXT("currency"), GrantCurrency) &&
+        GrantCurrency->Num() == 1 && (*GrantCurrency)[0]->TryGetObject(GrantEntry)) {
+      TestEqual(
+        TEXT("flush: sourceRef sent when set"),
+        (*GrantEntry)->GetStringField(TEXT("sourceRef")),
+        Grant.SourceRef
+      );
+      TestEqual(
+        TEXT("flush: actorAccountId sent when set"),
+        (*GrantEntry)->GetStringField(TEXT("actorAccountId")),
+        Grant.ActorAccountId
+      );
+      TestEqual(
+        TEXT("flush: the int64 maximum keeps every digit"),
+        (*GrantEntry)->GetStringField(TEXT("delta")),
+        FString(TEXT("9223372036854775807"))
+      );
+    } else {
+      AddError(TEXT("flush: expected exactly one granted entry object"));
+    }
   }
 
   // (The blob->row migrate envelope was deleted -- row-per-item is the native model now, so there

@@ -2499,7 +2499,10 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsFlushPayload(
   const FString &CharacterId,
   int64 BatchSeq,
   const TArray<TSharedPtr<FJsonValue>> &Upserts,
-  const TArray<TSharedPtr<FJsonValue>> &Deletes
+  const TArray<TSharedPtr<FJsonValue>> &Deletes,
+  const TArray<FRedwoodCurrencyEntry> &CurrencyEntries,
+  const TArray<FString> &GrantKeys,
+  const FString &WriterToken
 ) {
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("id"), ItemsEnvelopePlaceholderId);
@@ -2507,6 +2510,37 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsFlushPayload(
   Payload->SetNumberField(TEXT("batchSeq"), static_cast<double>(BatchSeq));
   Payload->SetArrayField(TEXT("upserts"), Upserts);
   Payload->SetArrayField(TEXT("deletes"), Deletes);
+
+  // FORK(hollowed-oath): amounts go as decimal strings. A JSON number is a double, which cannot
+  // hold every int64, so a large amount would arrive rounded.
+  TArray<TSharedPtr<FJsonValue>> CurrencyJsonArray;
+  CurrencyJsonArray.Reserve(CurrencyEntries.Num());
+  for (const FRedwoodCurrencyEntry &Entry : CurrencyEntries) {
+    TSharedPtr<FJsonObject> EntryObject = MakeShareable(new FJsonObject);
+    EntryObject->SetStringField(TEXT("id"), Entry.Id);
+    EntryObject->SetStringField(TEXT("delta"), LexToString(Entry.Delta));
+    EntryObject->SetStringField(TEXT("balanceAfter"), LexToString(Entry.BalanceAfter));
+    EntryObject->SetStringField(TEXT("reason"), Entry.Reason);
+    // Optional fields are left out when empty. The backend schema accepts a missing field, but
+    // not null.
+    if (!Entry.SourceRef.IsEmpty()) {
+      EntryObject->SetStringField(TEXT("sourceRef"), Entry.SourceRef);
+    }
+    if (!Entry.ActorAccountId.IsEmpty()) {
+      EntryObject->SetStringField(TEXT("actorAccountId"), Entry.ActorAccountId);
+    }
+    CurrencyJsonArray.Add(MakeShareable(new FJsonValueObject(EntryObject)));
+  }
+  Payload->SetArrayField(TEXT("currency"), CurrencyJsonArray);
+
+  TArray<TSharedPtr<FJsonValue>> GrantsJsonArray;
+  GrantsJsonArray.Reserve(GrantKeys.Num());
+  for (const FString &GrantKey : GrantKeys) {
+    GrantsJsonArray.Add(MakeShareable(new FJsonValueString(GrantKey)));
+  }
+  Payload->SetArrayField(TEXT("grants"), GrantsJsonArray);
+
+  Payload->SetStringField(TEXT("writerToken"), WriterToken);
   return Payload;
 }
 
@@ -2645,6 +2679,29 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     return;
   }
 
+  // FORK(hollowed-oath): everything this batch sends and its reply needs, copied now. The queues
+  // and the dirty maps can change before the reply arrives.
+  FRedwoodItemFlushSent Sent;
+  Sent.BatchSeq = BatchSeq;
+
+  // FORK(hollowed-oath): the currency this batch carries, taken right after the claim because the
+  // claim decides it (an unconfirmed batch goes out again exactly as it was sent). The reply must
+  // name the same counts, so CompleteItemFlush drops exactly what went out.
+  TArray<FRedwoodCurrencyEntry> SentCurrencyEntries;
+  TArray<FString> SentGrantKeys;
+  ClaimCurrencyToSend(CharacterComponent, SentCurrencyEntries, SentGrantKeys);
+  Sent.CurrencyCount = SentCurrencyEntries.Num();
+  Sent.GrantCount = SentGrantKeys.Num();
+  if (SentCurrencyEntries.Num() > 0) {
+    Sent.bHasBalanceAfter = true;
+    Sent.BalanceAfter = SentCurrencyEntries.Last().BalanceAfter;
+  }
+
+  // FORK(hollowed-oath): a re-send of an unconfirmed currency batch carries no item rows. If the
+  // first attempt committed, the backend answers this one as a replay and applies none of its rows,
+  // yet the success reply would clear them.
+  const bool bReplayProbe = CharacterComponent->IsItemFlushReplayProbe();
+
   // Generation counters, not plain ids -- lets CompleteItemFlush tell "the record I sent" apart
   // from "the record as it stands after a re-dirty that arrived while this send was in flight".
   const TMap<FString, uint64> &DirtyGenerations =
@@ -2653,47 +2710,50 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     CharacterComponent->GetPendingDeletedItemGenerations();
 
   TArray<TSharedPtr<FJsonValue>> UpsertsJsonArray;
-  // The exact (id, generation) pairs actually included in UpsertsJsonArray below -- NOT simply
-  // DirtyGenerations, since a dirty id with no matching record (logged below) is never sent and
-  // must not be acked.
-  TArray<TPair<FString, uint64>> SentUpserts;
-  for (const FRedwoodItemRecord &Record : *RecordsArray) {
-    const uint64 *Generation = DirtyGenerations.Find(Record.Id);
-    if (!Generation) {
-      continue;
+  TArray<TSharedPtr<FJsonValue>> DeletesJsonArray;
+  if (!bReplayProbe) {
+    // Sent.Upserts holds the exact (id, generation) pairs actually included in UpsertsJsonArray --
+    // NOT simply DirtyGenerations, since a dirty id with no matching record (logged below) is never
+    // sent and must not be acked.
+    for (const FRedwoodItemRecord &Record : *RecordsArray) {
+      const uint64 *Generation = DirtyGenerations.Find(Record.Id);
+      if (!Generation) {
+        continue;
+      }
+
+      UpsertsJsonArray.Add(MakeShareable(new FJsonValueObject(
+        URedwoodCommonGameSubsystem::SerializeItemRecord(Record)
+      )));
+      Sent.Upserts.Add(TPair<FString, uint64>(Record.Id, *Generation));
     }
 
-    UpsertsJsonArray.Add(MakeShareable(new FJsonValueObject(
-      URedwoodCommonGameSubsystem::SerializeItemRecord(Record)
-    )));
-    SentUpserts.Add(TPair<FString, uint64>(Record.Id, *Generation));
+    if (UpsertsJsonArray.Num() != DirtyGenerations.Num()) {
+      // A dirty item id that isn't in RecordsArray at all -- the game marked it dirty but never
+      // wrote a matching record into the items array before the flush ran. Not fatal (the
+      // deletion, if any, still goes out), but worth surfacing since that record is silently
+      // skipped this flush. It stays dirty (not in Sent.Upserts) so a later flush, once a matching
+      // record exists, retries it.
+      UE_LOG(
+        LogRedwood,
+        Warning,
+        TEXT(
+          "FlushItemsForCharacterComponent: %d dirty item id(s) had no matching record in %s (skipped, left dirty)"
+        ),
+        DirtyGenerations.Num() - UpsertsJsonArray.Num(),
+        *CharacterComponent->ItemsVariableName
+      );
+    }
+
+    for (const TPair<FString, uint64> &Deleted : DeletedGenerations) {
+      DeletesJsonArray.Add(MakeShareable(new FJsonValueString(Deleted.Key)));
+      Sent.Deletes.Add(Deleted);
+    }
   }
 
-  if (UpsertsJsonArray.Num() != DirtyGenerations.Num()) {
-    // A dirty item id that isn't in RecordsArray at all -- the game marked it dirty but never
-    // wrote a matching record into the items array before the flush ran. Not fatal (the deletion,
-    // if any, still goes out), but worth surfacing since that record is silently skipped this
-    // flush. It stays dirty (not in SentUpserts) so a later flush, once a matching record exists,
-    // retries it.
-    UE_LOG(
-      LogRedwood,
-      Warning,
-      TEXT(
-        "FlushItemsForCharacterComponent: %d dirty item id(s) had no matching record in %s (skipped, left dirty)"
-      ),
-      DirtyGenerations.Num() - UpsertsJsonArray.Num(),
-      *CharacterComponent->ItemsVariableName
-    );
-  }
-
-  TArray<TSharedPtr<FJsonValue>> DeletesJsonArray;
-  TArray<TPair<FString, uint64>> SentDeletes;
-  for (const TPair<FString, uint64> &Deleted : DeletedGenerations) {
-    DeletesJsonArray.Add(MakeShareable(new FJsonValueString(Deleted.Key)));
-    SentDeletes.Add(Deleted);
-  }
-
-  if (UpsertsJsonArray.Num() == 0 && DeletesJsonArray.Num() == 0) {
+  // FORK(hollowed-oath): pending currency counts as sendable. Without it a batch of entries alone
+  // would take this path, and the entries would never leave.
+  if (UpsertsJsonArray.Num() == 0 && DeletesJsonArray.Num() == 0 &&
+      SentCurrencyEntries.Num() == 0 && SentGrantKeys.Num() == 0) {
     // Nothing actually sendable (e.g. every dirty id lacked a record). Release the flight slot we
     // just claimed via the ack path with no sent ids and the current committed seq, so the next
     // flush isn't wedged behind a slot that never sent anything. Settle synchronously: no emit
@@ -2710,33 +2770,27 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
                          : CharacterComponent->RedwoodCharacterId,
     BatchSeq,
     UpsertsJsonArray,
-    DeletesJsonArray
+    DeletesJsonArray,
+    SentCurrencyEntries,
+    SentGrantKeys,
+    CharacterComponent->GetWriterToken()
   );
 
-  // SentUpserts/SentDeletes above are already independent copies of the (id, generation) pairs
-  // sent in this payload -- not references into CharacterComponent's live maps, which may change
-  // again (a re-dirty bumping a generation, a new mark, etc.) before this ack arrives.
   TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = CharacterComponent;
-  // FORK(hollowed-oath): carried into the ack so a committed seq can be written back onto the
-  // PlayerState snapshot -- see the write-back at the ack site for why a stale snapshot loses items.
+  // FORK(hollowed-oath): carried into the ack so the committed seq and balance can be written back
+  // onto the PlayerState snapshot -- see ApplyItemsFlushReply for why a stale snapshot loses items.
   TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerStateComponent = PlayerStateComponent;
 
   Sidecar->Emit(
     TEXT("realm:characters:items:flush"),
     Payload,
-    [WeakCharacterComponent, WeakPlayerStateComponent, SentUpserts, SentDeletes, OnAckSettled](auto Response) {
-      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
-      FString Error = MessageStruct->GetStringField(TEXT("error"));
-      // committedSeq rides both success and error (fence/replay) responses; TryGetNumberField
-      // leaves the default when absent (e.g. some error responses), which the error path treats
-      // as "no fence ahead of us" and leaves NextBatchSeq alone -- and avoids a spurious missing-
-      // field warning that GetNumberField would log.
-      // FORK(hollowed-oath): the default is -1, not 0. CompleteItemFlush reads a fence below the
-      // sent seq as a sequence gap and realigns to it; 0 is a real fence (a new character), so an
-      // absent field must not look like one.
-      double CommittedSeqValue = -1.0;
-      MessageStruct->TryGetNumberField(TEXT("committedSeq"), CommittedSeqValue);
-      int64 CommittedSeq = static_cast<int64>(CommittedSeqValue);
+    [WeakCharacterComponent, WeakPlayerStateComponent, Sent, OnAckSettled](auto Response) {
+      // FORK(hollowed-oath): an unreadable reply parses as an error with no fence: the outcome is
+      // unknown, so the batch is kept and re-sent.
+      const TSharedPtr<FJsonObject> *ReplyObject =
+        URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+      const FRedwoodItemFlushReply Reply =
+        ParseItemsFlushReply(ReplyObject ? *ReplyObject : TSharedPtr<FJsonObject>());
 
       URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
       if (!IsValid(CharacterComponent)) {
@@ -2744,9 +2798,9 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
         // in flight -- the single-flight slot lives on that now-dead component, so there is
         // nothing to release or clear. (Inherited exposure: the flush barrier that bounds a
         // detached pawn's lifetime keeps this from leaking a live component's slot.)
-        if (!Error.IsEmpty()) {
+        if (!Reply.Error.IsEmpty()) {
           UE_LOG(
-            LogRedwood, Error, TEXT("Failed to flush items (component gone): %s"), *Error
+            LogRedwood, Error, TEXT("Failed to flush items (component gone): %s"), *Reply.Error
           );
         }
         // Still settle: the detached release barrier must not stall forever just because the
@@ -2757,34 +2811,16 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
         return;
       }
 
-      if (!Error.IsEmpty()) {
-        UE_LOG(LogRedwood, Error, TEXT("Failed to flush items: %s"), *Error);
+      if (!Reply.Error.IsEmpty()) {
+        UE_LOG(LogRedwood, Error, TEXT("Failed to flush items: %s"), *Reply.Error);
       }
 
-      // ALWAYS complete (success or error): CompleteItemFlush releases the single-flight slot and,
-      // on success, clears only the generation-matched sent ids and advances the committed seq; on
-      // error it leaves the dirt for the next flush (realigning NextBatchSeq only if the backend
-      // reports a fence at/past the seq we sent).
-      CharacterComponent->CompleteItemFlush(
-        Error, CommittedSeq, SentUpserts, SentDeletes
+      // ALWAYS complete (success or error): CompleteItemFlush (inside) releases the single-flight
+      // slot and, on success, clears only the generation-matched sent ids and advances the
+      // committed seq; on error it leaves the dirt for the next flush.
+      ApplyItemsFlushReply(
+        CharacterComponent, WeakPlayerStateComponent.Get(), Reply, Sent
       );
-
-      // FORK(hollowed-oath): write the committed fence back onto the PlayerState snapshot.
-      // Only the COMPONENT's seq state advanced above; PlayerStateComponent->RedwoodCharacter
-      // .InventorySeq stayed at its login value. A character component recreated later in the
-      // session -- a respawn re-creating a pawn-owned component is the ordinary case -- seeds
-      // itself from that snapshot (SeedItemSeqFromCharacter), so it would send an ALREADY USED
-      // batchSeq. The backend no-ops that batch as a replay, and the no-op's success ack then
-      // clears the new component's dirty rows: the mutation is lost with every side reporting
-      // success. Keeping the snapshot current means a recreated component starts where the
-      // channel actually is.
-      if (Error.IsEmpty() && CommittedSeq > 0) {
-        if (URedwoodPlayerStateComponent *StateComponent = WeakPlayerStateComponent.Get()) {
-          if (StateComponent->RedwoodCharacter.InventorySeq < CommittedSeq) {
-            StateComponent->RedwoodCharacter.InventorySeq = CommittedSeq;
-          }
-        }
-      }
 
       // Settle AFTER CompleteItemFlush, on both success and error: the release barrier's rule is
       // "the attempt resolved", which is exactly here.
@@ -2793,6 +2829,117 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
       }
     }
   );
+}
+
+// FORK(hollowed-oath): the currency ledger steps of the item flush. See the declarations.
+void URedwoodServerGameSubsystem::ClaimCurrencyToSend(
+  const URedwoodCharacterComponent *CharacterComponent,
+  TArray<FRedwoodCurrencyEntry> &OutEntries,
+  TArray<FString> &OutGrantKeys
+) {
+  const TArray<FRedwoodCurrencyEntry> &PendingEntries =
+    CharacterComponent->GetPendingCurrencyEntries();
+  const TArray<FString> &PendingGrantKeys = CharacterComponent->GetPendingGrantKeys();
+  OutEntries.Append(
+    PendingEntries.GetData(),
+    FMath::Min(CharacterComponent->GetCurrencyEntriesToSendCount(), PendingEntries.Num())
+  );
+  OutGrantKeys.Append(
+    PendingGrantKeys.GetData(),
+    FMath::Min(CharacterComponent->GetGrantKeysToSendCount(), PendingGrantKeys.Num())
+  );
+}
+
+FRedwoodItemFlushReply URedwoodServerGameSubsystem::ParseItemsFlushReply(
+  const TSharedPtr<FJsonObject> &Reply
+) {
+  FRedwoodItemFlushReply Parsed;
+  if (!Reply.IsValid()) {
+    Parsed.Error = TEXT("unreadable item flush reply");
+    return Parsed;
+  }
+
+  // A JSON null error reads as empty: that is the backend's success shape.
+  Reply->TryGetStringField(TEXT("error"), Parsed.Error);
+  // committedSeq rides both success and error (fence/replay) responses. TryGetNumberField leaves
+  // the default when it is absent, and avoids the missing-field warning GetNumberField would log.
+  // The default is -1, not 0: CompleteItemFlush reads a fence below the sent seq as a sequence gap
+  // and realigns to it, and 0 is a real fence (a new character), so an absent field must not look
+  // like one.
+  double CommittedSeqValue = -1.0;
+  Reply->TryGetNumberField(TEXT("committedSeq"), CommittedSeqValue);
+  Parsed.CommittedSeq = static_cast<int64>(CommittedSeqValue);
+  // Both optional: a backend that predates them sends neither, and both then mean false.
+  Reply->TryGetBoolField(TEXT("final"), Parsed.bFinal);
+  Reply->TryGetBoolField(TEXT("rebaseRequired"), Parsed.bRebaseRequired);
+
+  const TArray<TSharedPtr<FJsonValue>> *AlertValues = nullptr;
+  if (Reply->TryGetArrayField(TEXT("alerts"), AlertValues)) {
+    for (const TSharedPtr<FJsonValue> &AlertValue : *AlertValues) {
+      const TSharedPtr<FJsonObject> *AlertObject = nullptr;
+      if (AlertValue.IsValid() && AlertValue->TryGetObject(AlertObject) && AlertObject) {
+        Parsed.Alerts.Add(*AlertObject);
+      }
+    }
+  }
+  return Parsed;
+}
+
+void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+  URedwoodCharacterComponent *CharacterComponent,
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  const FRedwoodItemFlushReply &Reply,
+  const FRedwoodItemFlushSent &Sent
+) {
+  // The snapshot is updated BEFORE CompleteItemFlush, because CompleteItemFlush runs a parked flush
+  // attempt, and that attempt seeds its seq forward from the snapshot.
+  if (PlayerStateComponent) {
+    FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+
+    // Write the committed fence back onto the PlayerState snapshot. Only the COMPONENT's seq state
+    // advances in CompleteItemFlush; the snapshot would otherwise stay at its login value. A
+    // character component recreated later in the session -- a respawn re-creating a pawn-owned
+    // component is the ordinary case -- seeds itself from that snapshot
+    // (SeedItemSeqFromCharacter), so it would send an ALREADY USED batchSeq. The backend no-ops
+    // that batch as a replay, and the no-op's success ack then clears the new component's dirty
+    // rows: the mutation is lost with every side reporting success.
+    if (Reply.Error.IsEmpty() && Reply.CommittedSeq > 0 &&
+        Snapshot.InventorySeq < Reply.CommittedSeq) {
+      Snapshot.InventorySeq = Reply.CommittedSeq;
+    }
+
+    // The committed balance, for the same reason: a recreated component and the game chain new
+    // entries from it. Only when the fence is exactly this batch's seq: a later fence means
+    // something else (a trade) committed after it, and the last BalanceAfter is then not the
+    // balance.
+    if (Reply.Error.IsEmpty() && Sent.bHasBalanceAfter && Reply.CommittedSeq == Sent.BatchSeq) {
+      Snapshot.CurrencyAmount = Sent.BalanceAfter;
+    }
+
+    // On a sequence gap the component realigns its lane back to the backend's fence. The snapshot
+    // must follow, or the forward seed in FlushItemsForCharacterComponent moves the lane straight
+    // back to the gapped seq, which the backend refuses forever.
+    const bool bSequenceGap = !Reply.Error.IsEmpty() && !Reply.bFinal && !Reply.bRebaseRequired &&
+      Reply.CommittedSeq >= 0 && Reply.CommittedSeq < Sent.BatchSeq - 1;
+    if (bSequenceGap && Snapshot.InventorySeq > Reply.CommittedSeq) {
+      Snapshot.InventorySeq = Reply.CommittedSeq;
+    }
+  }
+
+  CharacterComponent->CompleteItemFlush(
+    Reply.Error,
+    Reply.CommittedSeq,
+    Sent.Upserts,
+    Sent.Deletes,
+    Sent.CurrencyCount,
+    Sent.GrantCount,
+    Reply.bFinal,
+    Reply.bRebaseRequired
+  );
+
+  if (Reply.Alerts.Num() > 0) {
+    CharacterComponent->OnCurrencyAlerts.Broadcast(Reply.Alerts);
+  }
 }
 
 bool URedwoodServerGameSubsystem::AppendOfflineItemRows(

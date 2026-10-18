@@ -5,6 +5,8 @@
 #include "RedwoodGameplayTags.h"
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
+// FORK(hollowed-oath): currency entries ride the item flush.
+#include "RedwoodCurrencyTypes.h"
 
 #include "CoreMinimal.h"
 #include "Engine/TimerHandle.h"
@@ -23,6 +25,31 @@ class URedwoodSyncComponent;
 // (fork-added).
 class URedwoodCharacterComponent;
 class URedwoodPlayerStateComponent;
+
+// FORK(hollowed-oath) BEGIN: currency ledger types for the item flush (fork-added).
+// The fields of a realm:characters:items:flush reply. An error reply means the batch was NOT
+// saved, whatever CommittedSeq says.
+struct FRedwoodItemFlushReply {
+  FString Error;
+  // -1 when the reply carried no fence (a dropped socket, a timeout).
+  int64 CommittedSeq = -1;
+  bool bFinal = false;
+  bool bRebaseRequired = false;
+  TArray<TSharedPtr<FJsonObject>> Alerts;
+};
+
+// What one flush claimed and sent, kept for its reply.
+struct FRedwoodItemFlushSent {
+  int64 BatchSeq = 0;
+  TArray<TPair<FString, uint64>> Upserts;
+  TArray<TPair<FString, uint64>> Deletes;
+  int32 CurrencyCount = 0;
+  int32 GrantCount = 0;
+  // The last sent entry's BalanceAfter: the balance the backend holds once this batch commits.
+  bool bHasBalanceAfter = false;
+  int64 BalanceAfter = 0;
+};
+// FORK(hollowed-oath) END
 
 UCLASS(BlueprintType)
 class REDWOOD_API URedwoodServerGameSubsystem : public UGameInstanceSubsystem {
@@ -279,17 +306,47 @@ public:
   // reaches the realm; this was live-broken for both routes on the first deployed channel ("id is
   // a required field") because no test covered the envelope layer. Emit sites MUST build their
   // payloads through these.
+  // FORK(hollowed-oath): the flush also carries the claimed currency entries and grant keys, and
+  // the session's writer token on every batch (the backend commits nothing for another token).
   static TSharedPtr<FJsonObject> BuildItemsFlushPayload(
     const FString &CharacterId,
     int64 BatchSeq,
     const TArray<TSharedPtr<FJsonValue>> &Upserts,
-    const TArray<TSharedPtr<FJsonValue>> &Deletes
+    const TArray<TSharedPtr<FJsonValue>> &Deletes,
+    const TArray<FRedwoodCurrencyEntry> &CurrencyEntries,
+    const TArray<FString> &GrantKeys,
+    const FString &WriterToken
   );
   static TSharedPtr<FJsonObject> BuildItemsTradePayload(
     const FString &FromCharacterId,
     const FString &ToCharacterId,
     const TArray<FRedwoodTradeRootPlacement> &RootPlacements
   );
+
+  // FORK(hollowed-oath): currency ledger steps of the item flush, static so the tests can
+  // drive them without a sidecar.
+  //
+  // Copies exactly the entries and keys the component says the next batch must carry, from the
+  // front of its queues. Read right after TryBeginItemFlush: the counts depend on the claim (an
+  // unconfirmed batch is re-sent exactly as it went out).
+  static void ClaimCurrencyToSend(
+    const URedwoodCharacterComponent *CharacterComponent,
+    TArray<FRedwoodCurrencyEntry> &OutEntries,
+    TArray<FString> &OutGrantKeys
+  );
+
+  static FRedwoodItemFlushReply ParseItemsFlushReply(const TSharedPtr<FJsonObject> &Reply);
+
+  // Hands the reply to CompleteItemFlush and keeps the PlayerState snapshot (nullable) in step:
+  // the committed seq and balance on success, a lowered seq on a sequence gap. Broadcasts the
+  // reply's alerts.
+  static void ApplyItemsFlushReply(
+    URedwoodCharacterComponent *CharacterComponent,
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    const FRedwoodItemFlushReply &Reply,
+    const FRedwoodItemFlushSent &Sent
+  );
+
   // FORK(hollowed-oath) END
 
   // FORK(hollowed-oath): fork-added API (with EmitPlayerLeft below), not in
