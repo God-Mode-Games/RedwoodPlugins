@@ -241,6 +241,26 @@ void URedwoodServerGameSubsystem::Deinitialize() {
         *GrantKey
       );
     }
+    for (const TPair<FString, uint64> &Upsert : Flight.Sent.Upserts) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Server shutting down: character %s left in flight item row %s (generation %llu, upsert), outcome UNKNOWN (it may be saved)"),
+        *Flight.CharacterId,
+        *Upsert.Key,
+        Upsert.Value
+      );
+    }
+    for (const TPair<FString, uint64> &Delete : Flight.Sent.Deletes) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Server shutting down: character %s left in flight item row %s (generation %llu, delete), outcome UNKNOWN (it may be saved)"),
+        *Flight.CharacterId,
+        *Delete.Key,
+        Delete.Value
+      );
+    }
     if (Flight.OnAckSettled) {
       Flight.OnAckSettled();
     }

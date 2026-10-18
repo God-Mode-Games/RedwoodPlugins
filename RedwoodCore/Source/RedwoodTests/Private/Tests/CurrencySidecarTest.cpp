@@ -2889,6 +2889,16 @@ bool FRedwoodCurrencySidecarShutdownOpenFlushTest::RunTest(const FString &Parame
     EAutomationExpectedErrorFlags::Contains,
     1
   );
+  AddExpectedErrorPlain(
+    FString::Printf(TEXT("left in flight item row %s (generation"), *OwnedItemId),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  AddExpectedErrorPlain(
+    FString::Printf(TEXT("left in flight item row %s (generation"), *LaterItemId),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
@@ -2896,6 +2906,9 @@ bool FRedwoodCurrencySidecarShutdownOpenFlushTest::RunTest(const FString &Parame
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
   Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {RewardKey});
+  Actor->Items = {MakeRecord(OwnedItemId)};
+  Component->MarkItemsDirty({OwnedItemId});
+  Component->MarkItemsDeleted({LaterItemId});
   int32 SettleCount = 0;
   Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
   FRequest Flush;
