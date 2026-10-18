@@ -3038,4 +3038,48 @@ bool FRedwoodCurrencySidecarRowsOnlyTimedOutTest::RunTest(const FString &Paramet
   return ProbeThenSendRowsAfterSeq(Harness, Component, SentSeq);
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeReconnectResendsTest,
+  "Redwood.Currency.Trade.ReconnectResendsAtOnce",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A trade whose connection drops before its reply goes out again as soon as the sidecar is back,
+// byte for byte, with both lanes still held; it does not wait for the reply timeout.
+bool FRedwoodCurrencyTradeReconnectResendsTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FAccess::BindConnectedCallback(*Harness.Subsystem);
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  FTradeResult Result;
+  FRequest First;
+  if (!SendTrade(Harness, From, To, Result, First)) {
+    return false;
+  }
+  TSharedPtr<FSocketIONative> Socket = Harness.SidecarCopy;
+  if (!TestTrue(TEXT("The sidecar restarts"), Harness.Server->CloseWithCode(ServiceRestartCloseCode)) ||
+      !TestTrue(TEXT("The socket sees it"), Harness.PumpUntil([Socket]() { return !Socket->bIsConnected; })) ||
+      !Harness.AcceptAndWait()) {
+    return false;
+  }
+  FRequest Resend;
+  if (!Harness.ReadRequest(TradeEvent, Resend)) {
+    return false;
+  }
+  TestEqual(TEXT("The resend is byte for byte the first send"), SerializePayload(Resend.Payload), SerializePayload(First.Payload));
+  TestEqual(TEXT("The trade is not settled yet"), Result.Calls, 0);
+  Harness.Answer(Resend, CommittedReply(FromSeq + 1, ToSeq + 1));
+  TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
+  TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER

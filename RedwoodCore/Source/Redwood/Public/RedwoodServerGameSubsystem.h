@@ -977,6 +977,8 @@ private:
   void HandleItemsTradeTimeout(const FString &TradeId, uint64 Generation);
   // After an attempt whose outcome is unknown, or that did not reach the realm.
   void RetryItemsTrade(const FString &TradeId, const FString &Reason);
+  // Sends every trade that waited for the sidecar, and at once every trade whose reply was lost with
+  // the dropped connection.
   void ResumeItemsTradesAfterSidecarConnect();
   // A committed trade: each side adopts its fence and balance.
   void CommitItemsTrade(const FString &TradeId, const FRedwoodItemTradeReply &Reply);

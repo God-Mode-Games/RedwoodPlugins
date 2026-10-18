@@ -4489,13 +4489,34 @@ void URedwoodServerGameSubsystem::RetryItemsTrade(const FString &TradeId, const 
 void URedwoodServerGameSubsystem::ResumeItemsTradesAfterSidecarConnect() {
   // Keys first: a send can end its trade and change the map.
   TArray<FString> WaitingTradeIds;
-  for (const TPair<FString, FRedwoodPendingItemTrade> &Pair : PendingItemTrades) {
+  TArray<FString> UnansweredTradeIds;
+  for (TPair<FString, FRedwoodPendingItemTrade> &Pair : PendingItemTrades) {
     if (Pair.Value.bWaitingForSidecar) {
       WaitingTradeIds.Add(Pair.Key);
+    } else if (Pair.Value.Generation != 0) {
+      // FORK(hollowed-oath): sent on the dropped connection, so its reply never comes. Its outcome
+      // is unknown from here, and a late reply to it is ignored: send it again now instead of
+      // waiting out TradeReplyTimeoutSeconds. The receipt acks it if it committed.
+      Pair.Value.Generation = 0;
+      Pair.Value.bOutcomeUnknown = true;
+      UnansweredTradeIds.Add(Pair.Key);
     }
   }
   for (const FString &TradeId : WaitingTradeIds) {
     SendItemsTrade(TradeId);
+  }
+  for (const FString &TradeId : UnansweredTradeIds) {
+    const FRedwoodPendingItemTrade *Trade = PendingItemTrades.Find(TradeId);
+    if (!Trade) {
+      continue;
+    }
+    if (Trade->Attempts >= TradeMaxAttempts) {
+      GiveUpItemsTrade(
+        TradeId, FString::Printf(TEXT("the connection dropped; %d attempts made"), Trade->Attempts)
+      );
+    } else {
+      SendItemsTrade(TradeId);
+    }
   }
 }
 
