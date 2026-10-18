@@ -4571,6 +4571,19 @@ FRedwoodItemTradeReply URedwoodServerGameSubsystem::ParseItemsTradeReply(
     );
   }
   Reply->TryGetBoolField(TEXT("writerFenceLost"), Parsed.bWriterFenceLost);
+  const bool bNamesFromSide =
+    Reply->TryGetBoolField(TEXT("fromWriterFenceLost"), Parsed.bFromWriterFenceLost);
+  const bool bNamesToSide =
+    Reply->TryGetBoolField(TEXT("toWriterFenceLost"), Parsed.bToWriterFenceLost);
+  // An older realm names no side. Both are then read as lost, which is safe: a lost fence drops
+  // nothing (it is logged for staff), sends nothing more, and ends with the kick (R36), so the
+  // player signs in again with a fresh token. Reading neither as lost would let the stale one write.
+  if (Parsed.bWriterFenceLost && !bNamesFromSide && !bNamesToSide) {
+    Parsed.bFromWriterFenceLost = true;
+    Parsed.bToWriterFenceLost = true;
+  }
+  Parsed.bWriterFenceLost =
+    Parsed.bWriterFenceLost || Parsed.bFromWriterFenceLost || Parsed.bToWriterFenceLost;
   ParseCurrencyAlerts(Reply, Parsed.Alerts);
   return Parsed;
 }
@@ -4662,6 +4675,37 @@ void URedwoodServerGameSubsystem::HandleItemsTradeReply(
         RetryItemsTrade(TradeId, Parsed.Error);
         return;
       }
+      if (Parsed.bWriterFenceLost) {
+        // R37: another session owns the side the realm names. That side stops sending, as after a
+        // flush's writerFenceLost. Copies: the game's reaction to the lost fence may move this
+        // trade in the map.
+        const bool bResendAfterUnknown = Trade->bOutcomeUnknown;
+        const TWeakObjectPtr<URedwoodCharacterComponent> Fenced[] = {
+          Parsed.bFromWriterFenceLost ? Trade->From.CharacterComponent
+                                      : TWeakObjectPtr<URedwoodCharacterComponent>(),
+          Parsed.bToWriterFenceLost ? Trade->To.CharacterComponent
+                                    : TWeakObjectPtr<URedwoodCharacterComponent>(),
+        };
+        for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Fenced) {
+          if (URedwoodCharacterComponent *Component = WeakComponent.Get()) {
+            Component->MarkWriterFenceLost();
+          }
+        }
+        // The realm checks the fence before the receipt, so on a resend after an unknown outcome
+        // this refusal says nothing about whether the earlier attempt committed: give up, which
+        // logs every entry as UNKNOWN and freezes the side that is still this session's, so it
+        // loads from the database again.
+        if (bResendAfterUnknown) {
+          GiveUpItemsTrade(
+            TradeId, TEXT("a resend after an unknown outcome was refused for a lost writer fence")
+          );
+          return;
+        }
+        Trade = PendingItemTrades.Find(TradeId);
+        if (!Trade) {
+          return;
+        }
+      }
       break;
   }
 
@@ -4669,18 +4713,6 @@ void URedwoodServerGameSubsystem::HandleItemsTradeReply(
   // the balance before it, which is still the backend's, and the game is told. Copies: the game
   // reacts to the rebase and may start another trade, which can move this one in the map.
   const FRedwoodItemTradeSide Sides[] = {Trade->From, Trade->To};
-  // FORK(hollowed-oath): another session owns one of the characters. The reply does not say which,
-  // so both sides stop sending, as after a flush's writerFenceLost. That is safe for the side whose
-  // session is still current: a lost fence drops nothing (it is logged for staff), sends nothing
-  // more, and ends with the kick (R36), so the player signs in again and loads the database's
-  // state with a fresh token. Marking only one side would let the wrong one go on writing.
-  if (Parsed.bWriterFenceLost) {
-    for (const FRedwoodItemTradeSide &Side : Sides) {
-      if (URedwoodCharacterComponent *Component = Side.CharacterComponent.Get()) {
-        Component->MarkWriterFenceLost();
-      }
-    }
-  }
   for (const FRedwoodItemTradeSide &Side : Sides) {
     URedwoodCharacterComponent *Component = Side.CharacterComponent.Get();
     if (IsValid(Component) && Side.Entries.Num() > 0) {
@@ -4849,13 +4881,25 @@ void URedwoodServerGameSubsystem::GiveUpItemsTrade(const FString &TradeId, const
   // to one finds the other frozen too. Copies, because that reaction may move this trade in the map.
   const FString Error = FString::Printf(TEXT("trade %s outcome unknown: %s"), *TradeId, *Reason);
   const FRedwoodItemTradeSide Sides[] = {Trade->From, Trade->To};
+  // A side whose writer fence is lost is not this session's character any more: it sends nothing,
+  // has logged what it holds and has told the game. Freezing it would only log it twice.
+  auto IsFenceLost = [](const FRedwoodItemTradeSide &Side) {
+    const URedwoodCharacterComponent *Component = Side.CharacterComponent.Get();
+    return Component && Component->IsWriterFenceLost();
+  };
   for (const FRedwoodItemTradeSide &Side : Sides) {
+    if (IsFenceLost(Side)) {
+      continue;
+    }
     FreezeCharacter(Side.CharacterId, Side.PlayerStateComponent.Get());
     if (URedwoodCharacterComponent *Component = Side.CharacterComponent.Get()) {
       Component->FreezeAfterFinalRefusal(Error);
     }
   }
   for (const FRedwoodItemTradeSide &Side : Sides) {
+    if (IsFenceLost(Side)) {
+      continue;
+    }
     if (URedwoodCharacterComponent *Component = Side.CharacterComponent.Get()) {
       Component->NotifyItemFlushRefusedFinal(Error);
     }

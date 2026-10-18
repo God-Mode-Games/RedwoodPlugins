@@ -98,8 +98,11 @@ struct FRedwoodItemTradeReply {
   // Set by the realm when it holds a receipt for this trade id with other contents.
   bool bTradeIdReused = false;
   // Set by the realm when a side's writer token is stale: another session owns that character.
-  // The reply does not say which side.
+  // bWriterFenceLost is the summary, the two others name the side (R37). An older realm sends only
+  // the summary; both sides are then read as lost (see ParseItemsTradeReply).
   bool bWriterFenceLost = false;
+  bool bFromWriterFenceLost = false;
+  bool bToWriterFenceLost = false;
   TArray<TSharedPtr<FJsonObject>> Alerts;
 };
 
@@ -1026,7 +1029,8 @@ private:
   void ResumeItemsTradesAfterSidecarConnect();
   // A committed trade: each side adopts its fence and balance.
   void CommitItemsTrade(const FString &TradeId, const FRedwoodItemTradeReply &Reply);
-  // A trade whose outcome cannot be learned: logs it for staff and freezes both characters.
+  // A trade whose outcome cannot be learned: logs it for staff and freezes both characters, except
+  // a side whose writer fence is lost: that one already stops sending and has told the game.
   void GiveUpItemsTrade(const FString &TradeId, const FString &Reason);
   // Ends the trade: tells the caller, then resumes every held flush.
   void FinishItemsTrade(

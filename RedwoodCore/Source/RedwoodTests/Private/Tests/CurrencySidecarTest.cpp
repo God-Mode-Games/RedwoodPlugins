@@ -3942,19 +3942,84 @@ bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   FRedwoodCurrencyTradeWriterFenceLostTest,
-  "Redwood.Currency.Trade.WriterFenceLostMarksBothSides",
+  "Redwood.Currency.Trade.WriterFenceLostMarksNamedSide",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// The realm refuses the trade because another session owns one of the characters (writerFenceLost)
-// and does not say which. The trade settles as not applied, and both sides lose their fence: neither
-// sends again, and neither is frozen.
+// R37: a first send refused because another session owns a character settles as not applied, and
+// only the side the realm names loses its fence. An older realm sends only the summary flag and
+// names no side: then both lose it. Nobody freezes.
 bool FRedwoodCurrencyTradeWriterFenceLostTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencyTradeTest;
-  AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, 1);
-  AddExpectedErrorPlain(
-    TEXT("lost its writer fence (another session owns it); refused entry"), EAutomationExpectedErrorFlags::Contains, 1
-  );
+  struct FCase {
+    const TCHAR *What;
+    const TCHAR *Flags;
+    bool bFromLost;
+    bool bToLost;
+  };
+  const FCase Cases[] = {
+    {TEXT("the from side only"), TEXT(R"("writerFenceLost":true,"fromWriterFenceLost":true)"), true, false},
+    {TEXT("the to side only"), TEXT(R"("writerFenceLost":true,"toWriterFenceLost":true)"), false, true},
+    {TEXT("the summary only (an older realm)"), TEXT(R"("writerFenceLost":true)"), true, true},
+  };
+  AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, UE_ARRAY_COUNT(Cases));
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  for (const FCase &Case : Cases) {
+    // Fresh parties each time: a lost fence never comes back.
+    FParty From;
+    FParty To;
+    if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+        !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+      return false;
+    }
+    FTradeResult Result;
+    FRequest Request;
+    Harness.Subsystem->EmitItemsTrade(
+      From.Component, To.Component, {}, MakeTradeCurrency(TradedAmount, TradedAmount),
+      MakeCurrencyEntryId(), Capture(Result)
+    );
+    if (!Harness.ReadRequest(TradeEvent, Request)) {
+      return false;
+    }
+    Harness.Answer(
+      Request,
+      FString::Printf(
+        TEXT(R"({"error":"character is owned by another session","fromCommittedSeq":-1,"toCommittedSeq":-1,%s})"),
+        Case.Flags
+      )
+    );
+    const FString What(Case.What);
+    TestTrue(What + TEXT(": the trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
+    TestFalse(What + TEXT(": as not applied"), Result.Error.IsEmpty());
+    TestEqual(What + TEXT(": the payer's fence"), From.Component->IsWriterFenceLost(), Case.bFromLost);
+    TestEqual(What + TEXT(": the payee's fence"), To.Component->IsWriterFenceLost(), Case.bToLost);
+    TestFalse(
+      What + TEXT(": nobody is frozen"),
+      Harness.Subsystem->IsCharacterFrozen(FromId) || Harness.Subsystem->IsCharacterFrozen(ToId)
+    );
+    TestEqual(What + TEXT(": no seq moves"), From.Component->GetLastCommittedItemSeq(), FromSeq);
+  }
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeResendFenceLostGivesUpTest,
+  "Redwood.Currency.Trade.ResendFenceLostGivesUp",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// R37: the first send times out, and the resend is refused because another session owns the payee.
+// The realm checks the fence before the receipt, so the refusal says nothing about the first send:
+// the trade gives up. Every entry is logged as UNKNOWN, the payee loses its fence, and the payer,
+// still this session's, freezes so that it loads from the database again.
+bool FRedwoodCurrencyTradeResendFenceLostGivesUpTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, 2);
+  AddExpectedErrorPlain(TEXT("Its outcome is UNKNOWN"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedErrorPlain(TEXT("outcome UNKNOWN (it may be saved): in trade"), EAutomationExpectedErrorFlags::Contains, 2);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
@@ -3966,24 +4031,28 @@ bool FRedwoodCurrencyTradeWriterFenceLostTest::RunTest(const FString &Parameters
     return false;
   }
   FTradeResult Result;
-  FRequest Trade;
-  if (!SendTrade(Harness, From, To, Result, Trade)) {
+  FRequest First;
+  if (!SendTrade(Harness, From, To, Result, First)) {
+    return false;
+  }
+  Harness.Answer(First, TimedOutReply());
+  PumpFor(QuietWindowSeconds);
+  FAccess::ResendTradeNow(*Harness.Subsystem, TradeId);
+  FRequest Resend;
+  if (!Harness.ReadRequest(TradeEvent, Resend)) {
     return false;
   }
   Harness.Answer(
-    Trade,
-    TEXT(R"({"error":"character is owned by another session","fromCommittedSeq":-1,"toCommittedSeq":-1,"writerFenceLost":true})")
+    Resend,
+    TEXT(R"({"error":"character is owned by another session","fromCommittedSeq":-1,"toCommittedSeq":-1,"writerFenceLost":true,"toWriterFenceLost":true})")
   );
   TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
-  TestFalse(TEXT("As not applied"), Result.Error.IsEmpty());
-  TestTrue(TEXT("The payer's fence is lost"), From.Component->IsWriterFenceLost());
+  TestFalse(TEXT("With an error"), Result.Error.IsEmpty());
   TestTrue(TEXT("The payee's fence is lost"), To.Component->IsWriterFenceLost());
-  TestFalse(TEXT("Nobody is frozen"), Harness.Subsystem->IsCharacterFrozen(FromId) || Harness.Subsystem->IsCharacterFrozen(ToId));
-  TestEqual(TEXT("No seq moves"), From.Component->GetLastCommittedItemSeq(), FromSeq);
-  TestFalse(
-    TEXT("A fenced side takes no new currency"),
-    From.Component->QueueCurrency({MakeEntry(EntryIdB, LootAmount, FromBalance + LootAmount, LootReason)}, {})
-  );
+  TestFalse(TEXT("The payer's fence holds"), From.Component->IsWriterFenceLost());
+  TestTrue(TEXT("The payer freezes, so it loads from the database again"), Harness.Subsystem->IsCharacterFrozen(FromId));
+  TestFalse(TEXT("The fenced payee is not frozen as well"), Harness.Subsystem->IsCharacterFrozen(ToId));
+  TestTrue(TEXT("Nothing more goes out"), Harness.IsQuiet());
   return true;
 }
 
