@@ -2638,6 +2638,13 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     return;
   }
 
+  // FORK(hollowed-oath): another session owns this character (see IsWriterFenceLost). Never send
+  // again, not even a probe; settle so a detached pawn's barrier releases.
+  if (CharacterComponent->IsWriterFenceLost()) {
+    Settle();
+    return;
+  }
+
   // FORK(hollowed-oath): a final refusal froze this character. Nothing staged can be trusted, so
   // whatever this component staged since is dropped (and logged), and the attempt settles with
   // nothing left to save: a detached pawn's write binding releases as usual. With a batch of this
@@ -2895,6 +2902,12 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
         UE_LOG(LogRedwood, Error, TEXT("Failed to flush items: %s"), *Reply.Error);
       }
 
+      // FORK(hollowed-oath): before the component takes the reply, so the parked attempt it runs
+      // already sees that this session no longer owns the character.
+      if (Reply.bWriterFenceLost) {
+        CharacterComponent->MarkWriterFenceLost();
+      }
+
       // FORK(hollowed-oath): a final refusal freezes the whole character, BEFORE the component
       // takes the reply. CompleteItemFlush then freezes the component (dropping and logging all it
       // staged) and tells the game; by then every other component of the character, and a parked
@@ -2913,7 +2926,9 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
       );
 
       URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
-      if (Subsystem && Subsystem->IsCharacterFrozen(CharacterId)) {
+      if (CharacterComponent->IsWriterFenceLost()) {
+        // Nothing more to do: no reload or freeze for a session that no longer owns the character.
+      } else if (Subsystem && Subsystem->IsCharacterFrozen(CharacterId)) {
         // FORK(hollowed-oath): the character froze while this batch was in flight. Its reply has
         // removed what committed; drop the rest now.
         if (!CharacterComponent->IsFrozenAfterFinalRefusal()) {
@@ -2983,6 +2998,7 @@ FRedwoodItemFlushReply URedwoodServerGameSubsystem::ParseItemsFlushReply(
   Reply->TryGetBoolField(TEXT("final"), Parsed.bFinal);
   Reply->TryGetBoolField(TEXT("rebaseRequired"), Parsed.bRebaseRequired);
   Reply->TryGetBoolField(TEXT("notApplied"), Parsed.bNotApplied);
+  Reply->TryGetBoolField(TEXT("writerFenceLost"), Parsed.bWriterFenceLost);
 
   const TArray<TSharedPtr<FJsonValue>> *AlertValues = nullptr;
   if (Reply->TryGetArrayField(TEXT("alerts"), AlertValues)) {

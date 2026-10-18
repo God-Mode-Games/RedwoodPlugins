@@ -165,6 +165,12 @@ bool FRedwoodItemFlushReplyParseTest::RunTest(const FString &Parameters) {
     Fixture::ParseJson(TEXT(R"({"error":"batch was never applied","committedSeq":4,"notApplied":true})"))
   );
   TestTrue(TEXT("notApplied is read"), NotApplied.bNotApplied);
+  TestFalse(TEXT("writerFenceLost defaults to false"), NotApplied.bWriterFenceLost);
+
+  const FRedwoodItemFlushReply FenceLost = URedwoodServerGameSubsystem::ParseItemsFlushReply(
+    Fixture::ParseJson(TEXT(R"({"error":"character is owned by another session","committedSeq":4,"writerFenceLost":true})"))
+  );
+  TestTrue(TEXT("writerFenceLost is read"), FenceLost.bWriterFenceLost);
   TestFalse(TEXT("A rebase refusal is not final"), Rebase.bFinal);
 
   // A dropped socket's reply has no fence. -1, never 0: 0 is a real fence and would read as a gap.

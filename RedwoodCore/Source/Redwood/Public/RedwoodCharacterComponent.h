@@ -405,6 +405,16 @@ public:
     return bFrozenAfterFinalRefusal;
   }
 
+  // The realm said this session's writer token is stale (`writerFenceLost`): another session owns
+  // the character now. This component never sends again. Nothing is dropped: what it staged is
+  // not this session's to throw away, and the owning session has the truth.
+  bool IsWriterFenceLost() const {
+    return bWriterFenceLost;
+  }
+
+  // Logs a warning the first time only.
+  void MarkWriterFenceLost();
+
   // Drops EVERYTHING staged: dirty rows, pending deletes, entries and grant keys, sent or not,
   // and logs every dropped entry at Error so staff can rebuild it. An entry of an unconfirmed
   // batch is logged as "outcome unknown": it may be saved. Never call it while a batch is in
@@ -608,6 +618,9 @@ private:
 
   // See IsFrozenAfterFinalRefusal.
   bool bFrozenAfterFinalRefusal = false;
+
+  // See IsWriterFenceLost.
+  bool bWriterFenceLost = false;
 
   // Moves the committed seq and NextBatchSeq forward to CommittedSeq, never back: a replay probe
   // goes out under an older seq than NextBatchSeq, and its ack must not rewind the lane.

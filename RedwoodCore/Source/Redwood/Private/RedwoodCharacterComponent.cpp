@@ -955,6 +955,20 @@ void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
   bCurrencyRebaseRequired = false;
 }
 
+void URedwoodCharacterComponent::MarkWriterFenceLost() {
+  if (bWriterFenceLost) {
+    return;
+  }
+  bWriterFenceLost = true;
+  UE_LOG(
+    LogRedwood,
+    Warning,
+    TEXT("Character %s: another session owns this character now (writer fence lost); this component stops sending and keeps %d staged entries unsent"),
+    *RedwoodCharacterId,
+    PendingCurrencyEntries.Num()
+  );
+}
+
 void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) {
   // One line per dropped entry and key: the backend has the refusal alert, and these lines are
   // what staff rebuild the rest from. The front of an unconfirmed batch may have committed (its

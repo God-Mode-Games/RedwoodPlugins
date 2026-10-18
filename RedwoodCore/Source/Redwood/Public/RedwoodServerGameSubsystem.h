@@ -37,6 +37,8 @@ struct FRedwoodItemFlushReply {
   bool bRebaseRequired = false;
   // The backend's answer to a probe whose seq never committed: nothing was written.
   bool bNotApplied = false;
+  // The writer token this session sent is stale: another session owns the character.
+  bool bWriterFenceLost = false;
   TArray<TSharedPtr<FJsonObject>> Alerts;
 };
 

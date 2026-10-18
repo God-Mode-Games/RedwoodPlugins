@@ -1053,4 +1053,44 @@ bool FRedwoodCurrencySidecarFreezeWaitsForReplyTest::RunTest(const FString &Para
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarFlushWriterFenceLostTest,
+  "Redwood.Currency.Sidecar.FlushWriterFenceLostStopsSending",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A flush reply says another session owns the character. This component sends nothing more, not
+// even a probe, drops nothing, and every barrier settles.
+bool FRedwoodCurrencySidecarFlushWriterFenceLostTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
+  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {});
+
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  Harness.Answer(
+    Flush,
+    TEXT(R"({"error":"character is owned by another session","committedSeq":4,"writerFenceLost":true})")
+  );
+  TestTrue(TEXT("The barrier settles"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
+  TestTrue(TEXT("The session is over for this component"), Component->IsWriterFenceLost());
+
+  // Its batch is now unconfirmed, which would normally make the next flush a probe.
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
+  TestEqual(TEXT("A later barrier settles at once"), SettleCount, 2);
+  TestTrue(TEXT("No further frame leaves"), Harness.IsQuiet());
+  TestEqual(TEXT("Nothing is dropped"), Component->GetPendingCurrencyEntries().Num(), 1);
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER
