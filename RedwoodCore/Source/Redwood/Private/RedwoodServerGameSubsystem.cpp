@@ -2904,8 +2904,8 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // its settle, so a detached pawn's barrier waits for the delivery rather than for the hold.
   // An unconfirmed batch goes first, even with a rebase required behind it: the reload may read
   // the balance only once the probe has settled whether that batch committed.
-  const bool bNeedsReload =
-    CharacterComponent->IsCurrencyRebaseRequired() && !CharacterComponent->IsCurrencyBatchUnconfirmed();
+  const bool bNeedsReload = CharacterComponent->IsCurrencyRebaseRequired() &&
+    !CharacterComponent->IsCurrencyBatchUnconfirmed();
   if (bNeedsReload || CurrencyReloads.Contains(CharacterId)) {
     HoldItemFlushForCurrencyReload(
       CharacterId, PlayerStateComponent, CharacterComponent, OnAckSettled
@@ -3292,7 +3292,9 @@ void URedwoodServerGameSubsystem::SettleItemFlushOfGoneComponent(
   // key is already used. An unknown outcome marks the seq, so the next component probes it first.
   // Only for the same character: the PlayerState may have moved on to another one.
   URedwoodPlayerStateComponent *PlayerStateComponent = Flight.PlayerStateComponent.Get();
-  if (PlayerStateComponent && PlayerStateComponent->RedwoodCharacter.Id == Flight.CharacterId) {
+  const bool bSameCharacter =
+    PlayerStateComponent && PlayerStateComponent->RedwoodCharacter.Id == Flight.CharacterId;
+  if (bSameCharacter) {
     FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
     if (Reply) {
       WriteFlushReplyToSnapshot(Snapshot, *Reply, Sent);
@@ -3302,6 +3304,11 @@ void URedwoodServerGameSubsystem::SettleItemFlushOfGoneComponent(
         Snapshot, Sent.BatchSeq, Sent.CurrencyCount > 0 || Sent.GrantKeys.Num() > 0
       );
     }
+  }
+  // A final refusal is a desync of the character, not of the component: freeze it, as a live
+  // component's refusal does, so the next component hydrates frozen instead of staging on it.
+  if (Outcome == ERedwoodItemFlushOutcome::FinalRefusal) {
+    FreezeCharacter(Flight.CharacterId, bSameCharacter ? PlayerStateComponent : nullptr);
   }
 
   // Still settle: the detached release barrier must not stall forever just because the component
@@ -3717,7 +3724,8 @@ void URedwoodServerGameSubsystem::HoldItemFlushForCurrencyReload(
   }
   // A component with an unconfirmed batch is only held: its probe goes out after the reload, and
   // a rebase now could re-chain an entry that batch already committed.
-  if (CharacterComponent->IsCurrencyRebaseRequired() && !CharacterComponent->IsCurrencyBatchUnconfirmed()) {
+  if (CharacterComponent->IsCurrencyRebaseRequired() &&
+      !CharacterComponent->IsCurrencyBatchUnconfirmed()) {
     Reload->CharacterComponents.AddUnique(CharacterComponent);
   }
   AddHeldItemFlush(

@@ -650,7 +650,9 @@ public:
   // The kick of the incomplete-auth join, shared with the desync kick: the game session's kick,
   // or with no game session the two steps AGameSession::KickPlayer takes for a remote player (tell
   // the client, then destroy its controller, which ends the connection).
-  static void KickPlayerOrDestroyController(APlayerController *PlayerController, const FText &Reason);
+  static void KickPlayerOrDestroyController(
+    APlayerController *PlayerController, const FText &Reason
+  );
 
   // R26: the component is ending with a batch in flight. Its reply then settles the batch as a
   // gone component's (SettleItemFlushOfGoneComponent): it logs the entries and writes the snapshot.
@@ -982,7 +984,9 @@ private:
   // unknown, so the next component probes the seq. Reply is null when no reply settles the flush;
   // LostReplyWhy then says why.
   void SettleItemFlushOfGoneComponent(
-    FRedwoodInFlightItemFlush &Flight, const FRedwoodItemFlushReply *Reply, const FString &LostReplyWhy
+    FRedwoodInFlightItemFlush &Flight,
+    const FRedwoodItemFlushReply *Reply,
+    const FString &LostReplyWhy
   );
   // The components whose last flush reply left a batch unconfirmed (its outcome unknown), per
   // character. A trade must not start while any still is: the probe that settles it could find the
