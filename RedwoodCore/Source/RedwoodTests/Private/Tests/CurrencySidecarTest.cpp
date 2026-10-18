@@ -2,9 +2,11 @@
 
 // FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart. Drives the currency
 // half of URedwoodServerGameSubsystem's item flush through a real sidecar socket on a fake server:
-// the hold while a reload is needed, the settle a held attempt carries, the rows a re-sent batch
-// must not carry, a batch of currency alone, the per-character hold, late reload replies, the wait
-// for the sidecar, and the give-up. Each test fails if the code path it names is removed.
+// a batch of currency alone, the rows a re-sent batch must not carry, the freeze after a final
+// refusal, the hold while a rebase reload runs and the settle a held attempt carries, the
+// per-character hold, late reload replies, the wait for the sidecar through its real connect
+// hook, the give-ups, the shutdown, and a component that was never hydrated. Each test fails if
+// the code path it names is removed.
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
@@ -46,8 +48,9 @@ public:
   static void SendReloadNow(URedwoodServerGameSubsystem &Subsystem, const FString &CharacterId) {
     Subsystem.SendCurrencyReload(CharacterId);
   }
-  static void SidecarConnected(URedwoodServerGameSubsystem &Subsystem) {
-    Subsystem.ResumeCurrencyReloadsAfterSidecarConnect();
+  // The same connect callback InitializeSidecar installs, on the test's socket.
+  static void BindConnectedCallback(URedwoodServerGameSubsystem &Subsystem) {
+    Subsystem.BindSidecarConnectedCallback();
   }
 };
 
@@ -59,7 +62,9 @@ namespace RedwoodCurrencySidecarTest {
   const FString CharacterId = TEXT("character-1");
   const FString WriterToken = TEXT("writer-token-1");
   const FString EntryIdA = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+  const FString CreditEntryId = TEXT("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
   const FString LootReason = TEXT("Currency.Reason.Loot");
+  const FString SellReason = TEXT("Currency.Reason.Merchant.Sell");
   const FString OwnedItemId = TEXT("11111111-1111-1111-1111-111111111111");
   const FString PurchasedItemId = TEXT("22222222-2222-2222-2222-222222222222");
   const FString LaterItemId = TEXT("33333333-3333-3333-3333-333333333333");
@@ -67,18 +72,23 @@ namespace RedwoodCurrencySidecarTest {
   // Long enough for a request the game thread would send to reach the server, so its absence
   // means it was held. Pumped at the fake server's 10 Hz.
   constexpr double QuietWindowSeconds = 0.5;
+  // Far inside StepTimeout, so the sidecar's reconnect lands while a test waits for it.
+  constexpr uint32 ReconnectDelayForTestMs = 200;
+  constexpr uint16 ServiceRestartCloseCode = 1012;
 
   const TCHAR *const FlushEvent = TEXT("realm:characters:items:flush");
   const TCHAR *const LoadEvent = TEXT("realm:characters:items:load");
   const TCHAR *const TradeUsedSeqReply =
     TEXT(R"({"error":"batch seq was used by a trade","committedSeq":5,"rebaseRequired":true})");
+  const TCHAR *const FinalRefusalReply =
+    TEXT(R"({"error":"balance below zero","committedSeq":4,"final":true})");
 
-  FRedwoodCurrencyEntry MakeEntry(const FString &Id, int64 Delta, int64 BalanceAfter) {
+  FRedwoodCurrencyEntry MakeEntry(const FString &Id, int64 Delta, int64 BalanceAfter, const FString &Reason) {
     FRedwoodCurrencyEntry Entry;
     Entry.Id = Id;
     Entry.Delta = Delta;
     Entry.BalanceAfter = BalanceAfter;
-    Entry.Reason = LootReason;
+    Entry.Reason = Reason;
     return Entry;
   }
 
@@ -91,12 +101,9 @@ namespace RedwoodCurrencySidecarTest {
     return Record;
   }
 
-  // A load reply with one row (the owned item, as the backend holds it) and the given balance.
   FString MakeLoadReply(const TCHAR *Balance) {
     return FString::Printf(
-      TEXT(R"({"error":null,"items":[{"id":"%s","parentId":null,"domain":"general","slot":0,"quantity":1,"templateId":"T","attributes":{}}],"currency":{"amount":"%s","grants":[]}})"),
-      *OwnedItemId,
-      Balance
+      TEXT(R"({"error":null,"items":[],"currency":{"amount":"%s","grants":[]}})"), Balance
     );
   }
 
@@ -107,6 +114,12 @@ namespace RedwoodCurrencySidecarTest {
       FPlatformProcess::Sleep(PumpIntervalSeconds);
     }
   }
+
+  // RFC 6455 section 5.2: the 16-bit and 64-bit length markers, and the client's mask key.
+  constexpr uint8 SixteenBitLengthMarker = 126;
+  constexpr uint8 SixtyFourBitLengthMarker = 127;
+  constexpr int32 MaskKeyLength = 4;
+  constexpr uint8 TextOpcode = 0x1;
 
   // One request as the server read it.
   struct FRequest {
@@ -124,6 +137,10 @@ namespace RedwoodCurrencySidecarTest {
     UWorld *World = nullptr;
     URedwoodServerGameSubsystem *Subsystem = nullptr;
     TSharedPtr<FSocketIONative> SidecarCopy;
+    bool bShutDown = false;
+    // Client bytes read but not yet parsed: the client can send two frames in one TCP segment,
+    // and the fake server's own reader keeps only the first.
+    TArray<uint8> PendingBytes;
 
     explicit FSidecarHarness(FAutomationTestBase &InTest) : Test(InTest) {
       GameInstance = NewObject<UGameInstance>(GEngine);
@@ -134,6 +151,8 @@ namespace RedwoodCurrencySidecarTest {
       if (Subsystem) {
         TSharedPtr<FSocketIONative> &Sidecar = FAccess::Sidecar(*Subsystem);
         Sidecar = ISocketIOClientModule::Get().NewValidNativePointer();
+        // Set before Connect(), which applies it.
+        Sidecar->ReconnectionDelay = ReconnectDelayForTestMs;
         SidecarCopy = Sidecar;
       }
     }
@@ -144,6 +163,12 @@ namespace RedwoodCurrencySidecarTest {
         return false;
       }
       SidecarCopy->Connect(FString::Printf(TEXT("ws://127.0.0.1:%d"), Server->Port));
+      return AcceptAndWait();
+    }
+
+    // Accepts the client's (re)connect and waits until the game thread has seen it.
+    bool AcceptAndWait() {
+      PendingBytes.Reset();
       TSharedPtr<FSocketIONative> Socket = SidecarCopy;
       return Test.TestTrue(TEXT("The sidecar opens a session"), Server->AcceptSession()) &&
         Test.TestTrue(
@@ -153,22 +178,87 @@ namespace RedwoodCurrencySidecarTest {
     }
 
     // A character component on its own actor, hydrated as the login leg would leave it.
-    URedwoodCharacterComponent *MakeComponent(ARedwoodCurrencyFlushTestActor *&OutActor) {
+    URedwoodCharacterComponent *MakeComponent(
+      ARedwoodCurrencyFlushTestActor *&OutActor, const FString &InCharacterId = CharacterId
+    ) {
       OutActor = World->SpawnActor<ARedwoodCurrencyFlushTestActor>();
       URedwoodCharacterComponent *Component = NewObject<URedwoodCharacterComponent>(OutActor);
       Component->bUseItems = true;
-      Component->RedwoodCharacterId = CharacterId;
+      Component->RedwoodCharacterId = InCharacterId;
       Component->SeedWriterToken(WriterToken);
       Component->SeedItemSeqFromCharacter(SeededInventorySeq);
-      Component->OnRedwoodCharacterUpdated.AddDynamic(
-        OutActor, &ARedwoodCurrencyFlushTestActor::HandleCharacterUpdated
-      );
       return Component;
+    }
+
+    // Takes one complete client text frame off PendingBytes, if there is one.
+    bool TryTakeTextFrame(FString &OutText) {
+      while (PendingBytes.Num() >= 2) {
+        const uint8 Opcode = PendingBytes[0] & 0x0F;
+        const bool bMasked = (PendingBytes[1] & 0x80) != 0;
+        int32 Length = PendingBytes[1] & 0x7F;
+        int32 Offset = 2;
+        if (Length == SixteenBitLengthMarker) {
+          if (PendingBytes.Num() < 4) {
+            return false;
+          }
+          Length = (PendingBytes[2] << 8) | PendingBytes[3];
+          Offset = 4;
+        } else if (Length == SixtyFourBitLengthMarker) {
+          // No request here comes near 64 KiB; a frame that claims to is a broken read.
+          return false;
+        }
+        const int32 PayloadStart = Offset + (bMasked ? MaskKeyLength : 0);
+        if (PendingBytes.Num() < PayloadStart + Length) {
+          return false;
+        }
+        TArray<uint8> Payload;
+        Payload.Reserve(Length);
+        for (int32 Index = 0; Index < Length; ++Index) {
+          const uint8 Byte = PendingBytes[PayloadStart + Index];
+          Payload.Add(bMasked ? Byte ^ PendingBytes[Offset + Index % MaskKeyLength] : Byte);
+        }
+        PendingBytes.RemoveAt(0, PayloadStart + Length);
+        if (Opcode != TextOpcode) {
+          continue;
+        }
+        const FUTF8ToTCHAR Converted(
+          reinterpret_cast<const UTF8CHAR *>(Payload.GetData()), Payload.Num()
+        );
+        OutText = FString(Converted.Length(), Converted.Get());
+        return true;
+      }
+      return false;
+    }
+
+    // Reads the next client text frame. The game thread runs meanwhile: a request sent from a
+    // reply callback goes out only once the game thread has run that callback.
+    bool ReadTextFrame(FString &OutText) {
+      const double Deadline = FPlatformTime::Seconds() + StepTimeout.GetTotalSeconds();
+      while (true) {
+        if (TryTakeTextFrame(OutText)) {
+          return true;
+        }
+        uint32 Size = 0;
+        if (Server->Connection && Server->Connection->HasPendingData(Size) && Size > 0) {
+          TArray<uint8> Buffer;
+          Buffer.SetNumUninitialized(Size);
+          int32 Read = 0;
+          if (Server->Connection->Recv(Buffer.GetData(), Buffer.Num(), Read) && Read > 0) {
+            PendingBytes.Append(Buffer.GetData(), Read);
+          }
+          continue;
+        }
+        if (FPlatformTime::Seconds() > Deadline) {
+          return false;
+        }
+        FTaskGraphInterface::Get().ProcessThreadUntilIdle(ENamedThreads::GameThread);
+        FPlatformProcess::Sleep(PumpIntervalSeconds);
+      }
     }
 
     bool ReadRequest(const TCHAR *ExpectedEvent, FRequest &OutRequest) {
       FString Text;
-      if (!Test.TestTrue(TEXT("A request arrives"), Server->ReadClientText(Text))) {
+      if (!Test.TestTrue(TEXT("A request arrives"), ReadTextFrame(Text))) {
         return false;
       }
       const int32 ArgsStart = Text.Find(TEXT("["));
@@ -194,11 +284,18 @@ namespace RedwoodCurrencySidecarTest {
     // Lets any request the game thread would send reach the server, then says whether one did.
     bool IsQuiet() {
       PumpFor(QuietWindowSeconds);
-      return !Server->HasClientData();
+      return PendingBytes.Num() == 0 && !Server->HasClientData();
     }
 
     bool PumpUntil(TFunctionRef<bool()> Done) {
       return PumpGameThreadUntil(Done);
+    }
+
+    void ShutDown() {
+      if (!bShutDown && GameInstance) {
+        bShutDown = true;
+        GameInstance->Shutdown();
+      }
     }
 
     ~FSidecarHarness() {
@@ -210,9 +307,7 @@ namespace RedwoodCurrencySidecarTest {
         TSharedPtr<FSocketIONative> Socket = SidecarCopy;
         PumpGameThreadUntil([Socket]() { return !Socket->bIsConnected; });
       }
-      if (GameInstance) {
-        GameInstance->Shutdown();
-      }
+      ShutDown();
       if (SidecarCopy.IsValid()) {
         TSharedPtr<FSocketIONative> *Socket = &SidecarCopy;
         Test.TestTrue(
@@ -241,6 +336,21 @@ namespace RedwoodCurrencySidecarTest {
     }
     return FString();
   }
+
+  // Starts a rebase reload: one entry goes out, a trade has used its seq, and the reload request
+  // is read (and left unanswered).
+  bool StartRebaseReload(
+    FSidecarHarness &Harness,
+    URedwoodCharacterComponent *Component,
+    TFunction<void()> OnAckSettled,
+    FRequest &OutLoad
+  ) {
+    Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {});
+    Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, MoveTemp(OnAckSettled));
+    FRequest Flush;
+    return Harness.ReadRequest(FlushEvent, Flush) && Harness.Answer(Flush, TradeUsedSeqReply) &&
+      Harness.ReadRequest(LoadEvent, OutLoad);
+  }
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -258,7 +368,7 @@ bool FRedwoodCurrencySidecarCurrencyAloneTest::RunTest(const FString &Parameters
   }
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
-  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500)}, {});
+  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {});
 
   Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
   FRequest Flush;
@@ -296,7 +406,7 @@ bool FRedwoodCurrencySidecarResendCarriesNoRowsTest::RunTest(const FString &Para
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
   Actor->Items = {MakeRecord(OwnedItemId), MakeRecord(LaterItemId)};
   Component->MarkItemsDirty({OwnedItemId});
-  Component->QueueCurrency({MakeEntry(EntryIdA, -250, 750)}, {});
+  Component->QueueCurrency({MakeEntry(EntryIdA, -250, 750, LootReason)}, {});
 
   Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
   FRequest First;
@@ -329,63 +439,140 @@ bool FRedwoodCurrencySidecarResendCarriesNoRowsTest::RunTest(const FString &Para
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodCurrencySidecarFinalRefusalHoldsTest,
-  "Redwood.Currency.Sidecar.FinalRefusalHoldsUntilReload",
+  FRedwoodCurrencySidecarFinalRefusalFreezesTest,
+  "Redwood.Currency.Sidecar.FinalRefusalFreezesCharacter",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// A refused purchase: its item is still in the records. A later mark of that item must not save it
-// before the reload, and the reload puts the backend's rows back.
-bool FRedwoodCurrencySidecarFinalRefusalHoldsTest::RunTest(const FString &Parameters) {
+// A refused purchase freezes the character: nothing is repaired, nothing more leaves for it from
+// any component, no currency is taken, the game hears it once, and a detached pawn's barrier
+// still releases.
+bool FRedwoodCurrencySidecarFinalRefusalFreezesTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
+  AddExpectedError(TEXT("dropped currency entry"), EAutomationExpectedErrorFlags::Contains, 0);
+  AddExpectedError(TEXT("is frozen after a final refusal"), EAutomationExpectedErrorFlags::Contains, 0);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
   }
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
-  int64 RebasedBalance = -1;
-  Component->OnCurrencyRebased.AddLambda([&RebasedBalance](int64 Balance) {
-    RebasedBalance = Balance;
-  });
+  int32 RefusalCount = 0;
+  FString RefusedCharacterId;
+  Component->OnItemFlushRefusedFinal.AddLambda(
+    [&RefusalCount, &RefusedCharacterId](const FString &InCharacterId, const FString &) {
+      ++RefusalCount;
+      RefusedCharacterId = InCharacterId;
+    }
+  );
 
   // The game buys an item it cannot pay for.
   Actor->Items = {MakeRecord(OwnedItemId), MakeRecord(PurchasedItemId)};
   Component->MarkItemsDirty({PurchasedItemId});
-  Component->QueueCurrency({MakeEntry(EntryIdA, -2000, -1000)}, {});
+  Component->QueueCurrency({MakeEntry(EntryIdA, -2000, -1000, LootReason)}, {});
 
   Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
   FRequest Flush;
   if (!Harness.ReadRequest(FlushEvent, Flush)) {
     return false;
   }
-  Harness.Answer(Flush, TEXT(R"({"error":"balance below zero","committedSeq":4,"final":true})"));
-
-  FRequest Load;
-  if (!Harness.ReadRequest(LoadEvent, Load)) {
+  Harness.Answer(Flush, FinalRefusalReply);
+  if (!TestTrue(
+        TEXT("The component freezes"),
+        Harness.PumpUntil([Component]() { return Component->IsFrozenAfterFinalRefusal(); })
+      )) {
     return false;
   }
-  TestEqual(TEXT("The reload carries the writer token"), Load.Payload->GetStringField(TEXT("writerToken")), WriterToken);
 
-  // The game touches the refused item again while the reload runs.
+  TestEqual(TEXT("The game hears it once"), RefusalCount, 1);
+  TestEqual(TEXT("It names the character"), RefusedCharacterId, CharacterId);
+  TestTrue(TEXT("The character is frozen"), Harness.Subsystem->IsCharacterFrozen(CharacterId));
+  TestEqual(TEXT("Nothing is restored: the records stay as the game has them"), Actor->Items.Num(), 2);
+  TestFalse(TEXT("Nothing staged is left"), Component->IsItemsDirty());
+  TestNull(TEXT("No reload runs"), FAccess::Reload(*Harness.Subsystem, CharacterId));
+  TestFalse(
+    TEXT("New currency is refused"),
+    Component->QueueCurrency({MakeEntry(EntryIdA, 10, 10, LootReason)}, {})
+  );
+
+  // The game touches the refused item again: no flush leaves.
   Component->MarkItemsDirty({PurchasedItemId});
   Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
-  TestTrue(TEXT("Nothing flushes while the reload runs"), Harness.IsQuiet());
+  TestTrue(TEXT("No flush leaves for the frozen component"), Harness.IsQuiet());
 
-  Harness.Answer(Load, MakeLoadReply(TEXT("1000")));
-  TestTrue(
-    TEXT("The reload lands"),
-    Harness.PumpUntil([Component]() { return !Component->IsReloadRequired(); })
+  // Another component of the same character: it takes no currency and sends nothing either.
+  ARedwoodCurrencyFlushTestActor *OtherActor = nullptr;
+  URedwoodCharacterComponent *OtherComponent = Harness.MakeComponent(OtherActor);
+  TestFalse(
+    TEXT("The character's other component refuses currency"),
+    OtherComponent->QueueCurrency({MakeEntry(EntryIdA, 10, 10, LootReason)}, {})
   );
-  TestEqual(TEXT("The records hold the backend's rows only"), Actor->Items.Num(), 1);
-  if (Actor->Items.Num() == 1) {
-    TestEqual(TEXT("The owned item stays"), Actor->Items[0].Id, OwnedItemId);
+  OtherActor->Items = {MakeRecord(LaterItemId)};
+  OtherComponent->MarkItemsDirty({LaterItemId});
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, OtherComponent);
+  TestTrue(TEXT("No flush leaves for the character's other component"), Harness.IsQuiet());
+  TestFalse(TEXT("Its staged row is dropped"), OtherComponent->IsItemsDirty());
+
+  // A detached pawn's flush settles at once, with nothing left to save.
+  Component->MarkItemsDirty({PurchasedItemId});
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
+  TestEqual(TEXT("The detached barrier releases"), SettleCount, 1);
+  TestTrue(TEXT("Still nothing leaves"), Harness.IsQuiet());
+  TestEqual(TEXT("The game heard it only once"), RefusalCount, 1);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarSaleCreditNeverLeavesTest,
+  "Redwood.Currency.Sidecar.RefusedBuySaleCreditNeverLeaves",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A buy is refused for good while the player sells the bought item. The sale's credit must never
+// leave: the item it sells was never saved, so the credit would commit from nothing.
+bool FRedwoodCurrencySidecarSaleCreditNeverLeavesTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
+  AddExpectedError(TEXT("dropped currency entry AAAA"), EAutomationExpectedErrorFlags::Contains, 1);
+  // The credit is dropped, and logged so staff can see it never committed.
+  AddExpectedErrorPlain(
+    TEXT("dropped currency entry CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC delta 25 reason Currency.Reason.Merchant.Sell"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
   }
-  TestFalse(TEXT("The refused item is not dirty"), Component->GetDirtyItemGenerations().Contains(PurchasedItemId));
-  TestEqual(TEXT("The game rereads its inventory"), Actor->CharacterUpdatedCount, 1);
-  TestEqual(TEXT("The game hears the balance"), RebasedBalance, (int64)1000);
-  TestTrue(TEXT("Nothing is left to send"), Harness.IsQuiet());
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
+
+  Actor->Items = {MakeRecord(PurchasedItemId)};
+  Component->MarkItemsDirty({PurchasedItemId});
+  Component->QueueCurrency({MakeEntry(EntryIdA, -2000, -1000, LootReason)}, {});
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+  FRequest Buy;
+  if (!Harness.ReadRequest(FlushEvent, Buy)) {
+    return false;
+  }
+
+  // While the buy is in flight, the player sells the item.
+  Actor->Items.Reset();
+  Component->MarkItemsDeleted({PurchasedItemId});
+  TestTrue(
+    TEXT("The sale is staged"),
+    Component->QueueCurrency({MakeEntry(CreditEntryId, 25, -975, SellReason)}, {})
+  );
+
+  Harness.Answer(Buy, FinalRefusalReply);
+  Harness.PumpUntil([Component]() { return Component->IsFrozenAfterFinalRefusal(); });
+  TestEqual(TEXT("The credit is dropped"), Component->GetPendingCurrencyEntries().Num(), 0);
+  TestFalse(TEXT("The sale's delete is dropped"), Component->IsItemsDirty());
+
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+  TestTrue(TEXT("No credit ever leaves"), Harness.IsQuiet());
   return true;
 }
 
@@ -395,7 +582,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// A detached pawn's flush that needs a reload settles only once the re-chained entry is saved, so
+// A detached pawn's flush that needs a rebase settles only once the re-chained entry is saved, so
 // its write binding cannot be released before then.
 bool FRedwoodCurrencySidecarSettleWaitsForReloadTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
@@ -406,18 +593,10 @@ bool FRedwoodCurrencySidecarSettleWaitsForReloadTest::RunTest(const FString &Par
   }
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
-  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500)}, {});
 
   int32 SettleCount = 0;
-  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
-  FRequest Flush;
-  if (!Harness.ReadRequest(FlushEvent, Flush)) {
-    return false;
-  }
-  Harness.Answer(Flush, TradeUsedSeqReply);
-
   FRequest Load;
-  if (!Harness.ReadRequest(LoadEvent, Load)) {
+  if (!StartRebaseReload(Harness, Component, [&SettleCount]() { ++SettleCount; }, Load)) {
     return false;
   }
   TestEqual(TEXT("No settle while the entry is unsaved"), SettleCount, 0);
@@ -455,17 +634,8 @@ bool FRedwoodCurrencySidecarCharacterHoldTest::RunTest(const FString &Parameters
   ARedwoodCurrencyFlushTestActor *ItemActor = nullptr;
   URedwoodCharacterComponent *ItemComponent = Harness.MakeComponent(ItemActor);
 
-  // Refused for good, so the currency component has nothing left to send after the reload, and
-  // the only flush that follows is the held one.
-  CurrencyComponent->QueueCurrency({MakeEntry(EntryIdA, -2000, -1000)}, {});
-  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, CurrencyComponent);
-  FRequest Flush;
-  if (!Harness.ReadRequest(FlushEvent, Flush)) {
-    return false;
-  }
-  Harness.Answer(Flush, TEXT(R"({"error":"balance below zero","committedSeq":4,"final":true})"));
   FRequest Load;
-  if (!Harness.ReadRequest(LoadEvent, Load)) {
+  if (!StartRebaseReload(Harness, CurrencyComponent, nullptr, Load)) {
     return false;
   }
 
@@ -475,12 +645,20 @@ bool FRedwoodCurrencySidecarCharacterHoldTest::RunTest(const FString &Parameters
   Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, ItemComponent);
   TestTrue(TEXT("The other component of the character is held"), Harness.IsQuiet());
 
-  Harness.Answer(Load, MakeLoadReply(TEXT("1000")));
-  FRequest Resumed;
-  if (!Harness.ReadRequest(FlushEvent, Resumed)) {
-    return false;
+  // Both held components flush when the reload lands: the re-chained entry and the held row.
+  Harness.Answer(Load, MakeLoadReply(TEXT("2000")));
+  bool bRowSent = false;
+  bool bEntrySent = false;
+  for (int32 Index = 0; Index < 2; ++Index) {
+    FRequest Resumed;
+    if (!Harness.ReadRequest(FlushEvent, Resumed)) {
+      break;
+    }
+    bRowSent |= CountArray(Resumed.Payload, TEXT("upserts")) == 1;
+    bEntrySent |= FirstBalanceAfter(Resumed.Payload) == TEXT("2500");
   }
-  TestEqual(TEXT("The held row goes out after the reload"), CountArray(Resumed.Payload, TEXT("upserts")), 1);
+  TestTrue(TEXT("The held row goes out after the reload"), bRowSent);
+  TestTrue(TEXT("The re-chained entry goes out after the reload"), bEntrySent);
   return true;
 }
 
@@ -502,16 +680,8 @@ bool FRedwoodCurrencySidecarLateReloadReplyTest::RunTest(const FString &Paramete
   }
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
-  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500)}, {});
-
-  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
-  FRequest Flush;
-  if (!Harness.ReadRequest(FlushEvent, Flush)) {
-    return false;
-  }
-  Harness.Answer(Flush, TradeUsedSeqReply);
   FRequest FirstLoad;
-  if (!Harness.ReadRequest(LoadEvent, FirstLoad)) {
+  if (!StartRebaseReload(Harness, Component, nullptr, FirstLoad)) {
     return false;
   }
 
@@ -544,32 +714,31 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// A reload attempt that finds the sidecar down spends no attempt, and the connect event sends it.
+// The sidecar restarts during a reload. Retries while it is down spend no attempt, and the real
+// connect callback sends the reload when the sidecar is back.
 bool FRedwoodCurrencySidecarDownWaitsTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
+  AddExpectedError(TEXT("Currency reload failed"), EAutomationExpectedErrorFlags::Contains, 0);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
   }
+  FAccess::BindConnectedCallback(*Harness.Subsystem);
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
-  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500)}, {});
-
-  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
-  FRequest Flush;
-  if (!Harness.ReadRequest(FlushEvent, Flush)) {
-    return false;
-  }
-  Harness.Answer(Flush, TradeUsedSeqReply);
   FRequest FirstLoad;
-  if (!Harness.ReadRequest(LoadEvent, FirstLoad)) {
+  if (!StartRebaseReload(Harness, Component, nullptr, FirstLoad)) {
     return false;
   }
-  FAccess::TimeOutReload(*Harness.Subsystem, CharacterId);
 
-  // The sidecar is reconnecting when the retry fires. Set by hand, as ReloginFailureTest does.
-  Harness.SidecarCopy->bIsConnected = false;
+  TSharedPtr<FSocketIONative> Socket = Harness.SidecarCopy;
+  if (!TestTrue(TEXT("The sidecar restarts"), Harness.Server->CloseWithCode(ServiceRestartCloseCode)) ||
+      !TestTrue(TEXT("The socket sees it"), Harness.PumpUntil([Socket]() { return !Socket->bIsConnected; }))) {
+    return false;
+  }
+
+  FAccess::TimeOutReload(*Harness.Subsystem, CharacterId);
   for (int32 Retry = 0; Retry < URedwoodServerGameSubsystem::CurrencyReloadMaxAttempts * 2; ++Retry) {
     FAccess::SendReloadNow(*Harness.Subsystem, CharacterId);
   }
@@ -579,15 +748,16 @@ bool FRedwoodCurrencySidecarDownWaitsTest::RunTest(const FString &Parameters) {
     TestEqual(TEXT("Waiting spends no attempt"), Waiting->Attempts, 1);
   }
 
-  Harness.SidecarCopy->bIsConnected = true;
-  FAccess::SidecarConnected(*Harness.Subsystem);
+  if (!Harness.AcceptAndWait()) {
+    return false;
+  }
   FRequest SecondLoad;
   if (!Harness.ReadRequest(LoadEvent, SecondLoad)) {
     return false;
   }
   Harness.Answer(SecondLoad, MakeLoadReply(TEXT("2000")));
   TestTrue(
-    TEXT("The reload lands after the connect"),
+    TEXT("The reload lands after the reconnect"),
     Harness.PumpUntil([Component]() { return !Component->IsCurrencyRebaseRequired(); })
   );
   return true;
@@ -616,25 +786,21 @@ bool FRedwoodCurrencySidecarGiveUpTest::RunTest(const FString &Parameters) {
   }
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
-  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500)}, {});
 
   int32 SettleCount = 0;
-  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
-  FRequest Flush;
-  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+  FRequest Load;
+  if (!StartRebaseReload(Harness, Component, [&SettleCount]() { ++SettleCount; }, Load)) {
     return false;
   }
-  Harness.Answer(Flush, TradeUsedSeqReply);
 
   const FString FailedLoad =
     TEXT(R"({"error":"Item load request timed out.","items":[],"currency":{"amount":"0","grants":[]}})");
   for (int32 Attempt = 1; Attempt <= URedwoodServerGameSubsystem::CurrencyReloadMaxAttempts; ++Attempt) {
     if (Attempt > 1) {
       FAccess::SendReloadNow(*Harness.Subsystem, CharacterId);
-    }
-    FRequest Load;
-    if (!Harness.ReadRequest(LoadEvent, Load)) {
-      return false;
+      if (!Harness.ReadRequest(LoadEvent, Load)) {
+        return false;
+      }
     }
     TestEqual(TEXT("No settle before the give-up"), SettleCount, 0);
     Harness.Answer(Load, FailedLoad);
@@ -652,16 +818,17 @@ bool FRedwoodCurrencySidecarGiveUpTest::RunTest(const FString &Parameters) {
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodCurrencySidecarStaleTokenTest,
-  "Redwood.Currency.Sidecar.StaleTokenGivesUpAtOnce",
+  FRedwoodCurrencySidecarWriterFenceLostTest,
+  "Redwood.Currency.Sidecar.WriterFenceLostGivesUpAtOnce",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// Another session owns the character: no retry can help, so the reload ends on the first reply.
-bool FRedwoodCurrencySidecarStaleTokenTest::RunTest(const FString &Parameters) {
+// A "not bound" reply is retried, but the realm's writerFenceLost flag (another session owns the
+// character) ends the reload on that reply.
+bool FRedwoodCurrencySidecarWriterFenceLostTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
-  AddExpectedError(TEXT("Currency reload failed for good"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedError(TEXT("Currency reload failed"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedErrorPlain(TEXT("gave up (this session no longer owns the character)"), EAutomationExpectedErrorFlags::Contains, 1);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
@@ -669,25 +836,91 @@ bool FRedwoodCurrencySidecarStaleTokenTest::RunTest(const FString &Parameters) {
   }
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
-  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500)}, {});
 
   int32 SettleCount = 0;
-  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
-  FRequest Flush;
-  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+  FRequest Load;
+  if (!StartRebaseReload(Harness, Component, [&SettleCount]() { ++SettleCount; }, Load)) {
     return false;
   }
-  Harness.Answer(Flush, TradeUsedSeqReply);
-  FRequest Load;
+
+  // The binding is missing for now (a sidecar restart): retried.
+  Harness.Answer(
+    Load,
+    TEXT(R"({"error":"character not bound to this instance","items":[],"currency":{"amount":"0","grants":[]}})")
+  );
+  Harness.PumpUntil([&Harness]() {
+    const FRedwoodCurrencyReload *Reload = FAccess::Reload(*Harness.Subsystem, CharacterId);
+    return !Reload || Reload->Generation == 0;
+  });
+  TestNotNull(TEXT("A plain not-bound reply is retried"), FAccess::Reload(*Harness.Subsystem, CharacterId));
+  TestEqual(TEXT("No settle yet"), SettleCount, 0);
+
+  FAccess::SendReloadNow(*Harness.Subsystem, CharacterId);
   if (!Harness.ReadRequest(LoadEvent, Load)) {
     return false;
   }
   Harness.Answer(
     Load,
-    TEXT(R"({"error":"character not bound to this instance","items":[],"currency":{"amount":"0","grants":[]}})")
+    TEXT(R"({"error":"character not bound to this instance","writerFenceLost":true,"items":[],"currency":{"amount":"0","grants":[]}})")
   );
   TestTrue(TEXT("The held attempt settles at once"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
   TestNull(TEXT("No retry is scheduled"), FAccess::Reload(*Harness.Subsystem, CharacterId));
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarShutdownTest,
+  "Redwood.Currency.Sidecar.ShutdownSettlesHeldFlush",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A server that shuts down during a reload does not leave a held barrier waiting on it.
+bool FRedwoodCurrencySidecarShutdownTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
+  AddExpectedErrorPlain(TEXT("gave up (the server is shutting down)"), EAutomationExpectedErrorFlags::Contains, 1);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
+
+  int32 SettleCount = 0;
+  FRequest Load;
+  if (!StartRebaseReload(Harness, Component, [&SettleCount]() { ++SettleCount; }, Load)) {
+    return false;
+  }
+  TestEqual(TEXT("Held while the reload runs"), SettleCount, 0);
+
+  Harness.ShutDown();
+  TestEqual(TEXT("Shutdown settles the held attempt"), SettleCount, 1);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarUnhydratedTest,
+  "Redwood.Currency.Sidecar.UnhydratedComponentNeverFlushes",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A component with no character id sends nothing and joins no hold or reload.
+bool FRedwoodCurrencySidecarUnhydratedTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedError(TEXT("has no character id"), EAutomationExpectedErrorFlags::Contains, 1);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor, FString());
+  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {});
+
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
+  TestEqual(TEXT("The attempt settles at once"), SettleCount, 1);
+  TestTrue(TEXT("Nothing leaves"), Harness.IsQuiet());
+  TestNull(TEXT("No reload under an empty id"), FAccess::Reload(*Harness.Subsystem, FString()));
   return true;
 }
 
