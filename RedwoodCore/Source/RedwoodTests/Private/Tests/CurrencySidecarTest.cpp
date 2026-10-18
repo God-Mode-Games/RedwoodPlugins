@@ -2503,6 +2503,10 @@ bool FRedwoodCurrencyTradeOtherComponentUnconfirmedTest::RunTest(const FString &
     TradeCurrencyField(Trade.Payload, 0, TEXT("balanceAfter")),
     FString(TEXT("750"))
   );
+  // Settled here: a trade still open at teardown gives up with an Error, which fails the test.
+  Harness.Answer(Trade, CommittedReply(FromSeq + 2, ToSeq + 1));
+  TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
+  TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
   return true;
 }
 
