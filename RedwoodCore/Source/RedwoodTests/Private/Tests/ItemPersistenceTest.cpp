@@ -21,6 +21,8 @@
 #include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodServerGameSubsystem.h"
 #include "SIOJsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "Types/RedwoodTypesCharacters.h"
 
 // The namespace is named rather than anonymous, and referenced qualified rather than via a
@@ -63,10 +65,35 @@ namespace RedwoodItemPersistenceTest {
   // CompleteItemFlush, SeedItemSeqFromCharacter) is pure component state and never touches
   // GetOwner(), so a bare NewObject is sufficient -- the same pattern the game's own component
   // tests use (e.g. NewObject<UInventoryComponent>() in InventoryTests.cpp).
+  // A flush reply as ParseItemsFlushReply leaves it, for the batch that carried these rows.
+  void CompleteFlush(
+    URedwoodCharacterComponent *Component,
+    const FString &Error,
+    int64 CommittedSeq,
+    const TArray<TPair<FString, uint64>> &SentUpserts,
+    const TArray<TPair<FString, uint64>> &SentDeletes
+  ) {
+    FRedwoodItemFlushReply Reply;
+    Reply.Error = Error;
+    Reply.CommittedSeq = CommittedSeq;
+    FRedwoodItemFlushSent Sent;
+    Sent.Upserts = SentUpserts;
+    Sent.Deletes = SentDeletes;
+    Component->CompleteItemFlush(Reply, Sent);
+  }
+
   URedwoodCharacterComponent *MakeTestComponent() {
     URedwoodCharacterComponent *Component = NewObject<URedwoodCharacterComponent>();
     Component->bUseItems = true;
     return Component;
+  }
+
+  // FORK(hollowed-oath): literal wire JSON, so a test reads exactly what the backend sends.
+  TSharedPtr<FJsonObject> ParseJsonObject(const FString &Text) {
+    TSharedPtr<FJsonObject> Object;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Text);
+    FJsonSerializer::Deserialize(Reader, Object);
+    return Object;
   }
 }
 
@@ -145,7 +172,7 @@ bool FRedwoodItemSingleFlightClaimReleaseTest::RunTest(const FString &Parameters
   TestEqual(TEXT("Second claim leaves OutBatchSeq untouched"), SecondBatchSeq, (int64)0);
 
   TArray<TPair<FString, uint64>> EmptySentList;
-  Component->CompleteItemFlush(TEXT(""), 1, EmptySentList, EmptySentList);
+  Fixture::CompleteFlush(Component, TEXT(""), 1, EmptySentList, EmptySentList);
   TestFalse(TEXT("Flight slot released"), Component->IsItemFlushInFlight());
 
   int64 ThirdBatchSeq = 0;
@@ -174,26 +201,29 @@ bool FRedwoodItemGenerationMatchedAckTest::RunTest(const FString &Parameters) {
   int64 BatchSeq = 0;
   TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
 
-  // The flush captured generation 1 for both ids at send time.
+  // The flush captures each id's generation at send time, as the flush path does. Read, not
+  // assumed: generations come from ONE counter shared by every id (see MarkItemsDirty), so A and B
+  // hold different values.
+  const uint64 SentGenerationA = Component->GetDirtyItemGenerations().FindRef(Fixture::TestItemIdA);
+  const uint64 SentGenerationB = Component->GetDirtyItemGenerations().FindRef(Fixture::TestItemIdB);
   TArray<TPair<FString, uint64>> SentUpserts;
-  SentUpserts.Add(TPair<FString, uint64>(Fixture::TestItemIdA, 1));
-  SentUpserts.Add(TPair<FString, uint64>(Fixture::TestItemIdB, 1));
+  SentUpserts.Add(TPair<FString, uint64>(Fixture::TestItemIdA, SentGenerationA));
+  SentUpserts.Add(TPair<FString, uint64>(Fixture::TestItemIdB, SentGenerationB));
   TArray<TPair<FString, uint64>> SentDeletes;
 
-  // A mutates again while the send is still in flight -- its generation moves to 2 before the ack
-  // arrives.
+  // A mutates again while the send is still in flight -- its generation moves past the sent one
+  // before the ack arrives.
   Component->MarkItemsDirty({Fixture::TestItemIdA});
   const uint64 *MidFlightGeneration =
     Component->GetDirtyItemGenerations().Find(Fixture::TestItemIdA);
   TestTrue(TEXT("A re-dirtied mid-flight"), MidFlightGeneration != nullptr);
-  if (MidFlightGeneration) {
-    TestEqual(TEXT("A generation bumped to 2 mid-flight"), *MidFlightGeneration, (uint64)2);
-  }
+  const uint64 NewerGenerationA = MidFlightGeneration ? *MidFlightGeneration : 0;
+  TestTrue(TEXT("A's generation moved past the sent one mid-flight"), NewerGenerationA > SentGenerationA);
 
-  Component->CompleteItemFlush(TEXT(""), BatchSeq, SentUpserts, SentDeletes);
+  Fixture::CompleteFlush(Component, TEXT(""), BatchSeq, SentUpserts, SentDeletes);
 
-  // A's current generation (2) no longer matches what was sent (1), so the ack must not clear it
-  // -- the re-dirty that raced the send is not allowed to be silently lost.
+  // A's current generation no longer matches what was sent, so the ack must not clear it -- the
+  // re-dirty that raced the send is not allowed to be silently lost.
   TestTrue(
     TEXT("A survives the ack, still dirty"),
     Component->GetDirtyItemGenerations().Contains(Fixture::TestItemIdA)
@@ -201,7 +231,7 @@ bool FRedwoodItemGenerationMatchedAckTest::RunTest(const FString &Parameters) {
   const uint64 *SurvivingGeneration =
     Component->GetDirtyItemGenerations().Find(Fixture::TestItemIdA);
   if (SurvivingGeneration) {
-    TestEqual(TEXT("A's newer generation preserved"), *SurvivingGeneration, (uint64)2);
+    TestEqual(TEXT("A's newer generation preserved"), *SurvivingGeneration, NewerGenerationA);
   }
 
   // B was untouched during the flight, so its sent generation still matches current -- the ack
@@ -235,7 +265,7 @@ bool FRedwoodItemErrorPathTest::RunTest(const FString &Parameters) {
 
   // A network/backend failure: CommittedSeq (0) trails what was sent (1), so this is a plain
   // retry -- not a replay/fence the backend has already committed past.
-  Component->CompleteItemFlush(TEXT("boom"), 0, SentUpserts, SentDeletes);
+  Fixture::CompleteFlush(Component, TEXT("boom"), 0, SentUpserts, SentDeletes);
 
   TestFalse(
     TEXT("Flight slot released despite the error"), Component->IsItemFlushInFlight()
@@ -277,7 +307,7 @@ bool FRedwoodItemReplayResyncTest::RunTest(const FString &Parameters) {
   // The backend acks success but reports a committed seq (5) ahead of what this flush sent (3) --
   // e.g. it had already advanced past a replayed/duplicate batch. The ack must resync to the
   // backend's authoritative value rather than trusting only the seq this flush stamped.
-  Component->CompleteItemFlush(TEXT(""), 5, EmptySentList, EmptySentList);
+  Fixture::CompleteFlush(Component, TEXT(""), 5, EmptySentList, EmptySentList);
 
   TestEqual(
     TEXT("Committed seq resyncs to the backend's value"),
@@ -485,9 +515,17 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     )));
     TArray<TSharedPtr<FJsonValue>> Deletes;
 
+    // FORK(hollowed-oath): one debit with no optional fields, and one grant key.
+    FRedwoodCurrencyEntry Debit;
+    Debit.Id = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    Debit.Delta = -250;
+    Debit.BalanceAfter = 750;
+    Debit.Reason = TEXT("Currency.Reason.Merchant.Buy");
+    const FString WriterToken = TEXT("writer-token-1");
+
     TSharedPtr<FJsonObject> Payload =
       URedwoodServerGameSubsystem::BuildItemsFlushPayload(
-        CharacterId, 7, Upserts, Deletes
+        CharacterId, 7, Upserts, Deletes, {Debit}, {TEXT("quest:Q1")}, WriterToken
       );
     TestEnvelopeId(TEXT("flush"), Payload);
     TestEqual(
@@ -506,6 +544,104 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
       TEXT("flush: deletes array present"),
       Payload->HasTypedField<EJson::Array>(TEXT("deletes"))
     );
+
+    // FORK(hollowed-oath): amounts travel as decimal STRINGS (a JSON number is a double and cannot
+    // hold every int64), empty optional fields are left out (the backend refuses null), and the
+    // writer token rides every flush.
+    TestEqual(
+      TEXT("flush: writerToken"), Payload->GetStringField(TEXT("writerToken")), WriterToken
+    );
+    TestFalse(TEXT("flush: no probe field on a normal batch"), Payload->HasField(TEXT("probe")));
+    bool bProbe = false;
+    TestTrue(
+      TEXT("flush: a probe says so"),
+      URedwoodServerGameSubsystem::BuildItemsFlushPayload(CharacterId, 7, {}, {}, {Debit}, {}, WriterToken, true)
+          ->TryGetBoolField(TEXT("probe"), bProbe) &&
+        bProbe
+    );
+    const TArray<TSharedPtr<FJsonValue>> *Currency = nullptr;
+    TestTrue(
+      TEXT("flush: currency array present"),
+      Payload->TryGetArrayField(TEXT("currency"), Currency)
+    );
+    const TSharedPtr<FJsonObject> *Entry = nullptr;
+    if (Currency && Currency->Num() == 1 && (*Currency)[0]->TryGetObject(Entry)) {
+      TestTrue(
+        TEXT("flush: delta is a string"), (*Entry)->HasTypedField<EJson::String>(TEXT("delta"))
+      );
+      TestEqual(
+        TEXT("flush: currency[0].delta"),
+        (*Entry)->GetStringField(TEXT("delta")),
+        FString(TEXT("-250"))
+      );
+      TestTrue(
+        TEXT("flush: balanceAfter is a string"),
+        (*Entry)->HasTypedField<EJson::String>(TEXT("balanceAfter"))
+      );
+      TestEqual(
+        TEXT("flush: currency[0].balanceAfter"),
+        (*Entry)->GetStringField(TEXT("balanceAfter")),
+        FString(TEXT("750"))
+      );
+      TestEqual(
+        TEXT("flush: currency[0].id"), (*Entry)->GetStringField(TEXT("id")), Debit.Id
+      );
+      TestEqual(
+        TEXT("flush: currency[0].reason"), (*Entry)->GetStringField(TEXT("reason")), Debit.Reason
+      );
+      TestFalse(
+        TEXT("flush: an empty sourceRef is left out, never null"),
+        (*Entry)->HasField(TEXT("sourceRef"))
+      );
+      TestFalse(
+        TEXT("flush: an empty actorAccountId is left out, never null"),
+        (*Entry)->HasField(TEXT("actorAccountId"))
+      );
+    } else {
+      AddError(TEXT("flush: expected exactly one currency entry object"));
+    }
+    const TArray<TSharedPtr<FJsonValue>> *Grants = nullptr;
+    TestTrue(
+      TEXT("flush: grants array present"), Payload->TryGetArrayField(TEXT("grants"), Grants)
+    );
+    if (Grants && Grants->Num() == 1) {
+      TestEqual(
+        TEXT("flush: grants[0]"), (*Grants)[0]->AsString(), FString(TEXT("quest:Q1"))
+      );
+    } else {
+      AddError(TEXT("flush: expected exactly one grant key"));
+    }
+
+    // A filled optional field goes out as a string, and a large amount keeps every digit.
+    FRedwoodCurrencyEntry Grant = Debit;
+    Grant.Delta = MAX_int64;
+    Grant.SourceRef = TEXT("npc:merchant-1");
+    Grant.ActorAccountId = TEXT("account-gm");
+    TSharedPtr<FJsonObject> GrantPayload = URedwoodServerGameSubsystem::BuildItemsFlushPayload(
+      CharacterId, 8, {}, {}, {Grant}, {}, WriterToken
+    );
+    const TArray<TSharedPtr<FJsonValue>> *GrantCurrency = nullptr;
+    const TSharedPtr<FJsonObject> *GrantEntry = nullptr;
+    if (GrantPayload->TryGetArrayField(TEXT("currency"), GrantCurrency) &&
+        GrantCurrency->Num() == 1 && (*GrantCurrency)[0]->TryGetObject(GrantEntry)) {
+      TestEqual(
+        TEXT("flush: sourceRef sent when set"),
+        (*GrantEntry)->GetStringField(TEXT("sourceRef")),
+        Grant.SourceRef
+      );
+      TestEqual(
+        TEXT("flush: actorAccountId sent when set"),
+        (*GrantEntry)->GetStringField(TEXT("actorAccountId")),
+        Grant.ActorAccountId
+      );
+      TestEqual(
+        TEXT("flush: the int64 maximum keeps every digit"),
+        (*GrantEntry)->GetStringField(TEXT("delta")),
+        FString(TEXT("9223372036854775807"))
+      );
+    } else {
+      AddError(TEXT("flush: expected exactly one granted entry object"));
+    }
   }
 
   // (The blob->row migrate envelope was deleted -- row-per-item is the native model now, so there
@@ -523,12 +659,120 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     ChildPlacement.Domain = TEXT("content");
     ChildPlacement.Slot = 0;
     ChildPlacement.ParentId = RedwoodItemPersistenceTest::TestParentId;
+    // FORK(hollowed-oath): this one goes the other way.
+    ChildPlacement.FromCharacterId = TEXT("character-to");
+
+    // FORK(hollowed-oath): both sides' entries, the giver's with a source ref.
+    FRedwoodCurrencyEntry Paid;
+    Paid.Id = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    Paid.Delta = -300;
+    Paid.BalanceAfter = 700;
+    Paid.Reason = TEXT("Currency.Reason.Trade");
+    Paid.SourceRef = TEXT("trade:offer-1");
+    FRedwoodCurrencyEntry Received;
+    Received.Id = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+    Received.Delta = 300;
+    Received.BalanceAfter = 500;
+    Received.Reason = TEXT("Currency.Reason.Trade");
+    const FString TradeId = TEXT("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
 
     TSharedPtr<FJsonObject> Payload =
       URedwoodServerGameSubsystem::BuildItemsTradePayload(
-        TEXT("character-from"), TEXT("character-to"), {RootPlacement, ChildPlacement}
+        TEXT("character-from"),
+        TEXT("character-to"),
+        {RootPlacement, ChildPlacement},
+        {TPair<FString, FRedwoodCurrencyEntry>(TEXT("character-from"), Paid),
+         TPair<FString, FRedwoodCurrencyEntry>(TEXT("character-to"), Received)},
+        TEXT("writer-token-from"),
+        TEXT("writer-token-to"),
+        TradeId
       );
     TestEnvelopeId(TEXT("trade"), Payload);
+
+    // FORK(hollowed-oath): without both tokens the backend refuses every trade, and without the
+    // trade id every trade with currency.
+    TestEqual(
+      TEXT("trade: fromWriterToken"),
+      Payload->GetStringField(TEXT("fromWriterToken")),
+      FString(TEXT("writer-token-from"))
+    );
+    TestEqual(
+      TEXT("trade: toWriterToken"),
+      Payload->GetStringField(TEXT("toWriterToken")),
+      FString(TEXT("writer-token-to"))
+    );
+    TestEqual(TEXT("trade: tradeId"), Payload->GetStringField(TEXT("tradeId")), TradeId);
+    const TArray<TSharedPtr<FJsonValue>> *TradeCurrency = nullptr;
+    TestTrue(
+      TEXT("trade: currency array present"),
+      Payload->TryGetArrayField(TEXT("currency"), TradeCurrency)
+    );
+    if (TradeCurrency && TradeCurrency->Num() == 2) {
+      const TCHAR *const ExpectedCharacterIds[] = {TEXT("character-from"), TEXT("character-to")};
+      const TCHAR *const ExpectedDeltas[] = {TEXT("-300"), TEXT("300")};
+      const TCHAR *const ExpectedBalances[] = {TEXT("700"), TEXT("500")};
+      const FString ExpectedIds[] = {Paid.Id, Received.Id};
+      for (int32 Index = 0; Index < 2; ++Index) {
+        const TSharedPtr<FJsonObject> *Side = nullptr;
+        const TSharedPtr<FJsonObject> *SideEntry = nullptr;
+        if (!(*TradeCurrency)[Index]->TryGetObject(Side) ||
+            !(*Side)->TryGetObjectField(TEXT("entry"), SideEntry)) {
+          AddError(FString::Printf(TEXT("trade: currency[%d] is not {characterId, entry}"), Index));
+          continue;
+        }
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].characterId"), Index),
+          (*Side)->GetStringField(TEXT("characterId")),
+          FString(ExpectedCharacterIds[Index])
+        );
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].entry.id"), Index),
+          (*SideEntry)->GetStringField(TEXT("id")),
+          ExpectedIds[Index]
+        );
+        TestTrue(
+          FString::Printf(TEXT("trade: currency[%d] amounts are strings"), Index),
+          (*SideEntry)->HasTypedField<EJson::String>(TEXT("delta")) &&
+            (*SideEntry)->HasTypedField<EJson::String>(TEXT("balanceAfter"))
+        );
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].entry.delta"), Index),
+          (*SideEntry)->GetStringField(TEXT("delta")),
+          FString(ExpectedDeltas[Index])
+        );
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].entry.balanceAfter"), Index),
+          (*SideEntry)->GetStringField(TEXT("balanceAfter")),
+          FString(ExpectedBalances[Index])
+        );
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].entry.reason"), Index),
+          (*SideEntry)->GetStringField(TEXT("reason")),
+          FString(TEXT("Currency.Reason.Trade"))
+        );
+      }
+      const TSharedPtr<FJsonObject> *ReceivedEntry = nullptr;
+      const TSharedPtr<FJsonObject> *PaidEntry = nullptr;
+      if ((*TradeCurrency)[1]->AsObject()->TryGetObjectField(TEXT("entry"), ReceivedEntry) &&
+          (*TradeCurrency)[0]->AsObject()->TryGetObjectField(TEXT("entry"), PaidEntry)) {
+        TestEqual(
+          TEXT("trade: a set sourceRef is sent"),
+          (*PaidEntry)->GetStringField(TEXT("sourceRef")),
+          Paid.SourceRef
+        );
+        TestFalse(
+          TEXT("trade: an empty sourceRef is left out, never null"),
+          (*ReceivedEntry)->HasField(TEXT("sourceRef"))
+        );
+        TestFalse(
+          TEXT("trade: an empty actorAccountId is left out, never null"),
+          (*ReceivedEntry)->HasField(TEXT("actorAccountId"))
+        );
+      }
+    } else {
+      AddError(TEXT("trade: expected exactly two currency entries"));
+    }
+
     TestEqual(
       TEXT("trade: fromCharacterId"),
       Payload->GetStringField(TEXT("fromCharacterId")),
@@ -558,6 +802,18 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
           TEXT("trade: content-child ParentId survives"),
           (*Child)->GetStringField(TEXT("parentId")),
           RedwoodItemPersistenceTest::TestParentId
+        );
+        // FORK(hollowed-oath): every placement names the side it leaves; an empty one is the
+        // trade's from character.
+        TestEqual(
+          TEXT("trade: a placement with no source leaves the from character"),
+          (*Root)->GetStringField(TEXT("fromCharacterId")),
+          FString(TEXT("character-from"))
+        );
+        TestEqual(
+          TEXT("trade: a placement can leave the to character"),
+          (*Child)->GetStringField(TEXT("fromCharacterId")),
+          FString(TEXT("character-to"))
         );
       }
     } else {
@@ -601,9 +857,21 @@ bool FRedwoodParseCharacterInlineItemsTest::RunTest(const FString &Parameters) {
     TEXT("items"), URedwoodCommonGameSubsystem::SerializeItemRecords(Records)
   );
   CharacterObj->SetNumberField(TEXT("inventorySeq"), 5);
+  // FORK(hollowed-oath): the offline file's currency object, in the auth reply's shape.
+  CharacterObj->SetObjectField(
+    TEXT("currency"),
+    Fixture::ParseJsonObject(TEXT(R"({"amount":"1500000","grants":["quest:Q1"]})"))
+  );
 
   FRedwoodCharacterBackend Parsed =
     URedwoodCommonGameSubsystem::ParseCharacter(CharacterObj);
+
+  TestEqual(TEXT("The balance is read from its string"), Parsed.CurrencyAmount, (int64)1500000);
+  TestEqual(TEXT("One grant key is read"), Parsed.GrantKeys.Num(), 1);
+  if (Parsed.GrantKeys.Num() == 1) {
+    TestEqual(TEXT("The grant key survives"), Parsed.GrantKeys[0], FString(TEXT("quest:Q1")));
+  }
+  TestFalse(TEXT("A read balance is known"), Parsed.bCurrencyAmountUnknown);
 
   TestEqual(TEXT("Inline items parsed onto the struct"), Parsed.Items.Num(), 1);
   if (Parsed.Items.Num() == 1) {
@@ -634,6 +902,18 @@ bool FRedwoodParseCharacterInlineItemsTest::RunTest(const FString &Parameters) {
   TestEqual(
     TEXT("Absent items field leaves Items empty"), ParsedNoItems.Items.Num(), 0
   );
+  // FORK(hollowed-oath): no currency object is an unknown balance, never a zero one.
+  TestTrue(TEXT("Absent currency is an unknown balance"), ParsedNoItems.bCurrencyAmountUnknown);
+
+  // An unreadable currency object (a JSON number, not a decimal string) is unknown too, and loud.
+  AddExpectedError(TEXT("unreadable currency object"), EAutomationExpectedErrorFlags::Contains, 1);
+  NoItemsObj->SetObjectField(
+    TEXT("currency"), Fixture::ParseJsonObject(TEXT(R"({"amount":500,"grants":[]})"))
+  );
+  FRedwoodCharacterBackend ParsedBadCurrency =
+    URedwoodCommonGameSubsystem::ParseCharacter(NoItemsObj);
+  TestTrue(TEXT("Unreadable currency is an unknown balance"), ParsedBadCurrency.bCurrencyAmountUnknown);
+  TestEqual(TEXT("Unreadable currency leaves the balance unset"), ParsedBadCurrency.CurrencyAmount, (int64)0);
 
   return true;
 }

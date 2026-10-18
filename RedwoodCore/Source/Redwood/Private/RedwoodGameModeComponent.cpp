@@ -755,34 +755,33 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
             URedwoodCommonGameSubsystem::ParsePlayerData(Player)
           );
 
-          // FORK(hollowed-oath) BEGIN: backend item-load leg. Upstream trunk here is a
-          // single inline PlayerStateComponent->SetRedwoodCharacter(ParseCharacter(Character)).
-          // The fork hoists the parse into ParsedCharacter so it can graft the item rows --
-          // which the backend delivers as a SIBLING "items" field of the player-auth response,
-          // NOT nested in "character" -- onto it BEFORE SetRedwoodCharacter fires
-          // OnRedwoodCharacterUpdated. Merge must preserve that ordering (rows attached before the
-          // set) so RedwoodPlayerStateCharacterUpdated has them in hand when it broadcasts.
-          // (inventorySeq needs no such graft: unlike Items on THIS auth leg, the backend puts the
-          // seq directly on the character object, so ParseCharacter above already picked it up. Note
-          // ParseCharacter ALSO reads an inline "items" array, but only the backend character-LIST
-          // response and offline saves place items there; the auth response nests nothing in
-          // "character", so that inline read is a no-op here and this sibling graft is the only path
-          // that populates Items on this leg. See the item-array contract in ParseCharacter.)
-          FRedwoodCharacterBackend ParsedCharacter =
-            URedwoodCommonGameSubsystem::ParseCharacter(Character);
-
-          // Item rows ride this SAME player-auth response (a sibling field to "character", not
-          // nested inside it -- see the backend's PlayerAuth.SidecarToRealm IResponse extension
-          // that added "items" alongside "character"/"player"), so they are present before
-          // SetRedwoodCharacter fires OnRedwoodCharacterUpdated below, instead of arriving later
-          // via a separate realm:characters:items:load round trip.
-          const TArray<TSharedPtr<FJsonValue>> *ItemsJsonArray = nullptr;
-          if (MessageStruct->TryGetArrayField(TEXT("items"), ItemsJsonArray)) {
-            ParsedCharacter.Items =
-              URedwoodCommonGameSubsystem::ParseItemRecords(*ItemsJsonArray);
+          // FORK(hollowed-oath) BEGIN: upstream trunk here is a single inline
+          // PlayerStateComponent->SetRedwoodCharacter(ParseCharacter(Character)). The fork grafts
+          // the reply's sibling fields onto the character before the set (see
+          // ApplyPlayerAuthCharacter), and refuses the join when the load is incomplete: a
+          // character with no balance or no writer token cannot save, and a zero balance in place
+          // of a missing one would make every currency change it stages be refused for good.
+          FString LoadError;
+          if (!ApplyPlayerAuthCharacter(
+                GameMode->GetGameInstance()->GetSubsystem<URedwoodServerGameSubsystem>(),
+                PlayerStateComponent,
+                MessageStruct,
+                LoadError
+              )) {
+            UE_LOG(
+              LogRedwood,
+              Error,
+              TEXT("Player auth for character %s is an incomplete load, kicking them now: %s"),
+              *CharacterId,
+              *LoadError
+            );
+            // Nothing else would end this join, and it must not stay connected with no character.
+            // The return below keeps it from ever being marked server-ready either way.
+            URedwoodServerGameSubsystem::KickPlayerOrDestroyController(
+              PlayerController, FText::FromString(LoadError)
+            );
+            return;
           }
-
-          PlayerStateComponent->SetRedwoodCharacter(ParsedCharacter);
           // FORK(hollowed-oath) END
           PlayerStateComponent->SetServerReady();
 
@@ -835,3 +834,63 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
     }
   );
 }
+
+// FORK(hollowed-oath) BEGIN: the character half of the player-auth reply. See the declaration.
+bool URedwoodGameModeComponent::ApplyPlayerAuthCharacter(
+  URedwoodServerGameSubsystem *ServerSubsystem,
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  const TSharedPtr<FJsonObject> &Reply,
+  FString &OutError
+) {
+  const TSharedPtr<FJsonObject> *CharacterObject = nullptr;
+  if (!IsValid(PlayerStateComponent) || !Reply.IsValid() ||
+      !Reply->TryGetObjectField(TEXT("character"), CharacterObject)) {
+    OutError = TEXT("The character could not be loaded (no character)");
+    return false;
+  }
+  FRedwoodCharacterBackend Character =
+    URedwoodCommonGameSubsystem::ParseCharacter(*CharacterObject);
+
+  // The seq, the items, the balance and the token all come from ONE claim of the character's
+  // state on the backend, so the first flush continues from exactly that seq and that balance.
+  // A missing seq would seed the lane at 0, and the backend would take the first batch for a
+  // replay of a committed seq.
+  double InventorySeqValue = 0.0;
+  if (!(*CharacterObject)->TryGetNumberField(TEXT("inventorySeq"), InventorySeqValue)) {
+    OutError = TEXT("The character could not be loaded (no inventory seq)");
+    return false;
+  }
+
+  // The balance and the token are siblings of "character", like the item rows. Both are required:
+  // a missing balance is a failed load, never a zero one, and without the token no flush of this
+  // session can commit.
+  const TSharedPtr<FJsonObject> *CurrencyObject = nullptr;
+  if (!Reply->TryGetObjectField(CurrencyLoadField, CurrencyObject) ||
+      !TryParseCurrencyLoad(*CurrencyObject, Character.CurrencyAmount, Character.GrantKeys)) {
+    OutError = TEXT("The character could not be loaded (no readable currency)");
+    return false;
+  }
+  if (!Reply->TryGetStringField(TEXT("writerToken"), Character.WriterToken) ||
+      Character.WriterToken.IsEmpty()) {
+    OutError = TEXT("The character could not be loaded (no writer token)");
+    return false;
+  }
+  Character.bCurrencyAmountUnknown = false;
+
+  // Item rows ride this same reply (a sibling of "character", not nested in it), so they are on
+  // the character before SetRedwoodCharacter hydrates the components below, instead of arriving
+  // later through a separate realm:characters:items:load round trip.
+  const TArray<TSharedPtr<FJsonValue>> *ItemsJsonArray = nullptr;
+  if (Reply->TryGetArrayField(TEXT("items"), ItemsJsonArray)) {
+    Character.Items = URedwoodCommonGameSubsystem::ParseItemRecords(*ItemsJsonArray);
+  }
+
+  // This load is fresh from the database, so it repairs a character a final refusal froze. Only
+  // a complete load thaws, and before SetRedwoodCharacter, whose hydration must see it thawed.
+  if (ServerSubsystem) {
+    ServerSubsystem->ThawCharacter(Character.Id);
+  }
+  PlayerStateComponent->SetRedwoodCharacter(Character);
+  return true;
+}
+// FORK(hollowed-oath) END

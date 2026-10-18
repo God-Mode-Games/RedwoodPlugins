@@ -3,6 +3,8 @@
 #pragma once
 
 #include "RedwoodTypesCommon.h"
+// FORK(hollowed-oath): the currency a destroyed component hands to the snapshot.
+#include "RedwoodCurrencyTypes.h"
 
 #include "RedwoodTypesCharacters.generated.h"
 
@@ -125,6 +127,64 @@ struct FRedwoodCharacterBackend {
 
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   int64 InventorySeq = 0;
+
+  // The committed currency balance, in currency units. Kept current by the item flush reply and by
+  // the currency reload, like InventorySeq, so a component recreated mid-session and the game
+  // start their balance chain from what the backend holds instead of from the login value.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  int64 CurrencyAmount = 0;
+
+  // True when a reply confirmed the seq but not the balance (a replay acked behind a later fence:
+  // something else, such as a trade, committed after the batch). CurrencyAmount is then stale, and
+  // a component seeded from this snapshot must reload before it sends any currency.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  bool bCurrencyAmountUnknown = false;
+
+  // Set when a batch of a component that is gone (a respawn) may have committed at
+  // UnconfirmedInventorySeq: no reply settled it. A component that flushes from this snapshot
+  // probes that seq first, the way the gone one would have, and only then sends its own batch. A
+  // normal batch sent at that seq could be acked as a replay of the lost one, and its rows cleared
+  // unsaved (a consumed item would come back). Cleared once the committed seq reaches it.
+  UPROPERTY()
+  bool bInventorySeqUnconfirmed = false;
+
+  UPROPERTY()
+  int64 UnconfirmedInventorySeq = 0;
+
+  // Currency a destroyed component staged and never sent (R26: a respawn destroys a pawn-owned
+  // component between two save passes). The next component of this character takes it
+  // (URedwoodCharacterComponent::AdoptHandedOffCurrency) and sends it after a reload rebases it.
+  UPROPERTY()
+  TArray<FRedwoodCurrencyEntry> HandedOffCurrencyEntries;
+
+  UPROPERTY()
+  TArray<FString> HandedOffGrantKeys;
+
+  // Set when the backend refused one of this character's flushes for good. Every component
+  // hydrated from this snapshot starts frozen; only a fresh load from the database clears it.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  bool bFrozenAfterFinalRefusal = false;
+
+  // The one-time grant keys the backend holds for this character (a quest reward already paid).
+  // Loaded with the balance, extended when a flush that carried keys commits, and merged with the
+  // keys a currency reload reads (never replaced: the backend never removes a key). Read-only: only the backend's replies may change it. Do not test a key with
+  // this array: a Blueprint Contains ignores case (the backend does not), and a key that is staged
+  // or in flight is not here yet. Call URedwoodCharacterComponent::HasGrantKey instead.
+  UPROPERTY(BlueprintReadOnly, Category = "Redwood")
+  TArray<FString> GrantKeys;
+
+  // Offline/PIE only: the ids of every currency entry the character file has applied. The backend
+  // refuses an entry id it has already applied, and a freeze log tells staff to re-grant with the
+  // same id, so the offline save must refuse a repeat too. The backend keeps these in its ledger
+  // and never sends them; online this stays empty.
+  UPROPERTY()
+  TArray<FString> OfflineAppliedEntryIds;
+
+  // The writer token the realm issued this session at auth. A session secret: every items:flush
+  // must carry it, so it is not exposed to Blueprint and never written to disk (this struct itself
+  // is server-only). Components copy it at hydration.
+  UPROPERTY()
+  FString WriterToken;
   // FORK(hollowed-oath) END
 };
 
@@ -162,6 +222,12 @@ struct FRedwoodTradeRootPlacement {
   // in RedwoodCommonGameSubsystem.cpp) -- empty here means JSON null on the wire, not "".
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   FString ParentId;
+
+  // FORK(hollowed-oath): the character this item leaves, the trade's from or to character; the item
+  // moves to the other one. Empty means the trade's from character. Both directions in one trade
+  // make a swap one atomic request with its currency.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString FromCharacterId;
 };
 // FORK(hollowed-oath) END
 

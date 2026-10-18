@@ -10,6 +10,9 @@
 #include "RedwoodGameModeComponent.generated.h"
 
 class URedwoodServerGameSubsystem;
+// FORK(hollowed-oath): for ApplyPlayerAuthCharacter.
+class URedwoodPlayerStateComponent;
+class FJsonObject;
 
 // FORK(hollowed-oath): fork-added delegate, not in upstream Redwood. Part of
 // the linkdead pawn retention feature (HollowedOath#1365 binds it from
@@ -136,6 +139,20 @@ public:
 
   UFUNCTION()
   void FlushPersistence();
+
+  // FORK(hollowed-oath): the character half of a successful player-auth reply, which is a fresh
+  // load from the database. Parses "character", grafts the sibling "items", "currency" and
+  // "writerToken" onto it, thaws a character a final refusal froze, and sets it on the PlayerState
+  // component (which hydrates its character components). Returns false, with OutError set and
+  // nothing set or thawed, when the reply lacks the character, the currency, the writer token or
+  // the inventory seq: the caller must refuse the join. Static and public so a test drives it
+  // without a sidecar.
+  static bool ApplyPlayerAuthCharacter(
+    URedwoodServerGameSubsystem *ServerSubsystem,
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    const TSharedPtr<FJsonObject> &Reply,
+    FString &OutError
+  );
 
   void InitVariables(
     float InDatabasePersistenceInterval, float InPostBeginPlayDelay

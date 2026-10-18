@@ -6,10 +6,17 @@
 #include "CoreMinimal.h"
 
 #include "Types/RedwoodTypes.h"
+// FORK(hollowed-oath): currency entries ride the item flush.
+#include "RedwoodCurrencyTypes.h"
 
 #include "RedwoodCharacterComponent.generated.h"
 
 class USIOJsonObject;
+// FORK(hollowed-oath): the snapshot owner FindPlayerStateComponent returns.
+class URedwoodPlayerStateComponent;
+// FORK(hollowed-oath): the player FindPlayerController returns, for the desync kick.
+class APlayerController;
+class URedwoodServerGameSubsystem;
 
 UCLASS(
   Blueprintable,
@@ -25,6 +32,8 @@ public:
 
   //~ Begin UActorComponent Interface
   virtual void BeginPlay() override;
+  // FORK(hollowed-oath): R26, the currency queues must not die unlogged with the component.
+  virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
   //~ End UActorComponent Interface
 
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
@@ -299,7 +308,11 @@ public:
   // race. Consumed by URedwoodServerGameSubsystem's item flush / offline append paths.
   UFUNCTION(BlueprintPure, Category = "Redwood")
   bool IsItemsDirty() const {
-    return DirtyItemGenerations.Num() > 0 || PendingDeletedItemGenerations.Num() > 0;
+    // FORK(hollowed-oath): staged currency counts as dirt, so a balance change with no item change
+    // still drives a flush. So does an unconfirmed batch: its probe must go out even when nothing
+    // else is staged, or the seq stays unknown and the character can never trade.
+    return DirtyItemGenerations.Num() > 0 || PendingDeletedItemGenerations.Num() > 0 ||
+      PendingCurrencyEntries.Num() > 0 || PendingGrantKeys.Num() > 0 || bCurrencyBatchUnconfirmed;
   }
 
   // Drained by the server item-flush path when building the upsert payload; not BlueprintCallable
@@ -313,11 +326,10 @@ public:
     return PendingDeletedItemGenerations;
   }
 
-  // Unconditional full clear -- used where there is genuinely nothing to retry (e.g. the
-  // identity-mismatch safety rail that skips the flush entirely for a stale/un-hydrated component,
-  // so there is no in-flight send whose ack this would race). The normal flush path does NOT call
-  // this -- see CompleteItemFlush below, which clears only the specific ids a successfully-
-  // acknowledged flush actually sent.
+  // Unconditional full clear -- used where there is genuinely nothing to retry (the offline save,
+  // which writes every record, and the drops of everything staged), so there is no in-flight send
+  // whose ack this would race. The normal flush path does NOT call this -- see CompleteItemFlush
+  // below, which clears only the specific ids a successfully-acknowledged flush actually sent.
   void ClearItemsDirtyState() {
     DirtyItemGenerations.Empty();
     PendingDeletedItemGenerations.Empty();
@@ -342,19 +354,238 @@ public:
   // past the seq we sent without being handed it explicitly.
   bool TryBeginItemFlush(int64 &OutBatchSeq);
 
+  // FORK(hollowed-oath) BEGIN: currency ledger staging. Entries and one-time grant keys wait here
+  // until a flush carries them; they leave the queue only on an ack that proves the backend has
+  // them (success with a trustworthy seq) or when a freeze drops them. Any other error keeps
+  // them -- an error reply means NOT saved, whatever committedSeq says.
+  //
+  // Two rules keep an amount from being lost or applied twice when an ack is lost:
+  //  - Unconfirmed batch: after a reply whose outcome is unknown (a timeout, a dropped socket, a
+  //    "concurrent flush" refusal -- whatever committedSeq says), the batch goes out again as a
+  //    probe: EXACTLY the same entries and keys under the SAME seq, and no item rows. The backend
+  //    never applies a probe. It acks a committed batch from its ledger, or consumes the seq and
+  //    answers notApplied; the entries then go out in a normal batch with the current rows.
+  //    Adding a newer entry to the probe would turn a committed replay into a mixed batch that
+  //    the backend refuses.
+  //  - Rebase: after an error with `rebaseRequired` (the backend's replay-mismatch refusal: a trade
+  //    used the seq and the batch did not apply), the backend balance is not what the pending
+  //    entries were chained from. No currency is sent until the caller reloads the balance and
+  //    calls RebaseCurrency.
+  // A final refusal is different: the game and the backend disagree, and nothing here can tell
+  // which staged change depended on the refused one. The character freezes (see
+  // FreezeAfterFinalRefusal) until it is hydrated again from the database.
+  //
+  // Returns false when anything was refused: every entry and key while the character is frozen or
+  // its writer fence is lost, or an entry whose id the backend would refuse. The caller must not
+  // count a refused amount.
+  // FORK(hollowed-oath): also a debit that would go below zero when an unsettled trade of this
+  // character settles (URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalance).
+  bool QueueCurrency(
+    const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
+  );
+
+  const TArray<FRedwoodCurrencyEntry> &GetPendingCurrencyEntries() const {
+    return PendingCurrencyEntries;
+  }
+
+  const TArray<FString> &GetPendingGrantKeys() const {
+    return PendingGrantKeys;
+  }
+
+  // Call before staging a one-time reward. True when the key is already used: committed or handed
+  // off by a destroyed component (both on the PlayerState snapshot), or staged, in flight or
+  // unconfirmed on this component (a key leaves the
+  // queue only when its batch commits). Case-sensitive, as the backend is. Staging a used key gets
+  // the whole batch refused for good, which freezes the character. Keys staged on ANOTHER
+  // component of the same character are not seen: stage rewards on one component.
+  UFUNCTION(BlueprintPure, Category = "Redwood")
+  bool HasGrantKey(const FString &GrantKey) const;
+
+  // Offline/PIE only: moves every staged entry and key out, for the save that writes them into the
+  // character file. That save is synchronous and writes the whole file, so nothing is in flight or
+  // unconfirmed and no ack will come: without this the queues would keep the component dirty for
+  // the whole session.
+  void TakePendingCurrencyForOfflineSave(
+    TArray<FRedwoodCurrencyEntry> &OutEntries, TArray<FString> &OutGrantKeys
+  ) {
+    OutEntries = MoveTemp(PendingCurrencyEntries);
+    OutGrantKeys = MoveTemp(PendingGrantKeys);
+    PendingCurrencyEntries.Reset();
+    PendingGrantKeys.Reset();
+  }
+
+  // How many entries / keys from the FRONT of the queues the next batch must carry. The flush
+  // snapshots exactly this many at claim time and passes the same counts to CompleteItemFlush.
+  // Zero while a rebase is required; exactly the unconfirmed batch while one is outstanding.
+  int32 GetCurrencyEntriesToSendCount() const;
+  int32 GetGrantKeysToSendCount() const;
+
+  // Read right after TryBeginItemFlush. True when the claimed batch re-sends an unconfirmed
+  // currency batch. Such a batch must carry NO item rows, at the old seq or not: if the original
+  // committed, the backend answers the re-send as a replay and applies none of its rows, yet the
+  // success ack would clear them -- rows dirtied since (a second purchase's item) would be lost.
+  bool IsItemFlushReplayProbe() const {
+    return bItemFlushInFlight && bInFlightIsCurrencyResend;
+  }
+
+  bool IsCurrencyRebaseRequired() const {
+    return bCurrencyRebaseRequired;
+  }
+
+  // An earlier batch went out and its outcome is not known yet: it is re-sent exactly as it was, as
+  // a probe. A batch of item rows alone counts too (its probe carries nothing). Until the probe's
+  // reply, nobody knows the backend seq or balance, so a trade must wait.
+  bool IsCurrencyBatchUnconfirmed() const {
+    return bCurrencyBatchUnconfirmed;
+  }
+
+  // A final refusal froze this component: the backend refused a batch for good, so the game's
+  // staged state no longer matches the backend's. Cleared only by a fresh hydration.
+  bool IsFrozenAfterFinalRefusal() const {
+    return bFrozenAfterFinalRefusal;
+  }
+
+  // The realm said this session's writer token is stale (`writerFenceLost`): another session owns
+  // the character now. This component never sends again. Nothing is dropped: what it staged is
+  // not this session's to throw away, and the owning session has the truth.
+  bool IsWriterFenceLost() const {
+    return bWriterFenceLost;
+  }
+
+  // Logs a warning the first time only. Tells the game through OnWriterFenceLost, then the server
+  // kicks the player unless the game handles it (see
+  // URedwoodServerGameSubsystem::bGameHandlesCurrencyDesync).
+  void MarkWriterFenceLost();
+
+  // Tells the game that this character is frozen (OnItemFlushRefusedFinal), then the server kicks
+  // the player unless the game handles it (R35, R36: see
+  // URedwoodServerGameSubsystem::bGameHandlesCurrencyDesync). A frozen character that stays in the
+  // world can still change it, and an item dropped there is not in the database.
+  void NotifyItemFlushRefusedFinal(const FString &Error);
+
+  // Logs every staged entry and grant key through LogCurrencyForStaff, so staff can rebuild what
+  // this server will never save. Why says what happened to them.
+  void LogStagedCurrencyForStaff(const FString &Why) const;
+
+  // FORK(hollowed-oath): R34. The connection that carried the in-flight batch dropped, so its reply
+  // never comes. The batch may have committed: it becomes unconfirmed with the counts it took
+  // (exactly as after an unknown-outcome error), and the slot is released, so the next claim is a
+  // probe at its seq, rows-only batches too (see MarkCurrencyBatchUnconfirmed). A parked
+  // attempt is not run here: it runs when that next batch is answered.
+  void AbandonInFlightItemFlush(int32 SentCurrencyCount, int32 SentGrantCount);
+
+  // Drops EVERYTHING staged: dirty rows, pending deletes, entries and grant keys, sent or not,
+  // and logs every dropped entry at Error so staff can rebuild it. An entry of an unconfirmed
+  // batch is logged as "outcome unknown": it may be saved. Never call it while a batch is in
+  // flight (except for the refused batch itself): that batch's reply decides its entries.
+  // Repair is not attempted: a
+  // staged change may depend on the refused one (a sale of a refused purchase, whose credit would
+  // otherwise commit from nothing), and only the database knows the truth. The game sends the
+  // player back through character select, which hydrates again and clears the freeze.
+  void FreezeAfterFinalRefusal(const FString &Reason);
+
+  // M1: the save skips this component, because it does not play the PlayerState's character (a
+  // stale or never-hydrated component). Its rows and its currency are dropped together, and the
+  // currency logged for staff: a debit must not outlive the row it pays for, and an unconfirmed
+  // batch would keep it dirty forever. With a batch in flight nothing is dropped: its reply
+  // decides it, and the next save pass drops the rest.
+  void DropStagedForIdentityMismatch(const FString &AuthoritativeCharacterId);
+
+  // Holds currency until a reload rebases it: the balance the pending entries were chained from
+  // is not known to be the backend's. Ignored while a batch is in flight or unconfirmed: a reload
+  // could land before or after that batch commits, so its balance could count the batch's entries
+  // once or twice, and that batch must go out again unchanged anyway; its reply decides.
+  // bBeforeSettlingReply is for a caller about to hand CompleteItemFlush a success that settles
+  // that batch, so the hold is in place before the parked attempt CompleteItemFlush runs.
+  void RequireCurrencyReload(bool bBeforeSettlingReply = false);
+
+  // Re-chains every pending entry's BalanceAfter from Balance (the amount just loaded from the
+  // backend) and allows currency to be sent again. Ignored unless a rebase is required, and while a
+  // batch is in flight or unconfirmed: at any such time a pending entry may already be committed,
+  // and re-chaining it would count it twice.
+  void RebaseCurrency(int64 Balance);
+
+  // A trade of this character settled, and Balance is the backend balance after it: its own
+  // entries' last BalanceAfter when it committed, the balance before it when it did not apply.
+  // Every entry staged during the trade comes after it on the backend, so it is re-chained from
+  // Balance, and the game is told (OnCurrencyRebased): the game cannot know which balance its
+  // running total should have used while the outcome was open. Nothing can be in flight here,
+  // because the trade held this character's flushes; if one is, that is a bug, and the character
+  // freezes (ensure). If a re-chained entry would overflow or go below zero, nothing is re-chained
+  // and the queue waits for a reload instead (see RebaseCurrency).
+  void RechainCurrencyAfterTrade(int64 Balance);
+
+  // R26: what EndPlay does with the currency queues before the component goes. A batch in flight
+  // is left to its reply (the subsystem settles it as a gone component's). An unconfirmed batch is
+  // logged as UNKNOWN and its seq marked on the snapshot. Entries and keys never sent are handed to
+  // the PlayerState snapshot when that is safe, for the next component of the character to send;
+  // otherwise they are logged as NOT saved, with why. Every entry and key is logged either way.
+  // Only a component destroyed on its own (a respawn) hands anything off: when the world ends,
+  // the PlayerState ends with it. Public for the tests: an automation test cannot run EndPlay on a
+  // component that never began play.
+  void HandOffCurrencyAtEndPlay(EEndPlayReason::Type EndPlayReason);
+
+  // Takes the currency a destroyed component of this character handed to Snapshot, in front of
+  // its own queue, and holds all currency for a reload: the handed-off chain was built on a balance
+  // only the reload can confirm. Refused (false) while a batch of this component is in flight or
+  // unconfirmed, or for another character.
+  bool AdoptHandedOffCurrency(FRedwoodCharacterBackend &Snapshot);
+
+  // A batch of another component of this character may have committed at Seq (the snapshot's
+  // bInventorySeqUnconfirmed): the next claim probes Seq, with no rows and no currency, before any
+  // normal batch. With bReloadAfterProbe, currency is then held for a reload too: the lost batch
+  // may have moved the balance, and the reload must read it only once the probe has settled the
+  // seq. Ignored (false) while a batch of this component is in flight or unconfirmed, or when Seq
+  // is already committed for this component.
+  bool RequireItemSeqProbe(int64 Seq, bool bReloadAfterProbe);
+
+  // Moves the committed seq and NextBatchSeq forward to CommittedSeq, never back: a replay probe
+  // goes out under an older seq than NextBatchSeq, and its ack must not rewind the lane. Public for
+  // the trade, whose reply is the other thing that moves this character's seq.
+  void AdoptCommittedItemSeq(int64 CommittedSeq);
+
+  // The PlayerState component that holds this character's snapshot: through the pawn's
+  // controller, or the owner itself when this component sits on the PlayerState. Null for a
+  // detached pawn.
+  URedwoodPlayerStateComponent *FindPlayerStateComponent() const;
+
+  // The player who plays this character: the pawn's controller, or the PlayerState's owner. Null
+  // for a detached pawn.
+  APlayerController *FindPlayerController() const;
+
+  // The token the realm issued this session at auth. Every items:flush must carry it; the backend
+  // commits nothing for any other token.
+  const FString &GetWriterToken() const {
+    return WriterToken;
+  }
+
+  // Called at hydration, beside SeedItemSeqFromCharacter.
+  void SeedWriterToken(const FString &InWriterToken) {
+    WriterToken = InWriterToken;
+  }
+
+  FOnItemFlushRefusedFinal OnItemFlushRefusedFinal;
+  FOnCurrencyAlerts OnCurrencyAlerts;
+  FOnCurrencyRebased OnCurrencyRebased;
+  FOnWriterFenceLost OnWriterFenceLost;
+  // FORK(hollowed-oath) END
+
   // Ack handler for the in-flight item flush. On success (Error empty) clears the SENT generations
   // (generation-matched, exactly as the old container ack did) and advances the committed seq. On
   // error it normally leaves dirt in place so the next tick re-sends -- EXCEPT when the backend
   // reports it has already committed at or past the seq we sent (replay/fence resync), in which
   // case NextBatchSeq is realigned to CommittedSeq + 1 so future flushes aren't wedged behind a
-  // gap the backend will keep rejecting. ALWAYS releases the flight slot. SentUpserts/SentDeletes
-  // pair each sent id with the GENERATION current for it at send time.
-  void CompleteItemFlush(
-    const FString &Error,
-    int64 CommittedSeq,
-    const TArray<TPair<FString, uint64>> &SentUpserts,
-    const TArray<TPair<FString, uint64>> &SentDeletes
-  );
+  // gap the backend will keep rejecting. ALWAYS releases the flight slot. Sent.Upserts and
+  // Sent.Deletes pair each sent id with the GENERATION current for it at send time.
+  // FORK(hollowed-oath): the reply is read by ClassifyItemFlushReply against the seq this claim
+  // went out under. Sent.CurrencyCount and Sent.GrantKeys are what the batch took from the front of
+  // the currency queues. A final refusal freezes the component (FreezeAfterFinalRefusal). Only a
+  // rebaseRequired makes the queue wait for a reload (see the currency staging block above). A
+  // notApplied with the consumed seq sends the batch again as a normal batch. A batch the sidecar
+  // never passed on (notForwarded) changes nothing: an earlier unknown attempt stays unknown, and
+  // otherwise the same rows and entries go out again as a normal batch. A sequence gap realigns the
+  // lane to the backend's fence. Any other outcome is unknown, and the next attempt is a probe.
+  void CompleteItemFlush(const FRedwoodItemFlushReply &Reply, const FRedwoodItemFlushSent &Sent);
 
   // Seeds the committed-seq/next-batchSeq state from a freshly-loaded character's InventorySeq.
   // Called from the load-broadcast copy site (RedwoodPlayerStateCharacterUpdated) so the first
@@ -476,6 +707,56 @@ private:
   // the slot frees. Exactly one is held: the detached barrier makes a single attempt, and chaining
   // an unbounded queue here would be a worse failure than the interim settle it replaces (#1534).
   TFunction<void()> PendingItemFlushRetry;
+
+  // Currency ledger staging (see the public FORK block on QueueCurrency for the rules).
+  TArray<FRedwoodCurrencyEntry> PendingCurrencyEntries;
+  TArray<FString> PendingGrantKeys;
+
+  // An unconfirmed batch: the counts at the front of the queues and the seq it went out under.
+  bool bCurrencyBatchUnconfirmed = false;
+  int32 UnconfirmedCurrencyCount = 0;
+  int32 UnconfirmedGrantCount = 0;
+  int64 UnconfirmedBatchSeq = 0;
+  // Whether the in-flight claim re-sends the unconfirmed batch (see IsItemFlushReplayProbe).
+  bool bInFlightIsCurrencyResend = false;
+  // How many entries and keys from the front of the queues the in-flight claim carries.
+  int32 InFlightCurrencyCount = 0;
+  int32 InFlightGrantCount = 0;
+
+  // The PlayerState snapshot this component hydrated from. A pawn is detached from its controller
+  // before its EndPlay, so FindPlayerStateComponent can no longer reach it there.
+  TWeakObjectPtr<URedwoodPlayerStateComponent> HydratedPlayerStateComponent;
+
+  bool bCurrencyRebaseRequired = false;
+  FString WriterToken;
+
+  // See IsFrozenAfterFinalRefusal.
+  bool bFrozenAfterFinalRefusal = false;
+
+  // See IsWriterFenceLost.
+  bool bWriterFenceLost = false;
+
+  // Re-chains every pending entry from Balance. Returns false, with nothing changed, when an entry
+  // would overflow int64 or take the balance below zero.
+  bool TryRechainPendingCurrency(int64 Balance);
+
+  // The server subsystem of this component's game instance, or null (no world, or a client).
+  URedwoodServerGameSubsystem *GetServerSubsystem() const;
+
+  // I6: this component is hydrated for another character. Everything staged for the old one is
+  // logged under its id and dropped, with its item dirt: none of it may go out under the new
+  // character's id, seq or token. A batch in flight is left to its reply, as a gone component's.
+  void ResetCurrencyForNewCharacter(const FString &OldCharacterId, const FString &NewCharacterId);
+
+  void ClearSentItemGenerations(
+    const TArray<TPair<FString, uint64>> &SentUpserts,
+    const TArray<TPair<FString, uint64>> &SentDeletes
+  );
+  void RemoveSentCurrency(int32 SentCurrencyCount, int32 SentGrantCount);
+  // Logs every staged entry and key (LogStagedCurrencyForStaff, with Why), then drops them with
+  // the item dirt, the unconfirmed batch and any rebase.
+  void DropAllStaged(const FString &Why);
+  void MarkCurrencyBatchUnconfirmed(int32 SentCurrencyCount, int32 SentGrantCount, int64 SentSeq);
   // FORK(hollowed-oath) END
 
 public:

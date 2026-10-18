@@ -5,6 +5,8 @@
 #include "RedwoodGameplayTags.h"
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
+// FORK(hollowed-oath): currency entries ride the item flush.
+#include "RedwoodCurrencyTypes.h"
 
 #include "CoreMinimal.h"
 #include "Engine/TimerHandle.h"
@@ -23,6 +25,134 @@ class URedwoodSyncComponent;
 // (fork-added).
 class URedwoodCharacterComponent;
 class URedwoodPlayerStateComponent;
+
+// FORK(hollowed-oath) BEGIN: currency ledger types for the item flush (fork-added). The reply and
+// the sent batch (FRedwoodItemFlushReply, FRedwoodItemFlushSent) live in RedwoodCurrencyTypes.h,
+// beside the component that takes them.
+// A flush that went out and has not been answered.
+struct FRedwoodInFlightItemFlush {
+  TWeakObjectPtr<URedwoodCharacterComponent> CharacterComponent;
+  // Null on the detached-flush leg.
+  TWeakObjectPtr<URedwoodPlayerStateComponent> PlayerStateComponent;
+  FString CharacterId;
+  FRedwoodItemFlushSent Sent;
+  // The entries the batch carried, for the shutdown log: the component may be gone by then.
+  TArray<FRedwoodCurrencyEntry> CurrencyEntries;
+  TFunction<void()> OnAckSettled;
+  // Fires once, FlushReplyTimeoutSeconds after the send, unless a reply takes the attempt first.
+  FTimerHandle ReplyTimer;
+};
+
+// How a realm:characters:items:load reply ends a reload attempt.
+enum class ERedwoodCurrencyReloadResult : uint8 {
+  Applied,
+  // A failed load that a later attempt can fix (a realm hiccup, a malformed reply).
+  Retry,
+  // A load no attempt can fix: the realm says this session's writer token is stale
+  // (`writerFenceLost`), so another session owns the character.
+  GiveUp,
+};
+
+// One flush attempt held behind a reload, resumed with its settle when the reload lands.
+struct FRedwoodHeldItemFlush {
+  TWeakObjectPtr<URedwoodCharacterComponent> CharacterComponent;
+  TWeakObjectPtr<URedwoodPlayerStateComponent> PlayerStateComponent;
+  // Null for a live component's tick flush.
+  TFunction<void()> OnAckSettled;
+};
+
+// The reload of one CHARACTER: every component of that character is held while it runs, so a
+// pawn-owned component cannot send an item row whose debit waits on the PlayerState-owned one.
+struct FRedwoodCurrencyReload {
+  // The components that asked for the reload (IsCurrencyRebaseRequired) and take its result.
+  TArray<TWeakObjectPtr<URedwoodCharacterComponent>> CharacterComponents;
+  TWeakObjectPtr<URedwoodPlayerStateComponent> PlayerStateComponent;
+  TArray<FRedwoodHeldItemFlush> HeldFlushes;
+  int32 Attempts = 0;
+  // The attempt whose reply is awaited; 0 when none is. A reply for any other attempt is late and
+  // is ignored: it may predate a trade that the current attempt's balance includes.
+  uint64 Generation = 0;
+  // Set when the sidecar was down at send time. The reconnect sends it again; a wait for the
+  // sidecar spends no attempt, so a short outage cannot make a detached pawn give up.
+  bool bWaitingForSidecar = false;
+  FTimerHandle RetryTimer;
+};
+
+// The fields of a realm:characters:items:trade reply.
+struct FRedwoodItemTradeReply {
+  // False when the reply could not be read at all.
+  bool bReadable = false;
+  FString Error;
+  // -1 when the reply carried no fence, as every error reply does.
+  int64 FromCommittedSeq = -1;
+  int64 ToCommittedSeq = -1;
+  // Set by the sidecar: it sent the trade and no answer came, so it MAY have applied.
+  bool bTimedOut = false;
+  // Set by the sidecar: it had no realm to send the trade to, so it did NOT apply.
+  bool bNotForwarded = false;
+  // Set by the realm: it could not tell whether its own commit went through, so it MAY have applied.
+  bool bCommitUnknown = false;
+  // Set by the realm on its two refusals that depend on this server's session: they say nothing
+  // about an earlier attempt of the trade.
+  bool bSessionRefused = false;
+  // Set by the realm when it holds a receipt for this trade id with other contents.
+  bool bTradeIdReused = false;
+  // Set by the realm when a side's writer token is stale: another session owns that character.
+  // bWriterFenceLost is the summary, the two others name the side (R37). An older realm sends only
+  // the summary; both sides are then read as lost (see ParseItemsTradeReply).
+  bool bWriterFenceLost = false;
+  bool bFromWriterFenceLost = false;
+  bool bToWriterFenceLost = false;
+  TArray<TSharedPtr<FJsonObject>> Alerts;
+};
+
+// What one trade reply proves.
+enum class ERedwoodItemTradeOutcome : uint8 {
+  // The trade is committed: by this attempt, or by an earlier one that this resend replays.
+  Committed,
+  // The realm refused this attempt and wrote nothing.
+  Refused,
+  // The sidecar did not pass this attempt to the realm.
+  NotForwarded,
+  // The realm may have committed it or not: a timeout, a commit the realm could not confirm, an
+  // unreadable reply, or a success without a fence past each side's seq.
+  Unknown,
+};
+
+// One character of a trade, as the send saw it.
+struct FRedwoodItemTradeSide {
+  FString CharacterId;
+  TWeakObjectPtr<URedwoodCharacterComponent> CharacterComponent;
+  TWeakObjectPtr<URedwoodPlayerStateComponent> PlayerStateComponent;
+  // The committed seq and balance when the trade went out. Nothing else of this character can
+  // commit while the trade holds it, so the trade's own commit is SeqBefore + 1.
+  int64 SeqBefore = 0;
+  int64 BalanceBefore = 0;
+  // This side's entries, with BalanceAfter chained from BalanceBefore. They are never in the flush
+  // queues: the trade is its own atomic write.
+  TArray<FRedwoodCurrencyEntry> Entries;
+};
+
+// A trade that went out and has not settled. It holds every flush of both characters until it
+// does, through every resend.
+struct FRedwoodPendingItemTrade {
+  FRedwoodItemTradeSide From;
+  FRedwoodItemTradeSide To;
+  // Every attempt sends exactly this: the backend knows a resend by its trade id and entry ids.
+  TSharedPtr<FJsonObject> Payload;
+  TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete;
+  TArray<FRedwoodHeldItemFlush> HeldFlushes;
+  int32 Attempts = 0;
+  // The attempt whose reply is awaited; 0 when none is. Any other reply is late and is ignored.
+  uint64 Generation = 0;
+  // An attempt may have committed. From then on only a success settles the trade as committed,
+  // and nothing settles it as not applied.
+  bool bOutcomeUnknown = false;
+  // Set when the sidecar was down at a resend. The reconnect sends it, and no attempt is spent.
+  bool bWaitingForSidecar = false;
+  FTimerHandle Timer;
+};
+// FORK(hollowed-oath) END
 
 UCLASS(BlueprintType)
 class REDWOOD_API URedwoodServerGameSubsystem : public UGameInstanceSubsystem {
@@ -216,6 +346,10 @@ public:
   // character->instance binding this flush's auth gate needs, so the release must not fire until the
   // flush has settled. Null (the default) for the ordinary tick-flush caller, which needs no
   // completion signal.
+  // FORK(hollowed-oath): while the component needs a currency rebase the attempt is held, and
+  // OnAckSettled fires from the resumed flush after the currency reload, or when the reload gives
+  // up (see CurrencyReloadMaxAttempts). A reply that sets the rebase hands its settle on the same
+  // way.
   //
   // Item LOADING has no counterpart here: item rows arrive in the SAME round trip as the rest of
   // the character (see FRedwoodCharacterBackend::Items), populated directly in
@@ -243,27 +377,70 @@ public:
     URedwoodCharacterComponent *CharacterComponent
   );
 
+  // FORK(hollowed-oath): offline/PIE counterpart of the currency half of the item flush. Takes the
+  // component's staged entries and grant keys and applies them to the character snapshot, which
+  // the save then writes to the file (URedwoodCommonGameSubsystem::WriteOfflineCurrency). It refuses the whole batch, as the
+  // backend would, when an entry would take the balance below zero or past int64, does not end at
+  // its BalanceAfter, has no reason or an id the file already applied, or a key is already used: the refused batch is dropped and
+  // logged, and the balance does not move. An unknown balance applies nothing and keeps the
+  // queues. Returns true when the snapshot changed.
+  static bool ApplyOfflineCurrency(
+    FRedwoodCharacterBackend &Character, URedwoodCharacterComponent *CharacterComponent
+  );
+
   // Emit realm:characters:items:trade: atomically moves the given root items (each identified by a
   // (Domain, Slot) placement, optionally with a ParentId for a content-child destination -- see
-  // FRedwoodTradeRootPlacement) from one character to another on the backend. RootPlacements name
+  // FRedwoodTradeRootPlacement) from one character to another on the backend.
+  // FORK(hollowed-oath): a placement's FromCharacterId (empty = the from character) lets one trade
+  // move items both ways, so a swap and its currency are one atomic request. RootPlacements name
   // only the root rows being handed over; the backend re-parents each root and its nested children
-  // in one transaction. After a successful trade the backend bumps BOTH characters' InventorySeq,
-  // so each caller's next FlushItemsForCharacterComponent takes the seq-resync path (CommittedSeq
-  // ahead of its sent seq) and realigns -- the trade itself does not flush either side here.
+  // in one transaction, and bumps BOTH characters' InventorySeq.
   //
-  // FORK(hollowed-oath): FromCommittedSeq/ToCommittedSeq are the post-trade InventorySeq fences the
-  // backend returns on the ack (-1 on error paths; see RedwoodBackend feat/item-persistence trade
-  // handler). The backend bumps BOTH characters' seq server-side as part of the trade transaction,
-  // so each character's *next* flush arrives one seq behind what the server now expects -- without
-  // intervention that flush is silently treated as an idempotent replay (its batchSeq no longer
-  // matches CommittedSeq) even though the ack it receives is success-shaped, which clears the
-  // client's dirty state and DROPS the flush's contents. The CALLER (the game's trade task, which
-  // is the only place both characters' URedwoodCharacterComponent are reachable) MUST call
-  // SeedItemSeqFromCharacter on each trading character's component with the matching fence value
-  // BEFORE releasing that character's flush lane, or this loss reproduces on every trade. This
-  // function does not perform that re-seed itself -- the contract is documented here, on the
-  // signature, deliberately not wired in, because the components live outside RedwoodCore's reach
-  // from this call site.
+  // FORK(hollowed-oath): the trade also moves currency, and this function owns both characters'
+  // flush lanes while it runs.
+  //  - CurrencyByCharacter: each entry names its character (From or To). Give each entry its Id
+  //    (MakeCurrencyEntryId), Delta and the reason Currency.Reason.Trade; the deltas must sum to
+  //    zero. BalanceAfter is ignored: it is chained here from the committed balance on the
+  //    character's snapshot, the only balance the backend can check it against. A side that pays
+  //    or is paid must have no currency staged at send time (flush it first): the trade commits
+  //    before anything staged, so a staged debit could go below zero once the trade has applied.
+  //  - TradeId: the game's id for the trade (32 uppercase hex digits). Make a FRESH one for every
+  //    trade (MakeCurrencyEntryId). It is the backend's transfer id and receipt key, and the backend
+  //    knows a resend by it: a resend with other contents is refused, and a new trade under a
+  //    committed id would be acked as that old trade's replay. An id this server already sent is
+  //    refused before send.
+  //  - Both components need a PlayerState snapshot (FindPlayerStateComponent).
+  //
+  // Refused before anything is sent (OnComplete runs before this returns, with an error and -1
+  // fences) when either character is frozen, has lost its writer fence, is in another trade or a
+  // currency reload, has a batch in flight or unconfirmed, or when the currency is not valid.
+  //
+  // While the trade runs, every flush attempt of either character is held, and resumed with its
+  // settle when the trade settles. On success, each side's committed seq and balance are adopted
+  // on its component and snapshot (the caller must NOT re-seed), entries staged meanwhile are
+  // re-chained from the new balance, and OnCurrencyRebased tells the game. An error means NOT
+  // applied: nothing is dropped or applied, and staged entries are re-chained from the balance
+  // before the trade. A trade whose outcome is unknown (a timeout, or a commit the realm could not
+  // confirm) is sent again, byte for byte, with the lanes still held, until a reply settles it
+  // (TradeResendSeconds, TradeMaxAttempts): the backend acks a committed one from its receipt. A
+  // trade whose outcome cannot be learned (no settling reply after every attempt, or the server
+  // shutting down) freezes both characters like a final refusal: each one's
+  // OnItemFlushRefusedFinal fires and OnComplete gets an error. The game must then send both
+  // players through character select. Alerts the trade raised go to OnCurrencyAlerts of the
+  // character they name.
+  void EmitItemsTrade(
+    URedwoodCharacterComponent *FromCharacterComponent,
+    URedwoodCharacterComponent *ToCharacterComponent,
+    const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
+    const TArray<TPair<FString, FRedwoodCurrencyEntry>> &CurrencyByCharacter,
+    const FString &TradeId,
+    TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete
+  );
+
+  // FORK(hollowed-oath): the old call shape, kept only so the game module builds and loads until
+  // its trade moves to the overload above (currency ledger, Phase C). It sends nothing: without the
+  // writer tokens the backend refuses every trade anyway. OnComplete gets an error before this
+  // returns. Remove it with that move.
   void EmitItemsTrade(
     const FString &FromCharacterId,
     const FString &ToCharacterId,
@@ -279,17 +456,237 @@ public:
   // reaches the realm; this was live-broken for both routes on the first deployed channel ("id is
   // a required field") because no test covered the envelope layer. Emit sites MUST build their
   // payloads through these.
+  // FORK(hollowed-oath): the flush also carries the claimed currency entries and grant keys, and
+  // the session's writer token on every batch (the backend commits nothing for another token).
   static TSharedPtr<FJsonObject> BuildItemsFlushPayload(
     const FString &CharacterId,
     int64 BatchSeq,
     const TArray<TSharedPtr<FJsonValue>> &Upserts,
-    const TArray<TSharedPtr<FJsonValue>> &Deletes
+    const TArray<TSharedPtr<FJsonValue>> &Deletes,
+    const TArray<FRedwoodCurrencyEntry> &CurrencyEntries,
+    const TArray<FString> &GrantKeys,
+    const FString &WriterToken,
+    bool bProbe = false
   );
+  // FORK(hollowed-oath): the trade also carries both sides' writer tokens (the backend commits
+  // nothing without them), the trade id, and the currency entries, each with its character.
   static TSharedPtr<FJsonObject> BuildItemsTradePayload(
     const FString &FromCharacterId,
     const FString &ToCharacterId,
-    const TArray<FRedwoodTradeRootPlacement> &RootPlacements
+    const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
+    const TArray<TPair<FString, FRedwoodCurrencyEntry>> &CurrencyByCharacter,
+    const FString &FromWriterToken,
+    const FString &ToWriterToken,
+    const FString &TradeId
   );
+
+  // FORK(hollowed-oath): the trade reply's parse and what it proves. Unknown and NotForwarded come
+  // from the reply's flags (`timedOut`, `commitUnknown`, `notForwarded`; see
+  // ReadSidecarDeliveryFlags for an older sidecar). A success is Committed only with a fence past
+  // each side's seq before the trade: no other fence can come from this trade.
+  static FRedwoodItemTradeReply ParseItemsTradeReply(const TSharedPtr<FJsonObject> &Reply);
+  static ERedwoodItemTradeOutcome ClassifyItemsTradeReply(
+    const FRedwoodItemTradeReply &Reply, int64 FromSeqBefore, int64 ToSeqBefore
+  );
+
+  // FORK(hollowed-oath): checks the trade currency and chains each side's BalanceAfter from its
+  // BalanceBefore, into the sides' Entries. Refuses (false, with OutError) what the backend would
+  // refuse: an entry for a character outside the trade, a bad or repeated id, a reason other than
+  // TradeCurrencyReason, a zero delta, a balance that would go below zero or past int64, or deltas
+  // that do not sum to zero.
+  static bool ChainTradeCurrency(
+    const TArray<TPair<FString, FRedwoodCurrencyEntry>> &CurrencyByCharacter,
+    FRedwoodItemTradeSide &From,
+    FRedwoodItemTradeSide &To,
+    FString &OutError
+  );
+
+  // FORK(hollowed-oath): the lowest balance this character can hold once its unsettled trade
+  // settles: the balance after the trade when it pays, the balance before it when it is paid.
+  // Entries staged meanwhile are re-chained from whichever comes true, so each must fit on the
+  // lower one (QueueCurrency checks). False when no unsettled trade moves this character's
+  // currency.
+  bool GetUnsettledTradeFloorBalance(const FString &CharacterId, int64 &OutFloorBalance) const;
+
+  // FORK(hollowed-oath): the sidecar's `timedOut` and `notForwarded` reply flags. On a sidecar
+  // that predates them, the reply's error text is matched instead, with a Warning: these are the
+  // texts sidecar/src/routes/game-server/items.ts sends. A reply with either one carries a filler
+  // committedSeq of 0, which is not a fence.
+  static void ReadSidecarDeliveryFlags(
+    const TSharedPtr<FJsonObject> &Reply,
+    const FString &Error,
+    const TCHAR *TimedOutError,
+    bool &OutTimedOut,
+    bool &OutNotForwarded
+  );
+  static constexpr const TCHAR *FlushTimedOutError = TEXT("Item flush request timed out.");
+  static constexpr const TCHAR *SidecarRealmNotConnectedError = TEXT("Realm server not connected");
+
+  // FORK(hollowed-oath): the realm's two trade refusals that run before its transaction and depend
+  // on this server's session (its sidecar socket, the characters' binding), so a resend can get one
+  // although an earlier attempt committed. The realm flags them `sessionRefused`; these texts
+  // (realm-backend/src/routes/sidecar/items.ts) are read only from a realm too old to send the flag.
+  static constexpr const TCHAR *TradeNotBoundError =
+    TEXT("both characters must be bound to this instance");
+  static constexpr const TCHAR *TradeNotAuthorizedError = TEXT("not authorized");
+  // The realm's refusal of a trade id it holds a receipt for with other contents, flagged
+  // `tradeIdReused`; the text is read only from a realm too old to send the flag. A first send that
+  // gets it did not apply. A resend never should, since it is the first send again; one that does
+  // means a bug, and the earlier attempt's outcome is then unknown.
+  static constexpr const TCHAR *TradeIdReusedError = TEXT("trade id reused with different contents");
+
+  // The only reason the backend takes on a trade entry.
+  static constexpr const TCHAR *TradeCurrencyReason = TEXT("Currency.Reason.Trade");
+  // The sidecar's text when its realm request for a trade timed out. Read only from a sidecar too
+  // old to send the `timedOut` flag (see ReadSidecarDeliveryFlags).
+  static constexpr const TCHAR *TradeTimedOutError = TEXT("Item trade request timed out.");
+  // M5: a flush with no reply by then is treated as one whose connection dropped (R34): its batch
+  // becomes unconfirmed, its slot is released, and it is probed at once. The sidecar answers every
+  // request within its own realm timeout (10 seconds), so a longer silence means a sidecar that
+  // hangs with its connection open, and without this the slot, and every currency entry staged
+  // behind it, would wait for good. A reply that comes after is ignored by generation.
+  static constexpr float FlushReplyTimeoutSeconds = 30.f;
+
+  // A trade with no reply by then counts as timed out. The sidecar answers within its own realm
+  // timeout (10 seconds), so a longer silence means the socket dropped and no reply will come.
+  static constexpr float TradeReplyTimeoutSeconds = 30.f;
+  // The wait before a trade with an unknown outcome is sent again. A realm that timed out may still
+  // be running the first attempt, and a resend now would only queue behind it on the same rows; the
+  // wait gives it time to finish, so the resend gets its replay ack instead of another timeout.
+  static constexpr float TradeResendSeconds = 5.f;
+  // After this many attempts with no settling reply the trade gives up and freezes both
+  // characters. A wait for the sidecar does not count. Without a limit, a held detached pawn's
+  // write binding would never release.
+  static constexpr int32 TradeMaxAttempts = 6;
+
+  // FORK(hollowed-oath): currency ledger steps of the item flush, static so the tests can
+  // drive them without a sidecar.
+  //
+  // Copies exactly the entries and keys the component says the next batch must carry, from the
+  // front of its queues. Read right after TryBeginItemFlush: the counts depend on the claim (an
+  // unconfirmed batch is re-sent exactly as it went out).
+  static void ClaimCurrencyToSend(
+    const URedwoodCharacterComponent *CharacterComponent,
+    TArray<FRedwoodCurrencyEntry> &OutEntries,
+    TArray<FString> &OutGrantKeys
+  );
+
+  static FRedwoodItemFlushReply ParseItemsFlushReply(const TSharedPtr<FJsonObject> &Reply);
+
+  // FORK(hollowed-oath): the snapshot half of a COMMITTED reply: the seq (forward only), the
+  // balance (or the unknown mark behind a later fence) and the grant keys. Writes nothing for an
+  // error or notApplied reply. Also used when the component that sent the batch is gone.
+  static void WriteCommittedFlushToSnapshot(
+    FRedwoodCharacterBackend &Snapshot,
+    const FRedwoodItemFlushReply &Reply,
+    const FRedwoodItemFlushSent &Sent
+  );
+
+  // The whole snapshot half of a reply: the committed half above, the seq a notApplied consumed,
+  // and the seq a sequence gap lowers to. Also used when the component that sent the batch is gone.
+  static void WriteFlushReplyToSnapshot(
+    FRedwoodCharacterBackend &Snapshot,
+    const FRedwoodItemFlushReply &Reply,
+    const FRedwoodItemFlushSent &Sent
+  );
+
+  // A batch of a component that is gone may have committed at Seq: marks the snapshot (see
+  // FRedwoodCharacterBackend::bInventorySeqUnconfirmed), and its balance unknown when the batch
+  // carried currency or grant keys, so the next component probes the seq and then reloads.
+  static void MarkSnapshotSeqUnconfirmed(
+    FRedwoodCharacterBackend &Snapshot, int64 Seq, bool bCarriedCurrency
+  );
+
+  // Hands the reply to CompleteItemFlush and keeps the PlayerState snapshot (nullable) in step:
+  // the committed seq and balance on success, a lowered seq on a sequence gap. Broadcasts the
+  // reply's alerts.
+  static void ApplyItemsFlushReply(
+    URedwoodCharacterComponent *CharacterComponent,
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    const FRedwoodItemFlushReply &Reply,
+    const FRedwoodItemFlushSent &Sent
+  );
+
+  // Reads the balance and the used grant keys off a realm:characters:items:load reply. Anything
+  // but Applied leaves both outputs unusable.
+  static ERedwoodCurrencyReloadResult ParseCurrencyReloadReply(
+    const TSharedPtr<FJsonObject> &Reply, int64 &OutBalance, TArray<FString> &OutGrantKeys
+  );
+
+  // Applies a parsed reload to one component that asked for it: rebases its held currency from
+  // Balance, writes the balance to the snapshot and merges the grant keys into it, and tells the game
+  // (OnCurrencyRebased). Returns false when the rebase cannot apply; the component and the
+  // snapshot are then unchanged and it stays held.
+  static bool ApplyCurrencyReload(
+    URedwoodCharacterComponent *CharacterComponent,
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    int64 Balance,
+    const TArray<FString> &GrantKeys
+  );
+
+  // FORK(hollowed-oath): the per-character freeze after a final refusal. A frozen character sends
+  // nothing and takes no new currency until a fresh hydration from the database thaws it.
+  bool IsCharacterFrozen(const FString &CharacterId) const {
+    return FrozenCharacterIds.Contains(CharacterId);
+  }
+  // Called by the auth leg when the character is loaded fresh from the database (a new sign-in
+  // after character select), which is the repair. Nothing else thaws: a hydration from an existing
+  // snapshot (a respawn) may come from one the freeze could not mark.
+  void ThawCharacter(const FString &CharacterId) {
+    FrozenCharacterIds.Remove(CharacterId);
+  }
+
+  // Freezes the character: every component that flushes from now on drops what it has staged.
+  // Ends any reload of the character; its held attempts settle with nothing left to save.
+  // PlayerStateComponent (nullable) holds the snapshot that a later component hydrates from.
+  void FreezeCharacter(
+    const FString &CharacterId, URedwoodPlayerStateComponent *PlayerStateComponent
+  );
+
+  // R36: set by the game when it handles OnItemFlushRefusedFinal and OnWriterFenceLost itself (it
+  // sends the player to character select, or ends the stale session). Until then every such event
+  // kicks the player (KickPlayerAfterCurrencyDesync). An explicit flag, not a guess from the
+  // delegates' bindings: a listener whose object is pending kill still counts as bound, and a kick
+  // that a stale binding suppressed would never happen.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  bool bGameHandlesCurrencyDesync = false;
+
+  // R35: the default reaction to a desync (OnItemFlushRefusedFinal or OnWriterFenceLost fired),
+  // unless bGameHandlesCurrencyDesync is set or the server is shutting down. The character is
+  // frozen or fenced, so nothing it does is saved, yet it stays in the world: an item it drops
+  // there is not in the database, and the copy it drops can be picked up while the database still
+  // holds the original. So the player is kicked, through KickPlayerOrDestroyController. A detached
+  // pawn has no player: that is only logged. Why goes to the log.
+  void KickPlayerAfterCurrencyDesync(
+    URedwoodCharacterComponent *CharacterComponent, const FString &Why
+  );
+
+  // The kick of the incomplete-auth join, shared with the desync kick: the game session's kick,
+  // or with no game session the two steps AGameSession::KickPlayer takes for a remote player (tell
+  // the client, then destroy its controller, which ends the connection).
+  static void KickPlayerOrDestroyController(
+    APlayerController *PlayerController, const FText &Reason
+  );
+
+  // R26: the component is ending with a batch in flight. Its reply then settles the batch as a
+  // gone component's (SettleItemFlushOfGoneComponent): it logs the entries and writes the snapshot.
+  void DetachItemFlushesFromComponent(URedwoodCharacterComponent *CharacterComponent);
+
+  // What a player kicked by KickPlayerAfterCurrencyDesync is told.
+  static constexpr const TCHAR *CurrencyDesyncKickMessage =
+    TEXT("This character could not be saved. Sign in again to load it.");
+
+  // A failed reload is retried on a timer: a reload fails for a realm hiccup or a sidecar
+  // reconnect, which clear in seconds, and nothing else would re-run it for a detached pawn.
+  static constexpr float CurrencyReloadRetrySeconds = 5.f;
+  // A reload with no reply by then counts as failed. The sidecar answers within its own realm
+  // timeout (10 seconds), so a longer silence means the socket dropped and no reply will come;
+  // without this a detached pawn's barrier would wait on it forever.
+  static constexpr float CurrencyReloadReplyTimeoutSeconds = 30.f;
+  // After this many failed attempts the held flush attempts settle, so a detached pawn's write
+  // binding still releases when the realm keeps failing the load. A wait for the sidecar does not
+  // count. The give-up logs every entry it leaves unsaved.
+  static constexpr int32 CurrencyReloadMaxAttempts = 6;
   // FORK(hollowed-oath) END
 
   // FORK(hollowed-oath): fork-added API (with EmitPlayerLeft below), not in
@@ -533,6 +930,115 @@ private:
   );
 
   TSharedPtr<FSocketIONative> Sidecar;
+
+  // FORK(hollowed-oath) BEGIN: the currency reload that held item flushes wait on, keyed by
+  // character id. While any component of a character needs a rebase (a trade used its seq), no
+  // flush of that character goes out, items included: an item row must not commit before the
+  // debit that pays for it. Its reply rebases the held entries and resumes every held attempt,
+  // settle barrier and all.
+  TMap<FString, FRedwoodCurrencyReload> CurrencyReloads;
+  uint64 LastCurrencyReloadGeneration = 0;
+
+  // Characters frozen by a final refusal (see IsCharacterFrozen).
+  TSet<FString> FrozenCharacterIds;
+
+  // The sidecar's connect event: the upstream update timers, then the reloads that waited.
+  void BindSidecarConnectedCallback();
+  void HandleSidecarConnected();
+
+  // Joins the reload of this character, or starts one. OnAckSettled (nullable) is the held flush
+  // attempt's settle; the reload resumes the flush with it.
+  void HoldItemFlushForCurrencyReload(
+    const FString &CharacterId,
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    URedwoodCharacterComponent *CharacterComponent,
+    TFunction<void()> OnAckSettled
+  );
+  void SendCurrencyReload(const FString &CharacterId);
+  void HandleCurrencyReloadReply(
+    const FString &CharacterId, uint64 Generation, const TSharedPtr<FJsonObject> &Reply
+  );
+  void HandleCurrencyReloadTimeout(const FString &CharacterId, uint64 Generation);
+  void RetryCurrencyReload(const FString &CharacterId);
+  // Sends every reload that waited for the sidecar. Run from the sidecar's connect event.
+  void ResumeCurrencyReloadsAfterSidecarConnect();
+  // Ends a reload that cannot land: logs every entry it leaves unsaved, so staff can rebuild it,
+  // then settles every held attempt. The currency stays held on the components.
+  void GiveUpCurrencyReload(const FString &CharacterId, const FString &Reason);
+  // Ends the reload: clears its timer and settles every held attempt without resuming it.
+  void AbandonCurrencyReload(const FString &CharacterId);
+  // Runs every held attempt again, with its settle; one whose component is gone just settles.
+  void ResumeHeldItemFlushes(TArray<FRedwoodHeldItemFlush> &HeldFlushes);
+
+  // Trades that went out and have not settled, keyed by trade id (see EmitItemsTrade).
+  TMap<FString, FRedwoodPendingItemTrade> PendingItemTrades;
+  // Every trade id this server has sent. A reused id is refused (see EmitItemsTrade).
+  TSet<FString> SentItemTradeIds;
+  uint64 LastItemTradeGeneration = 0;
+
+  // Item flushes sent and not yet answered, by send generation. A reply takes its attempt out; a
+  // reply whose generation is gone is late, from a dropped connection, and is ignored. A trade must
+  // not start while a character has one open (HasOpenItemFlush): that batch would commit before or
+  // after the trade, so the seq and the balance the trade starts from would be guesses.
+  TMap<uint64, FRedwoodInFlightItemFlush> InFlightItemFlushes;
+  uint64 LastItemFlushGeneration = 0;
+  bool HasOpenItemFlush(const FString &CharacterId) const;
+  void HandleItemsFlushReply(uint64 Generation, const TSharedPtr<FJsonObject> &ReplyObject);
+  // R34: after a sidecar reconnect, every open flush is marked unconfirmed and re-sent as a probe,
+  // with its settle. Its old reply, if it ever comes, is ignored by generation.
+  void RequeueItemFlushesAfterReconnect();
+  // M5: the reply timer of one flush fired (see FlushReplyTimeoutSeconds).
+  void HandleItemsFlushTimeout(uint64 Generation);
+  // The shared step of a reconnect and a reply timeout, for one flush taken out of the map: its
+  // component marks the batch unconfirmed and probes it now, with the attempt's settle. A flush
+  // whose component is gone settles as one (SettleItemFlushOfGoneComponent, with LostReplyWhy).
+  void ProbeItemFlushWithLostReply(FRedwoodInFlightItemFlush &Flight, const FString &LostReplyWhy);
+  // Settles a flush whose component is gone (a respawn): logs every entry and key the reply does
+  // not prove saved, writes the reply to the snapshot, and marks the snapshot when the outcome is
+  // unknown, so the next component probes the seq. Reply is null when no reply settles the flush;
+  // LostReplyWhy then says why.
+  void SettleItemFlushOfGoneComponent(
+    FRedwoodInFlightItemFlush &Flight,
+    const FRedwoodItemFlushReply *Reply,
+    const FString &LostReplyWhy
+  );
+  // The components whose last flush reply left a batch unconfirmed (its outcome unknown), per
+  // character. A trade must not start while any still is: the probe that settles it could find the
+  // batch committed or not, so the balance before the trade is a guess.
+  TMap<FString, TArray<TWeakObjectPtr<URedwoodCharacterComponent>>> UnconfirmedCurrencyComponentsByCharacter;
+  bool HasUnconfirmedCurrencyBatch(const FString &CharacterId);
+
+  // The unsettled trade that holds this character, or null.
+  FRedwoodPendingItemTrade *FindItemTradeOfCharacter(const FString &CharacterId);
+  // Fills one side from its component and snapshot. False, with OutError, when the character
+  // must not trade now.
+  bool PrepareItemTradeSide(
+    URedwoodCharacterComponent *CharacterComponent,
+    FRedwoodItemTradeSide &OutSide,
+    FString &OutError
+  );
+  void SendItemsTrade(const FString &TradeId);
+  void HandleItemsTradeReply(
+    const FString &TradeId, uint64 Generation, const TSharedPtr<FJsonObject> &Reply
+  );
+  void HandleItemsTradeTimeout(const FString &TradeId, uint64 Generation);
+  // After an attempt whose outcome is unknown, or that did not reach the realm.
+  void RetryItemsTrade(const FString &TradeId, const FString &Reason);
+  // Sends every trade that waited for the sidecar, and at once every trade whose reply was lost with
+  // the dropped connection.
+  void ResumeItemsTradesAfterSidecarConnect();
+  // A committed trade: each side adopts its fence and balance.
+  void CommitItemsTrade(const FString &TradeId, const FRedwoodItemTradeReply &Reply);
+  // A trade whose outcome cannot be learned: logs it for staff and freezes both characters, except
+  // a side whose writer fence is lost: that one already stops sending and has told the game.
+  void GiveUpItemsTrade(const FString &TradeId, const FString &Reason);
+  // Ends the trade: tells the caller, then resumes every held flush.
+  void FinishItemsTrade(
+    const FString &TradeId, const FString &Error, int64 FromCommittedSeq, int64 ToCommittedSeq
+  );
+
+  friend class FRedwoodCurrencyFlushTestAccess;
+  // FORK(hollowed-oath) END
 
   float UpdateSidecarRate = 3.f; // in seconds
   float UpdateSidecarLoadingRate = 0.2f; // in seconds

@@ -22,6 +22,7 @@
   #include "RedwoodEditorSettings.h"
 #endif
 
+#include "Async/Async.h" // FORK(hollowed-oath): the deferred desync kick
 #include "Engine/AssetManager.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/GameSession.h"
@@ -199,6 +200,61 @@ void URedwoodServerGameSubsystem::OnShutdownMessage(
 }
 
 void URedwoodServerGameSubsystem::Deinitialize() {
+  // FORK(hollowed-oath): a held flush attempt must not outlive the server. Its settle releases a
+  // detached pawn's write binding, and its timer would fire on a dead game instance. The give-up
+  // logs what stays unsaved. Keys first: a settle can change the map.
+  // A trade that never settled gives up first: its held flushes then resume into the freeze.
+  TArray<FString> TradeIds;
+  PendingItemTrades.GetKeys(TradeIds);
+  for (const FString &TradeId : TradeIds) {
+    GiveUpItemsTrade(TradeId, TEXT("the server is shutting down"));
+  }
+  TArray<FString> ReloadingCharacterIds;
+  CurrencyReloads.GetKeys(ReloadingCharacterIds);
+  for (const FString &CharacterId : ReloadingCharacterIds) {
+    GiveUpCurrencyReload(CharacterId, TEXT("the server is shutting down"));
+  }
+  // Last, after the give-ups above, which can resume held flushes. A flush still open has no reply
+  // coming: its batch may or may not be saved, so it is logged as unknown for staff, the way a
+  // freeze logs, and its settle fires so a detached pawn's barrier ends.
+  TMap<uint64, FRedwoodInFlightItemFlush> OpenFlushes = MoveTemp(InFlightItemFlushes);
+  InFlightItemFlushes.Reset();
+  for (TPair<uint64, FRedwoodInFlightItemFlush> &Pair : OpenFlushes) {
+    FRedwoodInFlightItemFlush &Flight = Pair.Value;
+    GetGameInstance()->GetTimerManager().ClearTimer(Flight.ReplyTimer);
+    LogCurrencyForStaff(
+      Flight.CharacterId,
+      TEXT("in flight when the server shut down"),
+      Flight.CurrencyEntries,
+      Flight.CurrencyEntries.Num(),
+      Flight.Sent.GrantKeys,
+      Flight.Sent.GrantKeys.Num()
+    );
+    for (const TPair<FString, uint64> &Upsert : Flight.Sent.Upserts) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Server shutting down: character %s left in flight item row %s (generation %llu, upsert), outcome UNKNOWN (it may be saved)"),
+        *Flight.CharacterId,
+        *Upsert.Key,
+        Upsert.Value
+      );
+    }
+    for (const TPair<FString, uint64> &Delete : Flight.Sent.Deletes) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Server shutting down: character %s left in flight item row %s (generation %llu, delete), outcome UNKNOWN (it may be saved)"),
+        *Flight.CharacterId,
+        *Delete.Key,
+        Delete.Value
+      );
+    }
+    if (Flight.OnAckSettled) {
+      Flight.OnAckSettled();
+    }
+  }
+
   Super::Deinitialize();
 
   if (TimerHandle_UpdateSidecar.IsValid()) {
@@ -214,6 +270,43 @@ void URedwoodServerGameSubsystem::Deinitialize() {
   if (Sidecar.IsValid()) {
     ISocketIOClientModule::Get().ReleaseNativePointer(Sidecar);
     Sidecar = nullptr;
+  }
+}
+
+void URedwoodServerGameSubsystem::BindSidecarConnectedCallback() {
+  Sidecar->OnConnectedCallback =
+    [this](const FString &InSocketId, const FString &InSessionId) {
+      HandleSidecarConnected();
+    };
+}
+
+// FORK(hollowed-oath): the sidecar's connect event, which fires on every reconnect too.
+void URedwoodServerGameSubsystem::HandleSidecarConnected() {
+  if (Sidecar.IsValid()) {
+    GetGameInstance()->GetTimerManager().SetTimer(
+      TimerHandle_UpdateSidecarLoading,
+      this,
+      &URedwoodServerGameSubsystem::SendUpdateToSidecar,
+      UpdateSidecarLoadingRate,
+      true // loop
+    );
+
+    GetGameInstance()->GetTimerManager().SetTimer(
+      TimerHandle_UpdateSidecar,
+      this,
+      &URedwoodServerGameSubsystem::SendUpdateToSidecar,
+      UpdateSidecarRate,
+      true, // loop
+      0.f // immediately trigger first one
+    );
+    // FORK(hollowed-oath): a reply to a flush sent on the dropped connection never comes. The
+    // sidecar answers every request it gets within its realm timeout, so every flush still open
+    // now is one of those: re-send each as a probe (R34).
+    RequeueItemFlushesAfterReconnect();
+    // FORK(hollowed-oath): currency reloads and trade resends that waited for the sidecar go out
+    // now.
+    ResumeCurrencyReloadsAfterSidecarConnect();
+    ResumeItemsTradesAfterSidecarConnect();
   }
 }
 
@@ -566,27 +659,9 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
     }
   );
 
-  Sidecar->OnConnectedCallback =
-    [this](const FString &InSocketId, const FString &InSessionId) {
-      if (Sidecar.IsValid()) {
-        GetGameInstance()->GetTimerManager().SetTimer(
-          TimerHandle_UpdateSidecarLoading,
-          this,
-          &URedwoodServerGameSubsystem::SendUpdateToSidecar,
-          UpdateSidecarLoadingRate,
-          true // loop
-        );
-
-        GetGameInstance()->GetTimerManager().SetTimer(
-          TimerHandle_UpdateSidecar,
-          this,
-          &URedwoodServerGameSubsystem::SendUpdateToSidecar,
-          UpdateSidecarRate,
-          true, // loop
-          0.f // immediately trigger first one
-        );
-      }
-    };
+  // FORK(hollowed-oath): the connect callback lives in BindSidecarConnectedCallback, so a test can
+  // install the real one on its own socket.
+  BindSidecarConnectedCallback();
 
   FString SidecarPort = TEXT("3020"); // default port
   FParse::Value(FCommandLine::Get(), TEXT("SidecarPort="), SidecarPort);
@@ -1760,6 +1835,24 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
       CharacterObject->SetNumberField(
         TEXT("inventorySeq"), DetachedPSC->RedwoodCharacter.InventorySeq
       );
+      // FORK(hollowed-oath): the staged currency goes into the same write, as on the attached
+      // path.
+      ApplyOfflineCurrency(DetachedPSC->RedwoodCharacter, CharacterComponent);
+      URedwoodCommonGameSubsystem::WriteOfflineCurrency(
+        DetachedPSC->RedwoodCharacter, CharacterObject
+      );
+    } else if (CharacterComponent->GetPendingCurrencyEntries().Num() > 0 ||
+               CharacterComponent->GetPendingGrantKeys().Num() > 0) {
+      // FORK(hollowed-oath): with no PlayerState there is no balance to apply the entries to, so
+      // they go with the pawn, loudly. SaveCharacterJsonToDisk keeps the file's balance.
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Offline detached save: character %s has no PlayerState; %d currency entries and %d grant keys are NOT saved"),
+        *CharacterId,
+        CharacterComponent->GetPendingCurrencyEntries().Num(),
+        CharacterComponent->GetPendingGrantKeys().Num()
+      );
     }
     // FORK(hollowed-oath) END
     CharacterObject->SetStringField(TEXT("id"), CharacterId);
@@ -2216,14 +2309,11 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
             Pawn ? *Pawn->GetName() : TEXT("<none>")
           );
           CharacterComponent->ClearDirtyFlags();
-          // FORK(hollowed-oath): item dirty state is NOT touched by ClearDirtyFlags (it clears
-          // only on a send's ack), so the identity-mismatch skip path must clear it explicitly or
-          // this component's items stay dirty forever. Fork-added; keep alongside the skip.
-          // ClearDirtyFlags() deliberately leaves items alone (they only clear on a
-          // send's ack) -- but this component is never going to be flushed at all (it's
-          // being skipped outright), so there is no in-flight send to race; clear its
-          // item dirty state directly instead of leaving it stuck forever.
-          CharacterComponent->ClearItemsDirtyState();
+          // FORK(hollowed-oath): item dirt and staged currency are NOT touched by ClearDirtyFlags
+          // (they clear only on a send's ack), so the skip must drop them itself, or this
+          // component stays dirty forever. Both go together, the currency logged: a debit must
+          // not outlive the row it pays for. Fork-added; keep alongside the skip.
+          CharacterComponent->DropStagedForIdentityMismatch(AuthoritativeCharId);
           continue;
         }
 
@@ -2381,10 +2471,12 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
               PlayerStateComponent, CharacterComponent
             );
           }
-        } else if (AppendOfflineItemRows(
-                     OfflineItemRows, CharacterComponent
-                   )) {
-          bHasOfflineItemRows = true;
+        } else {
+          if (AppendOfflineItemRows(OfflineItemRows, CharacterComponent)) {
+            bHasOfflineItemRows = true;
+          }
+          // The staged currency moves onto the snapshot, which the offline block below writes.
+          ApplyOfflineCurrency(PlayerStateComponent->RedwoodCharacter, CharacterComponent);
         }
         // FORK(hollowed-oath) END
 
@@ -2427,6 +2519,11 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
       CharacterObject->SetNumberField(
         TEXT("inventorySeq"), PlayerStateComponent->RedwoodCharacter.InventorySeq
       );
+      // The balance and grant keys ride the same whole-file write, from the snapshot the
+      // component loop above applied the staged currency to.
+      URedwoodCommonGameSubsystem::WriteOfflineCurrency(
+        PlayerStateComponent->RedwoodCharacter, CharacterObject
+      );
     }
     // FORK(hollowed-oath) END
 
@@ -2460,8 +2557,8 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
 // never stranded and a failed/lost/component-destroyed send is always retried. At most one batch
 // is outstanding: while one is in flight TryBeginItemFlush returns false and this tick's flush is
 // parked (dirt keeps coalescing). AppendOfflineItemRows is its offline/PIE twin (whole-array write
-// into the on-disk character JSON). EmitItemsTrade is a one-shot backend op
-// with no dirty-state interaction. Called from CreatePlayerCharacterDataObject /
+// into the on-disk character JSON). EmitItemsTrade is a one-shot backend op that holds both
+// characters' flushes until it settles, then hands each side its commit. Called from CreatePlayerCharacterDataObject /
 // FlushDetachedCharacterData above; the game module (AClient / per-bag inventory) drives the dirty
 // state via URedwoodCharacterComponent::MarkItemsDirty/MarkItemsDeleted and calls the trade
 // emit. Declarations sit under a matching FORK marker in RedwoodServerGameSubsystem.h.
@@ -2495,11 +2592,51 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
 // file-local (static, not an anonymous namespace -- those merge across unity-build blobs)
 static const TCHAR *ItemsEnvelopePlaceholderId = TEXT("game-server");
 
+// FORK(hollowed-oath): one currency entry on the wire, for the flush and the trade. Amounts go as
+// decimal strings: a JSON number is a double, which cannot hold every int64, so a large amount
+// would arrive rounded. Optional fields are left out when empty: the backend schema accepts a
+// missing field, but not null.
+static TSharedPtr<FJsonObject> MakeCurrencyEntryJson(const FRedwoodCurrencyEntry &Entry) {
+  TSharedPtr<FJsonObject> EntryObject = MakeShareable(new FJsonObject);
+  EntryObject->SetStringField(TEXT("id"), Entry.Id);
+  EntryObject->SetStringField(TEXT("delta"), LexToString(Entry.Delta));
+  EntryObject->SetStringField(TEXT("balanceAfter"), LexToString(Entry.BalanceAfter));
+  EntryObject->SetStringField(TEXT("reason"), Entry.Reason);
+  if (!Entry.SourceRef.IsEmpty()) {
+    EntryObject->SetStringField(TEXT("sourceRef"), Entry.SourceRef);
+  }
+  if (!Entry.ActorAccountId.IsEmpty()) {
+    EntryObject->SetStringField(TEXT("actorAccountId"), Entry.ActorAccountId);
+  }
+  return EntryObject;
+}
+
+// FORK(hollowed-oath): the `alerts` of a flush or trade reply. An entry that is not an object is
+// skipped.
+static void ParseCurrencyAlerts(
+  const TSharedPtr<FJsonObject> &Reply, TArray<TSharedPtr<FJsonObject>> &OutAlerts
+) {
+  const TArray<TSharedPtr<FJsonValue>> *AlertValues = nullptr;
+  if (!Reply->TryGetArrayField(TEXT("alerts"), AlertValues)) {
+    return;
+  }
+  for (const TSharedPtr<FJsonValue> &AlertValue : *AlertValues) {
+    const TSharedPtr<FJsonObject> *AlertObject = nullptr;
+    if (AlertValue.IsValid() && AlertValue->TryGetObject(AlertObject) && AlertObject) {
+      OutAlerts.Add(*AlertObject);
+    }
+  }
+}
+
 TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsFlushPayload(
   const FString &CharacterId,
   int64 BatchSeq,
   const TArray<TSharedPtr<FJsonValue>> &Upserts,
-  const TArray<TSharedPtr<FJsonValue>> &Deletes
+  const TArray<TSharedPtr<FJsonValue>> &Deletes,
+  const TArray<FRedwoodCurrencyEntry> &CurrencyEntries,
+  const TArray<FString> &GrantKeys,
+  const FString &WriterToken,
+  bool bProbe
 ) {
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("id"), ItemsEnvelopePlaceholderId);
@@ -2507,13 +2644,39 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsFlushPayload(
   Payload->SetNumberField(TEXT("batchSeq"), static_cast<double>(BatchSeq));
   Payload->SetArrayField(TEXT("upserts"), Upserts);
   Payload->SetArrayField(TEXT("deletes"), Deletes);
+
+  TArray<TSharedPtr<FJsonValue>> CurrencyJsonArray;
+  CurrencyJsonArray.Reserve(CurrencyEntries.Num());
+  for (const FRedwoodCurrencyEntry &Entry : CurrencyEntries) {
+    CurrencyJsonArray.Add(MakeShareable(new FJsonValueObject(MakeCurrencyEntryJson(Entry))));
+  }
+  Payload->SetArrayField(TEXT("currency"), CurrencyJsonArray);
+
+  TArray<TSharedPtr<FJsonValue>> GrantsJsonArray;
+  GrantsJsonArray.Reserve(GrantKeys.Num());
+  for (const FString &GrantKey : GrantKeys) {
+    GrantsJsonArray.Add(MakeShareable(new FJsonValueString(GrantKey)));
+  }
+  Payload->SetArrayField(TEXT("grants"), GrantsJsonArray);
+
+  Payload->SetStringField(TEXT("writerToken"), WriterToken);
+  // FORK(hollowed-oath): a re-send of an unconfirmed batch says so. The backend never applies a
+  // probe; it only answers whether the first attempt committed. Left out otherwise (never false or
+  // null), the way older senders send it.
+  if (bProbe) {
+    Payload->SetBoolField(TEXT("probe"), true);
+  }
   return Payload;
 }
 
 TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsTradePayload(
   const FString &FromCharacterId,
   const FString &ToCharacterId,
-  const TArray<FRedwoodTradeRootPlacement> &RootPlacements
+  const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
+  const TArray<TPair<FString, FRedwoodCurrencyEntry>> &CurrencyByCharacter,
+  const FString &FromWriterToken,
+  const FString &ToWriterToken,
+  const FString &TradeId
 ) {
   TArray<TSharedPtr<FJsonValue>> RootPlacementsJsonArray;
   RootPlacementsJsonArray.Reserve(RootPlacements.Num());
@@ -2531,6 +2694,11 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsTradePayload(
     } else {
       PlacementObject->SetStringField(TEXT("parentId"), Placement.ParentId);
     }
+    // FORK(hollowed-oath): always named, so the backend never has to guess the direction.
+    PlacementObject->SetStringField(
+      TEXT("fromCharacterId"),
+      Placement.FromCharacterId.IsEmpty() ? FromCharacterId : Placement.FromCharacterId
+    );
     RootPlacementsJsonArray.Add(
       MakeShareable(new FJsonValueObject(PlacementObject))
     );
@@ -2541,7 +2709,95 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsTradePayload(
   Payload->SetStringField(TEXT("fromCharacterId"), FromCharacterId);
   Payload->SetStringField(TEXT("toCharacterId"), ToCharacterId);
   Payload->SetArrayField(TEXT("rootPlacements"), RootPlacementsJsonArray);
+
+  // FORK(hollowed-oath): each entry names its character, as the backend's trade schema reads it.
+  TArray<TSharedPtr<FJsonValue>> CurrencyJsonArray;
+  CurrencyJsonArray.Reserve(CurrencyByCharacter.Num());
+  for (const TPair<FString, FRedwoodCurrencyEntry> &Pair : CurrencyByCharacter) {
+    TSharedPtr<FJsonObject> SideObject = MakeShareable(new FJsonObject);
+    SideObject->SetStringField(TEXT("characterId"), Pair.Key);
+    SideObject->SetObjectField(TEXT("entry"), MakeCurrencyEntryJson(Pair.Value));
+    CurrencyJsonArray.Add(MakeShareable(new FJsonValueObject(SideObject)));
+  }
+  Payload->SetArrayField(TEXT("currency"), CurrencyJsonArray);
+  // FORK(hollowed-oath): without both tokens the backend refuses every trade; without the trade id,
+  // every trade that carries currency.
+  Payload->SetStringField(TEXT("fromWriterToken"), FromWriterToken);
+  Payload->SetStringField(TEXT("toWriterToken"), ToWriterToken);
+  Payload->SetStringField(TEXT("tradeId"), TradeId);
   return Payload;
+}
+
+// FORK(hollowed-oath): catch this component up to the character's committed fence before it
+// claims a seq. The fence is per-CHARACTER but NextBatchSeq is per-COMPONENT, so a component that
+// did not send the last batch -- the one deferred by the one-flush-per-character rule, or one
+// created after another had already flushed -- still holds its login-time value. Sending that
+// stale seq makes the backend answer "replay", and the success-shaped ack then clears rows that
+// were never persisted. The PlayerState snapshot carries the latest committed fence (written back
+// on every successful ack), so trust it when it is ahead. Only ever forward: seeding backwards
+// would re-wedge the lane behind a seq the backend has already passed.
+static void CatchUpItemSeqFromSnapshot(
+  const URedwoodPlayerStateComponent *PlayerStateComponent,
+  URedwoodCharacterComponent *CharacterComponent
+) {
+  if (!PlayerStateComponent) {
+    return;
+  }
+  const FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+  if (Snapshot.InventorySeq > CharacterComponent->GetLastCommittedItemSeq()) {
+    CharacterComponent->SeedItemSeqFromCharacter(Snapshot.InventorySeq);
+    // FORK(hollowed-oath): a component that catches up from a snapshot whose balance is stale
+    // must not send currency chained from it.
+    if (Snapshot.bCurrencyAmountUnknown) {
+      CharacterComponent->RequireCurrencyReload();
+    }
+  }
+  // FORK(hollowed-oath): a batch of a component that is gone may have committed at the marked
+  // seq. This component probes it before its own batch could take that seq.
+  if (Snapshot.bInventorySeqUnconfirmed) {
+    CharacterComponent->RequireItemSeqProbe(
+      Snapshot.UnconfirmedInventorySeq, Snapshot.bCurrencyAmountUnknown
+    );
+  }
+}
+
+// FORK(hollowed-oath): keeps a flush attempt for later. Every attempt with a settle is kept, so
+// each one settles exactly once. A live tick flush has none; one entry per component is enough to
+// flush it again later.
+static void AddHeldItemFlush(
+  TArray<FRedwoodHeldItemFlush> &HeldFlushes,
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  URedwoodCharacterComponent *CharacterComponent,
+  TFunction<void()> OnAckSettled
+) {
+  const bool bAlreadyHeldLive = !OnAckSettled &&
+    HeldFlushes.ContainsByPredicate([CharacterComponent](const FRedwoodHeldItemFlush &Held) {
+      return !Held.OnAckSettled && Held.CharacterComponent.Get() == CharacterComponent;
+    });
+  if (bAlreadyHeldLive) {
+    return;
+  }
+  FRedwoodHeldItemFlush &Held = HeldFlushes.AddDefaulted_GetRef();
+  Held.CharacterComponent = CharacterComponent;
+  Held.PlayerStateComponent = PlayerStateComponent;
+  Held.OnAckSettled = MoveTemp(OnAckSettled);
+}
+
+void URedwoodServerGameSubsystem::ResumeHeldItemFlushes(TArray<FRedwoodHeldItemFlush> &HeldFlushes) {
+  // Single-flight still holds: the first resumed attempt of a component claims its slot, a second
+  // parks behind it, and any more settle at once, exactly as un-held attempts would. A live
+  // component's entry flushes it now, so what waited goes out without waiting for the next save
+  // pass.
+  for (FRedwoodHeldItemFlush &Held : HeldFlushes) {
+    URedwoodCharacterComponent *Component = Held.CharacterComponent.Get();
+    if (IsValid(Component)) {
+      FlushItemsForCharacterComponent(
+        Held.PlayerStateComponent.Get(), Component, MoveTemp(Held.OnAckSettled)
+      );
+    } else if (Held.OnAckSettled) {
+      Held.OnAckSettled();
+    }
+  }
 }
 
 void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
@@ -2560,6 +2816,58 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
       OnAckSettled();
     }
   };
+
+  // FORK(hollowed-oath): a component that was never hydrated has no character to write for, and
+  // must never join a character's hold or reload (an empty id would join every other such one).
+  const FString CharacterId = PlayerStateComponent ? PlayerStateComponent->RedwoodCharacter.Id
+                                                   : CharacterComponent->RedwoodCharacterId;
+  if (CharacterId.IsEmpty()) {
+    if (CharacterComponent->IsItemsDirty()) {
+      UE_LOG(
+        LogRedwood, Error, TEXT("FlushItemsForCharacterComponent: the component has no character id; not flushing")
+      );
+    }
+    Settle();
+    return;
+  }
+
+  // FORK(hollowed-oath): another session owns this character (see IsWriterFenceLost). Never send
+  // again, not even a probe; settle so a detached pawn's barrier releases.
+  if (CharacterComponent->IsWriterFenceLost()) {
+    Settle();
+    return;
+  }
+
+  // FORK(hollowed-oath): a final refusal froze this character. Nothing staged can be trusted, so
+  // whatever this component staged since is dropped (and logged), and the attempt settles with
+  // nothing left to save: a detached pawn's write binding releases as usual. With a batch of this
+  // component in flight, its reply drops instead, AFTER it has removed what committed: dropping
+  // now would log saved entries as lost, and staff would pay them twice.
+  if (CharacterComponent->IsFrozenAfterFinalRefusal() || FrozenCharacterIds.Contains(CharacterId)) {
+    if (!CharacterComponent->IsItemFlushInFlight()) {
+      CharacterComponent->FreezeAfterFinalRefusal(TEXT("the character is frozen"));
+    }
+    Settle();
+    return;
+  }
+
+  // FORK(hollowed-oath): an unsettled trade owns this character's lane. Its commit takes the next
+  // seq and moves the balance: a batch sent meanwhile could take that seq first, or carry entries
+  // chained from the old balance, and a batch of item rows sent at a seq the trade used is acked as
+  // a replay and never saved. Held even with nothing dirty, so a detached pawn's write binding is
+  // not released under the trade. The trade resumes this attempt, settle and all, when it settles.
+  if (FRedwoodPendingItemTrade *Trade = FindItemTradeOfCharacter(CharacterId)) {
+    AddHeldItemFlush(
+      Trade->HeldFlushes, PlayerStateComponent, CharacterComponent, MoveTemp(OnAckSettled)
+    );
+    return;
+  }
+
+  // FORK(hollowed-oath): currency a destroyed component of this character handed to the snapshot
+  // (R26), for a component that hydrated before it was handed off.
+  if (PlayerStateComponent) {
+    CharacterComponent->AdoptHandedOffCurrency(PlayerStateComponent->RedwoodCharacter);
+  }
 
   // Early-out before claiming the flight slot: the detached-flush leg calls this without the
   // dispatch site's IsItemsDirty() pre-check, and a slot claimed here would never be released.
@@ -2586,6 +2894,25 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     return;
   }
 
+  CatchUpItemSeqFromSnapshot(PlayerStateComponent, CharacterComponent);
+
+  // FORK(hollowed-oath): while a reload is needed for this character, hold EVERY flush of it, from
+  // every component, item rows included. A purchase is its item row plus its debit; with the debit
+  // held for the reload, the row alone could commit, and if the debit is then refused for good the
+  // item is free. The flag is never set while this component has a batch in flight, so no reply is
+  // coming that would start the reload: start or join it now. Its reply resumes this attempt with
+  // its settle, so a detached pawn's barrier waits for the delivery rather than for the hold.
+  // An unconfirmed batch goes first, even with a rebase required behind it: the reload may read
+  // the balance only once the probe has settled whether that batch committed.
+  const bool bNeedsReload = CharacterComponent->IsCurrencyRebaseRequired() &&
+    !CharacterComponent->IsCurrencyBatchUnconfirmed();
+  if (bNeedsReload || CurrencyReloads.Contains(CharacterId)) {
+    HoldItemFlushForCurrencyReload(
+      CharacterId, PlayerStateComponent, CharacterComponent, OnAckSettled
+    );
+    return;
+  }
+
   // Claim the single-flight slot + the batchSeq this batch must stamp. If a batch is already
   // outstanding, park this tick's flush -- the dirt stays marked and coalesces until the in-flight
   // batch's ack releases the slot. Settle so the detached barrier doesn't wait forever on a parked
@@ -2593,21 +2920,6 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // DETACHED pawn has no next tick, so a parked attempt is DEFERRED rather than settled: it re-runs
   // from CompleteItemFlush once this batch's ack frees the slot, carrying the detached barrier's
   // settle with it, so the write binding cannot release before the rows land (#1534).
-  // FORK(hollowed-oath): catch this component up to the character's committed fence before it
-  // claims a seq. The fence is per-CHARACTER but NextBatchSeq is per-COMPONENT, so a component that
-  // did not send the last batch -- the one deferred by the one-flush-per-character rule, or one
-  // created after another had already flushed -- still holds its login-time value. Sending that
-  // stale seq makes the backend answer "replay", and the success-shaped ack then clears rows that
-  // were never persisted. The PlayerState snapshot carries the latest committed fence (written back
-  // on every successful ack), so trust it when it is ahead. Only ever forward: seeding backwards
-  // would re-wedge the lane behind a seq the backend has already passed.
-  if (PlayerStateComponent) {
-    const int64 AuthoritativeSeq = PlayerStateComponent->RedwoodCharacter.InventorySeq;
-    if (AuthoritativeSeq > CharacterComponent->GetLastCommittedItemSeq()) {
-      CharacterComponent->SeedItemSeqFromCharacter(AuthoritativeSeq);
-    }
-  }
-
   int64 BatchSeq = 0;
   if (!CharacterComponent->TryBeginItemFlush(BatchSeq)) {
     // PARK, don't settle. A live component would retry on its next tick, but a DETACHED pawn has no
@@ -2645,6 +2957,30 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     return;
   }
 
+  // FORK(hollowed-oath): everything this batch sends and its reply needs, copied now. The queues
+  // and the dirty maps can change before the reply arrives.
+  FRedwoodItemFlushSent Sent;
+  Sent.BatchSeq = BatchSeq;
+
+  // FORK(hollowed-oath): the currency this batch carries, taken right after the claim because the
+  // claim decides it (an unconfirmed batch goes out again exactly as it was sent). The reply must
+  // name the same counts, so CompleteItemFlush drops exactly what went out.
+  TArray<FRedwoodCurrencyEntry> SentCurrencyEntries;
+  TArray<FString> SentGrantKeys;
+  ClaimCurrencyToSend(CharacterComponent, SentCurrencyEntries, SentGrantKeys);
+  Sent.CurrencyCount = SentCurrencyEntries.Num();
+  Sent.GrantKeys = SentGrantKeys;
+  if (SentCurrencyEntries.Num() > 0) {
+    Sent.bHasBalanceAfter = true;
+    Sent.BalanceAfter = SentCurrencyEntries.Last().BalanceAfter;
+  }
+
+  // FORK(hollowed-oath): a re-send of an unconfirmed currency batch carries no item rows. If the
+  // first attempt committed, the backend answers this one as a replay and applies none of its rows,
+  // yet the success reply would clear them.
+  const bool bReplayProbe = CharacterComponent->IsItemFlushReplayProbe();
+  Sent.bProbe = bReplayProbe;
+
   // Generation counters, not plain ids -- lets CompleteItemFlush tell "the record I sent" apart
   // from "the record as it stands after a re-dirty that arrived while this send was in flight".
   const TMap<FString, uint64> &DirtyGenerations =
@@ -2653,143 +2989,1061 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     CharacterComponent->GetPendingDeletedItemGenerations();
 
   TArray<TSharedPtr<FJsonValue>> UpsertsJsonArray;
-  // The exact (id, generation) pairs actually included in UpsertsJsonArray below -- NOT simply
-  // DirtyGenerations, since a dirty id with no matching record (logged below) is never sent and
-  // must not be acked.
-  TArray<TPair<FString, uint64>> SentUpserts;
-  for (const FRedwoodItemRecord &Record : *RecordsArray) {
-    const uint64 *Generation = DirtyGenerations.Find(Record.Id);
-    if (!Generation) {
-      continue;
+  TArray<TSharedPtr<FJsonValue>> DeletesJsonArray;
+  if (!bReplayProbe) {
+    // Sent.Upserts holds the exact (id, generation) pairs actually included in UpsertsJsonArray --
+    // NOT simply DirtyGenerations, since a dirty id with no matching record (logged below) is never
+    // sent and must not be acked.
+    for (const FRedwoodItemRecord &Record : *RecordsArray) {
+      const uint64 *Generation = DirtyGenerations.Find(Record.Id);
+      if (!Generation) {
+        continue;
+      }
+
+      UpsertsJsonArray.Add(MakeShareable(new FJsonValueObject(
+        URedwoodCommonGameSubsystem::SerializeItemRecord(Record)
+      )));
+      Sent.Upserts.Add(TPair<FString, uint64>(Record.Id, *Generation));
     }
 
-    UpsertsJsonArray.Add(MakeShareable(new FJsonValueObject(
-      URedwoodCommonGameSubsystem::SerializeItemRecord(Record)
-    )));
-    SentUpserts.Add(TPair<FString, uint64>(Record.Id, *Generation));
+    if (UpsertsJsonArray.Num() != DirtyGenerations.Num()) {
+      // A dirty item id that isn't in RecordsArray at all -- the game marked it dirty but never
+      // wrote a matching record into the items array before the flush ran. Not fatal (the
+      // deletion, if any, still goes out), but worth surfacing since that record is silently
+      // skipped this flush. It stays dirty (not in Sent.Upserts) so a later flush, once a matching
+      // record exists, retries it.
+      UE_LOG(
+        LogRedwood,
+        Warning,
+        TEXT(
+          "FlushItemsForCharacterComponent: %d dirty item id(s) had no matching record in %s (skipped, left dirty)"
+        ),
+        DirtyGenerations.Num() - UpsertsJsonArray.Num(),
+        *CharacterComponent->ItemsVariableName
+      );
+    }
+
+    for (const TPair<FString, uint64> &Deleted : DeletedGenerations) {
+      DeletesJsonArray.Add(MakeShareable(new FJsonValueString(Deleted.Key)));
+      Sent.Deletes.Add(Deleted);
+    }
   }
 
-  if (UpsertsJsonArray.Num() != DirtyGenerations.Num()) {
-    // A dirty item id that isn't in RecordsArray at all -- the game marked it dirty but never
-    // wrote a matching record into the items array before the flush ran. Not fatal (the deletion,
-    // if any, still goes out), but worth surfacing since that record is silently skipped this
-    // flush. It stays dirty (not in SentUpserts) so a later flush, once a matching record exists,
-    // retries it.
-    UE_LOG(
-      LogRedwood,
-      Warning,
-      TEXT(
-        "FlushItemsForCharacterComponent: %d dirty item id(s) had no matching record in %s (skipped, left dirty)"
-      ),
-      DirtyGenerations.Num() - UpsertsJsonArray.Num(),
-      *CharacterComponent->ItemsVariableName
-    );
-  }
-
-  TArray<TSharedPtr<FJsonValue>> DeletesJsonArray;
-  TArray<TPair<FString, uint64>> SentDeletes;
-  for (const TPair<FString, uint64> &Deleted : DeletedGenerations) {
-    DeletesJsonArray.Add(MakeShareable(new FJsonValueString(Deleted.Key)));
-    SentDeletes.Add(Deleted);
-  }
-
-  if (UpsertsJsonArray.Num() == 0 && DeletesJsonArray.Num() == 0) {
+  // FORK(hollowed-oath): pending currency counts as sendable. Without it a batch of entries alone
+  // would take this path, and the entries would never leave.
+  // FORK(hollowed-oath): a probe always goes out, even an empty one (the probe of a batch of rows
+  // alone): its answer is what settles the seq.
+  if (!bReplayProbe && UpsertsJsonArray.Num() == 0 && DeletesJsonArray.Num() == 0 &&
+      SentCurrencyEntries.Num() == 0 && SentGrantKeys.Num() == 0) {
     // Nothing actually sendable (e.g. every dirty id lacked a record). Release the flight slot we
     // just claimed via the ack path with no sent ids and the current committed seq, so the next
     // flush isn't wedged behind a slot that never sent anything. Settle synchronously: no emit
     // means no async callback will ever settle this attempt.
-    CharacterComponent->CompleteItemFlush(
-      TEXT(""), CharacterComponent->GetLastCommittedItemSeq(), {}, {}
-    );
+    // FORK(hollowed-oath): as not sent, so the empty claim marks nothing unconfirmed.
+    FRedwoodItemFlushReply NothingSent;
+    NothingSent.CommittedSeq = CharacterComponent->GetLastCommittedItemSeq();
+    NothingSent.bNotForwarded = true;
+    CharacterComponent->CompleteItemFlush(NothingSent, FRedwoodItemFlushSent());
     Settle();
     return;
   }
 
   TSharedPtr<FJsonObject> Payload = BuildItemsFlushPayload(
-    PlayerStateComponent ? PlayerStateComponent->RedwoodCharacter.Id
-                         : CharacterComponent->RedwoodCharacterId,
+    CharacterId,
     BatchSeq,
     UpsertsJsonArray,
-    DeletesJsonArray
+    DeletesJsonArray,
+    SentCurrencyEntries,
+    SentGrantKeys,
+    CharacterComponent->GetWriterToken(),
+    bReplayProbe
   );
 
-  // SentUpserts/SentDeletes above are already independent copies of the (id, generation) pairs
-  // sent in this payload -- not references into CharacterComponent's live maps, which may change
-  // again (a re-dirty bumping a generation, a new mark, etc.) before this ack arrives.
-  TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = CharacterComponent;
-  // FORK(hollowed-oath): carried into the ack so a committed seq can be written back onto the
-  // PlayerState snapshot -- see the write-back at the ack site for why a stale snapshot loses items.
-  TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerStateComponent = PlayerStateComponent;
+  // FORK(hollowed-oath): the attempt is kept here under a generation, not in the reply callback. A
+  // reconnect must be able to take it back (RequeueItemFlushesAfterReconnect), and a reply that then
+  // arrives from the old connection must find nothing to act on.
+  const uint64 Generation = ++LastItemFlushGeneration;
+  FRedwoodInFlightItemFlush &Flight = InFlightItemFlushes.Add(Generation);
+  Flight.CharacterComponent = CharacterComponent;
+  // Carried into the ack so the committed seq and balance can be written back onto the PlayerState
+  // snapshot -- see ApplyItemsFlushReply for why a stale snapshot loses items.
+  Flight.PlayerStateComponent = PlayerStateComponent;
+  Flight.CharacterId = CharacterId;
+  Flight.Sent = MoveTemp(Sent);
+  Flight.CurrencyEntries = SentCurrencyEntries;
+  Flight.OnAckSettled = MoveTemp(OnAckSettled);
+  // FORK(hollowed-oath): M5, one timer per send (see FlushReplyTimeoutSeconds).
+  if (UGameInstance *GameInstance = GetGameInstance()) {
+    GameInstance->GetTimerManager().SetTimer(
+      Flight.ReplyTimer,
+      FTimerDelegate::CreateWeakLambda(
+        this, [this, Generation]() { HandleItemsFlushTimeout(Generation); }
+      ),
+      FlushReplyTimeoutSeconds,
+      false // no loop
+    );
+  }
 
+  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
   Sidecar->Emit(
     TEXT("realm:characters:items:flush"),
     Payload,
-    [WeakCharacterComponent, WeakPlayerStateComponent, SentUpserts, SentDeletes, OnAckSettled](auto Response) {
-      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
-      FString Error = MessageStruct->GetStringField(TEXT("error"));
-      // committedSeq rides both success and error (fence/replay) responses; TryGetNumberField
-      // leaves the 0 default when absent (e.g. some error responses), which the error path treats
-      // as "no fence ahead of us" and leaves NextBatchSeq alone -- and avoids a spurious missing-
-      // field warning that GetNumberField would log.
-      double CommittedSeqValue = 0.0;
-      MessageStruct->TryGetNumberField(TEXT("committedSeq"), CommittedSeqValue);
-      int64 CommittedSeq = static_cast<int64>(CommittedSeqValue);
-
-      URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
-      if (!IsValid(CharacterComponent)) {
-        // The player disconnected (or the pawn/PlayerState was destroyed) while this request was
-        // in flight -- the single-flight slot lives on that now-dead component, so there is
-        // nothing to release or clear. (Inherited exposure: the flush barrier that bounds a
-        // detached pawn's lifetime keeps this from leaking a live component's slot.)
-        if (!Error.IsEmpty()) {
-          UE_LOG(
-            LogRedwood, Error, TEXT("Failed to flush items (component gone): %s"), *Error
-          );
-        }
-        // Still settle: the detached release barrier must not stall forever just because the
-        // component died mid-flight -- the attempt HAS resolved.
-        if (OnAckSettled) {
-          OnAckSettled();
-        }
+    [WeakSubsystem, Generation](auto Response) {
+      URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
+      if (!Subsystem) {
         return;
       }
-
-      if (!Error.IsEmpty()) {
-        UE_LOG(LogRedwood, Error, TEXT("Failed to flush items: %s"), *Error);
-      }
-
-      // ALWAYS complete (success or error): CompleteItemFlush releases the single-flight slot and,
-      // on success, clears only the generation-matched sent ids and advances the committed seq; on
-      // error it leaves the dirt for the next flush (realigning NextBatchSeq only if the backend
-      // reports a fence at/past the seq we sent).
-      CharacterComponent->CompleteItemFlush(
-        Error, CommittedSeq, SentUpserts, SentDeletes
+      // FORK(hollowed-oath): an unreadable reply parses as an error with no fence: the outcome is
+      // unknown, so the batch is kept and re-sent.
+      const TSharedPtr<FJsonObject> *ReplyObject =
+        URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+      Subsystem->HandleItemsFlushReply(
+        Generation, ReplyObject ? *ReplyObject : TSharedPtr<FJsonObject>()
       );
-
-      // FORK(hollowed-oath): write the committed fence back onto the PlayerState snapshot.
-      // Only the COMPONENT's seq state advanced above; PlayerStateComponent->RedwoodCharacter
-      // .InventorySeq stayed at its login value. A character component recreated later in the
-      // session -- a respawn re-creating a pawn-owned component is the ordinary case -- seeds
-      // itself from that snapshot (SeedItemSeqFromCharacter), so it would send an ALREADY USED
-      // batchSeq. The backend no-ops that batch as a replay, and the no-op's success ack then
-      // clears the new component's dirty rows: the mutation is lost with every side reporting
-      // success. Keeping the snapshot current means a recreated component starts where the
-      // channel actually is.
-      if (Error.IsEmpty() && CommittedSeq > 0) {
-        if (URedwoodPlayerStateComponent *StateComponent = WeakPlayerStateComponent.Get()) {
-          if (StateComponent->RedwoodCharacter.InventorySeq < CommittedSeq) {
-            StateComponent->RedwoodCharacter.InventorySeq = CommittedSeq;
-          }
-        }
-      }
-
-      // Settle AFTER CompleteItemFlush, on both success and error: the release barrier's rule is
-      // "the attempt resolved", which is exactly here.
-      if (OnAckSettled) {
-        OnAckSettled();
-      }
     }
   );
+}
+
+void URedwoodServerGameSubsystem::HandleItemsFlushReply(
+  uint64 Generation, const TSharedPtr<FJsonObject> &ReplyObject
+) {
+  // Out of the map first: that is how a trade sees the batch as answered, and the parked attempt
+  // that CompleteItemFlush runs may send a new batch.
+  FRedwoodInFlightItemFlush Flight;
+  if (!InFlightItemFlushes.RemoveAndCopyValue(Generation, Flight)) {
+    // FORK(hollowed-oath): the connection it was sent on dropped, or its reply timed out, and the
+    // batch was already marked unconfirmed and its probe sent, settle and all (R34, M5). Acting on
+    // it now would settle that attempt twice and could clear rows the probe has yet to decide.
+    UE_LOG(LogRedwood, Log, TEXT("Ignoring a late item flush reply (its connection dropped, or it timed out)"));
+    return;
+  }
+  if (UGameInstance *GameInstance = GetGameInstance()) {
+    GameInstance->GetTimerManager().ClearTimer(Flight.ReplyTimer);
+  }
+  const TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = Flight.CharacterComponent;
+  const TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerStateComponent =
+    Flight.PlayerStateComponent;
+  const FString CharacterId = Flight.CharacterId;
+  const FRedwoodItemFlushSent &Sent = Flight.Sent;
+  TFunction<void()> OnAckSettled = MoveTemp(Flight.OnAckSettled);
+  const FRedwoodItemFlushReply Reply = ParseItemsFlushReply(ReplyObject);
+
+  URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
+  if (!IsValid(CharacterComponent)) {
+    // The player disconnected (or the pawn/PlayerState was destroyed) while this request was
+    // in flight -- the single-flight slot lives on that now-dead component, so there is
+    // nothing to release or clear. (Inherited exposure: the flush barrier that bounds a
+    // detached pawn's lifetime keeps this from leaking a live component's slot.)
+    if (!Reply.Error.IsEmpty()) {
+      UE_LOG(
+        LogRedwood, Error, TEXT("Failed to flush items (component gone): %s"), *Reply.Error
+      );
+    }
+    Flight.OnAckSettled = MoveTemp(OnAckSettled);
+    SettleItemFlushOfGoneComponent(Flight, &Reply, FString());
+    return;
+  }
+
+  if (!Reply.Error.IsEmpty()) {
+    UE_LOG(LogRedwood, Error, TEXT("Failed to flush items: %s"), *Reply.Error);
+  }
+
+  // FORK(hollowed-oath): before the component takes the reply, so the parked attempt it runs
+  // already sees that this session no longer owns the character.
+  if (Reply.bWriterFenceLost) {
+    CharacterComponent->MarkWriterFenceLost();
+  }
+
+  // FORK(hollowed-oath): a final refusal freezes the whole character, BEFORE the component
+  // takes the reply. CompleteItemFlush then freezes the component (dropping and logging all it
+  // staged) and tells the game; by then every other component of the character, and a parked
+  // attempt it runs, already sees the freeze. This attempt then settles with nothing to save.
+  if (!Reply.Error.IsEmpty() && Reply.bFinal) {
+    FreezeCharacter(CharacterId, WeakPlayerStateComponent.Get());
+  }
+
+  // ALWAYS complete (success or error): CompleteItemFlush (inside) releases the single-flight
+  // slot and, on success, clears only the generation-matched sent ids and advances the
+  // committed seq; on error it leaves the dirt for the next flush.
+  ApplyItemsFlushReply(
+    CharacterComponent, WeakPlayerStateComponent.Get(), Reply, Sent
+  );
+
+  // FORK(hollowed-oath): per character, so a trade sees an unknown outcome on any component.
+  if (CharacterComponent->IsCurrencyBatchUnconfirmed()) {
+    UnconfirmedCurrencyComponentsByCharacter.FindOrAdd(CharacterId).AddUnique(
+      CharacterComponent
+    );
+  }
+  if (CharacterComponent->IsWriterFenceLost()) {
+    // Nothing more to do: no reload or freeze for a session that no longer owns the character.
+  } else if (IsCharacterFrozen(CharacterId)) {
+    // FORK(hollowed-oath): the character froze while this batch was in flight. Its reply has
+    // removed what committed; drop the rest now.
+    if (!CharacterComponent->IsFrozenAfterFinalRefusal()) {
+      CharacterComponent->FreezeAfterFinalRefusal(TEXT("the character is frozen"));
+    }
+  } else if (CharacterComponent->IsCurrencyRebaseRequired() &&
+             !CharacterComponent->IsCurrencyBatchUnconfirmed()) {
+    // A trade used the seq, or the reply could not confirm the balance: a reload must land
+    // before anything is sent. Start it from this reply, and hand this attempt's settle to it:
+    // for a detached pawn the entries are not saved yet, and releasing the write binding now
+    // would refuse the resumed flush that saves them. While a batch is unconfirmed, its probe goes
+    // first instead, and the reload follows once the probe has settled the seq.
+    HoldItemFlushForCurrencyReload(
+      CharacterId, WeakPlayerStateComponent.Get(), CharacterComponent, MoveTemp(OnAckSettled)
+    );
+    return;
+  }
+
+  // Settle AFTER CompleteItemFlush, on both success and error: the release barrier's rule is
+  // "the attempt resolved", which is exactly here.
+  if (OnAckSettled) {
+    OnAckSettled();
+  }
+}
+
+void URedwoodServerGameSubsystem::RequeueItemFlushesAfterReconnect() {
+  // FORK(hollowed-oath): R34. Out of the map first: each probe sent below adds a new attempt.
+  TMap<uint64, FRedwoodInFlightItemFlush> Lost = MoveTemp(InFlightItemFlushes);
+  InFlightItemFlushes.Reset();
+  for (TPair<uint64, FRedwoodInFlightItemFlush> &Pair : Lost) {
+    FRedwoodInFlightItemFlush &Flight = Pair.Value;
+    if (UGameInstance *GameInstance = GetGameInstance()) {
+      GameInstance->GetTimerManager().ClearTimer(Flight.ReplyTimer);
+    }
+    ProbeItemFlushWithLostReply(
+      Flight, TEXT("its component is gone and its reply was lost with the connection")
+    );
+  }
+}
+
+void URedwoodServerGameSubsystem::HandleItemsFlushTimeout(uint64 Generation) {
+  FRedwoodInFlightItemFlush Flight;
+  if (!InFlightItemFlushes.RemoveAndCopyValue(Generation, Flight)) {
+    return;
+  }
+  UE_LOG(
+    LogRedwood,
+    Error,
+    TEXT("Item flush of character %s at seq %lld got no reply in %.0f seconds; its outcome is unknown, so it is probed"),
+    *Flight.CharacterId,
+    Flight.Sent.BatchSeq,
+    FlushReplyTimeoutSeconds
+  );
+  ProbeItemFlushWithLostReply(Flight, TEXT("its component is gone and its flush got no reply"));
+}
+
+void URedwoodServerGameSubsystem::ProbeItemFlushWithLostReply(
+  FRedwoodInFlightItemFlush &Flight, const FString &LostReplyWhy
+) {
+  URedwoodCharacterComponent *Component = Flight.CharacterComponent.Get();
+  if (!IsValid(Component)) {
+    // Nothing is left to re-send; the attempt has resolved as far as this server can tell.
+    SettleItemFlushOfGoneComponent(Flight, nullptr, LostReplyWhy);
+    return;
+  }
+  // The batch may have committed: unconfirmed, as after an unknown-outcome error, so the next
+  // attempt is a probe at its seq with the same entries and no rows.
+  Component->AbandonInFlightItemFlush(Flight.Sent.CurrencyCount, Flight.Sent.GrantKeys.Num());
+  if (Component->IsCurrencyBatchUnconfirmed()) {
+    UnconfirmedCurrencyComponentsByCharacter.FindOrAdd(Flight.CharacterId).AddUnique(Component);
+  }
+  // Sent now, with the attempt's settle, so a detached pawn's barrier waits for the probe, not
+  // for a tick it does not have. A parked attempt on the component stays parked until the probe
+  // is answered.
+  FlushItemsForCharacterComponent(
+    Flight.PlayerStateComponent.Get(), Component, MoveTemp(Flight.OnAckSettled)
+  );
+}
+
+void URedwoodServerGameSubsystem::SettleItemFlushOfGoneComponent(
+  FRedwoodInFlightItemFlush &Flight, const FRedwoodItemFlushReply *Reply, const FString &LostReplyWhy
+) {
+  const FRedwoodItemFlushSent &Sent = Flight.Sent;
+  const ERedwoodItemFlushOutcome Outcome =
+    Reply ? ClassifyItemFlushReply(*Reply, Sent.BatchSeq) : ERedwoodItemFlushOutcome::Unknown;
+  // A refused or unsent probe says nothing about the first attempt it re-sends.
+  const bool bOutcomeUnknown = Outcome == ERedwoodItemFlushOutcome::Unknown ||
+    (Sent.bProbe &&
+     (Outcome == ERedwoodItemFlushOutcome::FinalRefusal || Outcome == ERedwoodItemFlushOutcome::NotSent));
+
+  // What the component would have kept and sent again dies with it, so staff get every entry and
+  // key the reply does not prove saved.
+  if (Outcome != ERedwoodItemFlushOutcome::Committed) {
+    const FString Why = Reply ? FString::Printf(
+                                  TEXT("its component is gone and the reply did not save it (%s)"),
+                                  *Reply->Error
+                                )
+                              : LostReplyWhy;
+    LogCurrencyForStaff(
+      Flight.CharacterId,
+      Why,
+      Flight.CurrencyEntries,
+      bOutcomeUnknown ? Flight.CurrencyEntries.Num() : 0,
+      Sent.GrantKeys,
+      bOutcomeUnknown ? Sent.GrantKeys.Num() : 0
+    );
+  }
+
+  // FORK(hollowed-oath): the snapshot outlives the component, and the next component hydrates
+  // from it. A committed batch is still committed: without its seq, balance and grant keys there,
+  // the next component would reuse the seq, chain from a stale balance, and stage a reward whose
+  // key is already used. An unknown outcome marks the seq, so the next component probes it first.
+  // Only for the same character: the PlayerState may have moved on to another one.
+  URedwoodPlayerStateComponent *PlayerStateComponent = Flight.PlayerStateComponent.Get();
+  const bool bSameCharacter =
+    PlayerStateComponent && PlayerStateComponent->RedwoodCharacter.Id == Flight.CharacterId;
+  if (bSameCharacter) {
+    FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+    if (Reply) {
+      WriteFlushReplyToSnapshot(Snapshot, *Reply, Sent);
+    }
+    if (bOutcomeUnknown) {
+      MarkSnapshotSeqUnconfirmed(
+        Snapshot, Sent.BatchSeq, Sent.CurrencyCount > 0 || Sent.GrantKeys.Num() > 0
+      );
+    }
+  }
+  // A final refusal is a desync of the character, not of the component: freeze it, as a live
+  // component's refusal does, so the next component hydrates frozen instead of staging on it.
+  if (Outcome == ERedwoodItemFlushOutcome::FinalRefusal) {
+    FreezeCharacter(Flight.CharacterId, bSameCharacter ? PlayerStateComponent : nullptr);
+  }
+
+  // Still settle: the detached release barrier must not stall forever just because the component
+  // died mid-flight -- the attempt HAS resolved, as far as this server can learn.
+  if (Flight.OnAckSettled) {
+    TFunction<void()> OnAckSettled = MoveTemp(Flight.OnAckSettled);
+    OnAckSettled();
+  }
+}
+
+void URedwoodServerGameSubsystem::DetachItemFlushesFromComponent(
+  URedwoodCharacterComponent *CharacterComponent
+) {
+  for (TPair<uint64, FRedwoodInFlightItemFlush> &Pair : InFlightItemFlushes) {
+    FRedwoodInFlightItemFlush &Flight = Pair.Value;
+    if (Flight.CharacterComponent.Get() != CharacterComponent) {
+      continue;
+    }
+    Flight.CharacterComponent = nullptr;
+    // Marked now, not on the reply: the reply can take up to FlushReplyTimeoutSeconds, and a
+    // component that hydrates meanwhile would send a normal batch at this seq. If the detached
+    // batch then commits first, the new batch is acked as its replay and its rows are lost. The
+    // reply clears the mark once it settles the seq, and does not mark again past it.
+    URedwoodPlayerStateComponent *PlayerStateComponent = Flight.PlayerStateComponent.Get();
+    if (PlayerStateComponent && PlayerStateComponent->RedwoodCharacter.Id == Flight.CharacterId) {
+      MarkSnapshotSeqUnconfirmed(
+        PlayerStateComponent->RedwoodCharacter,
+        Flight.Sent.BatchSeq,
+        Flight.Sent.CurrencyCount > 0 || Flight.Sent.GrantKeys.Num() > 0
+      );
+    }
+  }
+}
+
+bool URedwoodServerGameSubsystem::HasOpenItemFlush(const FString &CharacterId) const {
+  for (const TPair<uint64, FRedwoodInFlightItemFlush> &Pair : InFlightItemFlushes) {
+    if (Pair.Value.CharacterId == CharacterId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// FORK(hollowed-oath): the currency ledger steps of the item flush. See the declarations.
+void URedwoodServerGameSubsystem::ClaimCurrencyToSend(
+  const URedwoodCharacterComponent *CharacterComponent,
+  TArray<FRedwoodCurrencyEntry> &OutEntries,
+  TArray<FString> &OutGrantKeys
+) {
+  const TArray<FRedwoodCurrencyEntry> &PendingEntries =
+    CharacterComponent->GetPendingCurrencyEntries();
+  const TArray<FString> &PendingGrantKeys = CharacterComponent->GetPendingGrantKeys();
+  OutEntries.Append(
+    PendingEntries.GetData(),
+    FMath::Min(CharacterComponent->GetCurrencyEntriesToSendCount(), PendingEntries.Num())
+  );
+  OutGrantKeys.Append(
+    PendingGrantKeys.GetData(),
+    FMath::Min(CharacterComponent->GetGrantKeysToSendCount(), PendingGrantKeys.Num())
+  );
+}
+
+FRedwoodItemFlushReply URedwoodServerGameSubsystem::ParseItemsFlushReply(
+  const TSharedPtr<FJsonObject> &Reply
+) {
+  FRedwoodItemFlushReply Parsed;
+  if (!Reply.IsValid()) {
+    Parsed.Error = TEXT("unreadable item flush reply");
+    return Parsed;
+  }
+
+  // A JSON null error reads as empty: that is the backend's success shape.
+  Reply->TryGetStringField(TEXT("error"), Parsed.Error);
+  // committedSeq rides both success and error (fence/replay) responses. TryGetNumberField leaves
+  // the default when it is absent, and avoids the missing-field warning GetNumberField would log.
+  // The default is -1, not 0: CompleteItemFlush reads a fence below the sent seq as a sequence gap
+  // and realigns to it, and 0 is a real fence (a new character), so an absent field must not look
+  // like one.
+  double CommittedSeqValue = -1.0;
+  Reply->TryGetNumberField(TEXT("committedSeq"), CommittedSeqValue);
+  Parsed.CommittedSeq = static_cast<int64>(CommittedSeqValue);
+  // Both optional: a backend that predates them sends neither, and both then mean false.
+  Reply->TryGetBoolField(TEXT("final"), Parsed.bFinal);
+  Reply->TryGetBoolField(TEXT("rebaseRequired"), Parsed.bRebaseRequired);
+  Reply->TryGetBoolField(TEXT("notApplied"), Parsed.bNotApplied);
+  Reply->TryGetBoolField(TEXT("writerFenceLost"), Parsed.bWriterFenceLost);
+  ReadSidecarDeliveryFlags(
+    Reply, Parsed.Error, FlushTimedOutError, Parsed.bTimedOut, Parsed.bNotForwarded
+  );
+  // A reply the sidecar makes itself (timedOut, notForwarded) knows no seq. Today it says -1, but
+  // an older sidecar said 0, and 0 read as a fence is a sequence gap: the lane would realign to 0,
+  // and a batch of item rows re-sent at seq 1 is acked as a replay and never saved. So these
+  // replies never carry a fence, whatever the field says.
+  // commitUnknown: the realm sends it only on trade replies today; no flush reply carries it. It
+  // is read here defensively, so that a flush reply that ever carries it is taken as the trade
+  // reply's flag is meant: an unknown outcome, no refusal and no fence, re-sent as a probe.
+  Reply->TryGetBoolField(TEXT("commitUnknown"), Parsed.bCommitUnknown);
+  if (Parsed.bCommitUnknown) {
+    Parsed.bFinal = false;
+    Parsed.bRebaseRequired = false;
+    Parsed.bNotApplied = false;
+    Parsed.bNotForwarded = false;
+    if (Parsed.Error.IsEmpty()) {
+      Parsed.Error = TEXT("the realm could not confirm the commit");
+    }
+  }
+  if (Parsed.bTimedOut || Parsed.bNotForwarded || Parsed.bCommitUnknown) {
+    Parsed.CommittedSeq = -1;
+  }
+
+  ParseCurrencyAlerts(Reply, Parsed.Alerts);
+  return Parsed;
+}
+
+void URedwoodServerGameSubsystem::ReadSidecarDeliveryFlags(
+  const TSharedPtr<FJsonObject> &Reply,
+  const FString &Error,
+  const TCHAR *TimedOutError,
+  bool &OutTimedOut,
+  bool &OutNotForwarded
+) {
+  OutTimedOut = false;
+  OutNotForwarded = false;
+  const bool bHasTimedOut = Reply->TryGetBoolField(TEXT("timedOut"), OutTimedOut);
+  const bool bHasNotForwarded = Reply->TryGetBoolField(TEXT("notForwarded"), OutNotForwarded);
+  if (bHasTimedOut || bHasNotForwarded || Error.IsEmpty()) {
+    return;
+  }
+  if (Error.Equals(TimedOutError, ESearchCase::CaseSensitive)) {
+    OutTimedOut = true;
+  } else if (Error.Equals(SidecarRealmNotConnectedError, ESearchCase::CaseSensitive)) {
+    OutNotForwarded = true;
+  } else {
+    return;
+  }
+  UE_LOG(
+    LogRedwood,
+    Warning,
+    TEXT("Sidecar reply has no timedOut or notForwarded flag; read the outcome from its text: \"%s\". Update the sidecar."),
+    *Error
+  );
+}
+
+// FORK(hollowed-oath): the snapshot's committed seq has reached the marked one, so that seq is
+// settled (committed by the lost batch, or consumed by something else) and needs no probe.
+static void ClearSettledSnapshotSeqProbe(FRedwoodCharacterBackend &Snapshot) {
+  if (Snapshot.bInventorySeqUnconfirmed &&
+      Snapshot.InventorySeq >= Snapshot.UnconfirmedInventorySeq) {
+    Snapshot.bInventorySeqUnconfirmed = false;
+    Snapshot.UnconfirmedInventorySeq = 0;
+  }
+}
+
+// FORK(hollowed-oath): a notApplied reply is never a commit, whatever its error text.
+static bool IsItemsFlushReplyCommitted(const FRedwoodItemFlushReply &Reply) {
+  return Reply.Error.IsEmpty() && !Reply.bNotApplied;
+}
+
+// A saved batch behind a later fence: the entries are committed, but the balance after them is
+// not known (see WriteCommittedFlushToSnapshot).
+static bool IsItemsFlushBalanceUnconfirmed(
+  const FRedwoodItemFlushReply &Reply, const FRedwoodItemFlushSent &Sent
+) {
+  return IsItemsFlushReplyCommitted(Reply) && Sent.bHasBalanceAfter &&
+    Reply.CommittedSeq > Sent.BatchSeq;
+}
+
+void URedwoodServerGameSubsystem::WriteCommittedFlushToSnapshot(
+  FRedwoodCharacterBackend &Snapshot,
+  const FRedwoodItemFlushReply &Reply,
+  const FRedwoodItemFlushSent &Sent
+) {
+  const bool bCommitted = IsItemsFlushReplyCommitted(Reply);
+
+  // Write the committed fence back onto the PlayerState snapshot. Only the COMPONENT's seq state
+  // advances in CompleteItemFlush; the snapshot would otherwise stay at its login value. A
+  // character component recreated later in the session -- a respawn re-creating a pawn-owned
+  // component is the ordinary case -- seeds itself from that snapshot
+  // (SeedItemSeqFromCharacter), so it would send an ALREADY USED batchSeq. The backend no-ops
+  // that batch as a replay, and the no-op's success ack then clears the new component's dirty
+  // rows: the mutation is lost with every side reporting success.
+  if (Reply.Error.IsEmpty() && Reply.CommittedSeq > 0 &&
+      Snapshot.InventorySeq < Reply.CommittedSeq) {
+    Snapshot.InventorySeq = Reply.CommittedSeq;
+  }
+  // The committed balance, for the same reason: a recreated component and the game chain new
+  // entries from it. Only when the fence is exactly this batch's seq: a later fence means
+  // something else (a trade) committed after it, and the last BalanceAfter is then not the
+  // balance. The snapshot then says so, and a reload sets it again.
+  if (bCommitted && Sent.bHasBalanceAfter && Reply.CommittedSeq == Sent.BatchSeq) {
+    Snapshot.CurrencyAmount = Sent.BalanceAfter;
+    Snapshot.bCurrencyAmountUnknown = false;
+  } else if (IsItemsFlushBalanceUnconfirmed(Reply, Sent)) {
+    Snapshot.bCurrencyAmountUnknown = true;
+  }
+
+  // FORK(hollowed-oath): the committed grant keys, for the same reason: game code on a recreated
+  // component checks the snapshot before it stages a one-time reward, and the backend refuses a
+  // reused key for good. These are exactly the replies on which CompleteItemFlush drops the sent
+  // keys as saved; a later fence still means this batch committed.
+  if (bCommitted && Reply.CommittedSeq >= Sent.BatchSeq) {
+    MergeGrantKeys(Snapshot.GrantKeys, Sent.GrantKeys);
+  }
+  ClearSettledSnapshotSeqProbe(Snapshot);
+}
+
+void URedwoodServerGameSubsystem::WriteFlushReplyToSnapshot(
+  FRedwoodCharacterBackend &Snapshot,
+  const FRedwoodItemFlushReply &Reply,
+  const FRedwoodItemFlushSent &Sent
+) {
+  WriteCommittedFlushToSnapshot(Snapshot, Reply, Sent);
+  switch (ClassifyItemFlushReply(Reply, Sent.BatchSeq)) {
+    case ERedwoodItemFlushOutcome::NotApplied:
+      // FORK(hollowed-oath): a notApplied reply also commits a seq (an empty one, that consumes
+      // the probed seq), so the snapshot follows it for the same reason.
+      if (Reply.CommittedSeq > Snapshot.InventorySeq) {
+        Snapshot.InventorySeq = Reply.CommittedSeq;
+      }
+      break;
+    case ERedwoodItemFlushOutcome::SequenceGap:
+      // On a sequence gap the component realigns its lane back to the backend's fence. The
+      // snapshot must follow, or the forward seed in FlushItemsForCharacterComponent moves the lane
+      // straight back to the gapped seq, which the backend refuses forever.
+      if (Snapshot.InventorySeq > Reply.CommittedSeq) {
+        Snapshot.InventorySeq = Reply.CommittedSeq;
+      }
+      break;
+    default:
+      break;
+  }
+  ClearSettledSnapshotSeqProbe(Snapshot);
+}
+
+void URedwoodServerGameSubsystem::MarkSnapshotSeqUnconfirmed(
+  FRedwoodCharacterBackend &Snapshot, int64 Seq, bool bCarriedCurrency
+) {
+  // A seq the snapshot has already passed is settled: a probe (or a later commit) answered for it,
+  // and the balance read after that already counts the batch if it committed.
+  if (Seq <= Snapshot.InventorySeq) {
+    return;
+  }
+  // The lowest unsettled seq is probed first; once the committed seq passes it, every later one
+  // is settled the same way.
+  if (!Snapshot.bInventorySeqUnconfirmed || Seq < Snapshot.UnconfirmedInventorySeq) {
+    Snapshot.bInventorySeqUnconfirmed = true;
+    Snapshot.UnconfirmedInventorySeq = Seq;
+  }
+  // The batch may have moved the balance and used its keys.
+  if (bCarriedCurrency) {
+    Snapshot.bCurrencyAmountUnknown = true;
+  }
+}
+
+void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+  URedwoodCharacterComponent *CharacterComponent,
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  const FRedwoodItemFlushReply &Reply,
+  const FRedwoodItemFlushSent &Sent
+) {
+  const bool bBalanceUnconfirmed = IsItemsFlushBalanceUnconfirmed(Reply, Sent);
+
+  // The snapshot is updated BEFORE CompleteItemFlush, because CompleteItemFlush runs a parked flush
+  // attempt, and that attempt seeds its seq forward from the snapshot.
+  if (PlayerStateComponent) {
+    WriteFlushReplyToSnapshot(PlayerStateComponent->RedwoodCharacter, Reply, Sent);
+  }
+
+  // Also before CompleteItemFlush: the parked attempt it runs must already see the hold, or it
+  // would send entries chained from a balance nobody has confirmed.
+  if (bBalanceUnconfirmed) {
+    CharacterComponent->RequireCurrencyReload(true);
+  }
+
+  CharacterComponent->CompleteItemFlush(Reply, Sent);
+
+  if (Reply.Alerts.Num() > 0) {
+    CharacterComponent->OnCurrencyAlerts.Broadcast(Reply.Alerts);
+  }
+}
+
+ERedwoodCurrencyReloadResult URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
+  const TSharedPtr<FJsonObject> &Reply, int64 &OutBalance, TArray<FString> &OutGrantKeys
+) {
+  // Every error reply also carries a filler balance of "0", so the error is checked first: a
+  // rebase from that filler would chain every held entry from zero.
+  if (!Reply.IsValid() || !Reply->HasField(TEXT("error"))) {
+    UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: unreadable reply"));
+    return ERedwoodCurrencyReloadResult::Retry;
+  }
+  // A JSON null error reads as empty: that is the backend's success shape.
+  FString Error;
+  Reply->TryGetStringField(TEXT("error"), Error);
+  // Only the machine-readable flag ends the reload: another session owns the character, and no
+  // retry changes that. A "not bound" error without it is retriable, since the instance binding
+  // comes back (after a sidecar restart, for one).
+  bool bWriterFenceLost = false;
+  Reply->TryGetBoolField(TEXT("writerFenceLost"), bWriterFenceLost);
+  if (!Error.IsEmpty() && bWriterFenceLost) {
+    UE_LOG(LogRedwood, Error, TEXT("Currency reload failed for good: %s"), *Error);
+    return ERedwoodCurrencyReloadResult::GiveUp;
+  }
+  if (!Error.IsEmpty()) {
+    UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: %s"), *Error);
+    return ERedwoodCurrencyReloadResult::Retry;
+  }
+
+  // The same rule as the auth leg's load (TryParseCurrencyLoad): the grant keys are part of the
+  // loaded state, and a reload that dropped them would leave the snapshot's keys stale.
+  const TSharedPtr<FJsonObject> *Currency = nullptr;
+  if (!Reply->TryGetObjectField(TEXT("currency"), Currency) || !Currency ||
+      !TryParseCurrencyLoad(*Currency, OutBalance, OutGrantKeys)) {
+    UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: the reply has no readable currency"));
+    return ERedwoodCurrencyReloadResult::Retry;
+  }
+  return ERedwoodCurrencyReloadResult::Applied;
+}
+
+bool URedwoodServerGameSubsystem::ApplyCurrencyReload(
+  URedwoodCharacterComponent *CharacterComponent,
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  int64 Balance,
+  const TArray<FString> &GrantKeys
+) {
+  if (CharacterComponent->IsCurrencyRebaseRequired()) {
+    CharacterComponent->RebaseCurrency(Balance);
+    if (CharacterComponent->IsCurrencyRebaseRequired()) {
+      // RebaseCurrency logged why (an overflow). The entries stay held and unchanged.
+      UE_LOG(
+        LogRedwood, Error, TEXT("Currency reload failed: the rebase from %lld did not apply"), Balance
+      );
+      return false;
+    }
+  }
+
+  // The loaded balance is committed, so the snapshot takes it, as it takes a flush's. The keys are
+  // merged in (MergeGrantKeys): one that a racing batch committed after the reload read the
+  // database would be lost by a replace. The merge adds a key that a flush committed but whose ack
+  // was lost.
+  if (PlayerStateComponent) {
+    FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+    Snapshot.CurrencyAmount = Balance;
+    Snapshot.bCurrencyAmountUnknown = false;
+    MergeGrantKeys(Snapshot.GrantKeys, GrantKeys);
+  }
+
+  CharacterComponent->OnCurrencyRebased.Broadcast(Balance);
+  return true;
+}
+
+void URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync(
+  URedwoodCharacterComponent *CharacterComponent, const FString &Why
+) {
+  APlayerController *PlayerController =
+    IsValid(CharacterComponent) ? CharacterComponent->FindPlayerController() : nullptr;
+  const FString CharacterId =
+    IsValid(CharacterComponent) ? CharacterComponent->RedwoodCharacterId : FString();
+  if (bGameHandlesCurrencyDesync) {
+    return;
+  }
+  // A server that is shutting down ends every session anyway; a kick now would only race it.
+  if (bIsShuttingDown) {
+    UE_LOG(
+      LogRedwood,
+      Log,
+      TEXT("Character %s cannot be saved (%s); the server is shutting down, so nobody is kicked"),
+      *CharacterId,
+      *Why
+    );
+    return;
+  }
+  if (!IsValid(PlayerController)) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("Character %s cannot be saved (%s) and the game does not handle it, but it has no player to kick (a detached pawn)"),
+      *CharacterId,
+      *Why
+    );
+    return;
+  }
+  UE_LOG(
+    LogRedwood,
+    Warning,
+    TEXT("Character %s cannot be saved (%s) and the game does not handle it: kicking the player"),
+    *CharacterId,
+    *Why
+  );
+  // Deferred to the next game-thread task run: the events fire from inside a flush or trade
+  // reply, and the kick destroys the controller, and with it the PlayerState and the pawn, while
+  // that reply is still being handled.
+  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
+  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
+  AsyncTask(ENamedThreads::GameThread, [WeakPlayerController, WeakSubsystem]() {
+    const URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
+    if (!Subsystem || Subsystem->bIsShuttingDown) {
+      return;
+    }
+    if (APlayerController *LivePlayerController = WeakPlayerController.Get()) {
+      KickPlayerOrDestroyController(
+        LivePlayerController, FText::FromString(CurrencyDesyncKickMessage)
+      );
+    }
+  });
+}
+
+void URedwoodServerGameSubsystem::KickPlayerOrDestroyController(
+  APlayerController *PlayerController, const FText &Reason
+) {
+  UWorld *World = PlayerController->GetWorld();
+  AGameModeBase *GameMode = World ? World->GetAuthGameMode() : nullptr;
+  if (IsValid(GameMode) && IsValid(GameMode->GameSession)) {
+    GameMode->GameSession->KickPlayer(PlayerController, Reason);
+    return;
+  }
+  // Nothing else would end this player's session, and it must not stay connected.
+  UE_LOG(LogRedwood, Error, TEXT("No GameSession to kick the player; destroying its PlayerController"));
+  PlayerController->ClientWasKicked(Reason);
+  PlayerController->Destroy();
+}
+
+void URedwoodServerGameSubsystem::FreezeCharacter(
+  const FString &CharacterId, URedwoodPlayerStateComponent *PlayerStateComponent
+) {
+  FrozenCharacterIds.Add(CharacterId);
+  // A component created later from this snapshot (a respawn) starts frozen too.
+  if (PlayerStateComponent) {
+    PlayerStateComponent->RedwoodCharacter.bFrozenAfterFinalRefusal = true;
+  }
+  // A rebase is pointless now. Its held attempts settle; each held component drops its staged
+  // state on its next flush.
+  if (CurrencyReloads.Contains(CharacterId)) {
+    GiveUpCurrencyReload(CharacterId, TEXT("the character is frozen after a final refusal"));
+  }
+}
+
+void URedwoodServerGameSubsystem::HoldItemFlushForCurrencyReload(
+  const FString &CharacterId,
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  URedwoodCharacterComponent *CharacterComponent,
+  TFunction<void()> OnAckSettled
+) {
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(CharacterId);
+  const bool bStart = Reload == nullptr;
+  if (bStart) {
+    Reload = &CurrencyReloads.Add(CharacterId);
+  }
+  if (PlayerStateComponent) {
+    Reload->PlayerStateComponent = PlayerStateComponent;
+  }
+  // A component with an unconfirmed batch is only held: its probe goes out after the reload, and
+  // a rebase now could re-chain an entry that batch already committed.
+  if (CharacterComponent->IsCurrencyRebaseRequired() &&
+      !CharacterComponent->IsCurrencyBatchUnconfirmed()) {
+    Reload->CharacterComponents.AddUnique(CharacterComponent);
+  }
+  AddHeldItemFlush(
+    Reload->HeldFlushes, PlayerStateComponent, CharacterComponent, MoveTemp(OnAckSettled)
+  );
+
+  if (bStart) {
+    SendCurrencyReload(CharacterId);
+  }
+}
+
+void URedwoodServerGameSubsystem::SendCurrencyReload(const FString &CharacterId) {
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(CharacterId);
+  if (!Reload) {
+    return;
+  }
+
+  // The token is the session's, the same on every component of the character.
+  FString WriterToken;
+  bool bAnyComponent = false;
+  for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Reload->CharacterComponents) {
+    if (const URedwoodCharacterComponent *Component = WeakComponent.Get()) {
+      bAnyComponent = true;
+      if (WriterToken.IsEmpty()) {
+        WriterToken = Component->GetWriterToken();
+      }
+    }
+  }
+  if (!bAnyComponent) {
+    // Every component that needed the reload is gone, and its held currency with it. The held
+    // attempts of the others settle; their next flush goes out as usual.
+    AbandonCurrencyReload(CharacterId);
+    return;
+  }
+
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    // Waiting for the sidecar is not a failed load: the connect event sends it again, and no
+    // attempt is spent, so a reconnect cannot run a detached pawn out of attempts.
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("Currency reload for character %s waits for the sidecar to connect"),
+      *CharacterId
+    );
+    Reload->bWaitingForSidecar = true;
+    return;
+  }
+  Reload->bWaitingForSidecar = false;
+  ++Reload->Attempts;
+
+  // The load carries the session's writer token, so the realm refuses it once another session owns
+  // the character, instead of handing out a balance this session can no longer write. Without a
+  // token this session's flushes are refused too, so that is a failed load, retried like the rest
+  // (the token is seeded at hydration).
+  if (WriterToken.IsEmpty()) {
+    UE_LOG(
+      LogRedwood, Error, TEXT("Currency reload failed for character %s: no writer token"), *CharacterId
+    );
+    RetryCurrencyReload(CharacterId);
+    return;
+  }
+
+  UGameInstance *GameInstance = GetGameInstance();
+  if (!GameInstance) {
+    GiveUpCurrencyReload(CharacterId, TEXT("no game instance to time the reply"));
+    return;
+  }
+
+  const uint64 Generation = ++LastCurrencyReloadGeneration;
+  Reload->Generation = Generation;
+
+  // A reply that never comes (the socket dropped) must not hold the flushes forever.
+  GameInstance->GetTimerManager().SetTimer(
+    Reload->RetryTimer,
+    FTimerDelegate::CreateWeakLambda(
+      this,
+      [this, CharacterId, Generation]() { HandleCurrencyReloadTimeout(CharacterId, Generation); }
+    ),
+    CurrencyReloadReplyTimeoutSeconds,
+    false // no loop
+  );
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("id"), ItemsEnvelopePlaceholderId);
+  Payload->SetStringField(TEXT("characterId"), CharacterId);
+  Payload->SetStringField(TEXT("writerToken"), WriterToken);
+
+  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
+  Sidecar->Emit(
+    TEXT("realm:characters:items:load"),
+    Payload,
+    [WeakSubsystem, CharacterId, Generation](auto Response) {
+      URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
+      if (!Subsystem) {
+        return;
+      }
+      const TSharedPtr<FJsonObject> *ReplyObject =
+        URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+      Subsystem->HandleCurrencyReloadReply(
+        CharacterId, Generation, ReplyObject ? *ReplyObject : TSharedPtr<FJsonObject>()
+      );
+    }
+  );
+}
+
+void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
+  const FString &CharacterId, uint64 Generation, const TSharedPtr<FJsonObject> &Reply
+) {
+  // A late reply to an attempt that timed out, or to a reload that already ended, may carry a
+  // balance from before a trade that the current attempt's balance includes.
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(CharacterId);
+  if (!Reload || Reload->Generation != Generation) {
+    UE_LOG(
+      LogRedwood,
+      Log,
+      TEXT("Ignoring a late currency reload reply for character %s"),
+      *CharacterId
+    );
+    return;
+  }
+  Reload->Generation = 0;
+  if (UGameInstance *GameInstance = GetGameInstance()) {
+    GameInstance->GetTimerManager().ClearTimer(Reload->RetryTimer);
+  }
+
+  int64 Balance = 0;
+  TArray<FString> GrantKeys;
+  switch (ParseCurrencyReloadReply(Reply, Balance, GrantKeys)) {
+    case ERedwoodCurrencyReloadResult::GiveUp: {
+      // Another session owns the character, as a flush reply's writerFenceLost says. Every
+      // component held here stops sending, exactly as after that flush reply: otherwise each one
+      // still needs its rebase, and every save pass would start this reload again, for the whole
+      // session. Copies: the game's reaction to the lost fence may change the map.
+      TArray<TWeakObjectPtr<URedwoodCharacterComponent>> Components = Reload->CharacterComponents;
+      for (const FRedwoodHeldItemFlush &Held : Reload->HeldFlushes) {
+        Components.AddUnique(Held.CharacterComponent);
+      }
+      for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Components) {
+        if (URedwoodCharacterComponent *Component = WeakComponent.Get()) {
+          Component->MarkWriterFenceLost();
+        }
+      }
+      GiveUpCurrencyReload(CharacterId, TEXT("this session no longer owns the character"));
+      return;
+    }
+    case ERedwoodCurrencyReloadResult::Retry:
+      RetryCurrencyReload(CharacterId);
+      return;
+    default:
+      break;
+  }
+
+  // Copies: ApplyCurrencyReload tells the game, and the game may flush (and so hold) in response,
+  // which changes the map and this reload's arrays.
+  const TArray<TWeakObjectPtr<URedwoodCharacterComponent>> Components = Reload->CharacterComponents;
+  const TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerState = Reload->PlayerStateComponent;
+  for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Components) {
+    URedwoodCharacterComponent *Component = WeakComponent.Get();
+    // A component whose batch is open or unconfirmed takes no rebase: that batch may hold entries
+    // the balance already counts. It asks for a reload again once its probe has settled.
+    if (IsValid(Component) && Component->IsCurrencyRebaseRequired() &&
+        !Component->IsItemFlushInFlight() && !Component->IsCurrencyBatchUnconfirmed() &&
+        !ApplyCurrencyReload(Component, WeakPlayerState.Get(), Balance, GrantKeys)) {
+      RetryCurrencyReload(CharacterId);
+      return;
+    }
+  }
+  Reload = CurrencyReloads.Find(CharacterId);
+  if (!Reload) {
+    return;
+  }
+
+  // Out of the map before any flush resumes: a resumed flush can need a reload again (a trade
+  // used the new seq too) and must then start a new one, not join this finished one.
+  FRedwoodCurrencyReload Finished = MoveTemp(*Reload);
+  CurrencyReloads.Remove(CharacterId);
+  if (UGameInstance *GameInstance = GetGameInstance()) {
+    GameInstance->GetTimerManager().ClearTimer(Finished.RetryTimer);
+  }
+
+  ResumeHeldItemFlushes(Finished.HeldFlushes);
+}
+
+void URedwoodServerGameSubsystem::HandleCurrencyReloadTimeout(
+  const FString &CharacterId, uint64 Generation
+) {
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(CharacterId);
+  if (!Reload || Reload->Generation != Generation) {
+    return;
+  }
+  // From here a reply to this attempt is late, and is ignored.
+  Reload->Generation = 0;
+  UE_LOG(
+    LogRedwood, Error, TEXT("Currency reload failed for character %s: no reply"), *CharacterId
+  );
+  RetryCurrencyReload(CharacterId);
+}
+
+void URedwoodServerGameSubsystem::RetryCurrencyReload(const FString &CharacterId) {
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(CharacterId);
+  if (!Reload) {
+    return;
+  }
+  if (Reload->Attempts >= CurrencyReloadMaxAttempts) {
+    GiveUpCurrencyReload(
+      CharacterId, FString::Printf(TEXT("%d attempts failed"), Reload->Attempts)
+    );
+    return;
+  }
+  UGameInstance *GameInstance = GetGameInstance();
+  if (!GameInstance) {
+    GiveUpCurrencyReload(CharacterId, TEXT("no game instance to time the retry"));
+    return;
+  }
+  GameInstance->GetTimerManager().SetTimer(
+    Reload->RetryTimer,
+    FTimerDelegate::CreateWeakLambda(
+      this, [this, CharacterId]() { SendCurrencyReload(CharacterId); }
+    ),
+    CurrencyReloadRetrySeconds,
+    false // no loop
+  );
+}
+
+void URedwoodServerGameSubsystem::ResumeCurrencyReloadsAfterSidecarConnect() {
+  // Keys first: a send can end its reload and change the map.
+  TArray<FString> WaitingCharacterIds;
+  for (const TPair<FString, FRedwoodCurrencyReload> &Pair : CurrencyReloads) {
+    if (Pair.Value.bWaitingForSidecar) {
+      WaitingCharacterIds.Add(Pair.Key);
+    }
+  }
+  for (const FString &CharacterId : WaitingCharacterIds) {
+    SendCurrencyReload(CharacterId);
+  }
+}
+
+void URedwoodServerGameSubsystem::GiveUpCurrencyReload(
+  const FString &CharacterId, const FString &Reason
+) {
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(CharacterId);
+  if (!Reload) {
+    return;
+  }
+
+  UE_LOG(
+    LogRedwood,
+    Error,
+    TEXT("Currency reload for character %s gave up (%s). Its held flushes now settle."),
+    *CharacterId,
+    *Reason
+  );
+  // Everything still held. A live component keeps it and tries again on its next flush; a
+  // detached pawn's is lost when the pawn goes, so these lines are what staff rebuild it from. A
+  // component whose writer fence is lost logged its currency when it lost it.
+  const FString Why = FString::Printf(TEXT("held by a currency reload that gave up (%s)"), *Reason);
+  for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Reload->CharacterComponents) {
+    const URedwoodCharacterComponent *Component = WeakComponent.Get();
+    if (Component && !Component->IsWriterFenceLost()) {
+      Component->LogStagedCurrencyForStaff(Why);
+    }
+  }
+  AbandonCurrencyReload(CharacterId);
+}
+
+void URedwoodServerGameSubsystem::AbandonCurrencyReload(const FString &CharacterId) {
+  FRedwoodCurrencyReload *Reload = CurrencyReloads.Find(CharacterId);
+  if (!Reload) {
+    return;
+  }
+  if (UGameInstance *GameInstance = GetGameInstance()) {
+    GameInstance->GetTimerManager().ClearTimer(Reload->RetryTimer);
+  }
+  // Out of the map first: a settle can release a binding and start other work that reaches here.
+  FRedwoodCurrencyReload Abandoned = MoveTemp(*Reload);
+  CurrencyReloads.Remove(CharacterId);
+  for (FRedwoodHeldItemFlush &Held : Abandoned.HeldFlushes) {
+    if (Held.OnAckSettled) {
+      Held.OnAckSettled();
+    }
+  }
 }
 
 bool URedwoodServerGameSubsystem::AppendOfflineItemRows(
@@ -2842,77 +4096,835 @@ bool URedwoodServerGameSubsystem::AppendOfflineItemRows(
   return true;
 }
 
+// FORK(hollowed-oath) BEGIN: the offline currency save. See the declaration.
+bool URedwoodServerGameSubsystem::ApplyOfflineCurrency(
+  FRedwoodCharacterBackend &Character, URedwoodCharacterComponent *CharacterComponent
+) {
+  const int32 StagedEntryCount = CharacterComponent->GetPendingCurrencyEntries().Num();
+  const int32 StagedGrantCount = CharacterComponent->GetPendingGrantKeys().Num();
+  if (StagedEntryCount == 0 && StagedGrantCount == 0) {
+    return false;
+  }
+  if (Character.bCurrencyAmountUnknown) {
+    // Chaining from a guessed balance would write a wrong one. The entries stay staged, and the
+    // file keeps the balance it has.
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("Offline save: character %s has an unknown balance; %d currency entries and %d grant keys stay staged"),
+      *Character.Id,
+      StagedEntryCount,
+      StagedGrantCount
+    );
+    return false;
+  }
+
+  TArray<FRedwoodCurrencyEntry> Entries;
+  TArray<FString> GrantKeys;
+  CharacterComponent->TakePendingCurrencyForOfflineSave(Entries, GrantKeys);
+
+  // The backend's flush rules, so offline play finds the same caller bugs a live server would.
+  FString Refusal;
+  int64 Balance = Character.CurrencyAmount;
+  // Ids are checked uppercase hex at the queue, so a plain (case-blind) compare is exact here.
+  TArray<FString> AppliedEntryIds = Character.OfflineAppliedEntryIds;
+  for (const FRedwoodCurrencyEntry &Entry : Entries) {
+    if (Entry.Reason.IsEmpty()) {
+      Refusal = FString::Printf(TEXT("entry %s has no reason"), *Entry.Id);
+      break;
+    }
+    if (AppliedEntryIds.Contains(Entry.Id)) {
+      Refusal = FString::Printf(TEXT("entry %s is already applied"), *Entry.Id);
+      break;
+    }
+    AppliedEntryIds.Add(Entry.Id);
+    // Balance is never negative here, so only a credit can pass int64.
+    if (Entry.Delta > 0 && Balance > MAX_int64 - Entry.Delta) {
+      Refusal = FString::Printf(TEXT("entry %s takes the balance past int64"), *Entry.Id);
+      break;
+    }
+    Balance += Entry.Delta;
+    if (Balance < 0) {
+      Refusal = FString::Printf(TEXT("entry %s takes the balance below zero"), *Entry.Id);
+      break;
+    }
+    if (Balance != Entry.BalanceAfter) {
+      Refusal = FString::Printf(
+        TEXT("entry %s ends at %lld, not at its balanceAfter %lld"),
+        *Entry.Id,
+        Balance,
+        Entry.BalanceAfter
+      );
+      break;
+    }
+  }
+  TArray<FString> UsedGrantKeys = Character.GrantKeys;
+  for (const FString &GrantKey : GrantKeys) {
+    if (Refusal.IsEmpty() && ContainsGrantKey(UsedGrantKeys, GrantKey)) {
+      Refusal = FString::Printf(TEXT("grant key %s is already used"), *GrantKey);
+    }
+    UsedGrantKeys.Add(GrantKey);
+  }
+
+  if (!Refusal.IsEmpty()) {
+    // As a final refusal online: the whole batch is dropped, nothing moves, and each part is
+    // logged so it can be rebuilt by hand.
+    LogCurrencyForStaff(
+      Character.Id, FString::Printf(TEXT("Offline save refused (%s)"), *Refusal), Entries, 0, GrantKeys, 0
+    );
+    return false;
+  }
+
+  Character.CurrencyAmount = Balance;
+  Character.GrantKeys.Append(GrantKeys);
+  Character.OfflineAppliedEntryIds = MoveTemp(AppliedEntryIds);
+  return true;
+}
+// FORK(hollowed-oath) END
+
 // One-shot trade emit: atomically re-parents the named root items from one character to another on
 // the backend. rootPlacements carries only each root row's (id, domain, slot, parentId); the
 // backend moves each root and its nested children in one transaction and bumps BOTH characters'
-// InventorySeq, so each side's next FlushItemsForCharacterComponent takes the seq-resync path (see
-// the header). parentId is optional on the wire (absent/null = root placement into the receiving
+// InventorySeq. parentId is optional on the wire (absent/null = root placement into the receiving
 // character's top-level inventory); non-null names the receiver-side bag item's InstanceId a
 // content-child placement lands inside -- production trades move items between bags, so a
 // zero-value (root-only) placement can no longer represent every destination a trade needs.
+// FORK(hollowed-oath): the trade carries currency too, and holds both characters' flush lanes
+// until it settles (see the header). The rules each step keeps are on the step.
+void URedwoodServerGameSubsystem::EmitItemsTrade(
+  URedwoodCharacterComponent *FromCharacterComponent,
+  URedwoodCharacterComponent *ToCharacterComponent,
+  const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
+  const TArray<TPair<FString, FRedwoodCurrencyEntry>> &CurrencyByCharacter,
+  const FString &TradeId,
+  TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete
+) {
+  // Every refusal here is before the send: nothing is held, staged or changed, so the caller can
+  // treat it like any trade error.
+  auto Refuse = [&OnComplete, &TradeId](const FString &Error) {
+    UE_LOG(LogRedwood, Error, TEXT("Trade %s refused before sending: %s"), *TradeId, *Error);
+    if (OnComplete) {
+      OnComplete(Error, -1, -1);
+    }
+  };
+
+  FRedwoodPendingItemTrade Trade;
+  FString Error;
+  if (!PrepareItemTradeSide(FromCharacterComponent, Trade.From, Error) ||
+      !PrepareItemTradeSide(ToCharacterComponent, Trade.To, Error)) {
+    Refuse(Error);
+    return;
+  }
+  if (Trade.From.CharacterId == Trade.To.CharacterId) {
+    Refuse(TEXT("cannot trade to the same character"));
+    return;
+  }
+  // The backend needs the id to know a resend, and refuses any currency without it.
+  if (!IsValidCurrencyEntryId(TradeId)) {
+    Refuse(TEXT("the trade id must be 32 uppercase hex digits"));
+    return;
+  }
+  // A reused id is never a resend here (the subsystem resends by itself): it is a second trade,
+  // which the backend would take for the first one's replay, or refuse.
+  if (SentItemTradeIds.Contains(TradeId)) {
+    Refuse(TEXT("the trade id was already used; make a fresh one for every trade"));
+    return;
+  }
+  for (const FRedwoodTradeRootPlacement &Placement : RootPlacements) {
+    if (!Placement.FromCharacterId.IsEmpty() && Placement.FromCharacterId != Trade.From.CharacterId &&
+        Placement.FromCharacterId != Trade.To.CharacterId) {
+      Refuse(FString::Printf(
+        TEXT("placement %s leaves character %s, who is outside the trade"),
+        *Placement.Id,
+        *Placement.FromCharacterId
+      ));
+      return;
+    }
+  }
+  if (!ChainTradeCurrency(CurrencyByCharacter, Trade.From, Trade.To, Error)) {
+    Refuse(Error);
+    return;
+  }
+  // A side that pays or is paid must have nothing staged: the trade commits before it, so a staged
+  // debit chained from the old balance could fall below zero once the trade applied, and that is
+  // refused for good.
+  for (const FRedwoodItemTradeSide *Side : {&Trade.From, &Trade.To}) {
+    if (Side->Entries.Num() > 0 &&
+        Side->CharacterComponent->GetPendingCurrencyEntries().Num() > 0) {
+      Refuse(FString::Printf(
+        TEXT("character %s has currency staged; flush it before the trade"), *Side->CharacterId
+      ));
+      return;
+    }
+  }
+  if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    Refuse(TEXT("Sidecar is not connected"));
+    return;
+  }
+
+  // The payload goes out with the chained entries, exactly as the sides hold them, so a resend is
+  // the same request.
+  TArray<TPair<FString, FRedwoodCurrencyEntry>> ChainedCurrency;
+  for (const FRedwoodItemTradeSide *Side : {&Trade.From, &Trade.To}) {
+    for (const FRedwoodCurrencyEntry &Entry : Side->Entries) {
+      ChainedCurrency.Emplace(Side->CharacterId, Entry);
+    }
+  }
+  Trade.Payload = BuildItemsTradePayload(
+    Trade.From.CharacterId,
+    Trade.To.CharacterId,
+    RootPlacements,
+    ChainedCurrency,
+    Trade.From.CharacterComponent->GetWriterToken(),
+    Trade.To.CharacterComponent->GetWriterToken(),
+    TradeId
+  );
+  Trade.OnComplete = MoveTemp(OnComplete);
+  SentItemTradeIds.Add(TradeId);
+  PendingItemTrades.Add(TradeId, MoveTemp(Trade));
+  SendItemsTrade(TradeId);
+}
+
 void URedwoodServerGameSubsystem::EmitItemsTrade(
   const FString &FromCharacterId,
   const FString &ToCharacterId,
   const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
-  TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)>
-    OnComplete
+  TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete
 ) {
-  if (Sidecar == nullptr || !Sidecar.IsValid() || !Sidecar->bIsConnected) {
-    UE_LOG(
-      LogRedwood, Error, TEXT("Sidecar is not connected; cannot trade items")
-    );
-    if (OnComplete) {
-      OnComplete(TEXT("Sidecar is not connected"), -1, -1);
+  const FString Error = TEXT(
+    "this trade call sends no writer tokens and cannot hold the flush lanes; use the overload that "
+    "takes the character components"
+  );
+  UE_LOG(
+    LogRedwood, Error, TEXT("Trade %s -> %s refused: %s"), *FromCharacterId, *ToCharacterId, *Error
+  );
+  if (OnComplete) {
+    OnComplete(Error, -1, -1);
+  }
+}
+
+bool URedwoodServerGameSubsystem::PrepareItemTradeSide(
+  URedwoodCharacterComponent *CharacterComponent,
+  FRedwoodItemTradeSide &OutSide,
+  FString &OutError
+) {
+  if (!IsValid(CharacterComponent) || CharacterComponent->RedwoodCharacterId.IsEmpty()) {
+    OutError = TEXT("a trading character has no hydrated character component");
+    return false;
+  }
+  const FString &CharacterId = CharacterComponent->RedwoodCharacterId;
+  // The snapshot holds the committed balance the entries chain from, and takes the trade's commit.
+  URedwoodPlayerStateComponent *PlayerStateComponent =
+    CharacterComponent->FindPlayerStateComponent();
+  if (!PlayerStateComponent || PlayerStateComponent->RedwoodCharacter.Id != CharacterId) {
+    OutError = FString::Printf(TEXT("character %s has no PlayerState snapshot"), *CharacterId);
+    return false;
+  }
+  // A frozen character's state cannot be trusted, and a lost fence means another session owns it:
+  // neither may move items or currency.
+  if (CharacterComponent->IsFrozenAfterFinalRefusal() || FrozenCharacterIds.Contains(CharacterId)) {
+    OutError = FString::Printf(TEXT("character %s is frozen after a final refusal"), *CharacterId);
+    return false;
+  }
+  if (CharacterComponent->IsWriterFenceLost() || CharacterComponent->GetWriterToken().IsEmpty()) {
+    OutError = FString::Printf(TEXT("character %s has no writer fence"), *CharacterId);
+    return false;
+  }
+  if (FindItemTradeOfCharacter(CharacterId)) {
+    OutError = FString::Printf(TEXT("character %s is in another trade"), *CharacterId);
+    return false;
+  }
+  // A batch whose reply is open, or whose outcome is unknown, would commit before or after the
+  // trade: the balance and the seq before the trade would then be guesses.
+  if (CharacterComponent->IsItemFlushInFlight() || CharacterComponent->IsCurrencyBatchUnconfirmed() ||
+      HasOpenItemFlush(CharacterId) ||
+      HasUnconfirmedCurrencyBatch(CharacterId) ||
+      PlayerStateComponent->RedwoodCharacter.bInventorySeqUnconfirmed) {
+    OutError = FString::Printf(TEXT("character %s has an item flush in flight or unconfirmed"), *CharacterId);
+    return false;
+  }
+
+  CatchUpItemSeqFromSnapshot(PlayerStateComponent, CharacterComponent);
+  const FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+  if (CharacterComponent->IsCurrencyRebaseRequired() || CurrencyReloads.Contains(CharacterId)) {
+    OutError = FString::Printf(TEXT("character %s waits for a currency reload"), *CharacterId);
+    return false;
+  }
+
+  OutSide.CharacterId = CharacterId;
+  OutSide.CharacterComponent = CharacterComponent;
+  OutSide.PlayerStateComponent = PlayerStateComponent;
+  OutSide.SeqBefore = CharacterComponent->GetLastCommittedItemSeq();
+  // Only read when the side pays or is paid; ChainTradeCurrency refuses an unknown balance then.
+  OutSide.BalanceBefore = Snapshot.bCurrencyAmountUnknown ? -1 : Snapshot.CurrencyAmount;
+  return true;
+}
+
+bool URedwoodServerGameSubsystem::ChainTradeCurrency(
+  const TArray<TPair<FString, FRedwoodCurrencyEntry>> &CurrencyByCharacter,
+  FRedwoodItemTradeSide &From,
+  FRedwoodItemTradeSide &To,
+  FString &OutError
+) {
+  // Each check here is one the backend makes too; refusing first spares both players a refusal
+  // alert for a trade that could never apply.
+  TArray<FString> SeenIds;
+  int64 Sum = 0;
+  int64 FromRunning = From.BalanceBefore;
+  int64 ToRunning = To.BalanceBefore;
+  TArray<FRedwoodCurrencyEntry> FromEntries;
+  TArray<FRedwoodCurrencyEntry> ToEntries;
+  for (const TPair<FString, FRedwoodCurrencyEntry> &Pair : CurrencyByCharacter) {
+    const FRedwoodCurrencyEntry &Entry = Pair.Value;
+    const bool bFrom = Pair.Key == From.CharacterId;
+    if (!bFrom && Pair.Key != To.CharacterId) {
+      OutError = FString::Printf(TEXT("currency entry %s is for a character outside the trade"), *Entry.Id);
+      return false;
     }
+    if (!IsValidCurrencyEntryId(Entry.Id) ||
+        SeenIds.ContainsByPredicate([&Entry](const FString &Seen) {
+          return Seen.Equals(Entry.Id, ESearchCase::CaseSensitive);
+        })) {
+      OutError = FString::Printf(TEXT("currency entry id '%s' is not valid or is repeated"), *Entry.Id);
+      return false;
+    }
+    SeenIds.Add(Entry.Id);
+    if (!Entry.Reason.Equals(TradeCurrencyReason, ESearchCase::CaseSensitive)) {
+      OutError = FString::Printf(
+        TEXT("currency entry %s has reason %s, not %s"), *Entry.Id, *Entry.Reason, TradeCurrencyReason
+      );
+      return false;
+    }
+    if (Entry.Delta == 0) {
+      OutError = FString::Printf(TEXT("currency entry %s has a zero delta"), *Entry.Id);
+      return false;
+    }
+    // BalanceBefore is -1 when the snapshot's balance is unknown: nothing can be chained from it.
+    int64 &Running = bFrom ? FromRunning : ToRunning;
+    if (Running < 0) {
+      OutError = FString::Printf(TEXT("the balance of character %s is not known"), *Pair.Key);
+      return false;
+    }
+    const bool bOverflows = Entry.Delta > 0 ? Running > MAX_int64 - Entry.Delta : false;
+    const bool bSumOverflows = Entry.Delta > 0 ? Sum > MAX_int64 - Entry.Delta
+                                               : Sum < MIN_int64 - Entry.Delta;
+    if (bOverflows || bSumOverflows) {
+      OutError = FString::Printf(TEXT("currency entry %s overflows"), *Entry.Id);
+      return false;
+    }
+    // Running >= 0 and a negative delta cannot overflow; it can only go below zero.
+    Running += Entry.Delta;
+    Sum += Entry.Delta;
+    if (Running < 0) {
+      OutError = FString::Printf(TEXT("character %s cannot pay currency entry %s"), *Pair.Key, *Entry.Id);
+      return false;
+    }
+    FRedwoodCurrencyEntry &Chained = (bFrom ? FromEntries : ToEntries).Add_GetRef(Entry);
+    Chained.BalanceAfter = Running;
+  }
+  if (Sum != 0) {
+    OutError = FString::Printf(TEXT("trade currency does not sum to zero (%lld)"), Sum);
+    return false;
+  }
+  From.Entries = MoveTemp(FromEntries);
+  To.Entries = MoveTemp(ToEntries);
+  return true;
+}
+
+bool URedwoodServerGameSubsystem::HasUnconfirmedCurrencyBatch(const FString &CharacterId) {
+  TArray<TWeakObjectPtr<URedwoodCharacterComponent>> *Components =
+    UnconfirmedCurrencyComponentsByCharacter.Find(CharacterId);
+  if (!Components) {
+    return false;
+  }
+  // Read live: a later reply, a freeze or a destroyed component ends the unknown outcome without
+  // telling this list.
+  Components->RemoveAll([](const TWeakObjectPtr<URedwoodCharacterComponent> &Weak) {
+    const URedwoodCharacterComponent *Component = Weak.Get();
+    return !IsValid(Component) || !Component->IsCurrencyBatchUnconfirmed();
+  });
+  if (Components->Num() == 0) {
+    UnconfirmedCurrencyComponentsByCharacter.Remove(CharacterId);
+    return false;
+  }
+  return true;
+}
+
+bool URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalance(
+  const FString &CharacterId, int64 &OutFloorBalance
+) const {
+  for (const TPair<FString, FRedwoodPendingItemTrade> &Pair : PendingItemTrades) {
+    for (const FRedwoodItemTradeSide *Side : {&Pair.Value.From, &Pair.Value.To}) {
+      if (Side->CharacterId == CharacterId && Side->Entries.Num() > 0) {
+        OutFloorBalance = FMath::Min(Side->BalanceBefore, Side->Entries.Last().BalanceAfter);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+FRedwoodPendingItemTrade *URedwoodServerGameSubsystem::FindItemTradeOfCharacter(
+  const FString &CharacterId
+) {
+  for (TPair<FString, FRedwoodPendingItemTrade> &Pair : PendingItemTrades) {
+    if (Pair.Value.From.CharacterId == CharacterId || Pair.Value.To.CharacterId == CharacterId) {
+      return &Pair.Value;
+    }
+  }
+  return nullptr;
+}
+
+void URedwoodServerGameSubsystem::SendItemsTrade(const FString &TradeId) {
+  FRedwoodPendingItemTrade *Trade = PendingItemTrades.Find(TradeId);
+  if (!Trade) {
+    return;
+  }
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    // Only a resend gets here (the first send is refused instead). Waiting spends no attempt, so a
+    // reconnect cannot run the trade out of attempts; the lanes stay held meanwhile.
+    UE_LOG(LogRedwood, Warning, TEXT("Trade %s waits for the sidecar to connect"), *TradeId);
+    Trade->bWaitingForSidecar = true;
+    return;
+  }
+  Trade->bWaitingForSidecar = false;
+
+  UGameInstance *GameInstance = GetGameInstance();
+  if (!GameInstance) {
+    GiveUpItemsTrade(TradeId, TEXT("no game instance to time the reply"));
+    return;
+  }
+  ++Trade->Attempts;
+  const uint64 Generation = ++LastItemTradeGeneration;
+  Trade->Generation = Generation;
+
+  // A reply that never comes (the socket dropped) must not hold both lanes forever.
+  GameInstance->GetTimerManager().SetTimer(
+    Trade->Timer,
+    FTimerDelegate::CreateWeakLambda(
+      this, [this, TradeId, Generation]() { HandleItemsTradeTimeout(TradeId, Generation); }
+    ),
+    TradeReplyTimeoutSeconds,
+    false // no loop
+  );
+
+  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
+  Sidecar->Emit(
+    TEXT("realm:characters:items:trade"),
+    Trade->Payload,
+    [WeakSubsystem, TradeId, Generation](auto Response) {
+      URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
+      if (!Subsystem) {
+        return;
+      }
+      const TSharedPtr<FJsonObject> *ReplyObject =
+        URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+      Subsystem->HandleItemsTradeReply(
+        TradeId, Generation, ReplyObject ? *ReplyObject : TSharedPtr<FJsonObject>()
+      );
+    }
+  );
+}
+
+FRedwoodItemTradeReply URedwoodServerGameSubsystem::ParseItemsTradeReply(
+  const TSharedPtr<FJsonObject> &Reply
+) {
+  FRedwoodItemTradeReply Parsed;
+  if (!Reply.IsValid() || !Reply->HasField(TEXT("error"))) {
+    Parsed.Error = TEXT("unreadable item trade reply");
+    return Parsed;
+  }
+  Parsed.bReadable = true;
+  // A JSON null error reads as empty: that is the backend's success shape.
+  Reply->TryGetStringField(TEXT("error"), Parsed.Error);
+  // JSON numbers land as doubles, and TryGetNumberField has no int64 overload here. A missing
+  // fence stays -1, which no committed trade carries.
+  double FromCommittedSeqValue = -1.0;
+  double ToCommittedSeqValue = -1.0;
+  Reply->TryGetNumberField(TEXT("fromCommittedSeq"), FromCommittedSeqValue);
+  Reply->TryGetNumberField(TEXT("toCommittedSeq"), ToCommittedSeqValue);
+  Parsed.FromCommittedSeq = static_cast<int64>(FromCommittedSeqValue);
+  Parsed.ToCommittedSeq = static_cast<int64>(ToCommittedSeqValue);
+  ReadSidecarDeliveryFlags(
+    Reply, Parsed.Error, TradeTimedOutError, Parsed.bTimedOut, Parsed.bNotForwarded
+  );
+  Reply->TryGetBoolField(TEXT("commitUnknown"), Parsed.bCommitUnknown);
+  if (!Reply->TryGetBoolField(TEXT("sessionRefused"), Parsed.bSessionRefused) &&
+      (Parsed.Error.Equals(TradeNotBoundError, ESearchCase::CaseSensitive) ||
+       Parsed.Error.Equals(TradeNotAuthorizedError, ESearchCase::CaseSensitive))) {
+    Parsed.bSessionRefused = true;
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("Trade reply has no sessionRefused flag; read the outcome from its text: \"%s\". Update the realm."),
+      *Parsed.Error
+    );
+  }
+  if (!Reply->TryGetBoolField(TEXT("tradeIdReused"), Parsed.bTradeIdReused) &&
+      Parsed.Error.Equals(TradeIdReusedError, ESearchCase::CaseSensitive)) {
+    Parsed.bTradeIdReused = true;
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("Trade reply has no tradeIdReused flag; read the outcome from its text: \"%s\". Update the realm."),
+      *Parsed.Error
+    );
+  }
+  Reply->TryGetBoolField(TEXT("writerFenceLost"), Parsed.bWriterFenceLost);
+  const bool bNamesFromSide =
+    Reply->TryGetBoolField(TEXT("fromWriterFenceLost"), Parsed.bFromWriterFenceLost);
+  const bool bNamesToSide =
+    Reply->TryGetBoolField(TEXT("toWriterFenceLost"), Parsed.bToWriterFenceLost);
+  // An older realm names no side. Both are then read as lost, which is safe: a lost fence drops
+  // nothing (it is logged for staff), sends nothing more, and ends with the kick (R36), so the
+  // player signs in again with a fresh token. Reading neither as lost would let the stale one write.
+  if (Parsed.bWriterFenceLost && !bNamesFromSide && !bNamesToSide) {
+    Parsed.bFromWriterFenceLost = true;
+    Parsed.bToWriterFenceLost = true;
+  }
+  Parsed.bWriterFenceLost =
+    Parsed.bWriterFenceLost || Parsed.bFromWriterFenceLost || Parsed.bToWriterFenceLost;
+  ParseCurrencyAlerts(Reply, Parsed.Alerts);
+  return Parsed;
+}
+
+ERedwoodItemTradeOutcome URedwoodServerGameSubsystem::ClassifyItemsTradeReply(
+  const FRedwoodItemTradeReply &Reply, int64 FromSeqBefore, int64 ToSeqBefore
+) {
+  // The flags come first: a reply that says it may have applied is never read as a refusal, and
+  // never as a commit whose fences could be filler.
+  if (!Reply.bReadable || Reply.bTimedOut || Reply.bCommitUnknown) {
+    return ERedwoodItemTradeOutcome::Unknown;
+  }
+  if (Reply.bNotForwarded) {
+    return ERedwoodItemTradeOutcome::NotForwarded;
+  }
+  if (Reply.Error.IsEmpty()) {
+    // A success whose fences do not pass the seqs before the trade cannot be this trade's commit;
+    // adopting it could leave a lane on a seq the trade used, where the next flush of item rows is
+    // acked as a replay and never saved. The resend's replay ack carries the real fences.
+    if (Reply.FromCommittedSeq > FromSeqBefore && Reply.ToCommittedSeq > ToSeqBefore) {
+      return ERedwoodItemTradeOutcome::Committed;
+    }
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("Trade reply has no error but fences %lld/%lld do not pass the seqs before the trade (%lld/%lld)"),
+      Reply.FromCommittedSeq,
+      Reply.ToCommittedSeq,
+      FromSeqBefore,
+      ToSeqBefore
+    );
+    return ERedwoodItemTradeOutcome::Unknown;
+  }
+  return ERedwoodItemTradeOutcome::Refused;
+}
+
+void URedwoodServerGameSubsystem::HandleItemsTradeReply(
+  const FString &TradeId, uint64 Generation, const TSharedPtr<FJsonObject> &Reply
+) {
+  // A reply to an attempt that timed out is late: a newer attempt is on its way, and only its reply
+  // can say what the backend holds now.
+  FRedwoodPendingItemTrade *Trade = PendingItemTrades.Find(TradeId);
+  if (!Trade || Trade->Generation != Generation) {
+    UE_LOG(LogRedwood, Log, TEXT("Ignoring a late reply for trade %s"), *TradeId);
+    return;
+  }
+  Trade->Generation = 0;
+  if (UGameInstance *GameInstance = GetGameInstance()) {
+    GameInstance->GetTimerManager().ClearTimer(Trade->Timer);
+  }
+
+  const FRedwoodItemTradeReply Parsed = ParseItemsTradeReply(Reply);
+  if (!Parsed.Error.IsEmpty()) {
+    UE_LOG(LogRedwood, Error, TEXT("Failed to trade items (trade %s): %s"), *TradeId, *Parsed.Error);
+  }
+  switch (ClassifyItemsTradeReply(Parsed, Trade->From.SeqBefore, Trade->To.SeqBefore)) {
+    case ERedwoodItemTradeOutcome::Committed:
+      CommitItemsTrade(TradeId, Parsed);
+      return;
+    case ERedwoodItemTradeOutcome::Unknown:
+      Trade->bOutcomeUnknown = true;
+      RetryItemsTrade(TradeId, Parsed.Error);
+      return;
+    case ERedwoodItemTradeOutcome::NotForwarded:
+      // This attempt never reached the realm, so it says nothing about an earlier one.
+      if (Trade->bOutcomeUnknown) {
+        RetryItemsTrade(TradeId, Parsed.Error);
+        return;
+      }
+      break;
+    default:
+      // After an attempt whose outcome is unknown, a refusal of the resend is proof that nothing
+      // applied: the realm checks for a committed trade (its receipt, or its ledger rows) after
+      // every refusal it makes inside its transaction, and acks a committed one as a replay. Its
+      // refusals before the transaction are the same on every attempt, so the first attempt was
+      // refused too, except the two that depend on this server's session: those say nothing about
+      // the earlier attempt, so the trade is sent again.
+      if (Trade->Attempts > 1 && Parsed.bTradeIdReused) {
+        UE_LOG(
+          LogRedwood,
+          Error,
+          TEXT("Trade %s: the realm says a resend differs from its first send, but a resend is the same request. This is a bug."),
+          *TradeId
+        );
+        GiveUpItemsTrade(TradeId, TEXT("a resend was refused as a reused trade id"));
+        return;
+      }
+      if (Trade->bOutcomeUnknown && Parsed.bSessionRefused) {
+        RetryItemsTrade(TradeId, Parsed.Error);
+        return;
+      }
+      if (Parsed.bWriterFenceLost) {
+        // R37: another session owns the side the realm names. That side stops sending, as after a
+        // flush's writerFenceLost. Copies: the game's reaction to the lost fence may move this
+        // trade in the map.
+        const bool bResendAfterUnknown = Trade->bOutcomeUnknown;
+        const TWeakObjectPtr<URedwoodCharacterComponent> Fenced[] = {
+          Parsed.bFromWriterFenceLost ? Trade->From.CharacterComponent
+                                      : TWeakObjectPtr<URedwoodCharacterComponent>(),
+          Parsed.bToWriterFenceLost ? Trade->To.CharacterComponent
+                                    : TWeakObjectPtr<URedwoodCharacterComponent>(),
+        };
+        for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Fenced) {
+          if (URedwoodCharacterComponent *Component = WeakComponent.Get()) {
+            Component->MarkWriterFenceLost();
+          }
+        }
+        // The realm checks the fence before the receipt, so on a resend after an unknown outcome
+        // this refusal says nothing about whether the earlier attempt committed: give up, which
+        // logs every entry as UNKNOWN and freezes the side that is still this session's, so it
+        // loads from the database again.
+        if (bResendAfterUnknown) {
+          GiveUpItemsTrade(
+            TradeId, TEXT("a resend after an unknown outcome was refused for a lost writer fence")
+          );
+          return;
+        }
+        Trade = PendingItemTrades.Find(TradeId);
+        if (!Trade) {
+          return;
+        }
+      }
+      break;
+  }
+
+  // NOT applied: nothing is dropped or applied. Entries staged during the trade are re-chained from
+  // the balance before it, which is still the backend's, and the game is told. Copies: the game
+  // reacts to the rebase and may start another trade, which can move this one in the map.
+  const FRedwoodItemTradeSide Sides[] = {Trade->From, Trade->To};
+  for (const FRedwoodItemTradeSide &Side : Sides) {
+    URedwoodCharacterComponent *Component = Side.CharacterComponent.Get();
+    if (IsValid(Component) && Side.Entries.Num() > 0) {
+      Component->RechainCurrencyAfterTrade(Side.BalanceBefore);
+    }
+  }
+  FinishItemsTrade(TradeId, Parsed.Error, -1, -1);
+}
+
+void URedwoodServerGameSubsystem::HandleItemsTradeTimeout(const FString &TradeId, uint64 Generation) {
+  FRedwoodPendingItemTrade *Trade = PendingItemTrades.Find(TradeId);
+  if (!Trade || Trade->Generation != Generation) {
+    return;
+  }
+  // From here a reply to this attempt is late, and is ignored.
+  Trade->Generation = 0;
+  Trade->bOutcomeUnknown = true;
+  UE_LOG(LogRedwood, Error, TEXT("Trade %s got no reply"), *TradeId);
+  RetryItemsTrade(TradeId, TEXT("no reply"));
+}
+
+void URedwoodServerGameSubsystem::RetryItemsTrade(const FString &TradeId, const FString &Reason) {
+  FRedwoodPendingItemTrade *Trade = PendingItemTrades.Find(TradeId);
+  if (!Trade) {
+    return;
+  }
+  if (Trade->Attempts >= TradeMaxAttempts) {
+    GiveUpItemsTrade(
+      TradeId, FString::Printf(TEXT("%s; %d attempts made"), *Reason, Trade->Attempts)
+    );
+    return;
+  }
+  UGameInstance *GameInstance = GetGameInstance();
+  if (!GameInstance) {
+    GiveUpItemsTrade(TradeId, TEXT("no game instance to time the resend"));
+    return;
+  }
+  GameInstance->GetTimerManager().SetTimer(
+    Trade->Timer,
+    FTimerDelegate::CreateWeakLambda(this, [this, TradeId]() { SendItemsTrade(TradeId); }),
+    TradeResendSeconds,
+    false // no loop
+  );
+}
+
+void URedwoodServerGameSubsystem::ResumeItemsTradesAfterSidecarConnect() {
+  // Keys first: a send can end its trade and change the map.
+  TArray<FString> WaitingTradeIds;
+  TArray<FString> UnansweredTradeIds;
+  for (TPair<FString, FRedwoodPendingItemTrade> &Pair : PendingItemTrades) {
+    if (Pair.Value.bWaitingForSidecar) {
+      WaitingTradeIds.Add(Pair.Key);
+    } else if (Pair.Value.Generation != 0) {
+      // FORK(hollowed-oath): sent on the dropped connection, so its reply never comes. Its outcome
+      // is unknown from here, and a late reply to it is ignored: send it again now instead of
+      // waiting out TradeReplyTimeoutSeconds. The receipt acks it if it committed.
+      Pair.Value.Generation = 0;
+      Pair.Value.bOutcomeUnknown = true;
+      UnansweredTradeIds.Add(Pair.Key);
+    }
+  }
+  for (const FString &TradeId : WaitingTradeIds) {
+    SendItemsTrade(TradeId);
+  }
+  for (const FString &TradeId : UnansweredTradeIds) {
+    const FRedwoodPendingItemTrade *Trade = PendingItemTrades.Find(TradeId);
+    if (!Trade) {
+      continue;
+    }
+    if (Trade->Attempts >= TradeMaxAttempts) {
+      GiveUpItemsTrade(
+        TradeId, FString::Printf(TEXT("the connection dropped; %d attempts made"), Trade->Attempts)
+      );
+    } else {
+      SendItemsTrade(TradeId);
+    }
+  }
+}
+
+void URedwoodServerGameSubsystem::CommitItemsTrade(
+  const FString &TradeId, const FRedwoodItemTradeReply &Reply
+) {
+  const FRedwoodPendingItemTrade *Trade = PendingItemTrades.Find(TradeId);
+  if (!Trade) {
+    return;
+  }
+  // Copies: the game reacts to each side's rebase and may start another trade, which can move this
+  // one in the map. The trade stays in the map meanwhile, so both lanes stay held until both sides
+  // have taken the commit.
+  const FRedwoodItemTradeSide From = Trade->From;
+  const FRedwoodItemTradeSide To = Trade->To;
+
+  // Each side takes the commit the way a flush ack does: the seq forward, and the balance only when
+  // the fence is exactly the trade's own commit. A replay ack carries the CURRENT fences, so a later
+  // fence means something else committed after the trade, and the balance is then reloaded.
+  auto CommitSide = [](const FRedwoodItemTradeSide &Side, int64 CommittedSeq) {
+    FRedwoodItemFlushReply AsFlushReply;
+    AsFlushReply.CommittedSeq = CommittedSeq;
+    FRedwoodItemFlushSent AsFlushSent;
+    AsFlushSent.BatchSeq = Side.SeqBefore + 1;
+    AsFlushSent.bHasBalanceAfter = Side.Entries.Num() > 0;
+    if (AsFlushSent.bHasBalanceAfter) {
+      AsFlushSent.BalanceAfter = Side.Entries.Last().BalanceAfter;
+    }
+    if (URedwoodPlayerStateComponent *PlayerStateComponent = Side.PlayerStateComponent.Get()) {
+      WriteCommittedFlushToSnapshot(PlayerStateComponent->RedwoodCharacter, AsFlushReply, AsFlushSent);
+    }
+    URedwoodCharacterComponent *Component = Side.CharacterComponent.Get();
+    if (!IsValid(Component)) {
+      return;
+    }
+    Component->AdoptCommittedItemSeq(CommittedSeq);
+    if (!AsFlushSent.bHasBalanceAfter) {
+      return;
+    }
+    if (CommittedSeq == AsFlushSent.BatchSeq) {
+      Component->RechainCurrencyAfterTrade(AsFlushSent.BalanceAfter);
+    } else {
+      Component->RequireCurrencyReload();
+    }
+  };
+  CommitSide(From, Reply.FromCommittedSeq);
+  CommitSide(To, Reply.ToCommittedSeq);
+
+  // Each alert goes to the character it names, so the game forwards it once.
+  for (const TSharedPtr<FJsonObject> &Alert : Reply.Alerts) {
+    const TSharedPtr<FJsonObject> *Detail = nullptr;
+    FString OwnerId;
+    if (Alert->TryGetObjectField(TEXT("detail"), Detail) && Detail) {
+      (*Detail)->TryGetStringField(TEXT("ownerId"), OwnerId);
+    }
+    const FRedwoodItemTradeSide &Side = OwnerId == To.CharacterId ? To : From;
+    if (URedwoodCharacterComponent *Component = Side.CharacterComponent.Get()) {
+      Component->OnCurrencyAlerts.Broadcast({Alert});
+    }
+  }
+
+  FinishItemsTrade(TradeId, FString(), Reply.FromCommittedSeq, Reply.ToCommittedSeq);
+}
+
+void URedwoodServerGameSubsystem::GiveUpItemsTrade(const FString &TradeId, const FString &Reason) {
+  FRedwoodPendingItemTrade *Trade = PendingItemTrades.Find(TradeId);
+  if (!Trade) {
     return;
   }
 
-  TSharedPtr<FJsonObject> Payload =
-    BuildItemsTradePayload(FromCharacterId, ToCharacterId, RootPlacements);
-
-  Sidecar->Emit(
-    TEXT("realm:characters:items:trade"),
-    Payload,
-    [OnComplete](auto Response) {
-      TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
-      FString Error = MessageStruct->GetStringField(TEXT("error"));
-      if (!Error.IsEmpty()) {
-        UE_LOG(LogRedwood, Error, TEXT("Failed to trade items: %s"), *Error);
-      }
-      // FORK(hollowed-oath): post-trade InventorySeq fences (see the header doc-comment on
-      // EmitItemsTrade for the full delta-loss contract). -1 default covers error acks that omit
-      // the fields entirely, matching the sentinel the backend itself sends on error paths. Routed
-      // through a double intermediate the same way committedSeq is above -- JSON numbers land as
-      // doubles, and TryGetNumberField has no int64 overload here.
-      double FromCommittedSeqValue = -1.0;
-      double ToCommittedSeqValue = -1.0;
-      const bool bHasFromSeq = MessageStruct->TryGetNumberField(
-        TEXT("fromCommittedSeq"), FromCommittedSeqValue
-      );
-      const bool bHasToSeq = MessageStruct->TryGetNumberField(
-        TEXT("toCommittedSeq"), ToCommittedSeqValue
-      );
-      // -1 is the ERROR sentinel, so a success-shaped ack that omits either fence would hand the
-      // caller a sentinel it is contractually required to reseed from -- silently corrupting the
-      // seq lane on what looks like a clean trade. Say so loudly; the caller still sees -1 and its
-      // own contract (reseed only from a valid fence) keeps it from adopting the sentinel.
-      if (Error.IsEmpty() && (!bHasFromSeq || !bHasToSeq)) {
-        UE_LOG(
-          LogRedwood,
-          Warning,
-          TEXT("EmitItemsTrade: success ack omitted %s%s%s -- seq resync cannot proceed from it"),
-          !bHasFromSeq ? TEXT("fromCommittedSeq") : TEXT(""),
-          (!bHasFromSeq && !bHasToSeq) ? TEXT(" and ") : TEXT(""),
-          !bHasToSeq ? TEXT("toCommittedSeq") : TEXT("")
-        );
-      }
-      int64 FromCommittedSeq = static_cast<int64>(FromCommittedSeqValue);
-      int64 ToCommittedSeq = static_cast<int64>(ToCommittedSeqValue);
-      if (OnComplete) {
-        OnComplete(Error, FromCommittedSeq, ToCommittedSeq);
-      }
-    }
+  // Staff rebuild the trade from these lines: it may have committed or not, and only the database
+  // can tell.
+  UE_LOG(
+    LogRedwood,
+    Error,
+    TEXT("Trade %s (%s -> %s) gave up (%s). Its outcome is UNKNOWN; both characters freeze."),
+    *TradeId,
+    *Trade->From.CharacterId,
+    *Trade->To.CharacterId,
+    *Reason
   );
+  const FString Why = FString::Printf(TEXT("in trade %s, which gave up (%s)"), *TradeId, *Reason);
+  for (const FRedwoodItemTradeSide *Side : {&Trade->From, &Trade->To}) {
+    LogCurrencyForStaff(Side->CharacterId, Why, Side->Entries, Side->Entries.Num(), {}, 0);
+  }
+
+  // The same freeze as a final refusal: the balance and the seq of both characters are unknown, so
+  // nothing staged can be sent, and only a fresh load from the database repairs them. Nothing is in
+  // flight: the trade held both lanes. Both freeze before the game hears of either, so its reaction
+  // to one finds the other frozen too. Copies, because that reaction may move this trade in the map.
+  const FString Error = FString::Printf(TEXT("trade %s outcome unknown: %s"), *TradeId, *Reason);
+  const FRedwoodItemTradeSide Sides[] = {Trade->From, Trade->To};
+  // A side whose writer fence is lost is not this session's character any more: it sends nothing,
+  // has logged what it holds and has told the game. Freezing it would only log it twice.
+  auto IsFenceLost = [](const FRedwoodItemTradeSide &Side) {
+    const URedwoodCharacterComponent *Component = Side.CharacterComponent.Get();
+    return Component && Component->IsWriterFenceLost();
+  };
+  for (const FRedwoodItemTradeSide &Side : Sides) {
+    if (IsFenceLost(Side)) {
+      continue;
+    }
+    FreezeCharacter(Side.CharacterId, Side.PlayerStateComponent.Get());
+    if (URedwoodCharacterComponent *Component = Side.CharacterComponent.Get()) {
+      Component->FreezeAfterFinalRefusal(Error);
+    }
+  }
+  for (const FRedwoodItemTradeSide &Side : Sides) {
+    if (IsFenceLost(Side)) {
+      continue;
+    }
+    if (URedwoodCharacterComponent *Component = Side.CharacterComponent.Get()) {
+      Component->NotifyItemFlushRefusedFinal(Error);
+    }
+  }
+  FinishItemsTrade(TradeId, Error, -1, -1);
+}
+
+void URedwoodServerGameSubsystem::FinishItemsTrade(
+  const FString &TradeId, const FString &Error, int64 FromCommittedSeq, int64 ToCommittedSeq
+) {
+  FRedwoodPendingItemTrade *Trade = PendingItemTrades.Find(TradeId);
+  if (!Trade) {
+    return;
+  }
+  if (UGameInstance *GameInstance = GetGameInstance()) {
+    GameInstance->GetTimerManager().ClearTimer(Trade->Timer);
+  }
+  // Out of the map first: the caller and the resumed flushes may start a new trade or flush, and
+  // must not be held by this finished one.
+  FRedwoodPendingItemTrade Finished = MoveTemp(*Trade);
+  PendingItemTrades.Remove(TradeId);
+  if (Finished.OnComplete) {
+    Finished.OnComplete(Error, FromCommittedSeq, ToCommittedSeq);
+  }
+  ResumeHeldItemFlushes(Finished.HeldFlushes);
 }
 // FORK(hollowed-oath) END
 
