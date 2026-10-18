@@ -381,12 +381,12 @@ public:
   int32 GetCurrencyEntriesToSendCount() const;
   int32 GetGrantKeysToSendCount() const;
 
-  // Read right after TryBeginItemFlush. True when the claimed batch re-sends an unconfirmed batch
-  // under a seq the lane has already moved past (a trade fence seeded the lane forward). Such a
-  // batch must carry NO item rows: the backend answers a seq at or below its fence as a replay and
-  // does not apply rows in it, yet its success ack would clear them.
+  // Read right after TryBeginItemFlush. True when the claimed batch re-sends an unconfirmed
+  // currency batch. Such a batch must carry NO item rows, at the old seq or not: if the original
+  // committed, the backend answers the re-send as a replay and applies none of its rows, yet the
+  // success ack would clear them -- rows dirtied since (a second purchase's item) would be lost.
   bool IsItemFlushReplayProbe() const {
-    return bItemFlushInFlight && InFlightBatchSeq < NextBatchSeq;
+    return bItemFlushInFlight && bInFlightIsCurrencyResend;
   }
 
   bool IsCurrencyRebaseRequired() const {
@@ -565,6 +565,8 @@ private:
   int32 UnconfirmedCurrencyCount = 0;
   int32 UnconfirmedGrantCount = 0;
   int64 UnconfirmedBatchSeq = 0;
+  // Whether the in-flight claim re-sends the unconfirmed batch (see IsItemFlushReplayProbe).
+  bool bInFlightIsCurrencyResend = false;
 
   bool bCurrencyRebaseRequired = false;
   FString WriterToken;

@@ -645,6 +645,7 @@ bool URedwoodCharacterComponent::TryBeginItemFlush(int64 &OutBatchSeq) {
   // batch committed (a replay it acks from its ledger) or not (a retriable refusal); under a new
   // seq a committed entry would be refused as a duplicate and the batch lost with it.
   InFlightBatchSeq = bCurrencyBatchUnconfirmed ? UnconfirmedBatchSeq : NextBatchSeq;
+  bInFlightIsCurrencyResend = bCurrencyBatchUnconfirmed;
   OutBatchSeq = InFlightBatchSeq;
   return true;
 }

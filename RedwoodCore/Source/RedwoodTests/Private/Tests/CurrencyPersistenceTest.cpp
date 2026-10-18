@@ -358,3 +358,54 @@ bool FRedwoodCurrencyConcurrentFlushIsUnconfirmedTest::RunTest(const FString &Pa
 
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyResendCarriesNoRowsTest,
+  "Redwood.Currency.ResendCarriesNoRows",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodCurrencyResendCarriesNoRowsTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyPersistenceTest;
+  const FString SecondItemId = TEXT("22222222-2222-2222-2222-222222222222");
+  URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
+
+  // Purchase 1: its item row and its debit in one batch, which times out.
+  Component->MarkItemsDirty({Fixture::ItemId});
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, -300, 200)}, {});
+  int64 BatchSeq = 0;
+  TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
+  TestFalse(TEXT("A first send is not a probe"), Component->IsItemFlushReplayProbe());
+  TArray<TPair<FString, uint64>> SentUpserts;
+  SentUpserts.Add(TPair<FString, uint64>(Fixture::ItemId, 1));
+  Component->CompleteItemFlush(TEXT("socket closed"), -1, SentUpserts, Fixture::NoItems, 1, 0);
+
+  // Purchase 2's item row goes dirty before the retry.
+  Component->MarkItemsDirty({SecondItemId});
+
+  // The same-seq retry re-sends the unconfirmed debit: it is a probe even though the lane did not
+  // move, so the flush sends no item rows in it.
+  int64 RetrySeq = 0;
+  TestTrue(TEXT("Retry claim succeeds"), Component->TryBeginItemFlush(RetrySeq));
+  TestEqual(TEXT("Same seq"), RetrySeq, BatchSeq);
+  TestTrue(TEXT("A same-seq re-send is a probe"), Component->IsItemFlushReplayProbe());
+
+  // Purchase 1 had committed; the backend acks the replay.
+  Component->CompleteItemFlush(TEXT(""), BatchSeq, Fixture::NoItems, Fixture::NoItems, 1, 0);
+
+  TestEqual(TEXT("The debit is acknowledged"), Component->GetPendingCurrencyEntries().Num(), 0);
+  TestTrue(
+    TEXT("Purchase 2's row stays dirty after the replay ack"),
+    Component->GetDirtyItemGenerations().Contains(SecondItemId)
+  );
+  TestTrue(
+    TEXT("Purchase 1's row stays dirty too, so it is re-sent rather than assumed"),
+    Component->GetDirtyItemGenerations().Contains(Fixture::ItemId)
+  );
+
+  int64 NextSeq = 0;
+  TestTrue(TEXT("Next claim succeeds"), Component->TryBeginItemFlush(NextSeq));
+  TestFalse(TEXT("The next batch is an ordinary one that carries rows"), Component->IsItemFlushReplayProbe());
+
+  return true;
+}
