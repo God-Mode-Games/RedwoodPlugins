@@ -304,9 +304,10 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 // component refuses new currency, and the game hears it once, with the character.
 bool FRedwoodCurrencyFinalRefusalFreezesTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyPersistenceTest;
-  // One staff line per dropped entry and key, then one per refused entry while frozen.
+  // One staff line per dropped entry and key (the refused probe's as UNKNOWN), then one per refused
+  // entry while frozen.
   AddExpectedErrorPlain(
-    TEXT("NOT saved: dropped by the freeze after a final refusal (overdraft)"), EAutomationExpectedErrorFlags::Contains, 3
+    TEXT("dropped by the freeze after a final refusal (overdraft)"), EAutomationExpectedErrorFlags::Contains, 3
   );
   AddExpectedError(TEXT("is frozen after a final refusal"), EAutomationExpectedErrorFlags::Contains, 1);
   URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
