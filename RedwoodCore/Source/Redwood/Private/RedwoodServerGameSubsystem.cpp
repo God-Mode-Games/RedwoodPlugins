@@ -2308,14 +2308,11 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
             Pawn ? *Pawn->GetName() : TEXT("<none>")
           );
           CharacterComponent->ClearDirtyFlags();
-          // FORK(hollowed-oath): item dirty state is NOT touched by ClearDirtyFlags (it clears
-          // only on a send's ack), so the identity-mismatch skip path must clear it explicitly or
-          // this component's items stay dirty forever. Fork-added; keep alongside the skip.
-          // ClearDirtyFlags() deliberately leaves items alone (they only clear on a
-          // send's ack) -- but this component is never going to be flushed at all (it's
-          // being skipped outright), so there is no in-flight send to race; clear its
-          // item dirty state directly instead of leaving it stuck forever.
-          CharacterComponent->ClearItemsDirtyState();
+          // FORK(hollowed-oath): item dirt and staged currency are NOT touched by ClearDirtyFlags
+          // (they clear only on a send's ack), so the skip must drop them itself, or this
+          // component stays dirty forever. Both go together, the currency logged: a debit must
+          // not outlive the row it pays for. Fork-added; keep alongside the skip.
+          CharacterComponent->DropStagedForIdentityMismatch(AuthoritativeCharId);
           continue;
         }
 

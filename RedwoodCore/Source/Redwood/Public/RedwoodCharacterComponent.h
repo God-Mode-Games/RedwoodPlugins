@@ -326,11 +326,10 @@ public:
     return PendingDeletedItemGenerations;
   }
 
-  // Unconditional full clear -- used where there is genuinely nothing to retry (e.g. the
-  // identity-mismatch safety rail that skips the flush entirely for a stale/un-hydrated component,
-  // so there is no in-flight send whose ack this would race). The normal flush path does NOT call
-  // this -- see CompleteItemFlush below, which clears only the specific ids a successfully-
-  // acknowledged flush actually sent.
+  // Unconditional full clear -- used where there is genuinely nothing to retry (the offline save,
+  // which writes every record, and the drops of everything staged), so there is no in-flight send
+  // whose ack this would race. The normal flush path does NOT call this -- see CompleteItemFlush
+  // below, which clears only the specific ids a successfully-acknowledged flush actually sent.
   void ClearItemsDirtyState() {
     DirtyItemGenerations.Empty();
     PendingDeletedItemGenerations.Empty();
@@ -482,6 +481,13 @@ public:
   // otherwise commit from nothing), and only the database knows the truth. The game sends the
   // player back through character select, which hydrates again and clears the freeze.
   void FreezeAfterFinalRefusal(const FString &Reason);
+
+  // M1: the save skips this component, because it does not play the PlayerState's character (a
+  // stale or never-hydrated component). Its rows and its currency are dropped together, and the
+  // currency logged for staff: a debit must not outlive the row it pays for, and an unconfirmed
+  // batch would keep it dirty forever. With a batch in flight nothing is dropped: its reply
+  // decides it, and the next save pass drops the rest.
+  void DropStagedForIdentityMismatch(const FString &AuthoritativeCharacterId);
 
   // Holds currency until a reload rebases it: the balance the pending entries were chained from
   // is not known to be the backend's. Ignored while a batch is in flight or unconfirmed: a reload
@@ -744,6 +750,9 @@ private:
     const TArray<TPair<FString, uint64>> &SentDeletes
   );
   void RemoveSentCurrency(int32 SentCurrencyCount, int32 SentGrantCount);
+  // Logs every staged entry and key (LogStagedCurrencyForStaff, with Why), then drops them with
+  // the item dirt, the unconfirmed batch and any rebase.
+  void DropAllStaged(const FString &Why);
   void MarkCurrencyBatchUnconfirmed(int32 SentCurrencyCount, int32 SentGrantCount, int64 SentSeq);
   // FORK(hollowed-oath) END
 

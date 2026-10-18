@@ -1183,18 +1183,29 @@ void URedwoodCharacterComponent::LogStagedCurrencyForStaff(const FString &Why) c
 }
 
 void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) {
-  LogStagedCurrencyForStaff(
-    FString::Printf(TEXT("dropped by the freeze after a final refusal (%s)"), *Reason)
-  );
+  DropAllStaged(FString::Printf(TEXT("dropped by the freeze after a final refusal (%s)"), *Reason));
+  bFrozenAfterFinalRefusal = true;
+}
+
+void URedwoodCharacterComponent::DropStagedForIdentityMismatch(const FString &AuthoritativeCharacterId) {
+  if (bItemFlushInFlight || !IsItemsDirty()) {
+    return;
+  }
+  DropAllStaged(FString::Printf(
+    TEXT("dropped by the save, which skips a component that does not play the PlayerState's character %s"),
+    *AuthoritativeCharacterId
+  ));
+}
+
+void URedwoodCharacterComponent::DropAllStaged(const FString &Why) {
+  LogStagedCurrencyForStaff(Why);
   PendingCurrencyEntries.Empty();
   PendingGrantKeys.Empty();
   bCurrencyBatchUnconfirmed = false;
   UnconfirmedCurrencyCount = 0;
   UnconfirmedGrantCount = 0;
   bCurrencyRebaseRequired = false;
-  DirtyItemGenerations.Empty();
-  PendingDeletedItemGenerations.Empty();
-  bFrozenAfterFinalRefusal = true;
+  ClearItemsDirtyState();
 }
 
 void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay() {

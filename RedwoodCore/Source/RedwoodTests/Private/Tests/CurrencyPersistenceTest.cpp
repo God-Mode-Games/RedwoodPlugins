@@ -663,3 +663,48 @@ bool FRedwoodCurrencyRechainBelowZeroTest::RunTest(const FString &Parameters) {
   TestFalse(TEXT("And releases it"), Component->IsCurrencyRebaseRequired());
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyIdentityMismatchDropsTogetherTest,
+  "Redwood.Currency.IdentityMismatchDropsTogether",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// M1: the save skips a component that does not play the PlayerState's character. Its row and its
+// debit go together, logged for staff, with its unconfirmed batch, so it does not stay dirty for
+// good. While a batch is in flight nothing is dropped: the reply decides that batch.
+bool FRedwoodCurrencyIdentityMismatchDropsTogetherTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyPersistenceTest;
+  AddExpectedErrorPlain(
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta -300 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): dropped by the save, which skips a component that does not play the PlayerState's character character-2"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  AddExpectedErrorPlain(
+    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB delta 100 reason Currency.Reason.Loot, NOT saved: dropped by the save"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
+  Component->RedwoodCharacterId = TEXT("character-1");
+
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, -300, 200)}, {});
+  int64 BatchSeq = 0;
+  TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
+  Component->MarkItemsDirty({Fixture::ItemId});
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 100, 300)}, {});
+
+  Component->DropStagedForIdentityMismatch(TEXT("character-2"));
+  TestEqual(TEXT("Nothing is dropped while a batch is in flight"), Component->GetPendingCurrencyEntries().Num(), 2);
+  TestTrue(TEXT("Nor the row"), Component->GetDirtyItemGenerations().Contains(Fixture::ItemId));
+
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT("socket closed"), -1), Fixture::MakeSent(1, 0));
+  TestTrue(TEXT("The batch is unconfirmed"), Component->IsCurrencyBatchUnconfirmed());
+
+  Component->DropStagedForIdentityMismatch(TEXT("character-2"));
+  TestEqual(TEXT("The entries are dropped"), Component->GetPendingCurrencyEntries().Num(), 0);
+  TestFalse(TEXT("With the row"), Component->GetDirtyItemGenerations().Contains(Fixture::ItemId));
+  TestFalse(TEXT("And the unconfirmed batch"), Component->IsCurrencyBatchUnconfirmed());
+  TestFalse(TEXT("So the component is clean"), Component->IsItemsDirty());
+  return true;
+}
