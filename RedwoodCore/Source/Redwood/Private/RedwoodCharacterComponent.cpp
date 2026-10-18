@@ -608,6 +608,10 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         // Seeded alongside the snapshot for the same reason: re-seeding mid-session from the stale
         // login InventorySeq would rewind the fence behind flushes that have already committed.
         SeedItemSeqFromCharacter(RedwoodCharacterBackend.InventorySeq);
+        // FORK(hollowed-oath): a snapshot whose balance is stale must not seed a currency chain.
+        if (RedwoodCharacterBackend.bCurrencyAmountUnknown) {
+          RequireCurrencyReload();
+        }
         HydratedItemsCharacterId = IncomingCharacterId;
       }
     }
@@ -731,6 +735,14 @@ void URedwoodCharacterComponent::CompleteItemFlush(
     RemoveSentCurrency(SentCurrencyCount, SentGrantCount);
     bCurrencyBatchUnconfirmed = false;
     bCurrencyRebaseRequired = true;
+    // The game's copy of these rows is what the backend refused, so it is replaced from the
+    // reload rather than trusted (see IsItemsReloadRequired).
+    for (const TPair<FString, uint64> &Sent : SentUpserts) {
+      ItemIdsToReload.Add(Sent.Key);
+    }
+    for (const TPair<FString, uint64> &Sent : SentDeletes) {
+      ItemIdsToReload.Add(Sent.Key);
+    }
     if (CommittedSeq >= SentSeq) {
       AdoptCommittedItemSeq(CommittedSeq);
     }
@@ -901,6 +913,21 @@ void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
     Entry.BalanceAfter = Running;
   }
   bCurrencyRebaseRequired = false;
+}
+
+void URedwoodCharacterComponent::CompleteItemsReload() {
+  for (const FString &ItemId : ItemIdsToReload) {
+    DirtyItemGenerations.Remove(ItemId);
+    PendingDeletedItemGenerations.Remove(ItemId);
+  }
+  ItemIdsToReload.Empty();
+}
+
+void URedwoodCharacterComponent::RequireCurrencyReload(bool bBeforeSettlingReply) {
+  if ((bItemFlushInFlight || bCurrencyBatchUnconfirmed) && !bBeforeSettlingReply) {
+    return;
+  }
+  bCurrencyRebaseRequired = true;
 }
 
 void URedwoodCharacterComponent::RemoveSentCurrency(int32 SentCurrencyCount, int32 SentGrantCount) {

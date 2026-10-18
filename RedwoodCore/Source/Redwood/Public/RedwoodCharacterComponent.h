@@ -393,6 +393,36 @@ public:
     return bCurrencyRebaseRequired;
   }
 
+  // The item rows of a batch the backend refused for good. The game still shows them as it staged
+  // them (a refused purchase's item is still in the records array), but the backend has none of
+  // that batch. Until a reload puts the backend's rows back, no flush of this character may go
+  // out: a later dirty mark would save the refused item with no debit.
+  bool IsItemsReloadRequired() const {
+    return ItemIdsToReload.Num() > 0;
+  }
+
+  const TSet<FString> &GetItemIdsToReload() const {
+    return ItemIdsToReload;
+  }
+
+  // Called once the records array holds the backend's rows for GetItemIdsToReload. Drops the dirt
+  // and pending deletions of those ids at ANY generation: a mark made after the refusal describes
+  // the game's copy, which the reload has just replaced.
+  void CompleteItemsReload();
+
+  // A reload, of either kind, must land before this component sends anything.
+  bool IsReloadRequired() const {
+    return bCurrencyRebaseRequired || IsItemsReloadRequired();
+  }
+
+  // Holds currency until a reload rebases it: the balance the pending entries were chained from
+  // is not known to be the backend's. Ignored while a batch is in flight or unconfirmed: a reload
+  // could land before or after that batch commits, so its balance could count the batch's entries
+  // once or twice, and that batch must go out again unchanged anyway; its reply decides.
+  // bBeforeSettlingReply is for a caller about to hand CompleteItemFlush a success that settles
+  // that batch, so the hold is in place before the parked attempt CompleteItemFlush runs.
+  void RequireCurrencyReload(bool bBeforeSettlingReply = false);
+
   // Re-chains every pending entry's BalanceAfter from Balance (the amount just loaded from the
   // backend) and allows currency to be sent again. Ignored unless a rebase is required: at any
   // other time a pending entry may already be committed, and re-chaining it would count it twice.
@@ -411,6 +441,7 @@ public:
 
   FOnItemFlushRefusedFinal OnItemFlushRefusedFinal;
   FOnCurrencyAlerts OnCurrencyAlerts;
+  FOnCurrencyRebased OnCurrencyRebased;
   // FORK(hollowed-oath) END
 
   // Ack handler for the in-flight item flush. On success (Error empty) clears the SENT generations
@@ -572,6 +603,9 @@ private:
 
   bool bCurrencyRebaseRequired = false;
   FString WriterToken;
+
+  // See IsItemsReloadRequired.
+  TSet<FString> ItemIdsToReload;
 
   // Moves the committed seq and NextBatchSeq forward to CommittedSeq, never back: a replay probe
   // goes out under an older seq than NextBatchSeq, and its ack must not rewind the lane.

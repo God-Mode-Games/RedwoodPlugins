@@ -131,6 +131,12 @@ struct FRedwoodCharacterBackend {
   // start their balance chain from what the backend holds instead of from the login value.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   int64 CurrencyAmount = 0;
+
+  // True when a reply confirmed the seq but not the balance (a replay acked behind a later fence:
+  // something else, such as a trade, committed after the batch). CurrencyAmount is then stale, and
+  // a component seeded from this snapshot must reload before it sends any currency.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  bool bCurrencyAmountUnknown = false;
   // FORK(hollowed-oath) END
 };
 

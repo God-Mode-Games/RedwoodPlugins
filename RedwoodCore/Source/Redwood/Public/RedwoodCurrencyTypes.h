@@ -109,6 +109,12 @@ inline bool TryParseCurrencyAmount(const FString &Text, int64 &OutAmount) {
 // has raised an alert; the character must reload before its balance can be trusted again.
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnItemFlushRefusedFinal, const FString & /*Error*/);
 
+// A reload gave the backend's balance, and every pending entry is now re-chained on top of it.
+// The game's running balance must restart from here: it is the last pending entry's BalanceAfter,
+// or Balance itself when nothing is pending. A game that keeps chaining from its old running
+// balance writes BalanceAfter values the backend refuses for good, and loses those entries.
+DECLARE_MULTICAST_DELEGATE_OneParam(FOnCurrencyRebased, int64 /*Balance*/);
+
 // The alerts a committed flush raised (`alerts` on the ack), for the game to forward to GMs.
 DECLARE_MULTICAST_DELEGATE_OneParam(
   FOnCurrencyAlerts, const TArray<TSharedPtr<FJsonObject>> &
