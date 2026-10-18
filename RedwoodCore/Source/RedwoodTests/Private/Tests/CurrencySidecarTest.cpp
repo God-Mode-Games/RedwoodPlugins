@@ -2187,7 +2187,7 @@ bool FRedwoodCurrencyTradeReplyClassifyTest::RunTest(const FString &Parameters) 
   using namespace RedwoodCurrencyTradeTest;
   // The two successes whose fences do not pass a seq, and the two old-sidecar fallbacks.
   AddExpectedErrorPlain(TEXT("do not pass the seqs before the trade"), EAutomationExpectedErrorFlags::Contains, 2);
-  AddExpectedErrorPlain(TEXT("read the outcome from its text"), EAutomationExpectedErrorFlags::Contains, 3);
+  AddExpectedErrorPlain(TEXT("read the outcome from its text"), EAutomationExpectedErrorFlags::Contains, 4);
 
   auto Classify = [](const FString &Json) {
     TSharedPtr<FJsonObject> Object;
@@ -2266,6 +2266,24 @@ bool FRedwoodCurrencyTradeReplyClassifyTest::RunTest(const FString &Parameters) 
   TestTrue(
     TEXT("An old realm's binding text is read, with a Warning"),
     Parse(ErrorReply(URedwoodServerGameSubsystem::TradeNotBoundError)).bSessionRefused
+  );
+
+  // tradeIdReused: the same rule.
+  TestTrue(
+    TEXT("tradeIdReused is read from the flag"),
+    Parse(TEXT(R"({"error":"reused for the test","fromCommittedSeq":-1,"toCommittedSeq":-1,"tradeIdReused":true})")).bTradeIdReused
+  );
+  TestFalse(
+    TEXT("A present false flag beats the reused-id text"),
+    Parse(FString::Printf(
+      TEXT(R"({"error":"%s","fromCommittedSeq":-1,"toCommittedSeq":-1,"tradeIdReused":false})"),
+      URedwoodServerGameSubsystem::TradeIdReusedError
+    )).bTradeIdReused
+  );
+  TestFalse(TEXT("Another refusal is no reused id"), Parse(ErrorReply(TEXT("empty trade"))).bTradeIdReused);
+  TestTrue(
+    TEXT("An old realm's reused-id text is read, with a Warning"),
+    Parse(ErrorReply(URedwoodServerGameSubsystem::TradeIdReusedError)).bTradeIdReused
   );
 
   TestEqual(
@@ -2583,7 +2601,9 @@ bool FRedwoodCurrencyTradeIdReusedTest::RunTest(const FString &Parameters) {
       !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
     return false;
   }
-  const FString ReusedReply = ErrorReply(URedwoodServerGameSubsystem::TradeIdReusedError);
+  // The flag decides, so the text is one the plugin knows nothing of.
+  const FString ReusedReply =
+    TEXT(R"({"error":"reused for the test","fromCommittedSeq":-1,"toCommittedSeq":-1,"tradeIdReused":true})");
 
   FTradeResult FirstResult;
   FRequest First;

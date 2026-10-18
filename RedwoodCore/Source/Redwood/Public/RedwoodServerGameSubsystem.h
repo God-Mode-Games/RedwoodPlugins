@@ -123,6 +123,8 @@ struct FRedwoodItemTradeReply {
   // Set by the realm on its two refusals that depend on this server's session: they say nothing
   // about an earlier attempt of the trade.
   bool bSessionRefused = false;
+  // Set by the realm when it holds a receipt for this trade id with other contents.
+  bool bTradeIdReused = false;
   TArray<TSharedPtr<FJsonObject>> Alerts;
 };
 
@@ -549,9 +551,10 @@ public:
   static constexpr const TCHAR *TradeNotBoundError =
     TEXT("both characters must be bound to this instance");
   static constexpr const TCHAR *TradeNotAuthorizedError = TEXT("not authorized");
-  // The realm's refusal of a trade id it holds a receipt for with other contents. A first send that
+  // The realm's refusal of a trade id it holds a receipt for with other contents, flagged
+  // `tradeIdReused`; the text is read only from a realm too old to send the flag. A first send that
   // gets it did not apply. A resend never should, since it is the first send again; one that does
-  // means a bug, and the earlier attempt's outcome is then unknown. The realm has no flag for it.
+  // means a bug, and the earlier attempt's outcome is then unknown.
   static constexpr const TCHAR *TradeIdReusedError = TEXT("trade id reused with different contents");
 
   // The only reason the backend takes on a trade entry.

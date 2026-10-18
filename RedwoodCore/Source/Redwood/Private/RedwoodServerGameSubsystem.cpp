@@ -4297,6 +4297,16 @@ FRedwoodItemTradeReply URedwoodServerGameSubsystem::ParseItemsTradeReply(
       *Parsed.Error
     );
   }
+  if (!Reply->TryGetBoolField(TEXT("tradeIdReused"), Parsed.bTradeIdReused) &&
+      Parsed.Error.Equals(TradeIdReusedError, ESearchCase::CaseSensitive)) {
+    Parsed.bTradeIdReused = true;
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("Trade reply has no tradeIdReused flag; read the outcome from its text: \"%s\". Update the realm."),
+      *Parsed.Error
+    );
+  }
   ParseCurrencyAlerts(Reply, Parsed.Alerts);
   return Parsed;
 }
@@ -4374,7 +4384,7 @@ void URedwoodServerGameSubsystem::HandleItemsTradeReply(
       // refusals before the transaction are the same on every attempt, so the first attempt was
       // refused too, except the two that depend on this server's session: those say nothing about
       // the earlier attempt, so the trade is sent again.
-      if (Trade->Attempts > 1 && Parsed.Error.Equals(TradeIdReusedError, ESearchCase::CaseSensitive)) {
+      if (Trade->Attempts > 1 && Parsed.bTradeIdReused) {
         UE_LOG(
           LogRedwood,
           Error,
