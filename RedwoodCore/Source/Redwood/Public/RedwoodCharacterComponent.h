@@ -12,6 +12,8 @@
 #include "RedwoodCharacterComponent.generated.h"
 
 class USIOJsonObject;
+// FORK(hollowed-oath): the snapshot owner FindPlayerStateComponent returns.
+class URedwoodPlayerStateComponent;
 
 UCLASS(
   Blueprintable,
@@ -420,6 +422,12 @@ public:
     return bCurrencyRebaseRequired;
   }
 
+  // An earlier batch went out and its outcome is not known yet: it is re-sent exactly as it was.
+  // Until its reply, nobody knows the backend balance, so a trade must wait.
+  bool IsCurrencyBatchUnconfirmed() const {
+    return bCurrencyBatchUnconfirmed;
+  }
+
   // A final refusal froze this component: the backend refused a batch for good, so the game's
   // staged state no longer matches the backend's. Cleared only by a fresh hydration.
   bool IsFrozenAfterFinalRefusal() const {
@@ -458,6 +466,25 @@ public:
   // backend) and allows currency to be sent again. Ignored unless a rebase is required: at any
   // other time a pending entry may already be committed, and re-chaining it would count it twice.
   void RebaseCurrency(int64 Balance);
+
+  // A trade of this character settled, and Balance is the backend balance after it: its own
+  // entries' last BalanceAfter when it committed, the balance before it when it did not apply.
+  // Every entry staged during the trade comes after it on the backend, so it is re-chained from
+  // Balance, and the game is told (OnCurrencyRebased): the game cannot know which balance its
+  // running total should have used while the outcome was open. Nothing can be in flight here,
+  // because the trade held this character's flushes. If a re-chained entry would overflow, the
+  // queue waits for a reload instead (see RebaseCurrency).
+  void RechainCurrencyAfterTrade(int64 Balance);
+
+  // Moves the committed seq and NextBatchSeq forward to CommittedSeq, never back: a replay probe
+  // goes out under an older seq than NextBatchSeq, and its ack must not rewind the lane. Public for
+  // the trade, whose reply is the other thing that moves this character's seq.
+  void AdoptCommittedItemSeq(int64 CommittedSeq);
+
+  // The PlayerState component that holds this character's snapshot: through the pawn's
+  // controller, or the owner itself when this component sits on the PlayerState. Null for a
+  // detached pawn.
+  URedwoodPlayerStateComponent *FindPlayerStateComponent() const;
 
   // The token the realm issued this session at auth. Every items:flush must carry it; the backend
   // commits nothing for any other token.
@@ -644,9 +671,9 @@ private:
   // See IsWriterFenceLost.
   bool bWriterFenceLost = false;
 
-  // Moves the committed seq and NextBatchSeq forward to CommittedSeq, never back: a replay probe
-  // goes out under an older seq than NextBatchSeq, and its ack must not rewind the lane.
-  void AdoptCommittedItemSeq(int64 CommittedSeq);
+  // Re-chains every pending entry from Balance. Returns false, with nothing changed, when an entry
+  // would overflow int64.
+  bool TryRechainPendingCurrency(int64 Balance);
 
   void ClearSentItemGenerations(
     const TArray<TPair<FString, uint64>> &SentUpserts,

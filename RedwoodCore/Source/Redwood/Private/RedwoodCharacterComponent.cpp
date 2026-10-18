@@ -860,20 +860,22 @@ void URedwoodCharacterComponent::ClearSentItemGenerations(
   }
 }
 
+URedwoodPlayerStateComponent *URedwoodCharacterComponent::FindPlayerStateComponent() const {
+  // Reached the way hydration reaches it.
+  APawn *Pawn = Cast<APawn>(GetOwner());
+  AController *Controller = IsValid(Pawn) ? Pawn->GetController() : nullptr;
+  APlayerState *PlayerState = IsValid(Controller)
+    ? Controller->PlayerState.Get()
+    : Cast<APlayerState>(GetOwner());
+  return IsValid(PlayerState) ? PlayerState->FindComponentByClass<URedwoodPlayerStateComponent>()
+                              : nullptr;
+}
+
 bool URedwoodCharacterComponent::HasGrantKey(const FString &GrantKey) const {
   if (ContainsGrantKey(PendingGrantKeys, GrantKey)) {
     return true;
   }
-  // The snapshot lives on the PlayerState, reached the way hydration reaches it: through the
-  // pawn's controller, or the owner itself when the component sits on the PlayerState.
-  const APawn *Pawn = Cast<APawn>(GetOwner());
-  const AController *Controller = IsValid(Pawn) ? Pawn->GetController() : nullptr;
-  const APlayerState *PlayerState = IsValid(Controller)
-    ? Controller->PlayerState.Get()
-    : Cast<APlayerState>(GetOwner());
-  const URedwoodPlayerStateComponent *PlayerStateComponent = IsValid(PlayerState)
-    ? PlayerState->FindComponentByClass<URedwoodPlayerStateComponent>()
-    : nullptr;
+  const URedwoodPlayerStateComponent *PlayerStateComponent = FindPlayerStateComponent();
   return PlayerStateComponent &&
     ContainsGrantKey(PlayerStateComponent->RedwoodCharacter.GrantKeys, GrantKey);
 }
@@ -968,13 +970,42 @@ void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
     return;
   }
 
+  // On an overflow the rebase stays pending: the queue is held, not dropped, until a reload yields
+  // a balance that fits.
+  if (TryRechainPendingCurrency(Balance)) {
+    bCurrencyRebaseRequired = false;
+  }
+}
+
+void URedwoodCharacterComponent::RechainCurrencyAfterTrade(int64 Balance) {
+  // A batch whose reply is still open may or may not be in Balance; re-chaining its entries could
+  // count them twice. The trade's hold makes this unreachable, so say so loudly and let a reload
+  // decide once that reply is in.
+  if (bItemFlushInFlight || bCurrencyBatchUnconfirmed) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("RechainCurrencyAfterTrade: character %s has a batch in flight or unconfirmed; waiting for a reload instead"),
+      *RedwoodCharacterId
+    );
+    RequireCurrencyReload(true);
+    return;
+  }
+  if (!TryRechainPendingCurrency(Balance)) {
+    bCurrencyRebaseRequired = true;
+    return;
+  }
+  OnCurrencyRebased.Broadcast(Balance);
+}
+
+bool URedwoodCharacterComponent::TryRechainPendingCurrency(int64 Balance) {
+  // Checked before anything is written: a batch that mixes stale and re-chained values is refused
+  // for good.
   int64 Running = Balance;
-  for (FRedwoodCurrencyEntry &Entry : PendingCurrencyEntries) {
+  for (const FRedwoodCurrencyEntry &Entry : PendingCurrencyEntries) {
     const bool bOverflows = Entry.Delta > 0 ? Running > MAX_int64 - Entry.Delta
                                             : Running < MIN_int64 - Entry.Delta;
     if (bOverflows) {
-      // Keep the rebase pending: sending would mix this entry's stale BalanceAfter with re-chained
-      // ones. The queue is held, not dropped, until a reload yields a balance that fits.
       UE_LOG(
         LogRedwood,
         Error,
@@ -982,12 +1013,16 @@ void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
         *Entry.Id,
         Running
       );
-      return;
+      return false;
     }
+    Running += Entry.Delta;
+  }
+  Running = Balance;
+  for (FRedwoodCurrencyEntry &Entry : PendingCurrencyEntries) {
     Running += Entry.Delta;
     Entry.BalanceAfter = Running;
   }
-  bCurrencyRebaseRequired = false;
+  return true;
 }
 
 void URedwoodCharacterComponent::MarkWriterFenceLost() {
