@@ -299,16 +299,16 @@ inline TSharedPtr<FJsonObject> MakeCurrencyLoadObject(
 // character is frozen with everything staged dropped and logged. The game must send the player
 // back through character select: only a fresh hydration from the database repairs the state.
 // Also fired, with the same freeze, for both characters of a trade whose outcome could not be
-// learned (see URedwoodServerGameSubsystem::EmitItemsTrade). With no handler bound, the server kicks
-// the player instead (URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync).
+// learned (see URedwoodServerGameSubsystem::EmitItemsTrade). The server then kicks the player,
+// unless the game has set URedwoodServerGameSubsystem::bGameHandlesCurrencyDesync.
 DECLARE_MULTICAST_DELEGATE_TwoParams(
   FOnItemFlushRefusedFinal, const FString & /*CharacterId*/, const FString & /*Error*/
 );
 
 // The realm said this session's writer token is stale: another session owns the character, and
 // nothing this server stages for it can be saved. The game must end this session for the
-// character, so the player does not keep playing on it. With no handler bound, the server kicks
-// the player itself (URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync).
+// character, so the player does not keep playing on it. The server then kicks the player, unless
+// the game has set URedwoodServerGameSubsystem::bGameHandlesCurrencyDesync.
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnWriterFenceLost, const FString & /*CharacterId*/);
 
 // A reload gave the backend's balance, and every pending entry is now re-chained on top of it.

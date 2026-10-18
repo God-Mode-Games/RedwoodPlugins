@@ -3666,6 +3666,9 @@ void URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync(
     IsValid(CharacterComponent) ? CharacterComponent->FindPlayerController() : nullptr;
   const FString CharacterId =
     IsValid(CharacterComponent) ? CharacterComponent->RedwoodCharacterId : FString();
+  if (bGameHandlesCurrencyDesync) {
+    return;
+  }
   // A server that is shutting down ends every session anyway; a kick now would only race it.
   if (bIsShuttingDown) {
     UE_LOG(
@@ -3681,7 +3684,7 @@ void URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync(
     UE_LOG(
       LogRedwood,
       Warning,
-      TEXT("Character %s cannot be saved (%s) and the game handles nothing for it, but it has no player to kick (a detached pawn)"),
+      TEXT("Character %s cannot be saved (%s) and the game does not handle it, but it has no player to kick (a detached pawn)"),
       *CharacterId,
       *Why
     );
@@ -3690,7 +3693,7 @@ void URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync(
   UE_LOG(
     LogRedwood,
     Warning,
-    TEXT("Character %s cannot be saved (%s) and the game handles nothing for it: kicking the player"),
+    TEXT("Character %s cannot be saved (%s) and the game does not handle it: kicking the player"),
     *CharacterId,
     *Why
   );

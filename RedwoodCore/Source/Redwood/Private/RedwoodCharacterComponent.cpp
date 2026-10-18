@@ -1163,25 +1163,20 @@ void URedwoodCharacterComponent::MarkWriterFenceLost() {
   // Kept, not dropped, but never sent from here: the same lines a freeze writes, so staff can tell
   // what may need a re-grant.
   LogStagedCurrencyForStaff(TEXT("writer fence lost, another session owns the character"));
-  // Broadcast first, then ask IsBound: Broadcast runs the live listeners and drops every binding
-  // whose object is gone, so a stale binding no longer counts as a handler.
   OnWriterFenceLost.Broadcast(RedwoodCharacterId);
-  if (!OnWriterFenceLost.IsBound()) {
-    if (URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem()) {
-      ServerSubsystem->KickPlayerAfterCurrencyDesync(this, TEXT("its writer fence is lost"));
-    }
+  // R36: the default kick, unless the game said it handles this (bGameHandlesCurrencyDesync).
+  if (URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem()) {
+    ServerSubsystem->KickPlayerAfterCurrencyDesync(this, TEXT("its writer fence is lost"));
   }
 }
 
 void URedwoodCharacterComponent::NotifyItemFlushRefusedFinal(const FString &Error) {
-  // As in MarkWriterFenceLost: only a live listener counts as a handler.
   OnItemFlushRefusedFinal.Broadcast(RedwoodCharacterId, Error);
-  if (!OnItemFlushRefusedFinal.IsBound()) {
-    if (URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem()) {
-      ServerSubsystem->KickPlayerAfterCurrencyDesync(
-        this, FString::Printf(TEXT("it is frozen after a final refusal (%s)"), *Error)
-      );
-    }
+  // R36: as in MarkWriterFenceLost.
+  if (URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem()) {
+    ServerSubsystem->KickPlayerAfterCurrencyDesync(
+      this, FString::Printf(TEXT("it is frozen after a final refusal (%s)"), *Error)
+    );
   }
 }
 

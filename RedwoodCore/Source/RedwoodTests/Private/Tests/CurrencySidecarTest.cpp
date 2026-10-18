@@ -3166,9 +3166,6 @@ bool FRedwoodCurrencyTradeReconnectResendsTest::RunTest(const FString &Parameter
 }
 
 namespace RedwoodCurrencySidecarTest {
-  // The owner of a stale binding (UnhandledDesyncKicks).
-  struct FStaleListener : public TSharedFromThis<FStaleListener> {};
-
   // A player with its own controller, and the character component on its PlayerState: the
   // component reaches its player the way a live one does.
   struct FPlayerParty {
@@ -3223,16 +3220,16 @@ namespace RedwoodCurrencySidecarTest {
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodCurrencySidecarUnhandledDesyncKicksTest,
-  "Redwood.Currency.Sidecar.UnhandledDesyncKicks",
+  FRedwoodCurrencySidecarDesyncKicksTest,
+  "Redwood.Currency.Sidecar.DesyncKicksUnlessGameHandles",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// R35: until the game binds them, a lost writer fence and a final refusal kick the player. A frozen
-// or fenced character that stays in the world saves nothing, and an item it drops there can be
-// picked up while the database still holds the original. A bound handler owns the reaction, and
-// then nothing is kicked.
-bool FRedwoodCurrencySidecarUnhandledDesyncKicksTest::RunTest(const FString &Parameters) {
+// R35, R36: a lost writer fence and a final refusal kick the player, even with a listener bound,
+// until the game says it handles them (bGameHandlesCurrencyDesync). A frozen or fenced character
+// that stays in the world saves nothing, and an item it drops there can be picked up while the
+// database still holds the original. While the server shuts down, nobody is kicked.
+bool FRedwoodCurrencySidecarDesyncKicksTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedErrorPlain(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 2);
   AddExpectedErrorPlain(
@@ -3244,79 +3241,65 @@ bool FRedwoodCurrencySidecarUnhandledDesyncKicksTest::RunTest(const FString &Par
   }
   ARedwoodKickProbeGameSession *KickProbe = InstallKickProbe(Harness);
   FPlayerParty Fenced;
-  FPlayerParty FencedHandled;
   FPlayerParty Refused;
+  FPlayerParty FencedHandled;
   FPlayerParty RefusedHandled;
-  FPlayerParty FencedStale;
   FPlayerParty FencedAtShutdown;
   // One character each: a freeze is per character.
   if (!KickProbe || !MakePlayerParty(Harness, TEXT("character-fenced"), Fenced) ||
-      !MakePlayerParty(Harness, TEXT("character-fenced-handled"), FencedHandled) ||
       !MakePlayerParty(Harness, TEXT("character-refused"), Refused) ||
+      !MakePlayerParty(Harness, TEXT("character-fenced-handled"), FencedHandled) ||
       !MakePlayerParty(Harness, TEXT("character-refused-handled"), RefusedHandled) ||
-      !MakePlayerParty(Harness, TEXT("character-fenced-stale"), FencedStale) ||
       !MakePlayerParty(Harness, TEXT("character-fenced-shutdown"), FencedAtShutdown)) {
     return false;
   }
+  int32 FenceLostCount = 0;
+  int32 RefusalCount = 0;
+  for (FPlayerParty *Party : {&Fenced, &Refused, &FencedHandled, &RefusedHandled}) {
+    Party->Component->OnWriterFenceLost.AddLambda([&FenceLostCount](const FString &) { ++FenceLostCount; });
+    Party->Component->OnItemFlushRefusedFinal.AddLambda(
+      [&RefusalCount](const FString &, const FString &) { ++RefusalCount; }
+    );
+  }
 
+  // The flag is off: a bound listener hears it, and the player is kicked all the same.
   Fenced.Component->MarkWriterFenceLost();
   TestTrue(
-    TEXT("An unhandled lost fence kicks the player"),
+    TEXT("A lost fence kicks the player, listener or not"),
     Harness.PumpUntil([KickProbe]() { return KickProbe->KickCount == 1; })
   );
+  TestEqual(TEXT("The listener hears the lost fence"), FenceLostCount, 1);
   TestEqual(
     TEXT("The kick says why"),
     KickProbe->LastKickReason,
     FString(URedwoodServerGameSubsystem::CurrencyDesyncKickMessage)
   );
-
-  int32 FenceLostCount = 0;
-  FencedHandled.Component->OnWriterFenceLost.AddLambda([&FenceLostCount](const FString &) { ++FenceLostCount; });
-  FencedHandled.Component->MarkWriterFenceLost();
-  PumpFor(QuietWindowSeconds);
-  TestEqual(TEXT("The handler hears the lost fence"), FenceLostCount, 1);
-  TestEqual(TEXT("A handled lost fence kicks nobody"), KickProbe->KickCount, 1);
-
   if (!RefuseFlushForGood(Harness, Refused.Component)) {
     return false;
   }
   TestTrue(
-    TEXT("An unhandled final refusal kicks the player"),
+    TEXT("A final refusal kicks the player, listener or not"),
     Harness.PumpUntil([KickProbe]() { return KickProbe->KickCount == 2; })
   );
+  TestEqual(TEXT("The listener hears the final refusal"), RefusalCount, 1);
 
-  int32 RefusalCount = 0;
-  RefusedHandled.Component->OnItemFlushRefusedFinal.AddLambda(
-    [&RefusalCount](const FString &, const FString &) { ++RefusalCount; }
-  );
+  // The game says it handles both: no kick.
+  Harness.Subsystem->bGameHandlesCurrencyDesync = true;
+  FencedHandled.Component->MarkWriterFenceLost();
   if (!RefuseFlushForGood(Harness, RefusedHandled.Component)) {
     return false;
   }
   PumpFor(QuietWindowSeconds);
-  TestEqual(TEXT("The handler hears the final refusal"), RefusalCount, 1);
-  TestEqual(TEXT("A handled final refusal kicks nobody"), KickProbe->KickCount, 2);
+  TestEqual(TEXT("The game's listener hears the lost fence"), FenceLostCount, 2);
+  TestEqual(TEXT("And the final refusal"), RefusalCount, 2);
+  TestEqual(TEXT("A game that handles them kicks nobody"), KickProbe->KickCount, 2);
 
-  // A listener whose owner is gone handles nothing: the player is kicked all the same. The owner
-  // is a shared object, released at once, so the binding is truly dead (a UObject that is only
-  // marked as garbage still counts for the engine until it is collected).
-  TSharedPtr<FStaleListener> GoneListener = MakeShared<FStaleListener>();
-  int32 StaleCount = 0;
-  FencedStale.Component->OnWriterFenceLost.AddSPLambda(
-    GoneListener.Get(), [&StaleCount](const FString &) { ++StaleCount; }
-  );
-  GoneListener.Reset();
-  FencedStale.Component->MarkWriterFenceLost();
-  TestTrue(
-    TEXT("A stale binding does not stop the kick"),
-    Harness.PumpUntil([KickProbe]() { return KickProbe->KickCount == 3; })
-  );
-  TestEqual(TEXT("The stale listener never runs"), StaleCount, 0);
-
-  // A server that is shutting down kicks nobody.
+  // A server that is shutting down kicks nobody, even with the flag off.
+  Harness.Subsystem->bGameHandlesCurrencyDesync = false;
   FAccess::SetShuttingDown(*Harness.Subsystem);
   FencedAtShutdown.Component->MarkWriterFenceLost();
   PumpFor(QuietWindowSeconds);
-  TestEqual(TEXT("No kick while the server shuts down"), KickProbe->KickCount, 3);
+  TestEqual(TEXT("No kick while the server shuts down"), KickProbe->KickCount, 2);
   return true;
 }
 
@@ -3886,8 +3869,8 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 // A batch refused for good after its component is gone: the refused entry is logged as NOT saved,
 // and the character freezes, snapshot and all, so the respawned component starts frozen instead of
 // staging on a state the backend refused. Nobody could tell the game when the refusal came, so the
-// respawned component tells it at hydration (N2): with no handler the player is kicked, and a
-// bound handler hears it instead.
+// respawned component tells it at hydration (N2): the player is kicked, unless the game handles
+// it (bGameHandlesCurrencyDesync), and then its handler hears it instead.
 bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedErrorPlain(
@@ -3937,6 +3920,8 @@ bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &
     Harness.PumpUntil([KickProbe]() { return KickProbe->KickCount == 1; })
   );
 
+  // The game handles it: its handler hears it, and nobody more is kicked.
+  Harness.Subsystem->bGameHandlesCurrencyDesync = true;
   int32 RefusalCount = 0;
   URedwoodCharacterComponent *Handled = HydrateOnPlayerState(
     PlayerState,
@@ -3948,7 +3933,7 @@ bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &
   );
   PumpFor(QuietWindowSeconds);
   TestTrue(TEXT("It starts frozen too"), Handled->IsFrozenAfterFinalRefusal());
-  TestEqual(TEXT("A bound handler hears it once"), RefusalCount, 1);
+  TestEqual(TEXT("The game's handler hears it once"), RefusalCount, 1);
   TestEqual(TEXT("And nobody more is kicked"), KickProbe->KickCount, 1);
   return true;
 }

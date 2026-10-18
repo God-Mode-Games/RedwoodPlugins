@@ -637,12 +637,20 @@ public:
     const FString &CharacterId, URedwoodPlayerStateComponent *PlayerStateComponent
   );
 
-  // R35: the default reaction to a desync the game does not handle (OnItemFlushRefusedFinal or
-  // OnWriterFenceLost fired with no handler bound). The character is frozen or fenced, so nothing
-  // it does is saved, yet it stays in the world: an item it drops there is not in the database,
-  // and the copy it drops can be picked up while the database still holds the original. So the
-  // player is kicked, through KickPlayerOrDestroyController. A detached pawn has no player: that
-  // is only logged. Why goes to the log.
+  // R36: set by the game when it handles OnItemFlushRefusedFinal and OnWriterFenceLost itself (it
+  // sends the player to character select, or ends the stale session). Until then every such event
+  // kicks the player (KickPlayerAfterCurrencyDesync). An explicit flag, not a guess from the
+  // delegates' bindings: a listener whose object is pending kill still counts as bound, and a kick
+  // that a stale binding suppressed would never happen.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  bool bGameHandlesCurrencyDesync = false;
+
+  // R35: the default reaction to a desync (OnItemFlushRefusedFinal or OnWriterFenceLost fired),
+  // unless bGameHandlesCurrencyDesync is set or the server is shutting down. The character is
+  // frozen or fenced, so nothing it does is saved, yet it stays in the world: an item it drops
+  // there is not in the database, and the copy it drops can be picked up while the database still
+  // holds the original. So the player is kicked, through KickPlayerOrDestroyController. A detached
+  // pawn has no player: that is only logged. Why goes to the log.
   void KickPlayerAfterCurrencyDesync(
     URedwoodCharacterComponent *CharacterComponent, const FString &Why
   );

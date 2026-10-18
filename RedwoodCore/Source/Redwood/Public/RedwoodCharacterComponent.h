@@ -452,14 +452,15 @@ public:
     return bWriterFenceLost;
   }
 
-  // Logs a warning the first time only. Tells the game through OnWriterFenceLost; with no handler
-  // bound, the server kicks the player (see
-  // URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync).
+  // Logs a warning the first time only. Tells the game through OnWriterFenceLost, then the server
+  // kicks the player unless the game handles it (see
+  // URedwoodServerGameSubsystem::bGameHandlesCurrencyDesync).
   void MarkWriterFenceLost();
 
-  // Tells the game that this character is frozen (OnItemFlushRefusedFinal). With no handler bound,
-  // the server kicks the player instead (R35): until the game handles it, a frozen character that
-  // stays in the world can still change it, and an item dropped there is not in the database.
+  // Tells the game that this character is frozen (OnItemFlushRefusedFinal), then the server kicks
+  // the player unless the game handles it (R35, R36: see
+  // URedwoodServerGameSubsystem::bGameHandlesCurrencyDesync). A frozen character that stays in the
+  // world can still change it, and an item dropped there is not in the database.
   void NotifyItemFlushRefusedFinal(const FString &Error);
 
   // Logs every staged entry and grant key through LogCurrencyForStaff, so staff can rebuild what
