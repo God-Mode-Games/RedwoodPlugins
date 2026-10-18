@@ -220,9 +220,14 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 // Offline, the character file is the database: the save applies the staged entries to the
-// snapshot and writes `{ amount, grants }`, and the component is no longer dirty.
+// snapshot and writes `{ amount, grants }`, and the component is no longer dirty. The file also
+// keeps the applied entry ids, so a repeat of one is refused after a reload, as the backend's
+// ledger refuses it.
 bool FRedwoodCurrencyOfflineSaveTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencyLoadTest;
+  AddExpectedErrorPlain(
+    FString::Printf(TEXT("entry %s is already applied"), *EntryIdA), EAutomationExpectedErrorFlags::Contains, 1
+  );
 
   FRedwoodCharacterBackend Character;
   URedwoodCharacterComponent *Component = MakeCharacterComponent();
@@ -262,6 +267,21 @@ bool FRedwoodCurrencyOfflineSaveTest::RunTest(const FString &Parameters) {
     URedwoodServerGameSubsystem::ApplyOfflineCurrency(Character, Component)
   );
   TestEqual(TEXT("Both keys are kept"), Character.GrantKeys.Num(), 2);
+
+  // The file as the next session loads it.
+  TSharedPtr<FJsonObject> FileObject = ParseJson(
+    TEXT(R"({"id":"character-1","playerId":"player-1","name":"Test Character",)")
+    TEXT(R"("createdAt":"2026-07-20T00:00:00.000Z","updatedAt":"2026-07-20T00:00:00.000Z"})")
+  );
+  URedwoodCommonGameSubsystem::WriteOfflineCurrency(Character, FileObject);
+  FRedwoodCharacterBackend Reloaded = URedwoodCommonGameSubsystem::ParseCharacter(FileObject);
+  TestEqual(TEXT("The file keeps both applied ids"), Reloaded.OfflineAppliedEntryIds.Num(), 2);
+  Component->QueueCurrency({MakeEntry(EntryIdA, 1, 301, LootReason)}, {});
+  TestFalse(
+    TEXT("A re-grant under an applied id is refused"),
+    URedwoodServerGameSubsystem::ApplyOfflineCurrency(Reloaded, Component)
+  );
+  TestEqual(TEXT("It moves no balance"), Reloaded.CurrencyAmount, (int64)300);
   return true;
 }
 

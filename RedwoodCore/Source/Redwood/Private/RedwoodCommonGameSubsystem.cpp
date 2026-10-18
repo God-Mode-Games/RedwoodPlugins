@@ -340,6 +340,10 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
   // until a load gives the real balance (see bCurrencyAmountUnknown).
   const TSharedPtr<FJsonObject> *CurrencyObject = nullptr;
   if (CharacterObj->TryGetObjectField(CurrencyLoadField, CurrencyObject)) {
+    // Offline files only; the ids are already-checked entry ids, so a plain string read is enough.
+    (*CurrencyObject)->TryGetStringArrayField(
+      OfflineAppliedEntryIdsField, Character.OfflineAppliedEntryIds
+    );
     if (!TryParseCurrencyLoad(*CurrencyObject, Character.CurrencyAmount, Character.GrantKeys)) {
       UE_LOG(
         LogRedwood,
@@ -506,9 +510,16 @@ void URedwoodCommonGameSubsystem::WriteOfflineCurrency(
   // The same `{ amount, grants }` shape as the auth reply, so ParseCharacter reads both the same
   // way. An unknown balance is left out rather than written as a guess.
   if (!Character.bCurrencyAmountUnknown) {
-    CharacterObject->SetObjectField(
-      CurrencyLoadField, MakeCurrencyLoadObject(Character.CurrencyAmount, Character.GrantKeys)
-    );
+    TSharedPtr<FJsonObject> CurrencyObject =
+      MakeCurrencyLoadObject(Character.CurrencyAmount, Character.GrantKeys);
+    // Inside the currency object, so it is kept and carried with the balance it belongs to.
+    TArray<TSharedPtr<FJsonValue>> EntryIdValues;
+    EntryIdValues.Reserve(Character.OfflineAppliedEntryIds.Num());
+    for (const FString &EntryId : Character.OfflineAppliedEntryIds) {
+      EntryIdValues.Add(MakeShared<FJsonValueString>(EntryId));
+    }
+    CurrencyObject->SetArrayField(OfflineAppliedEntryIdsField, EntryIdValues);
+    CharacterObject->SetObjectField(CurrencyLoadField, CurrencyObject);
   }
 }
 // FORK(hollowed-oath) END

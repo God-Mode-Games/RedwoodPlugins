@@ -151,6 +151,13 @@ struct FRedwoodCharacterBackend {
   UPROPERTY(BlueprintReadOnly, Category = "Redwood")
   TArray<FString> GrantKeys;
 
+  // Offline/PIE only: the ids of every currency entry the character file has applied. The backend
+  // refuses an entry id it has already applied, and a freeze log tells staff to re-grant with the
+  // same id, so the offline save must refuse a repeat too. The backend keeps these in its ledger
+  // and never sends them; online this stays empty.
+  UPROPERTY()
+  TArray<FString> OfflineAppliedEntryIds;
+
   // The writer token the realm issued this session at auth. A session secret: every items:flush
   // must carry it, so it is not exposed to Blueprint and never written to disk (this struct itself
   // is server-only). Components copy it at hydration.

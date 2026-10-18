@@ -318,7 +318,7 @@ public:
   // component's staged entries and grant keys and applies them to the character snapshot, which
   // the save then writes to the file (URedwoodCommonGameSubsystem::WriteOfflineCurrency). It refuses the whole batch, as the
   // backend would, when an entry would take the balance below zero or past int64, does not end at
-  // its BalanceAfter, or has no reason, or a key is already used: the refused batch is dropped and
+  // its BalanceAfter, has no reason or an id the file already applied, or a key is already used: the refused batch is dropped and
   // logged, and the balance does not move. An unknown balance applies nothing and keeps the
   // queues. Returns true when the snapshot changed.
   static bool ApplyOfflineCurrency(

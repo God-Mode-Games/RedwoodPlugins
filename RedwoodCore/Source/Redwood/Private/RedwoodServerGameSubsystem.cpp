@@ -3607,11 +3607,18 @@ bool URedwoodServerGameSubsystem::ApplyOfflineCurrency(
   // The backend's flush rules, so offline play finds the same caller bugs a live server would.
   FString Refusal;
   int64 Balance = Character.CurrencyAmount;
+  // Ids are checked uppercase hex at the queue, so a plain (case-blind) compare is exact here.
+  TArray<FString> AppliedEntryIds = Character.OfflineAppliedEntryIds;
   for (const FRedwoodCurrencyEntry &Entry : Entries) {
     if (Entry.Reason.IsEmpty()) {
       Refusal = FString::Printf(TEXT("entry %s has no reason"), *Entry.Id);
       break;
     }
+    if (AppliedEntryIds.Contains(Entry.Id)) {
+      Refusal = FString::Printf(TEXT("entry %s is already applied"), *Entry.Id);
+      break;
+    }
+    AppliedEntryIds.Add(Entry.Id);
     // Balance is never negative here, so only a credit can pass int64.
     if (Entry.Delta > 0 && Balance > MAX_int64 - Entry.Delta) {
       Refusal = FString::Printf(TEXT("entry %s takes the balance past int64"), *Entry.Id);
@@ -3670,6 +3677,7 @@ bool URedwoodServerGameSubsystem::ApplyOfflineCurrency(
 
   Character.CurrencyAmount = Balance;
   Character.GrantKeys.Append(GrantKeys);
+  Character.OfflineAppliedEntryIds = MoveTemp(AppliedEntryIds);
   return true;
 }
 // FORK(hollowed-oath) END

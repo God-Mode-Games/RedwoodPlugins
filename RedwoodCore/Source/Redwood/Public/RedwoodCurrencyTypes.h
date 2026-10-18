@@ -147,6 +147,10 @@ inline bool TryParseCurrencyLoad(
   return true;
 }
 
+// Offline/PIE only: the field in the offline file's currency object that holds the applied entry
+// ids (FRedwoodCharacterBackend::OfflineAppliedEntryIds). No backend reply has it.
+inline const TCHAR *const OfflineAppliedEntryIdsField = TEXT("appliedEntryIds");
+
 // Grant keys compare case-sensitively, as the backend's key column does. FString's own == and TSet
 // ignore case, so "quest:q1" would pass for a used "quest:Q1" that the backend counts as new.
 inline bool ContainsGrantKey(const TArray<FString> &GrantKeys, const FString &GrantKey) {
