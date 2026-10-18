@@ -4570,6 +4570,7 @@ FRedwoodItemTradeReply URedwoodServerGameSubsystem::ParseItemsTradeReply(
       *Parsed.Error
     );
   }
+  Reply->TryGetBoolField(TEXT("writerFenceLost"), Parsed.bWriterFenceLost);
   ParseCurrencyAlerts(Reply, Parsed.Alerts);
   return Parsed;
 }
@@ -4668,6 +4669,18 @@ void URedwoodServerGameSubsystem::HandleItemsTradeReply(
   // the balance before it, which is still the backend's, and the game is told. Copies: the game
   // reacts to the rebase and may start another trade, which can move this one in the map.
   const FRedwoodItemTradeSide Sides[] = {Trade->From, Trade->To};
+  // FORK(hollowed-oath): another session owns one of the characters. The reply does not say which,
+  // so both sides stop sending, as after a flush's writerFenceLost. That is safe for the side whose
+  // session is still current: a lost fence drops nothing (it is logged for staff), sends nothing
+  // more, and ends with the kick (R36), so the player signs in again and loads the database's
+  // state with a fresh token. Marking only one side would let the wrong one go on writing.
+  if (Parsed.bWriterFenceLost) {
+    for (const FRedwoodItemTradeSide &Side : Sides) {
+      if (URedwoodCharacterComponent *Component = Side.CharacterComponent.Get()) {
+        Component->MarkWriterFenceLost();
+      }
+    }
+  }
   for (const FRedwoodItemTradeSide &Side : Sides) {
     URedwoodCharacterComponent *Component = Side.CharacterComponent.Get();
     if (IsValid(Component) && Side.Entries.Num() > 0) {

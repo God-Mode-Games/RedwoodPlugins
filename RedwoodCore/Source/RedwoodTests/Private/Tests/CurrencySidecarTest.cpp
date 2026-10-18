@@ -3940,4 +3940,51 @@ bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeWriterFenceLostTest,
+  "Redwood.Currency.Trade.WriterFenceLostMarksBothSides",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The realm refuses the trade because another session owns one of the characters (writerFenceLost)
+// and does not say which. The trade settles as not applied, and both sides lose their fence: neither
+// sends again, and neither is frozen.
+bool FRedwoodCurrencyTradeWriterFenceLostTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedErrorPlain(
+    TEXT("lost its writer fence (another session owns it); refused entry"), EAutomationExpectedErrorFlags::Contains, 1
+  );
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  FTradeResult Result;
+  FRequest Trade;
+  if (!SendTrade(Harness, From, To, Result, Trade)) {
+    return false;
+  }
+  Harness.Answer(
+    Trade,
+    TEXT(R"({"error":"character is owned by another session","fromCommittedSeq":-1,"toCommittedSeq":-1,"writerFenceLost":true})")
+  );
+  TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
+  TestFalse(TEXT("As not applied"), Result.Error.IsEmpty());
+  TestTrue(TEXT("The payer's fence is lost"), From.Component->IsWriterFenceLost());
+  TestTrue(TEXT("The payee's fence is lost"), To.Component->IsWriterFenceLost());
+  TestFalse(TEXT("Nobody is frozen"), Harness.Subsystem->IsCharacterFrozen(FromId) || Harness.Subsystem->IsCharacterFrozen(ToId));
+  TestEqual(TEXT("No seq moves"), From.Component->GetLastCommittedItemSeq(), FromSeq);
+  TestFalse(
+    TEXT("A fenced side takes no new currency"),
+    From.Component->QueueCurrency({MakeEntry(EntryIdB, LootAmount, FromBalance + LootAmount, LootReason)}, {})
+  );
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER

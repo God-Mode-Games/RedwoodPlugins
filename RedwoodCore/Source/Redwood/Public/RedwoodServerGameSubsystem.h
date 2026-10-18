@@ -97,6 +97,9 @@ struct FRedwoodItemTradeReply {
   bool bSessionRefused = false;
   // Set by the realm when it holds a receipt for this trade id with other contents.
   bool bTradeIdReused = false;
+  // Set by the realm when a side's writer token is stale: another session owns that character.
+  // The reply does not say which side.
+  bool bWriterFenceLost = false;
   TArray<TSharedPtr<FJsonObject>> Alerts;
 };
 
