@@ -2056,7 +2056,9 @@ bool FRedwoodCurrencyTradeNoSettlingReplyTest::RunTest(const FString &Parameters
   AddExpectedErrorPlain(TEXT("Its outcome is UNKNOWN"), EAutomationExpectedErrorFlags::Contains, 1);
   // A staff line for each side's entry.
   AddExpectedErrorPlain(TEXT("outcome UNKNOWN (it may be saved): in trade"), EAutomationExpectedErrorFlags::Contains, 2);
-  AddExpectedErrorPlain(TEXT("is frozen after a final refusal"), EAutomationExpectedErrorFlags::Contains, 1);
+  // The refused new entry at the end. Only that line: each side's desync kick warning also says
+  // the character "is frozen after a final refusal", once per side.
+  AddExpectedErrorPlain(TEXT("is frozen after a final refusal; refused entry"), EAutomationExpectedErrorFlags::Contains, 1);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
