@@ -2632,6 +2632,71 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsTradePayload(
   return Payload;
 }
 
+// FORK(hollowed-oath): catch this component up to the character's committed fence before it
+// claims a seq. The fence is per-CHARACTER but NextBatchSeq is per-COMPONENT, so a component that
+// did not send the last batch -- the one deferred by the one-flush-per-character rule, or one
+// created after another had already flushed -- still holds its login-time value. Sending that
+// stale seq makes the backend answer "replay", and the success-shaped ack then clears rows that
+// were never persisted. The PlayerState snapshot carries the latest committed fence (written back
+// on every successful ack), so trust it when it is ahead. Only ever forward: seeding backwards
+// would re-wedge the lane behind a seq the backend has already passed.
+static void CatchUpItemSeqFromSnapshot(
+  const URedwoodPlayerStateComponent *PlayerStateComponent,
+  URedwoodCharacterComponent *CharacterComponent
+) {
+  if (!PlayerStateComponent) {
+    return;
+  }
+  const FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+  if (Snapshot.InventorySeq > CharacterComponent->GetLastCommittedItemSeq()) {
+    CharacterComponent->SeedItemSeqFromCharacter(Snapshot.InventorySeq);
+    // FORK(hollowed-oath): a component that catches up from a snapshot whose balance is stale
+    // must not send currency chained from it.
+    if (Snapshot.bCurrencyAmountUnknown) {
+      CharacterComponent->RequireCurrencyReload();
+    }
+  }
+}
+
+// FORK(hollowed-oath): keeps a flush attempt for later. Every attempt with a settle is kept, so
+// each one settles exactly once. A live tick flush has none; one entry per component is enough to
+// flush it again later.
+static void AddHeldItemFlush(
+  TArray<FRedwoodHeldItemFlush> &HeldFlushes,
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  URedwoodCharacterComponent *CharacterComponent,
+  TFunction<void()> OnAckSettled
+) {
+  const bool bAlreadyHeldLive = !OnAckSettled &&
+    HeldFlushes.ContainsByPredicate([CharacterComponent](const FRedwoodHeldItemFlush &Held) {
+      return !Held.OnAckSettled && Held.CharacterComponent.Get() == CharacterComponent;
+    });
+  if (bAlreadyHeldLive) {
+    return;
+  }
+  FRedwoodHeldItemFlush &Held = HeldFlushes.AddDefaulted_GetRef();
+  Held.CharacterComponent = CharacterComponent;
+  Held.PlayerStateComponent = PlayerStateComponent;
+  Held.OnAckSettled = MoveTemp(OnAckSettled);
+}
+
+void URedwoodServerGameSubsystem::ResumeHeldItemFlushes(TArray<FRedwoodHeldItemFlush> &HeldFlushes) {
+  // Single-flight still holds: the first resumed attempt of a component claims its slot, a second
+  // parks behind it, and any more settle at once, exactly as un-held attempts would. A live
+  // component's entry flushes it now, so what waited goes out without waiting for the next save
+  // pass.
+  for (FRedwoodHeldItemFlush &Held : HeldFlushes) {
+    URedwoodCharacterComponent *Component = Held.CharacterComponent.Get();
+    if (IsValid(Component)) {
+      FlushItemsForCharacterComponent(
+        Held.PlayerStateComponent.Get(), Component, MoveTemp(Held.OnAckSettled)
+      );
+    } else if (Held.OnAckSettled) {
+      Held.OnAckSettled();
+    }
+  }
+}
+
 void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   URedwoodPlayerStateComponent *PlayerStateComponent,
   URedwoodCharacterComponent *CharacterComponent,
@@ -2708,25 +2773,7 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     return;
   }
 
-  // FORK(hollowed-oath): catch this component up to the character's committed fence before it
-  // claims a seq. The fence is per-CHARACTER but NextBatchSeq is per-COMPONENT, so a component that
-  // did not send the last batch -- the one deferred by the one-flush-per-character rule, or one
-  // created after another had already flushed -- still holds its login-time value. Sending that
-  // stale seq makes the backend answer "replay", and the success-shaped ack then clears rows that
-  // were never persisted. The PlayerState snapshot carries the latest committed fence (written back
-  // on every successful ack), so trust it when it is ahead. Only ever forward: seeding backwards
-  // would re-wedge the lane behind a seq the backend has already passed.
-  if (PlayerStateComponent) {
-    const FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
-    if (Snapshot.InventorySeq > CharacterComponent->GetLastCommittedItemSeq()) {
-      CharacterComponent->SeedItemSeqFromCharacter(Snapshot.InventorySeq);
-      // FORK(hollowed-oath): a component that catches up from a snapshot whose balance is stale
-      // must not send currency chained from it.
-      if (Snapshot.bCurrencyAmountUnknown) {
-        CharacterComponent->RequireCurrencyReload();
-      }
-    }
-  }
+  CatchUpItemSeqFromSnapshot(PlayerStateComponent, CharacterComponent);
 
   // FORK(hollowed-oath): while a reload is needed for this character, hold EVERY flush of it, from
   // every component, item rows included. A purchase is its item row plus its debit; with the debit
@@ -3262,19 +3309,9 @@ void URedwoodServerGameSubsystem::HoldItemFlushForCurrencyReload(
   if (CharacterComponent->IsCurrencyRebaseRequired()) {
     Reload->CharacterComponents.AddUnique(CharacterComponent);
   }
-
-  // Every held attempt with a settle is kept, so each one settles exactly once. A live tick flush
-  // has none; one entry per component is enough to flush it again when the reload lands.
-  const bool bAlreadyHeldLive = !OnAckSettled &&
-    Reload->HeldFlushes.ContainsByPredicate([CharacterComponent](const FRedwoodHeldItemFlush &Held) {
-      return !Held.OnAckSettled && Held.CharacterComponent.Get() == CharacterComponent;
-    });
-  if (!bAlreadyHeldLive) {
-    FRedwoodHeldItemFlush &Held = Reload->HeldFlushes.AddDefaulted_GetRef();
-    Held.CharacterComponent = CharacterComponent;
-    Held.PlayerStateComponent = PlayerStateComponent;
-    Held.OnAckSettled = MoveTemp(OnAckSettled);
-  }
+  AddHeldItemFlush(
+    Reload->HeldFlushes, PlayerStateComponent, CharacterComponent, MoveTemp(OnAckSettled)
+  );
 
   if (bStart) {
     SendCurrencyReload(CharacterId);
@@ -3433,20 +3470,7 @@ void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
     GameInstance->GetTimerManager().ClearTimer(Finished.RetryTimer);
   }
 
-  // Single-flight still holds: the first resumed attempt of a component claims its slot, a second
-  // parks behind it, and any more settle at once, exactly as un-held attempts would. A live
-  // component's entry flushes it now, so the re-chained entries go out without waiting for the
-  // next save pass.
-  for (FRedwoodHeldItemFlush &Held : Finished.HeldFlushes) {
-    URedwoodCharacterComponent *Component = Held.CharacterComponent.Get();
-    if (IsValid(Component)) {
-      FlushItemsForCharacterComponent(
-        Held.PlayerStateComponent.Get(), Component, MoveTemp(Held.OnAckSettled)
-      );
-    } else if (Held.OnAckSettled) {
-      Held.OnAckSettled();
-    }
-  }
+  ResumeHeldItemFlushes(Finished.HeldFlushes);
 }
 
 void URedwoodServerGameSubsystem::HandleCurrencyReloadTimeout(

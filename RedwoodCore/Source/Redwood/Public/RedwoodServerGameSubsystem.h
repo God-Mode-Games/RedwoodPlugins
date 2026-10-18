@@ -738,6 +738,8 @@ private:
   void GiveUpCurrencyReload(const FString &CharacterId, const FString &Reason);
   // Ends the reload: clears its timer and settles every held attempt without resuming it.
   void AbandonCurrencyReload(const FString &CharacterId);
+  // Runs every held attempt again, with its settle; one whose component is gone just settles.
+  void ResumeHeldItemFlushes(TArray<FRedwoodHeldItemFlush> &HeldFlushes);
 
   friend class FRedwoodCurrencyFlushTestAccess;
   // FORK(hollowed-oath) END
