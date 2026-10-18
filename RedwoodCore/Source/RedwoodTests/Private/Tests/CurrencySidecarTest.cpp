@@ -3342,8 +3342,14 @@ namespace RedwoodCurrencySidecarTest {
   // A component on the PlayerState, hydrated from its snapshot the way a live one is (the handler
   // the PlayerState's OnRedwoodCharacterUpdated runs). Only the item channel: the others need data
   // these tests do not give.
-  URedwoodCharacterComponent *HydrateOnPlayerState(ARedwoodCurrencyLoadTestPlayerState *PlayerState) {
+  URedwoodCharacterComponent *HydrateOnPlayerState(
+    ARedwoodCurrencyLoadTestPlayerState *PlayerState,
+    TFunction<void(URedwoodCharacterComponent *)> BeforeHydrate = nullptr
+  ) {
     URedwoodCharacterComponent *Component = NewObject<URedwoodCharacterComponent>(PlayerState);
+    if (BeforeHydrate) {
+      BeforeHydrate(Component);
+    }
     Component->bUseCharacterCreatorData = false;
     Component->bUseMetadata = false;
     Component->bUseEquippedInventory = false;
@@ -3874,7 +3880,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 // A batch refused for good after its component is gone: the refused entry is logged as NOT saved,
 // and the character freezes, snapshot and all, so the respawned component starts frozen instead of
-// staging on a state the backend refused.
+// staging on a state the backend refused. Nobody could tell the game when the refusal came, so the
+// respawned component tells it at hydration (N2): with no handler the player is kicked, and a
+// bound handler hears it instead.
 bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedErrorPlain(
@@ -3891,9 +3899,15 @@ bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &
   }
   ARedwoodCurrencyLoadTestPlayerState *PlayerState = nullptr;
   URedwoodPlayerStateComponent *PlayerStateComponent = nullptr;
-  if (!MakeSnapshotOwner(Harness, PlayerState, PlayerStateComponent)) {
+  ARedwoodKickProbeGameSession *KickProbe = InstallKickProbe(Harness);
+  APlayerController *PlayerController = Harness.World->SpawnActor<APlayerController>();
+  if (!KickProbe || !TestNotNull(TEXT("The controller spawns"), PlayerController) ||
+      !MakeSnapshotOwner(Harness, PlayerState, PlayerStateComponent)) {
     return false;
   }
+  // The PlayerState's owner is its player, as in a live session.
+  PlayerState->SetOwner(PlayerController);
+  PlayerController->PlayerState = PlayerState;
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Sender = Harness.MakeComponent(Actor);
   Sender->QueueCurrency({MakeEntry(EntryIdA, -2000, -1000, LootReason)}, {});
@@ -3909,8 +3923,28 @@ bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &
     Harness.PumpUntil([&Harness]() { return Harness.Subsystem->IsCharacterFrozen(CharacterId); })
   );
   TestTrue(TEXT("The snapshot is marked frozen"), PlayerStateComponent->RedwoodCharacter.bFrozenAfterFinalRefusal);
+  TestEqual(TEXT("Nobody is kicked while no component can tell"), KickProbe->KickCount, 0);
+
   URedwoodCharacterComponent *Respawned = HydrateOnPlayerState(PlayerState);
   TestTrue(TEXT("The respawned component starts frozen"), Respawned->IsFrozenAfterFinalRefusal());
+  TestTrue(
+    TEXT("With no handler, hydrating frozen kicks the player"),
+    Harness.PumpUntil([KickProbe]() { return KickProbe->KickCount == 1; })
+  );
+
+  int32 RefusalCount = 0;
+  URedwoodCharacterComponent *Handled = HydrateOnPlayerState(
+    PlayerState,
+    [&RefusalCount](URedwoodCharacterComponent *Component) {
+      Component->OnItemFlushRefusedFinal.AddLambda(
+        [&RefusalCount](const FString &, const FString &) { ++RefusalCount; }
+      );
+    }
+  );
+  PumpFor(QuietWindowSeconds);
+  TestTrue(TEXT("It starts frozen too"), Handled->IsFrozenAfterFinalRefusal());
+  TestEqual(TEXT("A bound handler hears it once"), RefusalCount, 1);
+  TestEqual(TEXT("And nobody more is kicked"), KickProbe->KickCount, 1);
   return true;
 }
 

@@ -646,8 +646,17 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         // frozen. A hydration never thaws: only the auth leg's fresh database load does (see
         // URedwoodServerGameSubsystem::ThawCharacter), and the subsystem's per-character freeze
         // covers a snapshot the freeze could not reach.
-        bFrozenAfterFinalRefusal = RedwoodCharacterBackend.bFrozenAfterFinalRefusal;
+        const URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem();
+        bFrozenAfterFinalRefusal = RedwoodCharacterBackend.bFrozenAfterFinalRefusal ||
+          (ServerSubsystem && ServerSubsystem->IsCharacterFrozen(IncomingCharacterId));
         HydratedItemsCharacterId = IncomingCharacterId;
+        // FORK(hollowed-oath): a component that hydrates frozen tells the game, or with no
+        // handler gets the default kick (R35). It is the one place that covers both a respawn
+        // after a live freeze and a freeze whose component was gone (its reply froze the character
+        // with nobody to tell).
+        if (bFrozenAfterFinalRefusal) {
+          NotifyItemFlushRefusedFinal(TEXT("the character is frozen after a final refusal"));
+        }
       }
     }
     // FORK(hollowed-oath) END
