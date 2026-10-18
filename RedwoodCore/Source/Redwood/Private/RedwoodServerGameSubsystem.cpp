@@ -3007,14 +3007,17 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
 
   // FORK(hollowed-oath): pending currency counts as sendable. Without it a batch of entries alone
   // would take this path, and the entries would never leave.
-  if (UpsertsJsonArray.Num() == 0 && DeletesJsonArray.Num() == 0 &&
+  // FORK(hollowed-oath): a probe always goes out, even an empty one (the probe of a batch of rows
+  // alone): its answer is what settles the seq.
+  if (!bReplayProbe && UpsertsJsonArray.Num() == 0 && DeletesJsonArray.Num() == 0 &&
       SentCurrencyEntries.Num() == 0 && SentGrantKeys.Num() == 0) {
     // Nothing actually sendable (e.g. every dirty id lacked a record). Release the flight slot we
     // just claimed via the ack path with no sent ids and the current committed seq, so the next
     // flush isn't wedged behind a slot that never sent anything. Settle synchronously: no emit
     // means no async callback will ever settle this attempt.
+    // FORK(hollowed-oath): as not sent, so the empty claim marks nothing unconfirmed.
     CharacterComponent->CompleteItemFlush(
-      TEXT(""), CharacterComponent->GetLastCommittedItemSeq(), {}, {}
+      TEXT(""), CharacterComponent->GetLastCommittedItemSeq(), {}, {}, 0, 0, false, false, false, true
     );
     Settle();
     return;

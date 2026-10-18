@@ -2909,4 +2909,133 @@ bool FRedwoodCurrencySidecarShutdownOpenFlushTest::RunTest(const FString &Parame
   return true;
 }
 
+namespace RedwoodCurrencySidecarTest {
+  // I3: after a rows-only batch whose outcome is unknown, the probe goes out empty, its replay ack
+  // leaves the re-dirtied row dirty, and the row then goes out in a normal batch after the seq.
+  bool ProbeThenSendRowsAfterSeq(
+    FSidecarHarness &Harness, URedwoodCharacterComponent *Component, double SentSeq
+  ) {
+    Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+    FRequest Probe;
+    if (!Harness.ReadRequest(FlushEvent, Probe)) {
+      return false;
+    }
+    Harness.Test.TestTrue(TEXT("The re-send is a probe"), Probe.Payload->HasField(TEXT("probe")));
+    Harness.Test.TestEqual(TEXT("At the unknown batch's seq"), Probe.Payload->GetNumberField(TEXT("batchSeq")), SentSeq);
+    Harness.Test.TestEqual(TEXT("The probe carries no rows"), CountArray(Probe.Payload, TEXT("upserts")), 0);
+    Harness.Test.TestEqual(TEXT("And no currency"), CountArray(Probe.Payload, TEXT("currency")), 0);
+
+    // The original had committed: the probe's answer is a replay ack.
+    Harness.Answer(Probe, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), static_cast<int64>(SentSeq)));
+    Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+    Harness.Test.TestTrue(TEXT("The newer row stays dirty"), Component->GetDirtyItemGenerations().Contains(OwnedItemId));
+    Harness.Test.TestFalse(TEXT("The seq is settled"), Component->IsCurrencyBatchUnconfirmed());
+
+    Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+    FRequest Normal;
+    if (!Harness.ReadRequest(FlushEvent, Normal)) {
+      return false;
+    }
+    Harness.Test.TestFalse(TEXT("The next batch is a normal one"), Normal.Payload->HasField(TEXT("probe")));
+    Harness.Test.TestEqual(TEXT("After the settled seq"), Normal.Payload->GetNumberField(TEXT("batchSeq")), SentSeq + 1);
+    Harness.Test.TestEqual(TEXT("Carrying the newer row"), CountArray(Normal.Payload, TEXT("upserts")), 1);
+    Harness.Answer(Normal, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), static_cast<int64>(SentSeq) + 1));
+    Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+    Harness.Test.TestFalse(TEXT("The newer row is saved"), Component->GetDirtyItemGenerations().Contains(OwnedItemId));
+    return true;
+  }
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarRowsOnlyReconnectTest,
+  "Redwood.Items.Sidecar.RowsOnlyReconnectProbes",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A batch of item rows alone is in flight when the connection drops, and the row is changed again.
+// The original commits after all. Re-sent as a normal batch at its seq it would be acked as a
+// replay and the newer row cleared unsaved; as a probe, the newer row goes out after the seq.
+bool FRedwoodCurrencySidecarRowsOnlyReconnectTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FAccess::BindConnectedCallback(*Harness.Subsystem);
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
+  Actor->Items = {MakeRecord(OwnedItemId)};
+  Component->MarkItemsDirty({OwnedItemId});
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+  FRequest First;
+  if (!Harness.ReadRequest(FlushEvent, First)) {
+    return false;
+  }
+  const double SentSeq = First.Payload->GetNumberField(TEXT("batchSeq"));
+  Component->MarkItemsDirty({OwnedItemId});
+
+  TSharedPtr<FSocketIONative> Socket = Harness.SidecarCopy;
+  if (!TestTrue(TEXT("The sidecar restarts"), Harness.Server->CloseWithCode(ServiceRestartCloseCode)) ||
+      !TestTrue(TEXT("The socket sees it"), Harness.PumpUntil([Socket]() { return !Socket->bIsConnected; })) ||
+      !Harness.AcceptAndWait()) {
+    return false;
+  }
+  // The reconnect sends the probe itself.
+  FRequest Probe;
+  if (!Harness.ReadRequest(FlushEvent, Probe)) {
+    return false;
+  }
+  TestTrue(TEXT("The reconnect re-sends a probe"), Probe.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("At the batch's seq"), Probe.Payload->GetNumberField(TEXT("batchSeq")), SentSeq);
+  TestEqual(TEXT("With no rows"), CountArray(Probe.Payload, TEXT("upserts")), 0);
+  Harness.Answer(Probe, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), static_cast<int64>(SentSeq)));
+  Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+  TestTrue(TEXT("The newer row stays dirty"), Component->GetDirtyItemGenerations().Contains(OwnedItemId));
+
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+  FRequest Normal;
+  if (!Harness.ReadRequest(FlushEvent, Normal)) {
+    return false;
+  }
+  TestFalse(TEXT("The next batch is a normal one"), Normal.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("After the settled seq"), Normal.Payload->GetNumberField(TEXT("batchSeq")), SentSeq + 1);
+  TestEqual(TEXT("Carrying the newer row"), CountArray(Normal.Payload, TEXT("upserts")), 1);
+  Harness.Answer(Normal, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), static_cast<int64>(SentSeq) + 1));
+  Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+  TestFalse(TEXT("The newer row is saved"), Component->GetDirtyItemGenerations().Contains(OwnedItemId));
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarRowsOnlyTimedOutTest,
+  "Redwood.Items.Sidecar.RowsOnlyTimedOutProbes",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The same case through a timedOut reply: the batch of rows alone may have applied, so the next
+// attempt is an empty probe, and the newer row goes out after the seq it settles.
+bool FRedwoodCurrencySidecarRowsOnlyTimedOutTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedErrorPlain(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 1);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
+  Actor->Items = {MakeRecord(OwnedItemId)};
+  Component->MarkItemsDirty({OwnedItemId});
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+  FRequest First;
+  if (!Harness.ReadRequest(FlushEvent, First)) {
+    return false;
+  }
+  const double SentSeq = First.Payload->GetNumberField(TEXT("batchSeq"));
+  Component->MarkItemsDirty({OwnedItemId});
+  Harness.Answer(First, TEXT(R"({"error":"Item flush request timed out.","committedSeq":-1,"timedOut":true})"));
+  Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+  TestTrue(TEXT("The rows-only batch is unconfirmed"), Component->IsCurrencyBatchUnconfirmed());
+  return ProbeThenSendRowsAfterSeq(Harness, Component, SentSeq);
+}
+
 #endif // WITH_AUTOMATION_WORKER

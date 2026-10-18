@@ -304,9 +304,10 @@ public:
   UFUNCTION(BlueprintPure, Category = "Redwood")
   bool IsItemsDirty() const {
     // FORK(hollowed-oath): staged currency counts as dirt, so a balance change with no item change
-    // still drives a flush.
+    // still drives a flush. So does an unconfirmed batch: its probe must go out even when nothing
+    // else is staged, or the seq stays unknown and the character can never trade.
     return DirtyItemGenerations.Num() > 0 || PendingDeletedItemGenerations.Num() > 0 ||
-      PendingCurrencyEntries.Num() > 0 || PendingGrantKeys.Num() > 0;
+      PendingCurrencyEntries.Num() > 0 || PendingGrantKeys.Num() > 0 || bCurrencyBatchUnconfirmed;
   }
 
   // Drained by the server item-flush path when building the upsert payload; not BlueprintCallable
@@ -424,8 +425,9 @@ public:
     return bCurrencyRebaseRequired;
   }
 
-  // An earlier batch went out and its outcome is not known yet: it is re-sent exactly as it was.
-  // Until its reply, nobody knows the backend balance, so a trade must wait.
+  // An earlier batch went out and its outcome is not known yet: it is re-sent exactly as it was, as
+  // a probe. A batch of item rows alone counts too (its probe carries nothing). Until the probe's
+  // reply, nobody knows the backend seq or balance, so a trade must wait.
   bool IsCurrencyBatchUnconfirmed() const {
     return bCurrencyBatchUnconfirmed;
   }
@@ -449,7 +451,7 @@ public:
   // FORK(hollowed-oath): R34. The connection that carried the in-flight batch dropped, so its reply
   // never comes. The batch may have committed: it becomes unconfirmed with the counts it took
   // (exactly as after an unknown-outcome error), and the slot is released, so the next claim is a
-  // probe at its seq. A batch that carried no currency simply goes out again at its seq. A parked
+  // probe at its seq, rows-only batches too (see MarkCurrencyBatchUnconfirmed). A parked
   // attempt is not run here: it runs when that next batch is answered.
   void AbandonInFlightItemFlush(int32 SentCurrencyCount, int32 SentGrantCount);
 

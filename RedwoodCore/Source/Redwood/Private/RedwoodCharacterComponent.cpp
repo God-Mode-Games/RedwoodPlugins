@@ -1176,9 +1176,10 @@ void URedwoodCharacterComponent::RemoveSentCurrency(int32 SentCurrencyCount, int
 void URedwoodCharacterComponent::MarkCurrencyBatchUnconfirmed(
   int32 SentCurrencyCount, int32 SentGrantCount, int64 SentSeq
 ) {
-  if (SentCurrencyCount == 0 && SentGrantCount == 0) {
-    return;
-  }
+  // FORK(hollowed-oath): a batch of item rows alone too (I3). Sent again as a normal batch at its
+  // seq, it could meet its own late commit there and be acked as a replay: the success clears the
+  // generations it carries, which by then may be newer than the committed ones, or a delete made
+  // since, and that newer state is never saved. The probe settles the seq first, with no rows.
   bCurrencyBatchUnconfirmed = true;
   UnconfirmedCurrencyCount = SentCurrencyCount;
   UnconfirmedGrantCount = SentGrantCount;
