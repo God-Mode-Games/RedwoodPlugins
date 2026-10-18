@@ -2076,4 +2076,143 @@ bool FRedwoodCurrencyTradeReplyClassifyTest::RunTest(const FString &Parameters) 
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeFloorTest,
+  "Redwood.Currency.Trade.DebitBelowTradeFloorRefused",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// While a trade is unsettled, a debit staged on either side must fit on the lower of the balances
+// the trade can leave: after it for the payer, before it for the payee. One that does not is
+// refused at the queue, and what was accepted re-chains on the commit without going below zero.
+bool FRedwoodCurrencyTradeFloorTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  AddExpectedErrorPlain(TEXT("has a trade unsettled"), EAutomationExpectedErrorFlags::Contains, 2);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  // The payer offers everything it has.
+  FTradeResult Result;
+  Harness.Subsystem->EmitItemsTrade(
+    From.Component, To.Component, {}, MakeTradeCurrency(FromBalance, FromBalance), TradeId, Capture(Result)
+  );
+  FRequest Trade;
+  if (!Harness.ReadRequest(TradeEvent, Trade)) {
+    return false;
+  }
+
+  const FString PurchaseId = TEXT("11111111111111111111111111111111");
+  TestFalse(
+    TEXT("A purchase the payer could not pay after the trade is refused"),
+    From.Component->QueueCurrency({MakeEntry(PurchaseId, -100, FromBalance - 100, LootReason)}, {})
+  );
+  TestEqual(TEXT("It is not staged"), From.Component->GetPendingCurrencyEntries().Num(), 0);
+  TestTrue(
+    TEXT("A credit is accepted"),
+    From.Component->QueueCurrency({MakeEntry(EntryIdA, LootAmount, LootAmount, LootReason)}, {})
+  );
+  TestTrue(
+    TEXT("A debit the credit pays for is accepted"),
+    From.Component->QueueCurrency({MakeEntry(EntryIdB, -LootAmount, 0, LootReason)}, {})
+  );
+  // The payee's floor is its balance before the trade: the trade may not apply.
+  TestFalse(
+    TEXT("A payee debit past its balance before the trade is refused"),
+    To.Component->QueueCurrency({MakeEntry(PurchaseId, -(ToBalance + 1), FromBalance - 1, LootReason)}, {})
+  );
+  TestTrue(
+    TEXT("A payee debit within it is accepted"),
+    To.Component->QueueCurrency({MakeEntry(CreditEntryId, -ToBalance, FromBalance, LootReason)}, {})
+  );
+
+  Harness.Answer(Trade, CommittedReply(FromSeq + 1, ToSeq + 1));
+  TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
+  TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
+  const TArray<FRedwoodCurrencyEntry> &FromPending = From.Component->GetPendingCurrencyEntries();
+  if (TestEqual(TEXT("The payer keeps both accepted entries"), FromPending.Num(), 2)) {
+    TestEqual(TEXT("The credit re-chains from zero"), FromPending[0].BalanceAfter, LootAmount);
+    TestEqual(TEXT("The debit ends at zero, not below"), FromPending[1].BalanceAfter, static_cast<int64>(0));
+  }
+  TestFalse(TEXT("The payer's currency is not held"), From.Component->IsCurrencyRebaseRequired());
+  const TArray<FRedwoodCurrencyEntry> &ToPending = To.Component->GetPendingCurrencyEntries();
+  if (TestEqual(TEXT("The payee keeps its accepted debit"), ToPending.Num(), 1)) {
+    TestEqual(TEXT("It re-chains from the balance after the trade"), ToPending[0].BalanceAfter, FromBalance);
+  }
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeOtherComponentInFlightTest,
+  "Redwood.Currency.Trade.OtherComponentInFlightRefuses",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The flight slot is per component, but the seq is per character. While another component of the
+// payer has a batch open, the trade is refused: it could take that batch's seq. Once the batch is
+// answered, the trade goes out from the seq and balance that batch committed.
+bool FRedwoodCurrencyTradeOtherComponentInFlightTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  AddExpectedErrorPlain(TEXT("has an item flush in flight"), EAutomationExpectedErrorFlags::Contains, 1);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  // The payer's other component (its pawn's, say) sends loot and waits for the reply.
+  ARedwoodCurrencyFlushTestActor *PawnActor = nullptr;
+  URedwoodCharacterComponent *PawnComponent = Harness.MakeComponent(PawnActor, FromId);
+  PawnComponent->QueueCurrency({MakeEntry(EntryIdA, LootAmount, FromBalance + LootAmount, LootReason)}, {});
+  Harness.Subsystem->FlushItemsForCharacterComponent(From.PlayerStateComponent, PawnComponent);
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+
+  FTradeResult Refused;
+  Harness.Subsystem->EmitItemsTrade(
+    From.Component, To.Component, {}, MakeTradeCurrency(TradedAmount, TradedAmount), TradeId, Capture(Refused)
+  );
+  TestEqual(TEXT("The trade is refused at once"), Refused.Calls, 1);
+  TestFalse(TEXT("With an error"), Refused.Error.IsEmpty());
+  TestTrue(TEXT("No trade leaves"), Harness.IsQuiet());
+
+  Harness.Answer(Flush, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), FromSeq + 1));
+  TestTrue(
+    TEXT("The loot batch is answered"),
+    Harness.PumpUntil([PawnComponent]() { return PawnComponent->GetPendingCurrencyEntries().Num() == 0; })
+  );
+
+  FTradeResult Result;
+  FRequest Trade;
+  if (!SendTrade(Harness, From, To, Result, Trade)) {
+    return false;
+  }
+  TestEqual(
+    TEXT("The trade chains from the balance the loot batch committed"),
+    TradeCurrencyField(Trade.Payload, 0, TEXT("balanceAfter")),
+    FString(TEXT("750"))
+  );
+  Harness.Answer(Trade, CommittedReply(FromSeq + 2, ToSeq + 1));
+  TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
+  TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
+  TestFalse(
+    TEXT("Its fence is its own commit, so the balance stays known"),
+    From.PlayerStateComponent->RedwoodCharacter.bCurrencyAmountUnknown
+  );
+  TestEqual(TEXT("The payer's balance"), From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, FromBalance + LootAmount - TradedAmount);
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER
