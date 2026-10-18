@@ -681,3 +681,53 @@ bool FRedwoodCurrencyFlushDeliveryFlagsTest::RunTest(const FString &Parameters) 
   TestEqual(TEXT("At the timed-out seq"), Sent.BatchSeq, SeqBefore + 1);
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyFlushNoFenceReplyTest,
+  "Redwood.Currency.FlushNoFenceReply",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The sidecar's own replies (a schema error, a timeout, a missing realm) carry committedSeq -1, the
+// "no seq known" value. -1 is never a fence and never a sequence gap: the lane and the snapshot keep
+// their seq, nothing is dropped, and a schema error, which has no flag, is an unknown outcome.
+bool FRedwoodCurrencyFlushNoFenceReplyTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyFlushTest;
+  constexpr int64 SeqBefore = 6;
+  const TCHAR *const NoFenceReplies[] = {
+    TEXT(R"({"error":"batchSeq must be greater than or equal to 1","committedSeq":-1})"),
+    TEXT(R"({"error":"Item flush request timed out.","committedSeq":-1,"timedOut":true})"),
+    TEXT(R"({"error":"Realm server not connected","committedSeq":-1,"notForwarded":true})"),
+  };
+  for (const TCHAR *ReplyJson : NoFenceReplies) {
+    URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(SeqBefore);
+    URedwoodPlayerStateComponent *PlayerState = Fixture::MakePlayerStateComponent(SeqBefore, 1000);
+    Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, -250, 750)}, {});
+    FRedwoodItemFlushSent Sent = Fixture::ClaimBatch(*this, Component);
+    URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+      Component, PlayerState, URedwoodServerGameSubsystem::ParseItemsFlushReply(Fixture::ParseJson(ReplyJson)), Sent
+    );
+    const FString Label(ReplyJson);
+    TestEqual(Label + TEXT(": the entry is kept"), Component->GetPendingCurrencyEntries().Num(), 1);
+    TestEqual(Label + TEXT(": the lane keeps its seq"), Component->GetLastCommittedItemSeq(), SeqBefore);
+    TestEqual(Label + TEXT(": the snapshot keeps its seq"), PlayerState->RedwoodCharacter.InventorySeq, SeqBefore);
+    TestEqual(Label + TEXT(": the snapshot keeps its balance"), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)1000);
+    Sent = Fixture::ClaimBatch(*this, Component);
+    TestEqual(Label + TEXT(": the next batch keeps the seq"), Sent.BatchSeq, SeqBefore + 1);
+  }
+
+  // The schema error has no flag, so its outcome counts as unknown: the next attempt is a probe.
+  URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(SeqBefore);
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, -250, 750)}, {});
+  FRedwoodItemFlushSent Sent = Fixture::ClaimBatch(*this, Component);
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+    Component,
+    nullptr,
+    URedwoodServerGameSubsystem::ParseItemsFlushReply(Fixture::ParseJson(NoFenceReplies[0])),
+    Sent
+  );
+  TestTrue(TEXT("A schema error leaves the batch unconfirmed"), Component->IsCurrencyBatchUnconfirmed());
+  Fixture::ClaimBatch(*this, Component);
+  TestTrue(TEXT("Its next attempt is a probe"), Component->IsItemFlushReplayProbe());
+  return true;
+}
