@@ -2996,6 +2996,9 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerStateComponent = PlayerStateComponent;
   TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
 
+  // FORK(hollowed-oath): counted per character, not per component, so a trade sees a batch that
+  // another component of the character has open (see PrepareItemTradeSide).
+  ++InFlightItemFlushesByCharacter.FindOrAdd(CharacterId);
   Sidecar->Emit(
     TEXT("realm:characters:items:flush"),
     Payload,
@@ -3011,6 +3014,11 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
         URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
       const FRedwoodItemFlushReply Reply =
         ParseItemsFlushReply(ReplyObject ? *ReplyObject : TSharedPtr<FJsonObject>());
+      // FORK(hollowed-oath): first, so a parked attempt or a trade started from this reply counts
+      // the batch as answered.
+      if (URedwoodServerGameSubsystem *AnsweredSubsystem = WeakSubsystem.Get()) {
+        AnsweredSubsystem->EndItemFlushInFlight(CharacterId);
+      }
 
       URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
       if (!IsValid(CharacterComponent)) {
@@ -3928,7 +3936,8 @@ bool URedwoodServerGameSubsystem::PrepareItemTradeSide(
   }
   // A batch whose reply is open, or whose outcome is unknown, would commit before or after the
   // trade: the balance and the seq before the trade would then be guesses.
-  if (CharacterComponent->IsItemFlushInFlight() || CharacterComponent->IsCurrencyBatchUnconfirmed()) {
+  if (CharacterComponent->IsItemFlushInFlight() || CharacterComponent->IsCurrencyBatchUnconfirmed() ||
+      InFlightItemFlushesByCharacter.Contains(CharacterId)) {
     OutError = FString::Printf(TEXT("character %s has an item flush in flight"), *CharacterId);
     return false;
   }
@@ -4018,6 +4027,17 @@ bool URedwoodServerGameSubsystem::ChainTradeCurrency(
   From.Entries = MoveTemp(FromEntries);
   To.Entries = MoveTemp(ToEntries);
   return true;
+}
+
+void URedwoodServerGameSubsystem::EndItemFlushInFlight(const FString &CharacterId) {
+  int32 *Count = InFlightItemFlushesByCharacter.Find(CharacterId);
+  if (!Count) {
+    return;
+  }
+  // Removed at zero, so Contains means "a batch is open".
+  if (--*Count <= 0) {
+    InFlightItemFlushesByCharacter.Remove(CharacterId);
+  }
 }
 
 bool URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalance(
