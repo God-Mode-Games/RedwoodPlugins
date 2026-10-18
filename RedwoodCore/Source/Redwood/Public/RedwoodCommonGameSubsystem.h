@@ -177,6 +177,12 @@ public:
   static TArray<FRedwoodItemRecord> *ResolveItemsRecordsArray(
     URedwoodCharacterComponent *CharacterComponent
   );
+
+  // Writes Character's `currency` object onto an offline character save. Writes nothing for an
+  // unknown balance, so SaveCharacterJsonToDisk keeps the one already on disk.
+  static void WriteOfflineCurrency(
+    const FRedwoodCharacterBackend &Character, const TSharedPtr<FJsonObject> &CharacterObject
+  );
   // FORK(hollowed-oath) END
 
 private:

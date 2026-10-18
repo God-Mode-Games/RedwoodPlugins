@@ -21,6 +21,8 @@
 #include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodServerGameSubsystem.h"
 #include "SIOJsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "Types/RedwoodTypesCharacters.h"
 
 // The namespace is named rather than anonymous, and referenced qualified rather than via a
@@ -67,6 +69,14 @@ namespace RedwoodItemPersistenceTest {
     URedwoodCharacterComponent *Component = NewObject<URedwoodCharacterComponent>();
     Component->bUseItems = true;
     return Component;
+  }
+
+  // FORK(hollowed-oath): literal wire JSON, so a test reads exactly what the backend sends.
+  TSharedPtr<FJsonObject> ParseJsonObject(const FString &Text) {
+    TSharedPtr<FJsonObject> Object;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Text);
+    FJsonSerializer::Deserialize(Reader, Object);
+    return Object;
   }
 }
 
@@ -710,9 +720,21 @@ bool FRedwoodParseCharacterInlineItemsTest::RunTest(const FString &Parameters) {
     TEXT("items"), URedwoodCommonGameSubsystem::SerializeItemRecords(Records)
   );
   CharacterObj->SetNumberField(TEXT("inventorySeq"), 5);
+  // FORK(hollowed-oath): the offline file's currency object, in the auth reply's shape.
+  CharacterObj->SetObjectField(
+    TEXT("currency"),
+    Fixture::ParseJsonObject(TEXT(R"({"amount":"1500000","grants":["quest:Q1"]})"))
+  );
 
   FRedwoodCharacterBackend Parsed =
     URedwoodCommonGameSubsystem::ParseCharacter(CharacterObj);
+
+  TestEqual(TEXT("The balance is read from its string"), Parsed.CurrencyAmount, (int64)1500000);
+  TestEqual(TEXT("One grant key is read"), Parsed.GrantKeys.Num(), 1);
+  if (Parsed.GrantKeys.Num() == 1) {
+    TestEqual(TEXT("The grant key survives"), Parsed.GrantKeys[0], FString(TEXT("quest:Q1")));
+  }
+  TestFalse(TEXT("A read balance is known"), Parsed.bCurrencyAmountUnknown);
 
   TestEqual(TEXT("Inline items parsed onto the struct"), Parsed.Items.Num(), 1);
   if (Parsed.Items.Num() == 1) {
@@ -743,6 +765,18 @@ bool FRedwoodParseCharacterInlineItemsTest::RunTest(const FString &Parameters) {
   TestEqual(
     TEXT("Absent items field leaves Items empty"), ParsedNoItems.Items.Num(), 0
   );
+  // FORK(hollowed-oath): no currency object is an unknown balance, never a zero one.
+  TestTrue(TEXT("Absent currency is an unknown balance"), ParsedNoItems.bCurrencyAmountUnknown);
+
+  // An unreadable currency object (a JSON number, not a decimal string) is unknown too, and loud.
+  AddExpectedError(TEXT("unreadable currency object"), EAutomationExpectedErrorFlags::Contains, 1);
+  NoItemsObj->SetObjectField(
+    TEXT("currency"), Fixture::ParseJsonObject(TEXT(R"({"amount":500,"grants":[]})"))
+  );
+  FRedwoodCharacterBackend ParsedBadCurrency =
+    URedwoodCommonGameSubsystem::ParseCharacter(NoItemsObj);
+  TestTrue(TEXT("Unreadable currency is an unknown balance"), ParsedBadCurrency.bCurrencyAmountUnknown);
+  TestEqual(TEXT("Unreadable currency leaves the balance unset"), ParsedBadCurrency.CurrencyAmount, (int64)0);
 
   return true;
 }

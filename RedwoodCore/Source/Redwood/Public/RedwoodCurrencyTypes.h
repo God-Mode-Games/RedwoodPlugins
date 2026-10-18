@@ -9,6 +9,7 @@
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 
 #include "RedwoodCurrencyTypes.generated.h"
 
@@ -103,6 +104,62 @@ inline bool TryParseCurrencyAmount(const FString &Text, int64 &OutAmount) {
   }
   OutAmount = Negated;
   return true;
+}
+
+// The field that carries a character's loaded currency, `{ amount, grants }`: beside "items" on
+// the player-auth reply, and inline on an offline character file.
+inline const TCHAR *const CurrencyLoadField = TEXT("currency");
+
+// Reads a `{ amount, grants }` object (CurrencyLoadSchema in the backend's interfaces.ts). Returns
+// false, with the outputs untouched, unless the amount is a strict amount string of at least zero
+// and every grant is a non-empty string. A load that fails this is a failed load, never a zero
+// balance: a game server that started from zero would chain BalanceAfter values the backend
+// refuses for good.
+inline bool TryParseCurrencyLoad(
+  const TSharedPtr<FJsonObject> &CurrencyObject, int64 &OutAmount, TArray<FString> &OutGrantKeys
+) {
+  FString AmountText;
+  int64 Amount = 0;
+  const TArray<TSharedPtr<FJsonValue>> *GrantValues = nullptr;
+  if (!CurrencyObject.IsValid() ||
+      !CurrencyObject->TryGetStringField(TEXT("amount"), AmountText) ||
+      !TryParseCurrencyAmount(AmountText, Amount) || Amount < 0 ||
+      !CurrencyObject->TryGetArrayField(TEXT("grants"), GrantValues)) {
+    return false;
+  }
+  TArray<FString> GrantKeys;
+  GrantKeys.Reserve(GrantValues->Num());
+  for (const TSharedPtr<FJsonValue> &GrantValue : *GrantValues) {
+    // Checked as a string type, not with TryGetString: that one also turns a number or a bool
+    // into text, and the backend schema refuses both.
+    if (!GrantValue.IsValid() || GrantValue->Type != EJson::String) {
+      return false;
+    }
+    FString GrantKey = GrantValue->AsString();
+    if (GrantKey.IsEmpty()) {
+      return false;
+    }
+    GrantKeys.Add(MoveTemp(GrantKey));
+  }
+  OutAmount = Amount;
+  OutGrantKeys = MoveTemp(GrantKeys);
+  return true;
+}
+
+// The same `{ amount, grants }` shape, for the offline character file. The amount is a decimal
+// string, as on the wire, so an offline file and a backend reply are read by the same rule.
+inline TSharedPtr<FJsonObject> MakeCurrencyLoadObject(
+  int64 Amount, const TArray<FString> &GrantKeys
+) {
+  TSharedPtr<FJsonObject> CurrencyObject = MakeShared<FJsonObject>();
+  CurrencyObject->SetStringField(TEXT("amount"), LexToString(Amount));
+  TArray<TSharedPtr<FJsonValue>> GrantValues;
+  GrantValues.Reserve(GrantKeys.Num());
+  for (const FString &GrantKey : GrantKeys) {
+    GrantValues.Add(MakeShared<FJsonValueString>(GrantKey));
+  }
+  CurrencyObject->SetArrayField(TEXT("grants"), GrantValues);
+  return CurrencyObject;
 }
 
 // A flush the backend refused for good (`final: true`). The backend has raised an alert, and the

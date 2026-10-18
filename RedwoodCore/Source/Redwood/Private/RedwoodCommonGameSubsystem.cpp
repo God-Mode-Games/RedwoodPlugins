@@ -50,6 +50,14 @@ void URedwoodCommonGameSubsystem::SaveCharacterJsonToDisk(
       );
       TSharedPtr<FJsonValue> NullValue = MakeShareable(new FJsonValueNull());
       JsonObject->SetField(TEXT("archivedAt"), NullValue);
+      // FORK(hollowed-oath): this is a whole-file rewrite. A writer that has no balance to give
+      // (its snapshot's balance is unknown, or a detached pawn with no PlayerState) must not
+      // erase the one on disk, or the next load would read an old file with no money.
+      const TSharedPtr<FJsonObject> *ExistingCurrency = nullptr;
+      if (!JsonObject->HasField(CurrencyLoadField) &&
+          ExistingObject->TryGetObjectField(CurrencyLoadField, ExistingCurrency)) {
+        JsonObject->SetObjectField(CurrencyLoadField, *ExistingCurrency);
+      }
     }
   }
 
@@ -135,6 +143,8 @@ void URedwoodCommonGameSubsystem::SaveCharacterToDisk(
   // item is the native persistence model now, so there is no blob->row migration marker to write --
   // the former inventoryRowsMigrated field is deleted with the migrate route.
   JsonObject->SetNumberField(TEXT("inventorySeq"), Character.InventorySeq);
+
+  WriteOfflineCurrency(Character, JsonObject);
   // FORK(hollowed-oath) END
 
   SaveCharacterJsonToDisk(JsonObject);
@@ -186,6 +196,16 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::LoadCharacterFromDisk(
   }
 
   FRedwoodCharacterBackend Character = ParseCharacter(JsonObject);
+
+  // FORK(hollowed-oath): a file with no currency object predates the currency ledger, so it never
+  // held money, and offline the file is the whole database. Every offline write now carries the
+  // object (SaveCharacterJsonToDisk keeps it across a rewrite), so only an old file lacks it. A
+  // present but unreadable object stays unknown.
+  if (!JsonObject->HasField(CurrencyLoadField)) {
+    Character.CurrencyAmount = 0;
+    Character.GrantKeys.Reset();
+    Character.bCurrencyAmountUnknown = false;
+  }
 
   return Character;
 }
@@ -312,6 +332,25 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
   double InventorySeqValue = 0.0;
   if (CharacterObj->TryGetNumberField(TEXT("inventorySeq"), InventorySeqValue)) {
     Character.InventorySeq = static_cast<int64>(InventorySeqValue);
+  }
+
+  // The currency balance and grant keys, inline on an offline file. The player-auth reply carries
+  // them beside "character" instead, and its graft sets them after this call. A character with no
+  // readable balance is marked unknown, never zero: a component seeded from it holds its currency
+  // until a load gives the real balance (see bCurrencyAmountUnknown).
+  const TSharedPtr<FJsonObject> *CurrencyObject = nullptr;
+  if (CharacterObj->TryGetObjectField(CurrencyLoadField, CurrencyObject)) {
+    if (!TryParseCurrencyLoad(*CurrencyObject, Character.CurrencyAmount, Character.GrantKeys)) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Character %s has an unreadable currency object; its balance is unknown"),
+        *Character.Id
+      );
+      Character.bCurrencyAmountUnknown = true;
+    }
+  } else {
+    Character.bCurrencyAmountUnknown = true;
   }
   // FORK(hollowed-oath) END
 
@@ -459,6 +498,18 @@ TArray<FRedwoodItemRecord> *URedwoodCommonGameSubsystem::ResolveItemsRecordsArra
   }
 
   return ArrayProp->ContainerPtrToValuePtr<TArray<FRedwoodItemRecord>>(Target);
+}
+
+void URedwoodCommonGameSubsystem::WriteOfflineCurrency(
+  const FRedwoodCharacterBackend &Character, const TSharedPtr<FJsonObject> &CharacterObject
+) {
+  // The same `{ amount, grants }` shape as the auth reply, so ParseCharacter reads both the same
+  // way. An unknown balance is left out rather than written as a guess.
+  if (!Character.bCurrencyAmountUnknown) {
+    CharacterObject->SetObjectField(
+      CurrencyLoadField, MakeCurrencyLoadObject(Character.CurrencyAmount, Character.GrantKeys)
+    );
+  }
 }
 // FORK(hollowed-oath) END
 

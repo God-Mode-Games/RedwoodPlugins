@@ -142,6 +142,19 @@ struct FRedwoodCharacterBackend {
   // hydrated from this snapshot starts frozen; only a fresh load from the database clears it.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   bool bFrozenAfterFinalRefusal = false;
+
+  // The one-time grant keys the backend holds for this character (a quest reward already paid).
+  // Loaded with the balance, and extended when a flush that carried keys commits, so game code can
+  // skip a reward before it stages it: the backend refuses a reused key for good, which freezes
+  // the character.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  TArray<FString> GrantKeys;
+
+  // The writer token the realm issued this session at auth. A session secret: every items:flush
+  // must carry it, so it is not exposed to Blueprint and never written to disk (this struct itself
+  // is server-only). Components copy it at hydration.
+  UPROPERTY()
+  FString WriterToken;
   // FORK(hollowed-oath) END
 };
 
