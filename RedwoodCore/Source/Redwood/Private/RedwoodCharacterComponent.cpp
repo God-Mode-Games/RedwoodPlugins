@@ -1238,8 +1238,8 @@ void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay() {
       ServerSubsystem->DetachItemFlushesFromComponent(this);
     }
   } else if (bCurrencyBatchUnconfirmed) {
-    FirstUnsentEntry = UnconfirmedCurrencyCount;
-    FirstUnsentGrant = UnconfirmedGrantCount;
+    FirstUnsentEntry = FMath::Clamp(UnconfirmedCurrencyCount, 0, PendingCurrencyEntries.Num());
+    FirstUnsentGrant = FMath::Clamp(UnconfirmedGrantCount, 0, PendingGrantKeys.Num());
     LogCurrencyForStaff(
       RedwoodCharacterId,
       TEXT("its component ended with the batch unconfirmed"),
@@ -1395,7 +1395,8 @@ void URedwoodCharacterComponent::RequireCurrencyReload(bool bBeforeSettlingReply
 }
 
 void URedwoodCharacterComponent::RemoveSentCurrency(int32 SentCurrencyCount, int32 SentGrantCount) {
-  // The queues only grow at the back, so the sent entries are still the front ones.
+  // While a batch is out the queues only grow at the back (AdoptHandedOffCurrency adds at the
+  // front, but never then), so the sent entries are still the front ones.
   PendingCurrencyEntries.RemoveAt(0, SentCurrencyCount);
   PendingGrantKeys.RemoveAt(0, SentGrantCount);
 }
