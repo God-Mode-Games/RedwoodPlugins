@@ -121,7 +121,8 @@ inline bool TryParseCurrencyLoad(
   FString AmountText;
   int64 Amount = 0;
   const TArray<TSharedPtr<FJsonValue>> *GrantValues = nullptr;
-  if (!CurrencyObject.IsValid() ||
+  // A string only: TryGetStringField also reads a JSON number, which may have been rounded.
+  if (!CurrencyObject.IsValid() || !CurrencyObject->HasTypedField<EJson::String>(TEXT("amount")) ||
       !CurrencyObject->TryGetStringField(TEXT("amount"), AmountText) ||
       !TryParseCurrencyAmount(AmountText, Amount) || Amount < 0 ||
       !CurrencyObject->TryGetArrayField(TEXT("grants"), GrantValues)) {
