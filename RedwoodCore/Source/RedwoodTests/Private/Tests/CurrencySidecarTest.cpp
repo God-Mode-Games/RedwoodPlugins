@@ -388,6 +388,23 @@ namespace RedwoodCurrencySidecarTest {
     return Harness.ReadRequest(FlushEvent, Flush) && Harness.Answer(Flush, TradeUsedSeqReply) &&
       Harness.ReadRequest(LoadEvent, OutLoad);
   }
+
+  // Reads the flush a landed reload resumed and answers it as committed, so no flush is open at
+  // teardown: the shutdown logs an open flush's entries as unknown, at Error.
+  bool AnswerResumedFlush(FSidecarHarness &Harness, URedwoodCharacterComponent *Component) {
+    FRequest Resumed;
+    if (!Harness.ReadRequest(FlushEvent, Resumed)) {
+      return false;
+    }
+    Harness.Answer(
+      Resumed,
+      FString::Printf(
+        TEXT(R"({"error":null,"committedSeq":%lld})"),
+        static_cast<int64>(Resumed.Payload->GetNumberField(TEXT("batchSeq")))
+      )
+    );
+    return Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+  }
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -757,6 +774,7 @@ bool FRedwoodCurrencySidecarLateReloadReplyTest::RunTest(const FString &Paramete
   if (TestEqual(TEXT("The entry is kept"), Pending.Num(), 1)) {
     TestEqual(TEXT("It is chained from the current reply"), Pending[0].BalanceAfter, (int64)2500);
   }
+  TestTrue(TEXT("The resumed flush is answered"), AnswerResumedFlush(Harness, Component));
   return true;
 }
 
@@ -812,6 +830,7 @@ bool FRedwoodCurrencySidecarDownWaitsTest::RunTest(const FString &Parameters) {
     TEXT("The reload lands after the reconnect"),
     Harness.PumpUntil([Component]() { return !Component->IsCurrencyRebaseRequired(); })
   );
+  TestTrue(TEXT("The resumed flush is answered"), AnswerResumedFlush(Harness, Component));
   return true;
 }
 
