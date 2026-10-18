@@ -9,6 +9,7 @@
 #include "CoreMinimal.h"
 
 #include "GameFramework/Actor.h"
+#include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerState.h"
 #include "Types/RedwoodTypesCharacters.h"
 
@@ -16,6 +17,18 @@
 
 UCLASS()
 class ARedwoodCurrencyFlushTestActor : public AActor {
+  GENERATED_BODY()
+
+public:
+  // The default ItemsVariableName of URedwoodCharacterComponent.
+  UPROPERTY()
+  TArray<FRedwoodItemRecord> Items;
+};
+
+// A pawn owner, for a component that hydrates through its controller and outlives the controller
+// link at EndPlay, the way a respawned pawn's component does.
+UCLASS()
+class ARedwoodCurrencyFlushTestPawn : public APawn {
   GENERATED_BODY()
 
 public:

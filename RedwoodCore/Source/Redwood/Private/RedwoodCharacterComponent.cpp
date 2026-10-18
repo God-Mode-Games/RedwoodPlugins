@@ -147,6 +147,15 @@ void URedwoodCharacterComponent::BeginPlay() {
   }
 }
 
+// FORK(hollowed-oath): R26. Before Super, so the queues are logged or handed off while the
+// component still knows its character.
+void URedwoodCharacterComponent::EndPlay(const EEndPlayReason::Type EndPlayReason) {
+  if (GetOwnerRole() == ROLE_Authority) {
+    HandOffCurrencyAtEndPlay();
+  }
+  Super::EndPlay(EndPlayReason);
+}
+
 void URedwoodCharacterComponent::OnControllerChanged(
   APawn *Pawn, AController *OldController, AController *NewController
 ) {
@@ -618,6 +627,10 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         if (RedwoodCharacterBackend.bCurrencyAmountUnknown) {
           RequireCurrencyReload();
         }
+        // FORK(hollowed-oath): what the component this one replaces never sent, and the snapshot
+        // this one must reach at EndPlay.
+        HydratedPlayerStateComponent = PlayerStateComponent;
+        AdoptHandedOffCurrency(PlayerStateComponent->RedwoodCharacter);
         // FORK(hollowed-oath): a batch of the component this one replaces may have committed at
         // the marked seq; probe it before anything else goes out (see bInventorySeqUnconfirmed).
         if (RedwoodCharacterBackend.bInventorySeqUnconfirmed) {
@@ -668,6 +681,9 @@ bool URedwoodCharacterComponent::TryBeginItemFlush(int64 &OutBatchSeq) {
   // seq a committed entry would be refused as a duplicate and the batch lost with it.
   InFlightBatchSeq = bCurrencyBatchUnconfirmed ? UnconfirmedBatchSeq : NextBatchSeq;
   bInFlightIsCurrencyResend = bCurrencyBatchUnconfirmed;
+  // The same counts ClaimCurrencyToSend takes, so EndPlay knows which entries the batch carries.
+  InFlightCurrencyCount = FMath::Min(GetCurrencyEntriesToSendCount(), PendingCurrencyEntries.Num());
+  InFlightGrantCount = FMath::Min(GetGrantKeysToSendCount(), PendingGrantKeys.Num());
   OutBatchSeq = InFlightBatchSeq;
   return true;
 }
@@ -1175,6 +1191,132 @@ void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) 
   DirtyItemGenerations.Empty();
   PendingDeletedItemGenerations.Empty();
   bFrozenAfterFinalRefusal = true;
+}
+
+void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay() {
+  if (!bItemFlushInFlight && !bCurrencyBatchUnconfirmed && PendingCurrencyEntries.Num() == 0 &&
+      PendingGrantKeys.Num() == 0) {
+    return;
+  }
+  URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem();
+  URedwoodPlayerStateComponent *PlayerStateComponent = FindPlayerStateComponent();
+  if (!PlayerStateComponent) {
+    PlayerStateComponent = HydratedPlayerStateComponent.Get();
+  }
+  // A PlayerState that ends with this component (it sits on it) or for another character cannot
+  // take anything.
+  const bool bSnapshotOutlivesComponent = IsValid(PlayerStateComponent) &&
+    !RedwoodCharacterId.IsEmpty() && PlayerStateComponent->RedwoodCharacter.Id == RedwoodCharacterId &&
+    PlayerStateComponent->GetOwner() != GetOwner() && IsValid(PlayerStateComponent->GetOwner()) &&
+    !PlayerStateComponent->GetOwner()->IsActorBeingDestroyed();
+
+  // The front of the queues that already went out. A batch in flight is settled by its reply, as
+  // a gone component's: that logs it and writes the snapshot (detached here, so the reply does
+  // not reach a component that is ending). An unconfirmed batch has no reply coming: logged here
+  // as UNKNOWN, and its seq marked, so the next component probes it.
+  int32 FirstUnsentEntry = 0;
+  int32 FirstUnsentGrant = 0;
+  if (bItemFlushInFlight) {
+    FirstUnsentEntry = InFlightCurrencyCount;
+    FirstUnsentGrant = InFlightGrantCount;
+    if (ServerSubsystem) {
+      ServerSubsystem->DetachItemFlushesFromComponent(this);
+    }
+  } else if (bCurrencyBatchUnconfirmed) {
+    FirstUnsentEntry = UnconfirmedCurrencyCount;
+    FirstUnsentGrant = UnconfirmedGrantCount;
+    LogCurrencyForStaff(
+      RedwoodCharacterId,
+      TEXT("its component ended with the batch unconfirmed"),
+      MakeArrayView(PendingCurrencyEntries).Left(FirstUnsentEntry),
+      FirstUnsentEntry,
+      MakeArrayView(PendingGrantKeys).Left(FirstUnsentGrant),
+      FirstUnsentGrant
+    );
+    if (bSnapshotOutlivesComponent) {
+      URedwoodServerGameSubsystem::MarkSnapshotSeqUnconfirmed(
+        PlayerStateComponent->RedwoodCharacter,
+        UnconfirmedBatchSeq,
+        FirstUnsentEntry > 0 || FirstUnsentGrant > 0
+      );
+    }
+  }
+  FirstUnsentEntry = FMath::Clamp(FirstUnsentEntry, 0, PendingCurrencyEntries.Num());
+  FirstUnsentGrant = FMath::Clamp(FirstUnsentGrant, 0, PendingGrantKeys.Num());
+  const TConstArrayView<FRedwoodCurrencyEntry> UnsentEntries =
+    MakeArrayView(PendingCurrencyEntries).RightChop(FirstUnsentEntry);
+  const TConstArrayView<FString> UnsentGrantKeys =
+    MakeArrayView(PendingGrantKeys).RightChop(FirstUnsentGrant);
+
+  if (UnsentEntries.Num() > 0 || UnsentGrantKeys.Num() > 0) {
+    // The never-sent entries are handed off only when nothing can make their chain wrong behind
+    // the next component's back: the reload that rebases them must read a balance no open batch
+    // can still change, and a frozen or fenced character must not send at all.
+    const bool bFrozen = bFrozenAfterFinalRefusal ||
+      (ServerSubsystem && ServerSubsystem->IsCharacterFrozen(RedwoodCharacterId));
+    const TCHAR *Unsafe = !bSnapshotOutlivesComponent ? TEXT("no PlayerState of the character outlives the component")
+      : bItemFlushInFlight ? TEXT("a batch was in flight, so the balance they chain from waits on its reply")
+      : bFrozen ? TEXT("the character is frozen")
+      : bWriterFenceLost ? TEXT("the writer fence is lost")
+      : nullptr;
+    if (Unsafe) {
+      LogCurrencyForStaff(
+        RedwoodCharacterId,
+        FString::Printf(TEXT("its component ended and they cannot be handed on: %s"), Unsafe),
+        UnsentEntries,
+        0,
+        UnsentGrantKeys,
+        0
+      );
+    } else {
+      // NOT saved yet: logged too, so staff can tell if the next component never takes them.
+      LogCurrencyForStaff(
+        RedwoodCharacterId,
+        TEXT("its component ended, and they are handed to the PlayerState for the next component to send"),
+        UnsentEntries,
+        0,
+        UnsentGrantKeys,
+        0
+      );
+      FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+      Snapshot.HandedOffCurrencyEntries.Append(UnsentEntries.GetData(), UnsentEntries.Num());
+      Snapshot.HandedOffGrantKeys.Append(UnsentGrantKeys.GetData(), UnsentGrantKeys.Num());
+    }
+  }
+
+  // Ended: nothing here is this component's to send again, and a second call must not log twice.
+  // A detached batch keeps the flight slot taken, so this component can never open a second batch
+  // beside it.
+  PendingCurrencyEntries.Empty();
+  PendingGrantKeys.Empty();
+  bCurrencyBatchUnconfirmed = false;
+  UnconfirmedCurrencyCount = 0;
+  UnconfirmedGrantCount = 0;
+  bCurrencyRebaseRequired = false;
+}
+
+bool URedwoodCharacterComponent::AdoptHandedOffCurrency(FRedwoodCharacterBackend &Snapshot) {
+  if ((Snapshot.HandedOffCurrencyEntries.Num() == 0 && Snapshot.HandedOffGrantKeys.Num() == 0) ||
+      Snapshot.Id != RedwoodCharacterId || bItemFlushInFlight || bCurrencyBatchUnconfirmed) {
+    return false;
+  }
+  UE_LOG(
+    LogRedwood,
+    Log,
+    TEXT("Character %s takes %d currency entries and %d grant keys a destroyed component handed off; they wait for a reload"),
+    *RedwoodCharacterId,
+    Snapshot.HandedOffCurrencyEntries.Num(),
+    Snapshot.HandedOffGrantKeys.Num()
+  );
+  // In front: they were staged before anything this component staged.
+  PendingCurrencyEntries.Insert(MoveTemp(Snapshot.HandedOffCurrencyEntries), 0);
+  PendingGrantKeys.Insert(MoveTemp(Snapshot.HandedOffGrantKeys), 0);
+  Snapshot.HandedOffCurrencyEntries.Reset();
+  Snapshot.HandedOffGrantKeys.Reset();
+  // Set directly: nothing of this component is in flight or unconfirmed (checked above), which is
+  // all RequireCurrencyReload's guard is for.
+  bCurrencyRebaseRequired = true;
+  return true;
 }
 
 bool URedwoodCharacterComponent::RequireItemSeqProbe(int64 Seq, bool bReloadAfterProbe) {

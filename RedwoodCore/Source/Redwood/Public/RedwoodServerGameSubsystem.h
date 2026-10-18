@@ -643,6 +643,10 @@ public:
   // the client, then destroy its controller, which ends the connection).
   static void KickPlayerOrDestroyController(APlayerController *PlayerController, const FText &Reason);
 
+  // R26: the component is ending with a batch in flight. Its reply then settles the batch as a
+  // gone component's (SettleItemFlushOfGoneComponent): it logs the entries and writes the snapshot.
+  void DetachItemFlushesFromComponent(URedwoodCharacterComponent *CharacterComponent);
+
   // What a player kicked by KickPlayerAfterCurrencyDesync is told.
   static constexpr const TCHAR *CurrencyDesyncKickMessage =
     TEXT("This character could not be saved. Sign in again to load it.");

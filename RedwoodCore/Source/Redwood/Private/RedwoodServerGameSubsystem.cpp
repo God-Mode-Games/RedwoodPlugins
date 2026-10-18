@@ -2865,6 +2865,12 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     return;
   }
 
+  // FORK(hollowed-oath): currency a destroyed component of this character handed to the snapshot
+  // (R26), for a component that hydrated before it was handed off.
+  if (PlayerStateComponent) {
+    CharacterComponent->AdoptHandedOffCurrency(PlayerStateComponent->RedwoodCharacter);
+  }
+
   // Early-out before claiming the flight slot: the detached-flush leg calls this without the
   // dispatch site's IsItemsDirty() pre-check, and a slot claimed here would never be released.
   if (!CharacterComponent->IsItemsDirty()) {
@@ -3266,6 +3272,16 @@ void URedwoodServerGameSubsystem::SettleItemFlushOfGoneComponent(
   if (Flight.OnAckSettled) {
     TFunction<void()> OnAckSettled = MoveTemp(Flight.OnAckSettled);
     OnAckSettled();
+  }
+}
+
+void URedwoodServerGameSubsystem::DetachItemFlushesFromComponent(
+  URedwoodCharacterComponent *CharacterComponent
+) {
+  for (TPair<uint64, FRedwoodInFlightItemFlush> &Pair : InFlightItemFlushes) {
+    if (Pair.Value.CharacterComponent.Get() == CharacterComponent) {
+      Pair.Value.CharacterComponent = nullptr;
+    }
   }
 }
 

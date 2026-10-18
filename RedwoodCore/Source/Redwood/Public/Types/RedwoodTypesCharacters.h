@@ -3,6 +3,8 @@
 #pragma once
 
 #include "RedwoodTypesCommon.h"
+// FORK(hollowed-oath): the currency a destroyed component hands to the snapshot.
+#include "RedwoodCurrencyTypes.h"
 
 #include "RedwoodTypesCharacters.generated.h"
 
@@ -148,6 +150,15 @@ struct FRedwoodCharacterBackend {
 
   UPROPERTY()
   int64 UnconfirmedInventorySeq = 0;
+
+  // Currency a destroyed component staged and never sent (R26: a respawn destroys a pawn-owned
+  // component between two save passes). The next component of this character takes it
+  // (URedwoodCharacterComponent::AdoptHandedOffCurrency) and sends it after a reload rebases it.
+  UPROPERTY()
+  TArray<FRedwoodCurrencyEntry> HandedOffCurrencyEntries;
+
+  UPROPERTY()
+  TArray<FString> HandedOffGrantKeys;
 
   // Set when the backend refused one of this character's flushes for good. Every component
   // hydrated from this snapshot starts frozen; only a fresh load from the database clears it.

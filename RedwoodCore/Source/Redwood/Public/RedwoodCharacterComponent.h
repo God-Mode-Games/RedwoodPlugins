@@ -32,6 +32,8 @@ public:
 
   //~ Begin UActorComponent Interface
   virtual void BeginPlay() override;
+  // FORK(hollowed-oath): R26, the currency queues must not die unlogged with the component.
+  virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
   //~ End UActorComponent Interface
 
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
@@ -505,6 +507,21 @@ public:
   // and the queue waits for a reload instead (see RebaseCurrency).
   void RechainCurrencyAfterTrade(int64 Balance);
 
+  // R26: what EndPlay does with the currency queues before the component goes. A batch in flight
+  // is left to its reply (the subsystem settles it as a gone component's). An unconfirmed batch is
+  // logged as UNKNOWN and its seq marked on the snapshot. Entries and keys never sent are handed to
+  // the PlayerState snapshot when that is safe, for the next component of the character to send;
+  // otherwise they are logged as NOT saved, with why. Every entry and key is logged either way.
+  // Public for the tests: an automation test cannot run EndPlay on a component that never began
+  // play.
+  void HandOffCurrencyAtEndPlay();
+
+  // Takes the currency a destroyed component of this character handed to Snapshot, in front of
+  // its own queue, and holds all currency for a reload: the handed-off chain was built on a balance
+  // only the reload can confirm. Refused (false) while a batch of this component is in flight or
+  // unconfirmed, or for another character.
+  bool AdoptHandedOffCurrency(FRedwoodCharacterBackend &Snapshot);
+
   // A batch of another component of this character may have committed at Seq (the snapshot's
   // bInventorySeqUnconfirmed): the next claim probes Seq, with no rows and no currency, before any
   // normal batch. With bReloadAfterProbe, currency is then held for a reload too: the lost batch
@@ -693,6 +710,13 @@ private:
   int64 UnconfirmedBatchSeq = 0;
   // Whether the in-flight claim re-sends the unconfirmed batch (see IsItemFlushReplayProbe).
   bool bInFlightIsCurrencyResend = false;
+  // How many entries and keys from the front of the queues the in-flight claim carries.
+  int32 InFlightCurrencyCount = 0;
+  int32 InFlightGrantCount = 0;
+
+  // The PlayerState snapshot this component hydrated from. A pawn is detached from its controller
+  // before its EndPlay, so FindPlayerStateComponent can no longer reach it there.
+  TWeakObjectPtr<URedwoodPlayerStateComponent> HydratedPlayerStateComponent;
 
   bool bCurrencyRebaseRequired = false;
   FString WriterToken;

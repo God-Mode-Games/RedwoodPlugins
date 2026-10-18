@@ -3481,4 +3481,172 @@ bool FRedwoodCurrencySidecarReconnectGoneComponentTest::RunTest(const FString &P
   return true;
 }
 
+namespace RedwoodCurrencySidecarTest {
+  // A pawn whose component hydrated through the controller, on a PlayerState that holds the
+  // snapshot (MakeSnapshotOwner). DetachForEndPlay then does what APawn::Destroyed does before
+  // EndPlay: the pawn no longer reaches its controller.
+  struct FPawnParty {
+    APlayerController *PlayerController = nullptr;
+    ARedwoodCurrencyLoadTestPlayerState *PlayerState = nullptr;
+    URedwoodPlayerStateComponent *PlayerStateComponent = nullptr;
+    ARedwoodCurrencyFlushTestPawn *Pawn = nullptr;
+    URedwoodCharacterComponent *Component = nullptr;
+
+    void DetachForEndPlay() {
+      Pawn->Controller = nullptr;
+    }
+  };
+
+  bool MakePawnParty(FSidecarHarness &Harness, FPawnParty &OutParty) {
+    if (!MakeSnapshotOwner(Harness, OutParty.PlayerState, OutParty.PlayerStateComponent)) {
+      return false;
+    }
+    OutParty.PlayerController = Harness.World->SpawnActor<APlayerController>();
+    OutParty.Pawn = Harness.World->SpawnActor<ARedwoodCurrencyFlushTestPawn>();
+    if (!Harness.Test.TestNotNull(TEXT("The controller spawns"), OutParty.PlayerController) ||
+        !Harness.Test.TestNotNull(TEXT("The pawn spawns"), OutParty.Pawn)) {
+      return false;
+    }
+    OutParty.PlayerController->PlayerState = OutParty.PlayerState;
+    OutParty.Pawn->Controller = OutParty.PlayerController;
+    OutParty.Component = NewObject<URedwoodCharacterComponent>(OutParty.Pawn);
+    OutParty.Component->bUseCharacterCreatorData = false;
+    OutParty.Component->bUseMetadata = false;
+    OutParty.Component->bUseEquippedInventory = false;
+    OutParty.Component->bUseNonequippedInventory = false;
+    OutParty.Component->bUseData = false;
+    OutParty.Component->bUseItems = true;
+    OutParty.Component->ProcessEvent(
+      OutParty.Component->FindFunctionChecked(TEXT("RedwoodPlayerStateCharacterUpdated")), nullptr
+    );
+    return Harness.Test.TestEqual(
+      TEXT("The pawn's component hydrates the character"), OutParty.Component->RedwoodCharacterId, CharacterId
+    );
+  }
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarEndPlayHandsOffTest,
+  "Redwood.Currency.Sidecar.EndPlayHandsOffUnsent",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// R26: the pawn ends (a respawn) with an entry and a key staged and never sent. They are logged,
+// handed to the PlayerState, and the next component of the character takes them, holds them for a
+// reload, and sends them re-chained from the reloaded balance.
+bool FRedwoodCurrencySidecarEndPlayHandsOffTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  const FString RewardKey = TEXT("quest:Q1");
+  AddExpectedErrorPlain(
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, NOT saved: its component ended, and they are handed to the PlayerState"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  AddExpectedErrorPlain(
+    TEXT("grant quest:Q1, NOT saved: its component ended, and they are handed to the PlayerState"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  FSidecarHarness Harness(*this);
+  FPawnParty Party;
+  if (!Harness.Connect() || !MakePawnParty(Harness, Party)) {
+    return false;
+  }
+  const FRedwoodCharacterBackend &Snapshot = Party.PlayerStateComponent->RedwoodCharacter;
+  TestTrue(
+    TEXT("The pawn stages its reward"),
+    Party.Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {RewardKey})
+  );
+
+  Party.DetachForEndPlay();
+  Party.Component->HandOffCurrencyAtEndPlay();
+  TestEqual(TEXT("The entry is handed to the snapshot"), Snapshot.HandedOffCurrencyEntries.Num(), 1);
+  TestEqual(TEXT("And the key"), Snapshot.HandedOffGrantKeys.Num(), 1);
+  TestEqual(TEXT("The ended component keeps nothing"), Party.Component->GetPendingCurrencyEntries().Num(), 0);
+
+  // The respawned component takes them, and holds them for a reload.
+  URedwoodCharacterComponent *Respawned = HydrateOnPlayerState(Party.PlayerState);
+  const TArray<FRedwoodCurrencyEntry> &Pending = Respawned->GetPendingCurrencyEntries();
+  if (!TestEqual(TEXT("The respawned component takes the entry"), Pending.Num(), 1)) {
+    return false;
+  }
+  TestEqual(TEXT("It is the same entry"), Pending[0].Id, EntryIdA);
+  TestTrue(TEXT("And the key"), Respawned->HasGrantKey(RewardKey));
+  TestEqual(TEXT("The snapshot gives them once"), Snapshot.HandedOffCurrencyEntries.Num(), 0);
+  TestTrue(TEXT("They wait for a reload"), Respawned->IsCurrencyRebaseRequired());
+
+  Harness.Subsystem->FlushItemsForCharacterComponent(Party.PlayerStateComponent, Respawned);
+  FRequest Load;
+  if (!Harness.ReadRequest(LoadEvent, Load)) {
+    return false;
+  }
+  // Something else moved the balance meanwhile.
+  Harness.Answer(Load, MakeLoadReply(TEXT("1200")));
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  TestEqual(TEXT("The entry goes out"), CountArray(Flush.Payload, TEXT("currency")), 1);
+  TestEqual(TEXT("Re-chained from the reloaded balance"), FirstBalanceAfter(Flush.Payload), FString(TEXT("1700")));
+  TestEqual(TEXT("With its key"), CountArray(Flush.Payload, TEXT("grants")), 1);
+  Harness.Answer(Flush, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SeededInventorySeq + 1));
+  Harness.PumpUntil([Respawned]() { return !Respawned->IsItemFlushInFlight(); });
+  TestEqual(TEXT("The handed-off entry is saved"), Respawned->GetPendingCurrencyEntries().Num(), 0);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarEndPlayInFlightTest,
+  "Redwood.Currency.Sidecar.EndPlayInFlightLogsOnly",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// R26: the pawn ends with a batch in flight and an entry staged behind it. The staged entry's chain
+// waits on that batch, so it is not handed off: it is logged as NOT saved, with why. The batch's
+// reply, which no longer reaches the ended component, settles it as a gone component's: an unknown
+// outcome is logged as UNKNOWN and marked on the snapshot.
+bool FRedwoodCurrencySidecarEndPlayInFlightTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedErrorPlain(
+    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB delta 200 reason Currency.Reason.Loot, NOT saved: its component ended and they cannot be handed on: a batch was in flight"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  AddExpectedErrorPlain(
+    TEXT("Failed to flush items (component gone): Item flush request timed out."), EAutomationExpectedErrorFlags::Contains, 1
+  );
+  AddExpectedErrorPlain(
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  FSidecarHarness Harness(*this);
+  FPawnParty Party;
+  if (!Harness.Connect() || !MakePawnParty(Harness, Party)) {
+    return false;
+  }
+  const FRedwoodCharacterBackend &Snapshot = Party.PlayerStateComponent->RedwoodCharacter;
+  Party.Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {});
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(
+    Party.PlayerStateComponent, Party.Component, [&SettleCount]() { ++SettleCount; }
+  );
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  Party.Component->QueueCurrency({MakeEntry(EntryIdB, 200, 1700, LootReason)}, {});
+
+  Party.DetachForEndPlay();
+  Party.Component->HandOffCurrencyAtEndPlay();
+  TestEqual(TEXT("Nothing is handed off behind an open batch"), Snapshot.HandedOffCurrencyEntries.Num(), 0);
+  TestTrue(TEXT("The ended component never opens a second batch"), Party.Component->IsItemFlushInFlight());
+
+  Harness.Answer(Flush, TEXT(R"({"error":"Item flush request timed out.","committedSeq":-1,"timedOut":true})"));
+  TestTrue(TEXT("The reply settles the attempt"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
+  TestTrue(TEXT("Its unknown outcome is marked"), Snapshot.bInventorySeqUnconfirmed);
+  TestEqual(TEXT("At its seq"), Snapshot.UnconfirmedInventorySeq, SeededInventorySeq + 1);
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER
