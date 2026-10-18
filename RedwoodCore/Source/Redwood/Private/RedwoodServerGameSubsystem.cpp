@@ -3323,8 +3323,22 @@ void URedwoodServerGameSubsystem::DetachItemFlushesFromComponent(
   URedwoodCharacterComponent *CharacterComponent
 ) {
   for (TPair<uint64, FRedwoodInFlightItemFlush> &Pair : InFlightItemFlushes) {
-    if (Pair.Value.CharacterComponent.Get() == CharacterComponent) {
-      Pair.Value.CharacterComponent = nullptr;
+    FRedwoodInFlightItemFlush &Flight = Pair.Value;
+    if (Flight.CharacterComponent.Get() != CharacterComponent) {
+      continue;
+    }
+    Flight.CharacterComponent = nullptr;
+    // Marked now, not on the reply: the reply can take up to FlushReplyTimeoutSeconds, and a
+    // component that hydrates meanwhile would send a normal batch at this seq. If the detached
+    // batch then commits first, the new batch is acked as its replay and its rows are lost. The
+    // reply clears the mark once it settles the seq, and does not mark again past it.
+    URedwoodPlayerStateComponent *PlayerStateComponent = Flight.PlayerStateComponent.Get();
+    if (PlayerStateComponent && PlayerStateComponent->RedwoodCharacter.Id == Flight.CharacterId) {
+      MarkSnapshotSeqUnconfirmed(
+        PlayerStateComponent->RedwoodCharacter,
+        Flight.Sent.BatchSeq,
+        Flight.Sent.CurrencyCount > 0 || Flight.Sent.GrantKeys.Num() > 0
+      );
     }
   }
 }
@@ -3532,14 +3546,18 @@ void URedwoodServerGameSubsystem::WriteFlushReplyToSnapshot(
 void URedwoodServerGameSubsystem::MarkSnapshotSeqUnconfirmed(
   FRedwoodCharacterBackend &Snapshot, int64 Seq, bool bCarriedCurrency
 ) {
+  // A seq the snapshot has already passed is settled: a probe (or a later commit) answered for it,
+  // and the balance read after that already counts the batch if it committed.
+  if (Seq <= Snapshot.InventorySeq) {
+    return;
+  }
   // The lowest unsettled seq is probed first; once the committed seq passes it, every later one
   // is settled the same way.
-  if (Seq > Snapshot.InventorySeq &&
-      (!Snapshot.bInventorySeqUnconfirmed || Seq < Snapshot.UnconfirmedInventorySeq)) {
+  if (!Snapshot.bInventorySeqUnconfirmed || Seq < Snapshot.UnconfirmedInventorySeq) {
     Snapshot.bInventorySeqUnconfirmed = true;
     Snapshot.UnconfirmedInventorySeq = Seq;
   }
-  // The batch may have moved the balance and used its keys, whatever its seq now says.
+  // The batch may have moved the balance and used its keys.
   if (bCarriedCurrency) {
     Snapshot.bCurrencyAmountUnknown = true;
   }

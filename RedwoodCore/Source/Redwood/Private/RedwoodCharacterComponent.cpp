@@ -1227,7 +1227,7 @@ void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay(EEndPlayReason::Type E
 
   // The front of the queues that already went out. A batch in flight is settled by its reply, as
   // a gone component's: that logs it and writes the snapshot (detached here, so the reply does
-  // not reach a component that is ending). An unconfirmed batch has no reply coming: logged here
+  // not reach a component that is ending; the detach marks its seq at once). An unconfirmed batch has no reply coming: logged here
   // as UNKNOWN, and its seq marked, so the next component probes it.
   int32 FirstUnsentEntry = 0;
   int32 FirstUnsentGrant = 0;

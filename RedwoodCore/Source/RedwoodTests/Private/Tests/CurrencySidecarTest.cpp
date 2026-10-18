@@ -3645,11 +3645,37 @@ bool FRedwoodCurrencySidecarEndPlayInFlightTest::RunTest(const FString &Paramete
   Party.Component->HandOffCurrencyAtEndPlay(EEndPlayReason::Destroyed);
   TestEqual(TEXT("Nothing is handed off behind an open batch"), Snapshot.HandedOffCurrencyEntries.Num(), 0);
   TestTrue(TEXT("The ended component never opens a second batch"), Party.Component->IsItemFlushInFlight());
+  // N1: marked at the detach, before any reply.
+  TestTrue(TEXT("The open batch's seq is marked at once"), Snapshot.bInventorySeqUnconfirmed);
+  TestEqual(TEXT("At its seq"), Snapshot.UnconfirmedInventorySeq, SeededInventorySeq + 1);
+
+  // The respawn comes before the old batch's reply: its first frame is a probe at that seq, never a
+  // normal batch there.
+  URedwoodCharacterComponent *Respawned = HydrateOnPlayerState(Party.PlayerState);
+  Harness.Subsystem->FlushItemsForCharacterComponent(Party.PlayerStateComponent, Respawned);
+  FRequest Probe;
+  if (!Harness.ReadRequest(FlushEvent, Probe)) {
+    return false;
+  }
+  TestTrue(TEXT("The respawned component probes first"), Probe.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("At the open batch's seq"), BatchSeqOfFlush(Probe.Payload), SeededInventorySeq + 1);
 
   Harness.Answer(Flush, TEXT(R"({"error":"Item flush request timed out.","committedSeq":-1,"timedOut":true})"));
   TestTrue(TEXT("The reply settles the attempt"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
-  TestTrue(TEXT("Its unknown outcome is marked"), Snapshot.bInventorySeqUnconfirmed);
-  TestEqual(TEXT("At its seq"), Snapshot.UnconfirmedInventorySeq, SeededInventorySeq + 1);
+  TestTrue(TEXT("Its unknown outcome stays marked"), Snapshot.bInventorySeqUnconfirmed);
+
+  // The old batch had committed: the probe gets the replay ack, and the balance is reloaded.
+  Harness.Answer(Probe, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SeededInventorySeq + 1));
+  FRequest Load;
+  if (!Harness.ReadRequest(LoadEvent, Load)) {
+    return false;
+  }
+  TestFalse(TEXT("The settled seq clears the mark"), Snapshot.bInventorySeqUnconfirmed);
+  Harness.Answer(Load, MakeLoadReply(TEXT("1500")));
+  TestTrue(
+    TEXT("The reload lands"),
+    Harness.PumpUntil([&Harness]() { return FAccess::Reload(*Harness.Subsystem, CharacterId) == nullptr; })
+  );
   return true;
 }
 
