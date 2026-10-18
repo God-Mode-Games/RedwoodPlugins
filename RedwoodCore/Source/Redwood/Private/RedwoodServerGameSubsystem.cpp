@@ -3382,11 +3382,7 @@ void URedwoodServerGameSubsystem::WriteCommittedFlushToSnapshot(
   // reused key for good. These are exactly the replies on which CompleteItemFlush drops the sent
   // keys as saved; a later fence still means this batch committed.
   if (bCommitted && Reply.CommittedSeq >= Sent.BatchSeq) {
-    for (const FString &GrantKey : Sent.GrantKeys) {
-      if (!ContainsGrantKey(Snapshot.GrantKeys, GrantKey)) {
-        Snapshot.GrantKeys.Add(GrantKey);
-      }
-    }
+    MergeGrantKeys(Snapshot.GrantKeys, Sent.GrantKeys);
   }
 }
 
@@ -3490,18 +3486,14 @@ bool URedwoodServerGameSubsystem::ApplyCurrencyReload(
   }
 
   // The loaded balance is committed, so the snapshot takes it, as it takes a flush's. The keys are
-  // merged in, not swapped in: the backend never removes a key, so every key on the snapshot is
-  // still used, and one that a racing batch committed after the reload read the database would be
-  // lost by a replace. The merge adds a key that a flush committed but whose ack was lost.
+  // merged in (MergeGrantKeys): one that a racing batch committed after the reload read the
+  // database would be lost by a replace. The merge adds a key that a flush committed but whose ack
+  // was lost.
   if (PlayerStateComponent) {
     FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
     Snapshot.CurrencyAmount = Balance;
     Snapshot.bCurrencyAmountUnknown = false;
-    for (const FString &GrantKey : GrantKeys) {
-      if (!ContainsGrantKey(Snapshot.GrantKeys, GrantKey)) {
-        Snapshot.GrantKeys.Add(GrantKey);
-      }
-    }
+    MergeGrantKeys(Snapshot.GrantKeys, GrantKeys);
   }
 
   CharacterComponent->OnCurrencyRebased.Broadcast(Balance);
