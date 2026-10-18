@@ -60,6 +60,10 @@ public:
   static void BindConnectedCallback(URedwoodServerGameSubsystem &Subsystem) {
     Subsystem.BindSidecarConnectedCallback();
   }
+  // Whether the connect callback has run: it starts the sidecar update timer.
+  static bool HasHandledSidecarConnect(URedwoodServerGameSubsystem &Subsystem) {
+    return Subsystem.TimerHandle_UpdateSidecar.IsValid();
+  }
   // A final refusal's freeze, without driving one through a flush.
   static void FreezeCharacter(URedwoodServerGameSubsystem &Subsystem, const FString &CharacterId) {
     Subsystem.FreezeCharacter(CharacterId, nullptr);
@@ -212,6 +216,23 @@ namespace RedwoodCurrencySidecarTest {
       }
       SidecarCopy->Connect(FString::Printf(TEXT("ws://127.0.0.1:%d"), Server->Port));
       return AcceptAndWait();
+    }
+
+    // Connects with the subsystem's real connect callback, and waits until that callback has run
+    // for this first connect. The socket reports bIsConnected before the callback reaches the game
+    // thread, and a callback that lands after the test's first flush is read as a reconnect: R34
+    // turns that flush into a probe, and the test reads a second flush frame where it expects
+    // another request. So the callback is bound before connecting and awaited, never bound after.
+    bool ConnectWithConnectCallback() {
+      if (Subsystem) {
+        FAccess::BindConnectedCallback(*Subsystem);
+      }
+      URedwoodServerGameSubsystem *InSubsystem = Subsystem;
+      return Connect() &&
+        Test.TestTrue(
+          TEXT("The connect callback runs"),
+          PumpGameThreadUntil([InSubsystem]() { return FAccess::HasHandledSidecarConnect(*InSubsystem); })
+        );
     }
 
     // Accepts the client's (re)connect and waits until the game thread has seen it.
@@ -806,10 +827,9 @@ bool FRedwoodCurrencySidecarDownWaitsTest::RunTest(const FString &Parameters) {
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedError(TEXT("Currency reload failed"), EAutomationExpectedErrorFlags::Contains, 0);
   FSidecarHarness Harness(*this);
-  if (!Harness.Connect()) {
+  if (!Harness.ConnectWithConnectCallback()) {
     return false;
   }
-  FAccess::BindConnectedCallback(*Harness.Subsystem);
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
   FRequest FirstLoad;
@@ -2815,10 +2835,9 @@ bool FRedwoodCurrencyTradeReconnectClearsOpenFlushTest::RunTest(const FString &P
   using namespace RedwoodCurrencyTradeTest;
   AddExpectedErrorPlain(TEXT("has an item flush in flight"), EAutomationExpectedErrorFlags::Contains, 1);
   FSidecarHarness Harness(*this);
-  if (!Harness.Connect()) {
+  if (!Harness.ConnectWithConnectCallback()) {
     return false;
   }
-  FAccess::BindConnectedCallback(*Harness.Subsystem);
   FParty From;
   FParty To;
   if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
@@ -2878,10 +2897,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencySidecarReconnectProbesTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   FSidecarHarness Harness(*this);
-  if (!Harness.Connect()) {
+  if (!Harness.ConnectWithConnectCallback()) {
     return false;
   }
-  FAccess::BindConnectedCallback(*Harness.Subsystem);
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
   Actor->Items = {MakeRecord(OwnedItemId)};
@@ -3043,10 +3061,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencySidecarRowsOnlyReconnectTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   FSidecarHarness Harness(*this);
-  if (!Harness.Connect()) {
+  if (!Harness.ConnectWithConnectCallback()) {
     return false;
   }
-  FAccess::BindConnectedCallback(*Harness.Subsystem);
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
   Actor->Items = {MakeRecord(OwnedItemId)};
@@ -3134,10 +3151,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencyTradeReconnectResendsTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencyTradeTest;
   FSidecarHarness Harness(*this);
-  if (!Harness.Connect()) {
+  if (!Harness.ConnectWithConnectCallback()) {
     return false;
   }
-  FAccess::BindConnectedCallback(*Harness.Subsystem);
   FParty From;
   FParty To;
   if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
@@ -3471,10 +3487,9 @@ bool FRedwoodCurrencySidecarReconnectGoneComponentTest::RunTest(const FString &P
     1
   );
   FSidecarHarness Harness(*this);
-  if (!Harness.Connect()) {
+  if (!Harness.ConnectWithConnectCallback()) {
     return false;
   }
-  FAccess::BindConnectedCallback(*Harness.Subsystem);
   ARedwoodCurrencyLoadTestPlayerState *PlayerState = nullptr;
   URedwoodPlayerStateComponent *PlayerStateComponent = nullptr;
   if (!MakeSnapshotOwner(Harness, PlayerState, PlayerStateComponent)) {
