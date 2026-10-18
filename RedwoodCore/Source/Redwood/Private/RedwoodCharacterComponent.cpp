@@ -665,150 +665,135 @@ bool URedwoodCharacterComponent::TryBeginItemFlush(int64 &OutBatchSeq) {
 }
 
 void URedwoodCharacterComponent::CompleteItemFlush(
-  const FString &Error,
-  int64 CommittedSeq,
-  const TArray<TPair<FString, uint64>> &SentUpserts,
-  const TArray<TPair<FString, uint64>> &SentDeletes,
-  int32 SentCurrencyCount,
-  int32 SentGrantCount,
-  bool bFinalRefusal,
-  bool bRebaseRequired,
-  bool bNotApplied,
-  bool bNotSent
+  const FRedwoodItemFlushReply &Reply, const FRedwoodItemFlushSent &Sent
 ) {
   // The seq the just-completed flush stamped on its payload (claimed in TryBeginItemFlush).
   const int64 SentSeq = InFlightBatchSeq;
+  const int64 CommittedSeq = Reply.CommittedSeq;
 
   // FORK(hollowed-oath): nothing leaves the queues between the claim and this ack except here, so
   // the counts can only exceed the queues through a caller bug. Clamp rather than over-remove.
-  SentCurrencyCount = FMath::Clamp(SentCurrencyCount, 0, PendingCurrencyEntries.Num());
-  SentGrantCount = FMath::Clamp(SentGrantCount, 0, PendingGrantKeys.Num());
+  const int32 SentCurrencyCount = FMath::Clamp(Sent.CurrencyCount, 0, PendingCurrencyEntries.Num());
+  const int32 SentGrantCount = FMath::Clamp(Sent.GrantKeys.Num(), 0, PendingGrantKeys.Num());
 
-  if (bNotSent) {
-    // FORK(hollowed-oath): the realm never saw this batch. Marking it unconfirmed would turn the
-    // next attempt into a probe that carries no rows, for no reason; clearing an earlier unconfirmed
-    // state would send that batch's entries as new under a seq that may hold them already. Leave
-    // both as they are: the rows stay dirty and the entries stay queued.
-  } else if (bNotApplied && CommittedSeq >= SentSeq) {
-    // FORK(hollowed-oath): the backend answered a probe: the batch never committed. The backend
-    // has CONSUMED that seq with an empty commit (CommittedSeq), so a late original arriving under
-    // it now fails instead of applying after the fact. The entries are simply pending again,
-    // unchanged: the empty commit moved no balance, so their BalanceAfter still holds. The next
-    // claim is a normal batch after that fence, so the payment goes out WITH the current item
-    // rows: both save or neither does.
-    bCurrencyBatchUnconfirmed = false;
-    AdoptCommittedItemSeq(CommittedSeq);
-  } else if (bNotApplied) {
-    // FORK(hollowed-oath): notApplied without the consumed seq. While the seq is still free, the
-    // original attempt can arrive late and commit under it, so a normal batch there could pay the
-    // entries twice. Keep the batch unconfirmed: the next attempt is another probe, and no seq
-    // below the sent one is ever adopted.
-    UE_LOG(
-      LogRedwood,
-      Error,
-      TEXT("CompleteItemFlush: notApplied with committedSeq %lld below the probed seq %lld; probing again"),
-      CommittedSeq,
-      SentSeq
-    );
-    MarkCurrencyBatchUnconfirmed(SentCurrencyCount, SentGrantCount, SentSeq);
-  } else if (Error.IsEmpty()) {
-    // Success: clear only the ids whose generation still matches what was sent, exactly as the
-    // old container ack did -- if MarkItemsDirty/MarkItemsDeleted bumped an id again while the
-    // request was in flight, leave it dirty (at its newer generation) so the next flush re-sends
-    // the newer record instead of clearing away a write we never actually persisted.
-    // FORK(hollowed-oath): a malformed success ack leaves the rows DIRTY. Clearing them while
-    // refusing to adopt the reported seq (below) was the worst of both worlds: NextBatchSeq stayed
-    // where it was, so the NEXT flush re-sent the same batchSeq, the backend no-oped it as a replay
-    // of a seq it had already committed, and that no-op's success ack then cleared the NEW
-    // mutation -- silently losing it. Retaining the generations makes the replay self-healing
-    // instead: the same rows go out again at the same seq, the backend answers with a fence at or
-    // past it, and THAT ack (which passes the check below) clears them properly.
-    const bool bSeqTrustworthy = CommittedSeq >= SentSeq;
-    if (bSeqTrustworthy) {
-      ClearSentItemGenerations(SentUpserts, SentDeletes);
+  const ERedwoodItemFlushOutcome Outcome = ClassifyItemFlushReply(Reply, SentSeq);
+  switch (Outcome) {
+    case ERedwoodItemFlushOutcome::NotSent:
+      // FORK(hollowed-oath): the realm never saw this batch. Marking it unconfirmed would turn the
+      // next attempt into a probe that carries no rows, for no reason; clearing an earlier
+      // unconfirmed state would send that batch's entries as new under a seq that may hold them
+      // already. Leave both as they are: the rows stay dirty and the entries stay queued.
+      break;
+
+    case ERedwoodItemFlushOutcome::NotApplied:
+      // FORK(hollowed-oath): the backend answered a probe: the batch never committed. The backend
+      // has CONSUMED that seq with an empty commit (CommittedSeq), so a late original arriving
+      // under it now fails instead of applying after the fact. The entries are simply pending
+      // again, unchanged: the empty commit moved no balance, so their BalanceAfter still holds. The
+      // next claim is a normal batch after that fence, so the payment goes out WITH the current
+      // item rows: both save or neither does.
+      bCurrencyBatchUnconfirmed = false;
+      AdoptCommittedItemSeq(CommittedSeq);
+      break;
+
+    case ERedwoodItemFlushOutcome::Committed:
+      // Success: clear only the ids whose generation still matches what was sent, exactly as the
+      // old container ack did -- if MarkItemsDirty/MarkItemsDeleted bumped an id again while the
+      // request was in flight, leave it dirty (at its newer generation) so the next flush re-sends
+      // the newer record instead of clearing away a write we never actually persisted.
+      ClearSentItemGenerations(Sent.Upserts, Sent.Deletes);
       // FORK(hollowed-oath): the backend holds these entries -- committed now, or by the earlier
       // attempt this batch replays (the backend acks a replay that carries currency only when
       // every entry id is already in its ledger). Entries queued after the claim sit behind them
       // and stay.
       RemoveSentCurrency(SentCurrencyCount, SentGrantCount);
       bCurrencyBatchUnconfirmed = false;
-    }
+      AdoptCommittedItemSeq(CommittedSeq);
+      break;
 
-    // FORK(hollowed-oath): defensive guard against a malformed SUCCESS ack. We otherwise trust the
-    // backend to report committedSeq >= SentSeq on every success response -- that trust is the
-    // whole point of the seq fence. But FlushItemsForCharacterComponent's TryGetNumberField parses
-    // a missing/malformed "committedSeq" field to 0.0, and adopting that here would reset
-    // NextBatchSeq to 1, wedging the fence (every later flush would then stamp a seq the backend
-    // has already moved past). If the contract is ever violated like this, do NOT adopt the bogus
-    // seq: leave LastCommittedItemSeq/NextBatchSeq exactly as they were. The generations above are
-    // still cleared and the flight slot below is still released either way -- the send itself did
-    // succeed; only the seq bookkeeping in the ack is suspect.
-    if (!bSeqTrustworthy) {
-      UE_LOG(
-        LogRedwood,
-        Warning,
-        TEXT(
-          "CompleteItemFlush: success ack reported committedSeq %lld < sent batchSeq %lld "
-          "(contract violation -- missing/malformed committedSeq field?); ignoring the reported "
-          "seq, KEEPING the sent rows dirty for a self-healing replay, and leaving NextBatchSeq "
-          "at %lld"
-        ),
-        CommittedSeq,
-        SentSeq,
-        NextBatchSeq
-      );
-      // FORK(hollowed-oath): the same self-healing replay for currency -- keep the batch exactly as
-      // sent, under its seq, until an ack can be trusted.
-      MarkCurrencyBatchUnconfirmed(SentCurrencyCount, SentGrantCount, SentSeq);
-    } else {
-      AdoptCommittedItemSeq(CommittedSeq);
-    }
-  } else if (bFinalRefusal) {
-    // FORK(hollowed-oath): the backend refused this batch for good, rolled ALL of it back, and
-    // raised an alert. The game's state and the backend's now disagree, and a later staged change
-    // may depend on the refused one, so nothing staged can be trusted: freeze (see
-    // FreezeAfterFinalRefusal).
-    FreezeAfterFinalRefusal(Error);
-    if (CommittedSeq >= SentSeq) {
-      AdoptCommittedItemSeq(CommittedSeq);
-    }
-  } else {
-    // Error: leave dirt in place so the next tick re-sends. Normally we also leave NextBatchSeq
-    // alone so the retry re-uses the same seq -- EXCEPT when the backend reports it has already
-    // committed at or past the seq we sent (a replay it no-oped, or a fence ahead of us). In that
-    // case keeping our old NextBatchSeq would wedge every future flush behind a gap the backend
-    // keeps rejecting, so realign to the backend's committed fence.
-    if (CommittedSeq >= SentSeq) {
-      AdoptCommittedItemSeq(CommittedSeq);
-    }
-    if (bRebaseRequired) {
+    case ERedwoodItemFlushOutcome::FinalRefusal:
+      // FORK(hollowed-oath): the backend refused this batch for good, rolled ALL of it back, and
+      // raised an alert. The game's state and the backend's now disagree, and a later staged change
+      // may depend on the refused one, so nothing staged can be trusted: freeze (see
+      // FreezeAfterFinalRefusal).
+      FreezeAfterFinalRefusal(Reply.Error);
+      if (CommittedSeq >= SentSeq) {
+        AdoptCommittedItemSeq(CommittedSeq);
+      }
+      break;
+
+    case ERedwoodItemFlushOutcome::RebaseRequired:
       // FORK(hollowed-oath): only the backend's replay-mismatch refusal sets rebaseRequired: a trade
       // used this seq, and the backend checked that the batch's entry ids and keys are NOT all in
       // its ledger. Exactly one batch is re-sent per seq (see the staging block in the header), so
       // none of it applied. The entries are kept -- an error reply means not saved. The trade moved
       // the balance, so every pending BalanceAfter is stale and would be refused as final. Hold
-      // currency until the caller reloads; the flag is the signal for the flush path (B2) to start
-      // that reload and then call RebaseCurrency.
+      // currency until the caller reloads; the flag is the signal for the flush path to start that
+      // reload and then call RebaseCurrency. The lane moves past the trade's seq, or every later
+      // flush would be wedged behind a fence the backend keeps rejecting.
+      if (CommittedSeq >= SentSeq) {
+        AdoptCommittedItemSeq(CommittedSeq);
+      }
       bCurrencyBatchUnconfirmed = false;
       bCurrencyRebaseRequired = true;
-    } else if (CommittedSeq >= 0 && CommittedSeq < SentSeq - 1) {
-      // FORK(hollowed-oath): a sequence gap. The backend is behind the seq we sent, so this batch
-      // (and any earlier attempt of it under the same seq) cannot have committed. Re-sending the
-      // gapped seq would be refused forever; realign to the backend's fence, as the success path
-      // does, and send the kept entries as an ordinary batch there. Negative means the reply had no
-      // fence at all (a dropped socket), which is not a gap.
+      break;
+
+    case ERedwoodItemFlushOutcome::SequenceGap:
+      // FORK(hollowed-oath): the backend is behind the seq we sent, so this batch (and any earlier
+      // attempt of it under the same seq) cannot have committed. Re-sending the gapped seq would be
+      // refused forever; realign to the backend's fence and send the kept entries as an ordinary
+      // batch there.
       LastCommittedItemSeq = CommittedSeq;
       NextBatchSeq = CommittedSeq + 1;
       bCurrencyBatchUnconfirmed = false;
-    } else {
-      // FORK(hollowed-oath): any other error leaves the outcome unknown, WHATEVER committedSeq says.
-      // A "concurrent flush" refusal of a retry that raced its own still-running original reports
-      // the original's commit as the fence; treating that as "did not apply" and rebasing would
-      // re-chain the committed entry on top of itself, and its re-send would be refused as a
-      // duplicate. Re-send the identical batch under its seq instead: the backend acks it from its
-      // ledger if it committed.
+      break;
+
+    case ERedwoodItemFlushOutcome::Unknown:
+    default:
+      if (Reply.bNotApplied) {
+        // FORK(hollowed-oath): notApplied without the consumed seq. While the seq is still free,
+        // the original attempt can arrive late and commit under it, so a normal batch there could
+        // pay the entries twice. Keep the batch unconfirmed: the next attempt is another probe, and
+        // no seq below the sent one is ever adopted.
+        UE_LOG(
+          LogRedwood,
+          Error,
+          TEXT("CompleteItemFlush: notApplied with committedSeq %lld below the probed seq %lld; probing again"),
+          CommittedSeq,
+          SentSeq
+        );
+      } else if (Reply.Error.IsEmpty()) {
+        // FORK(hollowed-oath): a malformed SUCCESS ack (committedSeq below the sent seq, which a
+        // missing field also gives). Clearing the rows while refusing the reported seq was the
+        // worst of both worlds: NextBatchSeq stayed where it was, the NEXT flush re-sent the same
+        // batchSeq, the backend no-oped it as a replay, and that no-op's success ack then cleared
+        // the NEW mutation. Adopting the bogus seq instead would rewind the lane and wedge it. So
+        // the rows stay dirty, the lane stays where it is, and the batch is probed at its seq: the
+        // probe's ack, which carries a real fence, settles it.
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT(
+            "CompleteItemFlush: success ack reported committedSeq %lld < sent batchSeq %lld "
+            "(contract violation -- missing/malformed committedSeq field?); ignoring the reported "
+            "seq, KEEPING the sent rows dirty, and probing the batch at its seq"
+          ),
+          CommittedSeq,
+          SentSeq
+        );
+      } else if (CommittedSeq >= SentSeq) {
+        // An error with a fence at or past the sent seq (a replay the backend no-oped, or a fence
+        // ahead of us): keeping the old NextBatchSeq would wedge every later flush behind it.
+        AdoptCommittedItemSeq(CommittedSeq);
+      }
+      // FORK(hollowed-oath): the outcome is unknown, WHATEVER committedSeq says. A "concurrent
+      // flush" refusal of a retry that raced its own still-running original reports the original's
+      // commit as the fence; treating that as "did not apply" and rebasing would re-chain the
+      // committed entry on top of itself, and its re-send would be refused as a duplicate. Probe
+      // the identical batch under its seq instead: the backend acks it from its ledger if it
+      // committed.
       MarkCurrencyBatchUnconfirmed(SentCurrencyCount, SentGrantCount, SentSeq);
-    }
+      break;
   }
 
   // Always release the flight slot, whatever the outcome.
@@ -816,8 +801,8 @@ void URedwoodCharacterComponent::CompleteItemFlush(
 
   // FORK(hollowed-oath): after the state above is settled, so a listener that reacts (by returning
   // the player to character select) sees the component frozen and empty.
-  if (bFinalRefusal && !Error.IsEmpty()) {
-    OnItemFlushRefusedFinal.Broadcast(RedwoodCharacterId, Error);
+  if (Outcome == ERedwoodItemFlushOutcome::FinalRefusal) {
+    OnItemFlushRefusedFinal.Broadcast(RedwoodCharacterId, Reply.Error);
   }
 
   // A flush attempt that arrived while this batch was outstanding PARKED itself here rather than

@@ -34,6 +34,46 @@ namespace RedwoodCurrencyPersistenceTest {
 
   const TArray<TPair<FString, uint64>> NoItems;
 
+  // A flush reply as ParseItemsFlushReply leaves it.
+  FRedwoodItemFlushReply MakeReply(const FString &Error, int64 CommittedSeq) {
+    FRedwoodItemFlushReply Reply;
+    Reply.Error = Error;
+    Reply.CommittedSeq = CommittedSeq;
+    return Reply;
+  }
+
+  FRedwoodItemFlushReply MakeFinalReply(const FString &Error, int64 CommittedSeq) {
+    FRedwoodItemFlushReply Reply = MakeReply(Error, CommittedSeq);
+    Reply.bFinal = true;
+    return Reply;
+  }
+
+  FRedwoodItemFlushReply MakeRebaseReply(const FString &Error, int64 CommittedSeq) {
+    FRedwoodItemFlushReply Reply = MakeReply(Error, CommittedSeq);
+    Reply.bRebaseRequired = true;
+    return Reply;
+  }
+
+  FRedwoodItemFlushReply MakeNotAppliedReply(const FString &Error, int64 CommittedSeq) {
+    FRedwoodItemFlushReply Reply = MakeReply(Error, CommittedSeq);
+    Reply.bNotApplied = true;
+    return Reply;
+  }
+
+  // The batch a reply answers: CurrencyCount entries and GrantCount keys from the front of the
+  // queues (only the key count matters to the component), and the rows it carried.
+  FRedwoodItemFlushSent MakeSent(
+    int32 CurrencyCount, int32 GrantCount, const TArray<TPair<FString, uint64>> &Upserts = NoItems
+  ) {
+    FRedwoodItemFlushSent Sent;
+    Sent.CurrencyCount = CurrencyCount;
+    for (int32 Index = 0; Index < GrantCount; ++Index) {
+      Sent.GrantKeys.Add(FString::Printf(TEXT("sent-key-%d"), Index));
+    }
+    Sent.Upserts = Upserts;
+    return Sent;
+  }
+
   // The row half of the flush payload, as the flush path must build it: every dirty row, except in
   // a re-send of an unconfirmed currency batch, which carries none.
   TArray<TPair<FString, uint64>> CollectSentRows(const URedwoodCharacterComponent *Component) {
@@ -90,7 +130,7 @@ bool FRedwoodCurrencyInFlightEntryKeptTest::RunTest(const FString &Parameters) {
 
   // B is staged while A's batch is in flight; A's ack must not take B with it.
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 200, 700)}, {});
-  Component->CompleteItemFlush(TEXT(""), BatchSeq, Fixture::NoItems, Fixture::NoItems, SentCount, 0);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT(""), BatchSeq), Fixture::MakeSent(SentCount, 0));
 
   const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
   TestEqual(TEXT("One entry remains"), Pending.Num(), 1);
@@ -119,7 +159,7 @@ bool FRedwoodCurrencyReplayClearsSentTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("First attempt uses seq 2"), FirstSeq, (int64)2);
 
   // The backend committed seq 2, but the ack was lost: the game server sees only a dropped socket.
-  Component->CompleteItemFlush(TEXT("socket closed"), -1, Fixture::NoItems, Fixture::NoItems, 1, 1);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT("socket closed"), -1), Fixture::MakeSent(1, 1));
 
   // A newer entry staged before the retry must not join it.
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 200, 700)}, {});
@@ -132,7 +172,7 @@ bool FRedwoodCurrencyReplayClearsSentTest::RunTest(const FString &Parameters) {
 
   // The backend finds every entry id in its ledger and acks the replay with its fence (3: a trade
   // has also committed since).
-  Component->CompleteItemFlush(TEXT(""), 3, Fixture::NoItems, Fixture::NoItems, 1, 1);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT(""), 3), Fixture::MakeSent(1, 1));
 
   const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
   TestEqual(TEXT("The replayed entry is dropped, not sent again"), Pending.Num(), 1);
@@ -172,7 +212,7 @@ bool FRedwoodCurrencyErrorKeepsEntriesTest::RunTest(const FString &Parameters) {
   // rebaseRequired: the entries did not apply. Dropping them on committedSeq alone would lose the
   // money.
   Component->CompleteItemFlush(
-    TEXT("batch seq was used by a trade"), 5, Fixture::NoItems, Fixture::NoItems, 2, 0, false, true
+    Fixture::MakeRebaseReply(TEXT("batch seq was used by a trade"), 5), Fixture::MakeSent(2, 0)
   );
 
   TestEqual(TEXT("Both entries are kept"), Component->GetPendingCurrencyEntries().Num(), 2);
@@ -209,7 +249,7 @@ bool FRedwoodCurrencyUnknownErrorKeepsBatchTest::RunTest(const FString &Paramete
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 500, 500)}, {});
   int64 BatchSeq = 0;
   TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
-  Component->CompleteItemFlush(TEXT("flush failed"), -1, Fixture::NoItems, Fixture::NoItems, 1, 0);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT("flush failed"), -1), Fixture::MakeSent(1, 0));
 
   const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
   TestEqual(TEXT("The entry is kept"), Pending.Num(), 1);
@@ -241,7 +281,7 @@ bool FRedwoodCurrencyUnknownErrorKeepsBatchTest::RunTest(const FString &Paramete
 
   // The batch never committed: the backend refuses the probe because the trade used its seq.
   Component->CompleteItemFlush(
-    TEXT("batch seq was used by a trade"), 3, Fixture::NoItems, Fixture::NoItems, 1, 0, false, true
+    Fixture::MakeRebaseReply(TEXT("batch seq was used by a trade"), 3), Fixture::MakeSent(1, 0)
   );
   TestEqual(TEXT("Still kept after the probe's refusal"), Component->GetPendingCurrencyEntries().Num(), 1);
   TestTrue(TEXT("Now a rebase is required"), Component->IsCurrencyRebaseRequired());
@@ -294,13 +334,13 @@ bool FRedwoodCurrencyFinalRefusalFreezesTest::RunTest(const FString &Parameters)
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 100, 300)}, {});
 
   // A plain error never drops anything; only an explicit final refusal does.
-  Component->CompleteItemFlush(TEXT("overdraft"), 0, SentUpserts, Fixture::NoItems, 1, 1, false);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT("overdraft"), 0), Fixture::MakeSent(1, 1, SentUpserts));
   TestEqual(TEXT("A non-final error keeps both entries"), Component->GetPendingCurrencyEntries().Num(), 2);
   TestEqual(TEXT("No final broadcast for a plain error"), BroadcastCount, 0);
   TestFalse(TEXT("No freeze for a plain error"), Component->IsFrozenAfterFinalRefusal());
 
   TestTrue(TEXT("Retry claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
-  Component->CompleteItemFlush(TEXT("overdraft"), 0, SentUpserts, Fixture::NoItems, 1, 1, true);
+  Component->CompleteItemFlush(Fixture::MakeFinalReply(TEXT("overdraft"), 0), Fixture::MakeSent(1, 1, SentUpserts));
 
   TestTrue(TEXT("The component is frozen"), Component->IsFrozenAfterFinalRefusal());
   TestEqual(TEXT("Every entry is dropped, sent or not"), Component->GetPendingCurrencyEntries().Num(), 0);
@@ -337,7 +377,7 @@ bool FRedwoodCurrencyConcurrentFlushIsUnconfirmedTest::RunTest(const FString &Pa
   TestEqual(TEXT("Batch N is seq 5"), FirstSeq, (int64)5);
 
   // Batch N times out while the backend is still applying it.
-  Component->CompleteItemFlush(TEXT("socket closed"), -1, Fixture::NoItems, Fixture::NoItems, 1, 0);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT("socket closed"), -1), Fixture::MakeSent(1, 0));
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 200, 1700)}, {});
 
   // The retry races the original; the original commits seq 5 first, and the retry is refused as a
@@ -346,12 +386,8 @@ bool FRedwoodCurrencyConcurrentFlushIsUnconfirmedTest::RunTest(const FString &Pa
   TestTrue(TEXT("Retry claim succeeds"), Component->TryBeginItemFlush(RetrySeq));
   TestEqual(TEXT("The retry re-uses seq 5"), RetrySeq, (int64)5);
   Component->CompleteItemFlush(
-    TEXT("concurrent flush: inventorySeq or writer changed under fence"),
-    5,
-    Fixture::NoItems,
-    Fixture::NoItems,
-    1,
-    0
+    Fixture::MakeReply(TEXT("concurrent flush: inventorySeq or writer changed under fence"), 5),
+    Fixture::MakeSent(1, 0)
   );
   TestFalse(TEXT("No rebase: the outcome is unknown"), Component->IsCurrencyRebaseRequired());
   const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
@@ -365,7 +401,7 @@ bool FRedwoodCurrencyConcurrentFlushIsUnconfirmedTest::RunTest(const FString &Pa
   TestTrue(TEXT("Probe claim succeeds"), Component->TryBeginItemFlush(ProbeSeq));
   TestEqual(TEXT("The probe re-uses seq 5"), ProbeSeq, (int64)5);
   TestEqual(TEXT("The probe carries only A"), Component->GetCurrencyEntriesToSendCount(), 1);
-  Component->CompleteItemFlush(TEXT(""), 5, Fixture::NoItems, Fixture::NoItems, 1, 0);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT(""), 5), Fixture::MakeSent(1, 0));
 
   TestEqual(TEXT("A is dropped once, by the replay ack"), Pending.Num(), 1);
   if (Pending.Num() == 1) {
@@ -399,7 +435,7 @@ bool FRedwoodCurrencyResendCarriesNoRowsTest::RunTest(const FString &Parameters)
   TestFalse(TEXT("A first send is not a probe"), Component->IsItemFlushReplayProbe());
   TArray<TPair<FString, uint64>> SentUpserts;
   SentUpserts.Add(TPair<FString, uint64>(Fixture::ItemId, 1));
-  Component->CompleteItemFlush(TEXT("socket closed"), -1, SentUpserts, Fixture::NoItems, 1, 0);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT("socket closed"), -1), Fixture::MakeSent(1, 0, SentUpserts));
 
   // Purchase 2's item row goes dirty before the retry.
   Component->MarkItemsDirty({SecondItemId});
@@ -415,7 +451,7 @@ bool FRedwoodCurrencyResendCarriesNoRowsTest::RunTest(const FString &Parameters)
   // re-send carried, so the checks below fail if the probe flag lets rows into it.
   const TArray<TPair<FString, uint64>> ResentRows = Fixture::CollectSentRows(Component);
   TestEqual(TEXT("The re-send carries no rows"), ResentRows.Num(), 0);
-  Component->CompleteItemFlush(TEXT(""), BatchSeq, ResentRows, Fixture::NoItems, 1, 0);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT(""), BatchSeq), Fixture::MakeSent(1, 0, ResentRows));
 
   TestEqual(TEXT("The debit is acknowledged"), Component->GetPendingCurrencyEntries().Num(), 0);
   TestTrue(
@@ -451,7 +487,7 @@ bool FRedwoodCurrencySequenceGapRealignsTest::RunTest(const FString &Parameters)
   TestEqual(TEXT("Claim uses seq 10"), BatchSeq, (int64)10);
 
   // The backend has committed only seq 7: seq 10 is a gap and did not apply.
-  Component->CompleteItemFlush(TEXT("sequence gap"), 7, Fixture::NoItems, Fixture::NoItems, 1, 0);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT("sequence gap"), 7), Fixture::MakeSent(1, 0));
 
   TestEqual(TEXT("The entry is kept"), Component->GetPendingCurrencyEntries().Num(), 1);
   TestFalse(TEXT("No rebase: the balance did not move"), Component->IsCurrencyRebaseRequired());
@@ -529,12 +565,12 @@ bool FRedwoodCurrencyFreezeMarksUnknownOutcomeTest::RunTest(const FString &Param
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 500, 500)}, {});
   int64 BatchSeq = 0;
   TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
-  Component->CompleteItemFlush(TEXT("socket closed"), -1, Fixture::NoItems, Fixture::NoItems, 1, 0);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT("socket closed"), -1), Fixture::MakeSent(1, 0));
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 200, 700)}, {});
 
   TestTrue(TEXT("Probe claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
   TestTrue(TEXT("The claim is a probe"), Component->IsItemFlushReplayProbe());
-  Component->CompleteItemFlush(TEXT("refused"), 1, Fixture::NoItems, Fixture::NoItems, 1, 0, true);
+  Component->CompleteItemFlush(Fixture::MakeFinalReply(TEXT("refused"), 1), Fixture::MakeSent(1, 0));
 
   TestTrue(TEXT("The component is frozen"), Component->IsFrozenAfterFinalRefusal());
   return true;
@@ -559,7 +595,7 @@ bool FRedwoodCurrencyNotAppliedNeedsConsumedSeqTest::RunTest(const FString &Para
   int64 BatchSeq = 0;
   TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
   TestEqual(TEXT("The first attempt uses seq 5"), BatchSeq, (int64)5);
-  Component->CompleteItemFlush(TEXT("socket closed"), -1, Fixture::NoItems, Fixture::NoItems, 1, 0);
+  Component->CompleteItemFlush(Fixture::MakeReply(TEXT("socket closed"), -1), Fixture::MakeSent(1, 0));
 
   // The old shape (committedSeq is the seq before the probe), then no fence at all.
   const int64 OldShapeFences[] = {4, -1};
@@ -568,7 +604,7 @@ bool FRedwoodCurrencyNotAppliedNeedsConsumedSeqTest::RunTest(const FString &Para
     TestTrue(TEXT("The claim is a probe"), Component->IsItemFlushReplayProbe());
     TestEqual(TEXT("The probe uses the unconfirmed seq"), BatchSeq, (int64)5);
     Component->CompleteItemFlush(
-      TEXT("batch was never applied"), Fence, Fixture::NoItems, Fixture::NoItems, 1, 0, false, false, true
+      Fixture::MakeNotAppliedReply(TEXT("batch was never applied"), Fence), Fixture::MakeSent(1, 0)
     );
     TestEqual(TEXT("The entry is kept"), Component->GetPendingCurrencyEntries().Num(), 1);
     TestEqual(TEXT("No seq below the probed one is adopted"), Component->GetLastCommittedItemSeq(), (int64)4);
@@ -580,7 +616,7 @@ bool FRedwoodCurrencyNotAppliedNeedsConsumedSeqTest::RunTest(const FString &Para
 
   // The R31 shape: the probed seq is consumed, and the next batch goes after it.
   Component->CompleteItemFlush(
-    TEXT("batch was never applied"), 5, Fixture::NoItems, Fixture::NoItems, 1, 0, false, false, true
+    Fixture::MakeNotAppliedReply(TEXT("batch was never applied"), 5), Fixture::MakeSent(1, 0)
   );
   TestTrue(TEXT("Claim after the consumed seq succeeds"), Component->TryBeginItemFlush(BatchSeq));
   TestFalse(TEXT("It is a normal batch"), Component->IsItemFlushReplayProbe());

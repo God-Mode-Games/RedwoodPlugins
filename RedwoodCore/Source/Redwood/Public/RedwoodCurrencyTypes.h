@@ -45,6 +45,92 @@ struct REDWOOD_API FRedwoodCurrencyEntry {
   FString ActorAccountId;
 };
 
+// The fields of a realm:characters:items:flush reply. An error reply means the batch was NOT
+// saved, whatever CommittedSeq says.
+struct FRedwoodItemFlushReply {
+  FString Error;
+  // -1 when the reply carried no fence (a dropped socket, a timeout).
+  int64 CommittedSeq = -1;
+  bool bFinal = false;
+  bool bRebaseRequired = false;
+  // The backend's answer to a probe whose seq never committed: nothing was written.
+  bool bNotApplied = false;
+  // The writer token this session sent is stale: another session owns the character.
+  bool bWriterFenceLost = false;
+  // Set by the sidecar: it sent the batch and no answer came, so the batch MAY have applied.
+  bool bTimedOut = false;
+  // Set by the sidecar: it had no realm to send the batch to, so the batch did NOT apply.
+  bool bNotForwarded = false;
+  // Set by the realm: it could not tell whether its own commit went through. Read like bTimedOut.
+  bool bCommitUnknown = false;
+  TArray<TSharedPtr<FJsonObject>> Alerts;
+};
+
+// What one flush claimed and sent, kept for its reply.
+struct FRedwoodItemFlushSent {
+  int64 BatchSeq = 0;
+  // A re-send of an unconfirmed batch. Only a reply that settles its seq tells anything about the
+  // first attempt; a refused or unsent probe leaves that outcome unknown.
+  bool bProbe = false;
+  TArray<TPair<FString, uint64>> Upserts;
+  TArray<TPair<FString, uint64>> Deletes;
+  int32 CurrencyCount = 0;
+  // The keys themselves, not only their count: a commit adds them to the snapshot's GrantKeys.
+  TArray<FString> GrantKeys;
+  // The last sent entry's BalanceAfter: the balance the backend holds once this batch commits.
+  bool bHasBalanceAfter = false;
+  int64 BalanceAfter = 0;
+};
+
+// What a flush reply proves about the batch it answers.
+enum class ERedwoodItemFlushOutcome : uint8 {
+  // Saved: by this attempt, or by an earlier one that this one replays.
+  Committed,
+  // A probe's batch never committed, and the backend consumed its seq with an empty commit.
+  NotApplied,
+  // The sidecar never passed it to the realm.
+  NotSent,
+  // Refused for good and rolled back (`final`).
+  FinalRefusal,
+  // A trade used the seq and the batch did not apply (`rebaseRequired`).
+  RebaseRequired,
+  // The backend is behind the seq, so the batch did not apply.
+  SequenceGap,
+  // It may have committed or not.
+  Unknown,
+};
+
+// The one reading of a flush reply, shared by the component (its queues and its lane) and the
+// subsystem (the snapshot and the staff log), so the two never disagree. SentSeq is the seq the
+// batch went out under. A notApplied or a success counts only with a fence at or past SentSeq:
+// below it the seq is still free, and the attempt may yet commit there.
+inline ERedwoodItemFlushOutcome ClassifyItemFlushReply(
+  const FRedwoodItemFlushReply &Reply, int64 SentSeq
+) {
+  if (Reply.bNotForwarded) {
+    return ERedwoodItemFlushOutcome::NotSent;
+  }
+  if (Reply.bNotApplied) {
+    return Reply.CommittedSeq >= SentSeq ? ERedwoodItemFlushOutcome::NotApplied
+                                         : ERedwoodItemFlushOutcome::Unknown;
+  }
+  if (Reply.Error.IsEmpty()) {
+    return Reply.CommittedSeq >= SentSeq ? ERedwoodItemFlushOutcome::Committed
+                                         : ERedwoodItemFlushOutcome::Unknown;
+  }
+  if (Reply.bFinal) {
+    return ERedwoodItemFlushOutcome::FinalRefusal;
+  }
+  if (Reply.bRebaseRequired) {
+    return ERedwoodItemFlushOutcome::RebaseRequired;
+  }
+  // Negative means the reply had no fence at all (a dropped socket), which is not a gap.
+  if (Reply.CommittedSeq >= 0 && Reply.CommittedSeq < SentSeq - 1) {
+    return ERedwoodItemFlushOutcome::SequenceGap;
+  }
+  return ERedwoodItemFlushOutcome::Unknown;
+}
+
 // The backend refuses any other id shape for good, so the game server refuses it at the queue.
 constexpr int32 CurrencyEntryIdLength = 32;
 

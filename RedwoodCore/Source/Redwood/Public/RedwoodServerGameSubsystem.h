@@ -26,41 +26,9 @@ class URedwoodSyncComponent;
 class URedwoodCharacterComponent;
 class URedwoodPlayerStateComponent;
 
-// FORK(hollowed-oath) BEGIN: currency ledger types for the item flush (fork-added).
-// The fields of a realm:characters:items:flush reply. An error reply means the batch was NOT
-// saved, whatever CommittedSeq says.
-struct FRedwoodItemFlushReply {
-  FString Error;
-  // -1 when the reply carried no fence (a dropped socket, a timeout).
-  int64 CommittedSeq = -1;
-  bool bFinal = false;
-  bool bRebaseRequired = false;
-  // The backend's answer to a probe whose seq never committed: nothing was written.
-  bool bNotApplied = false;
-  // The writer token this session sent is stale: another session owns the character.
-  bool bWriterFenceLost = false;
-  // Set by the sidecar: it sent the batch and no answer came, so the batch MAY have applied.
-  bool bTimedOut = false;
-  // Set by the sidecar: it had no realm to send the batch to, so the batch did NOT apply.
-  bool bNotForwarded = false;
-  // Set by the realm: it could not tell whether its own commit went through. Read like bTimedOut.
-  bool bCommitUnknown = false;
-  TArray<TSharedPtr<FJsonObject>> Alerts;
-};
-
-// What one flush claimed and sent, kept for its reply.
-struct FRedwoodItemFlushSent {
-  int64 BatchSeq = 0;
-  TArray<TPair<FString, uint64>> Upserts;
-  TArray<TPair<FString, uint64>> Deletes;
-  int32 CurrencyCount = 0;
-  // The keys themselves, not only their count: a commit adds them to the snapshot's GrantKeys.
-  TArray<FString> GrantKeys;
-  // The last sent entry's BalanceAfter: the balance the backend holds once this batch commits.
-  bool bHasBalanceAfter = false;
-  int64 BalanceAfter = 0;
-};
-
+// FORK(hollowed-oath) BEGIN: currency ledger types for the item flush (fork-added). The reply and
+// the sent batch (FRedwoodItemFlushReply, FRedwoodItemFlushSent) live in RedwoodCurrencyTypes.h,
+// beside the component that takes them.
 // A flush that went out and has not been answered.
 struct FRedwoodInFlightItemFlush {
   TWeakObjectPtr<URedwoodCharacterComponent> CharacterComponent;

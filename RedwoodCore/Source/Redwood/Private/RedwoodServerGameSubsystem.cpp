@@ -2976,6 +2976,7 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // first attempt committed, the backend answers this one as a replay and applies none of its rows,
   // yet the success reply would clear them.
   const bool bReplayProbe = CharacterComponent->IsItemFlushReplayProbe();
+  Sent.bProbe = bReplayProbe;
 
   // Generation counters, not plain ids -- lets CompleteItemFlush tell "the record I sent" apart
   // from "the record as it stands after a re-dirty that arrived while this send was in flight".
@@ -3036,9 +3037,10 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     // flush isn't wedged behind a slot that never sent anything. Settle synchronously: no emit
     // means no async callback will ever settle this attempt.
     // FORK(hollowed-oath): as not sent, so the empty claim marks nothing unconfirmed.
-    CharacterComponent->CompleteItemFlush(
-      TEXT(""), CharacterComponent->GetLastCommittedItemSeq(), {}, {}, 0, 0, false, false, false, true
-    );
+    FRedwoodItemFlushReply NothingSent;
+    NothingSent.CommittedSeq = CharacterComponent->GetLastCommittedItemSeq();
+    NothingSent.bNotForwarded = true;
+    CharacterComponent->CompleteItemFlush(NothingSent, FRedwoodItemFlushSent());
     Settle();
     return;
   }
@@ -3426,18 +3428,7 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
     CharacterComponent->RequireCurrencyReload(true);
   }
 
-  CharacterComponent->CompleteItemFlush(
-    Reply.Error,
-    Reply.CommittedSeq,
-    Sent.Upserts,
-    Sent.Deletes,
-    Sent.CurrencyCount,
-    Sent.GrantKeys.Num(),
-    Reply.bFinal,
-    Reply.bRebaseRequired,
-    Reply.bNotApplied,
-    Reply.bNotForwarded
-  );
+  CharacterComponent->CompleteItemFlush(Reply, Sent);
 
   if (Reply.Alerts.Num() > 0) {
     CharacterComponent->OnCurrencyAlerts.Broadcast(Reply.Alerts);

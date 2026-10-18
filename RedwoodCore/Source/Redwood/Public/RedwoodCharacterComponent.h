@@ -521,30 +521,17 @@ public:
   // error it normally leaves dirt in place so the next tick re-sends -- EXCEPT when the backend
   // reports it has already committed at or past the seq we sent (replay/fence resync), in which
   // case NextBatchSeq is realigned to CommittedSeq + 1 so future flushes aren't wedged behind a
-  // gap the backend will keep rejecting. ALWAYS releases the flight slot. SentUpserts/SentDeletes
-  // pair each sent id with the GENERATION current for it at send time.
-  // FORK(hollowed-oath): SentCurrencyCount/SentGrantCount are the counts the batch took from the
-  // front of the currency queues. bFinalRefusal is the ack's `final` flag: it freezes the component
-  // (FreezeAfterFinalRefusal). bRebaseRequired is the ack's `rebaseRequired` flag: only that makes
-  // the queue wait for a reload (see the currency staging block above). bNotApplied is the ack's
-  // `notApplied` flag on a probe: the batch never committed, so it goes out again as a normal batch.
-  // bNotSent is the sidecar's `notForwarded`: the batch never left the sidecar, so nothing about it
-  // changes. An earlier attempt whose outcome is unknown stays unknown; otherwise the same rows and
-  // entries go out again as a normal batch, with no probe.
-  // A negative CommittedSeq means the reply carried no fence; a fence below SentSeq - 1 on an
-  // error is a sequence gap, and the lane realigns to it.
-  void CompleteItemFlush(
-    const FString &Error,
-    int64 CommittedSeq,
-    const TArray<TPair<FString, uint64>> &SentUpserts,
-    const TArray<TPair<FString, uint64>> &SentDeletes,
-    int32 SentCurrencyCount = 0,
-    int32 SentGrantCount = 0,
-    bool bFinalRefusal = false,
-    bool bRebaseRequired = false,
-    bool bNotApplied = false,
-    bool bNotSent = false
-  );
+  // gap the backend will keep rejecting. ALWAYS releases the flight slot. Sent.Upserts and
+  // Sent.Deletes pair each sent id with the GENERATION current for it at send time.
+  // FORK(hollowed-oath): the reply is read by ClassifyItemFlushReply against the seq this claim
+  // went out under. Sent.CurrencyCount and Sent.GrantKeys are what the batch took from the front of
+  // the currency queues. A final refusal freezes the component (FreezeAfterFinalRefusal). Only a
+  // rebaseRequired makes the queue wait for a reload (see the currency staging block above). A
+  // notApplied with the consumed seq sends the batch again as a normal batch. A batch the sidecar
+  // never passed on (notForwarded) changes nothing: an earlier unknown attempt stays unknown, and
+  // otherwise the same rows and entries go out again as a normal batch. A sequence gap realigns the
+  // lane to the backend's fence. Any other outcome is unknown, and the next attempt is a probe.
+  void CompleteItemFlush(const FRedwoodItemFlushReply &Reply, const FRedwoodItemFlushSent &Sent);
 
   // Seeds the committed-seq/next-batchSeq state from a freshly-loaded character's InventorySeq.
   // Called from the load-broadcast copy site (RedwoodPlayerStateCharacterUpdated) so the first

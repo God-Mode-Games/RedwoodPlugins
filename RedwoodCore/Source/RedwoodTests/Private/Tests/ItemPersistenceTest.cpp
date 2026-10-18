@@ -65,6 +65,23 @@ namespace RedwoodItemPersistenceTest {
   // CompleteItemFlush, SeedItemSeqFromCharacter) is pure component state and never touches
   // GetOwner(), so a bare NewObject is sufficient -- the same pattern the game's own component
   // tests use (e.g. NewObject<UInventoryComponent>() in InventoryTests.cpp).
+  // A flush reply as ParseItemsFlushReply leaves it, for the batch that carried these rows.
+  void CompleteFlush(
+    URedwoodCharacterComponent *Component,
+    const FString &Error,
+    int64 CommittedSeq,
+    const TArray<TPair<FString, uint64>> &SentUpserts,
+    const TArray<TPair<FString, uint64>> &SentDeletes
+  ) {
+    FRedwoodItemFlushReply Reply;
+    Reply.Error = Error;
+    Reply.CommittedSeq = CommittedSeq;
+    FRedwoodItemFlushSent Sent;
+    Sent.Upserts = SentUpserts;
+    Sent.Deletes = SentDeletes;
+    Component->CompleteItemFlush(Reply, Sent);
+  }
+
   URedwoodCharacterComponent *MakeTestComponent() {
     URedwoodCharacterComponent *Component = NewObject<URedwoodCharacterComponent>();
     Component->bUseItems = true;
@@ -155,7 +172,7 @@ bool FRedwoodItemSingleFlightClaimReleaseTest::RunTest(const FString &Parameters
   TestEqual(TEXT("Second claim leaves OutBatchSeq untouched"), SecondBatchSeq, (int64)0);
 
   TArray<TPair<FString, uint64>> EmptySentList;
-  Component->CompleteItemFlush(TEXT(""), 1, EmptySentList, EmptySentList);
+  Fixture::CompleteFlush(Component, TEXT(""), 1, EmptySentList, EmptySentList);
   TestFalse(TEXT("Flight slot released"), Component->IsItemFlushInFlight());
 
   int64 ThirdBatchSeq = 0;
@@ -203,7 +220,7 @@ bool FRedwoodItemGenerationMatchedAckTest::RunTest(const FString &Parameters) {
   const uint64 NewerGenerationA = MidFlightGeneration ? *MidFlightGeneration : 0;
   TestTrue(TEXT("A's generation moved past the sent one mid-flight"), NewerGenerationA > SentGenerationA);
 
-  Component->CompleteItemFlush(TEXT(""), BatchSeq, SentUpserts, SentDeletes);
+  Fixture::CompleteFlush(Component, TEXT(""), BatchSeq, SentUpserts, SentDeletes);
 
   // A's current generation no longer matches what was sent, so the ack must not clear it -- the
   // re-dirty that raced the send is not allowed to be silently lost.
@@ -248,7 +265,7 @@ bool FRedwoodItemErrorPathTest::RunTest(const FString &Parameters) {
 
   // A network/backend failure: CommittedSeq (0) trails what was sent (1), so this is a plain
   // retry -- not a replay/fence the backend has already committed past.
-  Component->CompleteItemFlush(TEXT("boom"), 0, SentUpserts, SentDeletes);
+  Fixture::CompleteFlush(Component, TEXT("boom"), 0, SentUpserts, SentDeletes);
 
   TestFalse(
     TEXT("Flight slot released despite the error"), Component->IsItemFlushInFlight()
@@ -290,7 +307,7 @@ bool FRedwoodItemReplayResyncTest::RunTest(const FString &Parameters) {
   // The backend acks success but reports a committed seq (5) ahead of what this flush sent (3) --
   // e.g. it had already advanced past a replayed/duplicate batch. The ack must resync to the
   // backend's authoritative value rather than trusting only the seq this flush stamped.
-  Component->CompleteItemFlush(TEXT(""), 5, EmptySentList, EmptySentList);
+  Fixture::CompleteFlush(Component, TEXT(""), 5, EmptySentList, EmptySentList);
 
   TestEqual(
     TEXT("Committed seq resyncs to the backend's value"),
