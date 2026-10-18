@@ -613,17 +613,11 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         if (RedwoodCharacterBackend.bCurrencyAmountUnknown) {
           RequireCurrencyReload();
         }
-        // FORK(hollowed-oath): a final refusal froze the character. A snapshot the freeze marked
-        // (a respawn in the same session) stays frozen; a snapshot fresh from the database (a new
-        // sign-in after character select) is the repair, and ends the freeze for the character.
+        // FORK(hollowed-oath): a snapshot the freeze marked (a respawn in the same session) starts
+        // frozen. A hydration never thaws: only the auth leg's fresh database load does (see
+        // URedwoodServerGameSubsystem::ThawCharacter), and the subsystem's per-character freeze
+        // covers a snapshot the freeze could not reach.
         bFrozenAfterFinalRefusal = RedwoodCharacterBackend.bFrozenAfterFinalRefusal;
-        if (!bFrozenAfterFinalRefusal) {
-          UGameInstance *GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
-          if (URedwoodServerGameSubsystem *ServerSubsystem =
-                GameInstance ? GameInstance->GetSubsystem<URedwoodServerGameSubsystem>() : nullptr) {
-            ServerSubsystem->ThawCharacter(IncomingCharacterId);
-          }
-        }
         HydratedItemsCharacterId = IncomingCharacterId;
       }
     }

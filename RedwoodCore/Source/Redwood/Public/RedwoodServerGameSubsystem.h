@@ -409,8 +409,9 @@ public:
   bool IsCharacterFrozen(const FString &CharacterId) const {
     return FrozenCharacterIds.Contains(CharacterId);
   }
-  // Called when a component hydrates from a snapshot that is not frozen: a new sign-in after
-  // character select, which is the repair.
+  // Called by the auth leg when the character is loaded fresh from the database (a new sign-in
+  // after character select), which is the repair. Nothing else thaws: a hydration from an existing
+  // snapshot (a respawn) may come from one the freeze could not mark.
   void ThawCharacter(const FString &CharacterId) {
     FrozenCharacterIds.Remove(CharacterId);
   }

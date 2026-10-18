@@ -782,6 +782,12 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
               URedwoodCommonGameSubsystem::ParseItemRecords(*ItemsJsonArray);
           }
 
+          // FORK(hollowed-oath): this load is fresh from the database, so it repairs a character a
+          // final refusal froze. Before SetRedwoodCharacter, whose hydration must see it thawed.
+          if (URedwoodServerGameSubsystem *FreezeSubsystem =
+                GameMode->GetGameInstance()->GetSubsystem<URedwoodServerGameSubsystem>()) {
+            FreezeSubsystem->ThawCharacter(ParsedCharacter.Id);
+          }
           PlayerStateComponent->SetRedwoodCharacter(ParsedCharacter);
           // FORK(hollowed-oath) END
           PlayerStateComponent->SetServerReady();
