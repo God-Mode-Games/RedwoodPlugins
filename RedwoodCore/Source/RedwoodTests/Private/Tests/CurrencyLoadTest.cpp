@@ -253,6 +253,15 @@ bool FRedwoodCurrencyOfflineSaveTest::RunTest(const FString &Parameters) {
   TestFalse(
     TEXT("Nothing staged applies nothing"), URedwoodServerGameSubsystem::ApplyOfflineCurrency(Character, Component)
   );
+
+  // The backend's keys are case-sensitive, so a key that differs only in case is a new one.
+  const FString OtherCaseKey = TEXT("quest:q1");
+  Component->QueueCurrency({}, {OtherCaseKey});
+  TestTrue(
+    TEXT("A key in another case is not a used one"),
+    URedwoodServerGameSubsystem::ApplyOfflineCurrency(Character, Component)
+  );
+  TestEqual(TEXT("Both keys are kept"), Character.GrantKeys.Num(), 2);
   return true;
 }
 

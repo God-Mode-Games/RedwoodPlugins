@@ -3091,7 +3091,9 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
     // keys as saved; a later fence still means this batch committed.
     if (bCommitted && Reply.CommittedSeq >= Sent.BatchSeq) {
       for (const FString &GrantKey : Sent.GrantKeys) {
-        Snapshot.GrantKeys.AddUnique(GrantKey);
+        if (!ContainsGrantKey(Snapshot.GrantKeys, GrantKey)) {
+          Snapshot.GrantKeys.Add(GrantKey);
+        }
       }
     }
 
@@ -3632,10 +3634,9 @@ bool URedwoodServerGameSubsystem::ApplyOfflineCurrency(
       break;
     }
   }
-  TSet<FString> UsedGrantKeys;
-  UsedGrantKeys.Append(Character.GrantKeys);
+  TArray<FString> UsedGrantKeys = Character.GrantKeys;
   for (const FString &GrantKey : GrantKeys) {
-    if (Refusal.IsEmpty() && UsedGrantKeys.Contains(GrantKey)) {
+    if (Refusal.IsEmpty() && ContainsGrantKey(UsedGrantKeys, GrantKey)) {
       Refusal = FString::Printf(TEXT("grant key %s is already used"), *GrantKey);
     }
     UsedGrantKeys.Add(GrantKey);

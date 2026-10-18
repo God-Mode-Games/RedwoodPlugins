@@ -147,6 +147,14 @@ inline bool TryParseCurrencyLoad(
   return true;
 }
 
+// Grant keys compare case-sensitively, as the backend's key column does. FString's own == and TSet
+// ignore case, so "quest:q1" would pass for a used "quest:Q1" that the backend counts as new.
+inline bool ContainsGrantKey(const TArray<FString> &GrantKeys, const FString &GrantKey) {
+  return GrantKeys.ContainsByPredicate([&GrantKey](const FString &Used) {
+    return Used.Equals(GrantKey, ESearchCase::CaseSensitive);
+  });
+}
+
 // The same `{ amount, grants }` shape, for the offline character file. The amount is a decimal
 // string, as on the wire, so an offline file and a backend reply are read by the same rule.
 inline TSharedPtr<FJsonObject> MakeCurrencyLoadObject(
