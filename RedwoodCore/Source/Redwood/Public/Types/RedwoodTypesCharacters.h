@@ -125,6 +125,12 @@ struct FRedwoodCharacterBackend {
 
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   int64 InventorySeq = 0;
+
+  // The committed currency balance, in currency units. Kept current by the item flush reply and by
+  // the currency reload, like InventorySeq, so a component recreated mid-session and the game
+  // start their balance chain from what the backend holds instead of from the login value.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  int64 CurrencyAmount = 0;
   // FORK(hollowed-oath) END
 };
 
