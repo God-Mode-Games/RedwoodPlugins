@@ -3666,6 +3666,17 @@ void URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync(
     IsValid(CharacterComponent) ? CharacterComponent->FindPlayerController() : nullptr;
   const FString CharacterId =
     IsValid(CharacterComponent) ? CharacterComponent->RedwoodCharacterId : FString();
+  // A server that is shutting down ends every session anyway; a kick now would only race it.
+  if (bIsShuttingDown) {
+    UE_LOG(
+      LogRedwood,
+      Log,
+      TEXT("Character %s cannot be saved (%s); the server is shutting down, so nobody is kicked"),
+      *CharacterId,
+      *Why
+    );
+    return;
+  }
   if (!IsValid(PlayerController)) {
     UE_LOG(
       LogRedwood,
@@ -3687,7 +3698,12 @@ void URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync(
   // reply, and the kick destroys the controller, and with it the PlayerState and the pawn, while
   // that reply is still being handled.
   TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
-  AsyncTask(ENamedThreads::GameThread, [WeakPlayerController]() {
+  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
+  AsyncTask(ENamedThreads::GameThread, [WeakPlayerController, WeakSubsystem]() {
+    const URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
+    if (!Subsystem || Subsystem->bIsShuttingDown) {
+      return;
+    }
     if (APlayerController *LivePlayerController = WeakPlayerController.Get()) {
       KickPlayerOrDestroyController(
         LivePlayerController, FText::FromString(CurrencyDesyncKickMessage)

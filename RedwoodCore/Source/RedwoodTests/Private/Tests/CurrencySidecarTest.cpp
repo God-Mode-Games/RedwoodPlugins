@@ -91,6 +91,10 @@ public:
   static void ResendTradeNow(URedwoodServerGameSubsystem &Subsystem, const FString &TradeId) {
     Subsystem.SendItemsTrade(TradeId);
   }
+  // The shutdown message's flag, without sending the message.
+  static void SetShuttingDown(URedwoodServerGameSubsystem &Subsystem) {
+    Subsystem.bIsShuttingDown = true;
+  }
   // A flush's reply timer firing, without waiting for it.
   static void TimeOutFlush(URedwoodServerGameSubsystem &Subsystem, uint64 Generation) {
     Subsystem.HandleItemsFlushTimeout(Generation);
@@ -3240,11 +3244,15 @@ bool FRedwoodCurrencySidecarUnhandledDesyncKicksTest::RunTest(const FString &Par
   FPlayerParty FencedHandled;
   FPlayerParty Refused;
   FPlayerParty RefusedHandled;
+  FPlayerParty FencedStale;
+  FPlayerParty FencedAtShutdown;
   // One character each: a freeze is per character.
   if (!KickProbe || !MakePlayerParty(Harness, TEXT("character-fenced"), Fenced) ||
       !MakePlayerParty(Harness, TEXT("character-fenced-handled"), FencedHandled) ||
       !MakePlayerParty(Harness, TEXT("character-refused"), Refused) ||
-      !MakePlayerParty(Harness, TEXT("character-refused-handled"), RefusedHandled)) {
+      !MakePlayerParty(Harness, TEXT("character-refused-handled"), RefusedHandled) ||
+      !MakePlayerParty(Harness, TEXT("character-fenced-stale"), FencedStale) ||
+      !MakePlayerParty(Harness, TEXT("character-fenced-shutdown"), FencedAtShutdown)) {
     return false;
   }
 
@@ -3284,6 +3292,26 @@ bool FRedwoodCurrencySidecarUnhandledDesyncKicksTest::RunTest(const FString &Par
   PumpFor(QuietWindowSeconds);
   TestEqual(TEXT("The handler hears the final refusal"), RefusalCount, 1);
   TestEqual(TEXT("A handled final refusal kicks nobody"), KickProbe->KickCount, 2);
+
+  // A listener whose object is gone handles nothing: the player is kicked all the same.
+  UObject *GoneListener = NewObject<UObject>();
+  int32 StaleCount = 0;
+  FencedStale.Component->OnWriterFenceLost.AddWeakLambda(
+    GoneListener, [&StaleCount](const FString &) { ++StaleCount; }
+  );
+  GoneListener->MarkAsGarbage();
+  FencedStale.Component->MarkWriterFenceLost();
+  TestTrue(
+    TEXT("A stale binding does not stop the kick"),
+    Harness.PumpUntil([KickProbe]() { return KickProbe->KickCount == 3; })
+  );
+  TestEqual(TEXT("The stale listener never runs"), StaleCount, 0);
+
+  // A server that is shutting down kicks nobody.
+  FAccess::SetShuttingDown(*Harness.Subsystem);
+  FencedAtShutdown.Component->MarkWriterFenceLost();
+  PumpFor(QuietWindowSeconds);
+  TestEqual(TEXT("No kick while the server shuts down"), KickProbe->KickCount, 3);
   return true;
 }
 
