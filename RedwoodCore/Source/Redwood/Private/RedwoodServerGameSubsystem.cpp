@@ -3927,7 +3927,6 @@ void URedwoodServerGameSubsystem::EmitItemsTrade(
       ChainedCurrency.Emplace(Side->CharacterId, Entry);
     }
   }
-  Trade.bCarriesCurrency = ChainedCurrency.Num() > 0;
   Trade.Payload = BuildItemsTradePayload(
     Trade.From.CharacterId,
     Trade.To.CharacterId,
@@ -4201,6 +4200,11 @@ FRedwoodItemTradeReply URedwoodServerGameSubsystem::ParseItemsTradeReply(
   return Parsed;
 }
 
+bool URedwoodServerGameSubsystem::IsItemsTradeSessionRefusal(const FString &Error) {
+  return Error.Equals(TradeNotBoundError, ESearchCase::CaseSensitive) ||
+    Error.Equals(TradeNotAuthorizedError, ESearchCase::CaseSensitive);
+}
+
 ERedwoodItemTradeOutcome URedwoodServerGameSubsystem::ClassifyItemsTradeReply(
   const FRedwoodItemTradeReply &Reply, int64 FromSeqBefore, int64 ToSeqBefore
 ) {
@@ -4268,14 +4272,14 @@ void URedwoodServerGameSubsystem::HandleItemsTradeReply(
       }
       break;
     default:
-      // A refusal after an attempt whose outcome is unknown proves nothing: the realm checks for a
-      // committed resend only after the binding and fence checks, and a resend that raced a still
-      // running first attempt can be refused by its item checks although that attempt committed.
-      if (Trade->bOutcomeUnknown) {
-        GiveUpItemsTrade(
-          TradeId,
-          FString::Printf(TEXT("a resend was refused (%s) after an attempt whose outcome is unknown"), *Parsed.Error)
-        );
+      // After an attempt whose outcome is unknown, a refusal of the resend is proof that nothing
+      // applied: the realm checks for a committed trade (its receipt, or its ledger rows) after
+      // every refusal it makes inside its transaction, and acks a committed one as a replay. Its
+      // refusals before the transaction are the same on every attempt, so the first attempt was
+      // refused too, except the two that depend on this server's session: those say nothing about
+      // the earlier attempt, so the trade is sent again.
+      if (Trade->bOutcomeUnknown && IsItemsTradeSessionRefusal(Parsed.Error)) {
+        RetryItemsTrade(TradeId, Parsed.Error);
         return;
       }
       break;
@@ -4309,14 +4313,6 @@ void URedwoodServerGameSubsystem::HandleItemsTradeTimeout(const FString &TradeId
 void URedwoodServerGameSubsystem::RetryItemsTrade(const FString &TradeId, const FString &Reason) {
   FRedwoodPendingItemTrade *Trade = PendingItemTrades.Find(TradeId);
   if (!Trade) {
-    return;
-  }
-  // The backend knows a committed resend only by its ledger rows. With no currency, a resend of a
-  // committed trade is refused like a new trade that cannot apply, so a resend would prove nothing.
-  if (Trade->bOutcomeUnknown && !Trade->bCarriesCurrency) {
-    GiveUpItemsTrade(
-      TradeId, FString::Printf(TEXT("%s; a trade without currency cannot be resent"), *Reason)
-    );
     return;
   }
   if (Trade->Attempts >= TradeMaxAttempts) {

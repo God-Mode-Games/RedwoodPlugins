@@ -147,7 +147,6 @@ struct FRedwoodPendingItemTrade {
   FRedwoodItemTradeSide To;
   // Every attempt sends exactly this: the backend knows a resend by its trade id and entry ids.
   TSharedPtr<FJsonObject> Payload;
-  bool bCarriesCurrency = false;
   TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete;
   TArray<FRedwoodHeldItemFlush> HeldFlushes;
   int32 Attempts = 0;
@@ -426,10 +425,11 @@ public:
   // on its component and snapshot (the caller must NOT re-seed), entries staged meanwhile are
   // re-chained from the new balance, and OnCurrencyRebased tells the game. An error means NOT
   // applied: nothing is dropped or applied, and staged entries are re-chained from the balance
-  // before the trade. A timed-out trade that carries currency is sent again, unchanged, with the
-  // lanes still held, until a reply settles it (TradeResendSeconds, TradeMaxAttempts). A trade
-  // whose outcome cannot be learned (no currency to know a resend by, a refusal after a timeout,
-  // or no reply after every attempt) freezes both characters like a final refusal: each one's
+  // before the trade. A trade whose outcome is unknown (a timeout, or a commit the realm could not
+  // confirm) is sent again, byte for byte, with the lanes still held, until a reply settles it
+  // (TradeResendSeconds, TradeMaxAttempts): the backend acks a committed one from its receipt. A
+  // trade whose outcome cannot be learned (no settling reply after every attempt, or the server
+  // shutting down) freezes both characters like a final refusal: each one's
   // OnItemFlushRefusedFinal fires and OnComplete gets an error. The game must then send both
   // players through character select. Alerts the trade raised go to OnCurrencyAlerts of the
   // character they name.
@@ -527,6 +527,16 @@ public:
   static constexpr const TCHAR *FlushTimedOutError = TEXT("Item flush request timed out.");
   static constexpr const TCHAR *SidecarRealmNotConnectedError = TEXT("Realm server not connected");
 
+  // FORK(hollowed-oath): the realm's two trade refusals that run before its transaction and depend
+  // on this server's session (its sidecar socket, the characters' binding), so a resend can get one
+  // although an earlier attempt committed (realm-backend/src/routes/sidecar/items.ts). Every other
+  // refusal is the same on every attempt or comes after the realm checked for a commit. The realm
+  // has no flag for these, so the texts are matched.
+  static constexpr const TCHAR *TradeNotBoundError =
+    TEXT("both characters must be bound to this instance");
+  static constexpr const TCHAR *TradeNotAuthorizedError = TEXT("not authorized");
+  static bool IsItemsTradeSessionRefusal(const FString &Error);
+
   // The only reason the backend takes on a trade entry.
   static constexpr const TCHAR *TradeCurrencyReason = TEXT("Currency.Reason.Trade");
   // The sidecar's text when its realm request for a trade timed out. Read only from a sidecar too
@@ -535,9 +545,9 @@ public:
   // A trade with no reply by then counts as timed out. The sidecar answers within its own realm
   // timeout (10 seconds), so a longer silence means the socket dropped and no reply will come.
   static constexpr float TradeReplyTimeoutSeconds = 30.f;
-  // The wait before a timed-out trade is sent again. A realm that timed out may still be running
-  // the first attempt; a resend that races it can be refused although the trade committed, and a
-  // refusal after a timeout freezes both characters. The wait makes that race unlikely.
+  // The wait before a trade with an unknown outcome is sent again. A realm that timed out may still
+  // be running the first attempt, and a resend now would only queue behind it on the same rows; the
+  // wait gives it time to finish, so the resend gets its replay ack instead of another timeout.
   static constexpr float TradeResendSeconds = 5.f;
   // After this many attempts with no settling reply the trade gives up and freezes both
   // characters. A wait for the sidecar does not count. Without a limit, a held detached pawn's

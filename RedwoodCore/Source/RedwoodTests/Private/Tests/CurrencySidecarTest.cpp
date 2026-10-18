@@ -15,8 +15,10 @@
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "Misc/AutomationTest.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 
 #include "CurrencyFlushTestActor.h"
 #include "FakeSocketIoServer.h"
@@ -1557,6 +1559,17 @@ namespace RedwoodCurrencyTradeTest {
                                                             : FString();
   }
 
+  // The payload as one line of JSON, to compare two sends byte for byte.
+  FString SerializePayload(const TSharedPtr<FJsonObject> &Payload) {
+    FString Text;
+    if (Payload.IsValid()) {
+      TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Text);
+      FJsonSerializer::Serialize(Payload.ToSharedRef(), Writer);
+    }
+    return Text;
+  }
+
   int64 BatchSeqOf(const TSharedPtr<FJsonObject> &Payload) {
     return Payload.IsValid() ? static_cast<int64>(Payload->GetNumberField(TEXT("batchSeq"))) : -1;
   }
@@ -1787,6 +1800,7 @@ bool FRedwoodCurrencyTradeTimeoutResendTest::RunTest(const FString &Parameters) 
     return false;
   }
   TestEqual(TEXT("The resend keeps the trade id"), Second.Payload->GetStringField(TEXT("tradeId")), TradeId);
+  TestEqual(TEXT("The resend is byte for byte the first send"), SerializePayload(Second.Payload), SerializePayload(First.Payload));
   for (int32 Index = 0; Index < 2; ++Index) {
     for (const TCHAR *Field : {TEXT("characterId"), TEXT("id"), TEXT("delta"), TEXT("balanceAfter")}) {
       TestEqual(
@@ -1853,17 +1867,74 @@ bool FRedwoodCurrencyTradeLaterFenceTest::RunTest(const FString &Parameters) {
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   FRedwoodCurrencyTradeRefusalAfterTimeoutTest,
-  "Redwood.Currency.Trade.RefusalAfterTimeoutFreezes",
+  "Redwood.Currency.Trade.RefusalAfterTimeoutIsNotApplied",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// A trade with no reply is sent again. A late reply to the first attempt is ignored. A refusal of
-// the resend proves nothing about the first attempt, so both characters freeze, the game is told,
-// and the held flush settles with nothing sent.
+// A trade with no reply is sent again, and a late reply to the first attempt is ignored. The realm
+// checks for a committed trade after every refusal inside its transaction, so a refusal of the
+// resend proves the trade never applied: it settles as NOT applied, and nobody freezes.
 bool FRedwoodCurrencyTradeRefusalAfterTimeoutTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencyTradeTest;
   AddExpectedErrorPlain(TEXT("got no reply"), EAutomationExpectedErrorFlags::Contains, 1);
   AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, 1);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  FTradeResult Result;
+  FRequest First;
+  if (!SendTrade(Harness, From, To, Result, First)) {
+    return false;
+  }
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(
+    From.PlayerStateComponent, From.Component, [&SettleCount]() { ++SettleCount; }
+  );
+
+  FAccess::TimeOutTrade(*Harness.Subsystem, TradeId);
+  FAccess::ResendTradeNow(*Harness.Subsystem, TradeId);
+  FRequest Second;
+  if (!Harness.ReadRequest(TradeEvent, Second)) {
+    return false;
+  }
+  Harness.Answer(First, CommittedReply(FromSeq + 1, ToSeq + 1));
+  PumpFor(QuietWindowSeconds);
+  TestEqual(TEXT("A late reply settles nothing"), Result.Calls, 0);
+  TestEqual(TEXT("A late reply moves no seq"), From.Component->GetLastCommittedItemSeq(), FromSeq);
+
+  Harness.Answer(Second, ErrorReply(TEXT("character is owned by another session")));
+  TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
+  TestFalse(TEXT("The caller gets the error"), Result.Error.IsEmpty());
+  TestFalse(TEXT("The payer is not frozen"), Harness.Subsystem->IsCharacterFrozen(FromId));
+  TestFalse(TEXT("The payee is not frozen"), Harness.Subsystem->IsCharacterFrozen(ToId));
+  TestEqual(TEXT("The payer's lane is unchanged"), From.Component->GetLastCommittedItemSeq(), FromSeq);
+  TestEqual(TEXT("The payer's balance is unchanged"), From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, FromBalance);
+  TestEqual(TEXT("The held flush settles"), SettleCount, 1);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeNoSettlingReplyTest,
+  "Redwood.Currency.Trade.NoSettlingReplyFreezes",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// After a timeout, a refusal that depends on this server's session (the characters' binding) says
+// nothing about the first attempt, so the trade is sent again. When no attempt settles it, its
+// outcome cannot be learned: both characters freeze, the game is told, and the held flush settles
+// with nothing sent.
+bool FRedwoodCurrencyTradeNoSettlingReplyTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  const int32 Resends = URedwoodServerGameSubsystem::TradeMaxAttempts - 1;
+  AddExpectedErrorPlain(TEXT("got no reply"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, Resends);
   AddExpectedErrorPlain(TEXT("Its outcome is UNKNOWN"), EAutomationExpectedErrorFlags::Contains, 1);
   AddExpectedErrorPlain(TEXT("is frozen after a final refusal"), EAutomationExpectedErrorFlags::Contains, 1);
   FSidecarHarness Harness(*this);
@@ -1892,19 +1963,22 @@ bool FRedwoodCurrencyTradeRefusalAfterTimeoutTest::RunTest(const FString &Parame
   Harness.Subsystem->FlushItemsForCharacterComponent(
     From.PlayerStateComponent, From.Component, [&SettleCount]() { ++SettleCount; }
   );
-
   FAccess::TimeOutTrade(*Harness.Subsystem, TradeId);
-  FAccess::ResendTradeNow(*Harness.Subsystem, TradeId);
-  FRequest Second;
-  if (!Harness.ReadRequest(TradeEvent, Second)) {
-    return false;
-  }
-  Harness.Answer(First, CommittedReply(FromSeq + 1, ToSeq + 1));
-  PumpFor(QuietWindowSeconds);
-  TestEqual(TEXT("A late reply settles nothing"), Result.Calls, 0);
-  TestEqual(TEXT("A late reply moves no seq"), From.Component->GetLastCommittedItemSeq(), FromSeq);
 
-  Harness.Answer(Second, ErrorReply(TEXT("character is owned by another session")));
+  for (int32 Attempt = 0; Attempt < Resends; ++Attempt) {
+    TestEqual(TEXT("Not settled while attempts remain"), Result.Calls, 0);
+    FAccess::ResendTradeNow(*Harness.Subsystem, TradeId);
+    FRequest Resend;
+    if (!Harness.ReadRequest(TradeEvent, Resend)) {
+      return false;
+    }
+    Harness.Answer(Resend, ErrorReply(URedwoodServerGameSubsystem::TradeNotBoundError));
+    Harness.PumpUntil([&Harness]() {
+      const FRedwoodPendingItemTrade *Pending = FAccess::Trade(*Harness.Subsystem, TradeId);
+      return !Pending || Pending->Generation == 0;
+    });
+  }
+
   TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
   TestFalse(TEXT("The caller gets an error"), Result.Error.IsEmpty());
   TestTrue(TEXT("The payer is frozen"), Harness.Subsystem->IsCharacterFrozen(FromId));
@@ -1922,17 +1996,17 @@ bool FRedwoodCurrencyTradeRefusalAfterTimeoutTest::RunTest(const FString &Parame
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodCurrencyTradeItemOnlyTimeoutTest,
-  "Redwood.Currency.Trade.ItemOnlyTimeoutFreezes",
+  FRedwoodCurrencyTradeItemOnlyCommitUnknownTest,
+  "Redwood.Currency.Trade.ItemOnlyCommitUnknownResends",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// A trade with no currency cannot be resent: the backend knows a committed resend only by its
-// ledger rows. A timeout then leaves the outcome unknown for good, and both characters freeze.
-bool FRedwoodCurrencyTradeItemOnlyTimeoutTest::RunTest(const FString &Parameters) {
+// A trade with items only, whose commit the realm could not confirm, is sent again byte for byte
+// (the backend refuses a reused trade id with other contents), with both lanes held. Its receipt
+// lets the backend ack the resend as a replay, and the trade then settles as committed.
+bool FRedwoodCurrencyTradeItemOnlyCommitUnknownTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencyTradeTest;
   AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, 1);
-  AddExpectedErrorPlain(TEXT("Its outcome is UNKNOWN"), EAutomationExpectedErrorFlags::Contains, 1);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
@@ -1949,19 +2023,34 @@ bool FRedwoodCurrencyTradeItemOnlyTimeoutTest::RunTest(const FString &Parameters
   Placement.Slot = 0;
   FTradeResult Result;
   Harness.Subsystem->EmitItemsTrade(From.Component, To.Component, {Placement}, {}, TradeId, Capture(Result));
-  FRequest Trade;
-  if (!Harness.ReadRequest(TradeEvent, Trade)) {
+  FRequest First;
+  if (!Harness.ReadRequest(TradeEvent, First)) {
     return false;
   }
-  TestEqual(TEXT("The item-only trade carries an empty currency array"), CountArray(Trade.Payload, TEXT("currency")), 0);
-  TestEqual(TEXT("It still carries the trade id"), Trade.Payload->GetStringField(TEXT("tradeId")), TradeId);
+  TestEqual(TEXT("The item-only trade carries an empty currency array"), CountArray(First.Payload, TEXT("currency")), 0);
+  TestEqual(TEXT("It still carries the trade id"), First.Payload->GetStringField(TEXT("tradeId")), TradeId);
 
-  Harness.Answer(Trade, TimedOutReply());
+  Harness.Answer(
+    First,
+    TEXT(R"({"error":"database socket timed out","fromCommittedSeq":-1,"toCommittedSeq":-1,"commitUnknown":true})")
+  );
+  Harness.Subsystem->FlushItemsForCharacterComponent(To.PlayerStateComponent, To.Component);
+  TestTrue(TEXT("Nothing goes out before the resend"), Harness.IsQuiet());
+  TestEqual(TEXT("The trade is not settled"), Result.Calls, 0);
+  TestFalse(TEXT("Nobody is frozen"), Harness.Subsystem->IsCharacterFrozen(FromId));
+
+  FAccess::ResendTradeNow(*Harness.Subsystem, TradeId);
+  FRequest Second;
+  if (!Harness.ReadRequest(TradeEvent, Second)) {
+    return false;
+  }
+  TestEqual(TEXT("The resend is byte for byte the first send"), SerializePayload(Second.Payload), SerializePayload(First.Payload));
+
+  Harness.Answer(Second, CommittedReply(FromSeq + 1, ToSeq + 1));
   TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
-  TestFalse(TEXT("The caller gets an error"), Result.Error.IsEmpty());
-  TestTrue(TEXT("The giver is frozen"), Harness.Subsystem->IsCharacterFrozen(FromId));
-  TestTrue(TEXT("The receiver is frozen"), Harness.Subsystem->IsCharacterFrozen(ToId));
-  TestTrue(TEXT("No resend goes out"), Harness.IsQuiet());
+  TestTrue(TEXT("The replay settles it as committed"), Result.Error.IsEmpty());
+  TestEqual(TEXT("The giver's lane takes the fence"), From.Component->GetLastCommittedItemSeq(), FromSeq + 1);
+  TestEqual(TEXT("The receiver's lane takes the fence"), To.Component->GetLastCommittedItemSeq(), ToSeq + 1);
   return true;
 }
 
