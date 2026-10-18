@@ -3132,7 +3132,7 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
 }
 
 ERedwoodCurrencyReloadResult URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
-  const TSharedPtr<FJsonObject> &Reply, int64 &OutBalance
+  const TSharedPtr<FJsonObject> &Reply, int64 &OutBalance, TArray<FString> &OutGrantKeys
 ) {
   // Every error reply also carries a filler balance of "0", so the error is checked first: a
   // rebase from that filler would chain every held entry from zero.
@@ -3157,19 +3157,12 @@ ERedwoodCurrencyReloadResult URedwoodServerGameSubsystem::ParseCurrencyReloadRep
     return ERedwoodCurrencyReloadResult::Retry;
   }
 
+  // The same rule as the auth leg's load (TryParseCurrencyLoad): the grant keys are part of the
+  // loaded state, and a reload that dropped them would leave the snapshot's keys stale.
   const TSharedPtr<FJsonObject> *Currency = nullptr;
-  FString BalanceText;
-  // A string only: TryGetStringField also reads a JSON number, which may have been rounded.
   if (!Reply->TryGetObjectField(TEXT("currency"), Currency) || !Currency ||
-      !(*Currency)->HasTypedField<EJson::String>(TEXT("amount")) ||
-      !(*Currency)->TryGetStringField(TEXT("amount"), BalanceText) ||
-      !TryParseCurrencyAmount(BalanceText, OutBalance) || OutBalance < 0) {
-    UE_LOG(
-      LogRedwood,
-      Error,
-      TEXT("Currency reload failed: the reply has no readable balance ('%s')"),
-      *BalanceText
-    );
+      !TryParseCurrencyLoad(*Currency, OutBalance, OutGrantKeys)) {
+    UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: the reply has no readable currency"));
     return ERedwoodCurrencyReloadResult::Retry;
   }
   return ERedwoodCurrencyReloadResult::Applied;
@@ -3178,7 +3171,8 @@ ERedwoodCurrencyReloadResult URedwoodServerGameSubsystem::ParseCurrencyReloadRep
 bool URedwoodServerGameSubsystem::ApplyCurrencyReload(
   URedwoodCharacterComponent *CharacterComponent,
   URedwoodPlayerStateComponent *PlayerStateComponent,
-  int64 Balance
+  int64 Balance,
+  const TArray<FString> &GrantKeys
 ) {
   if (CharacterComponent->IsCurrencyRebaseRequired()) {
     CharacterComponent->RebaseCurrency(Balance);
@@ -3191,10 +3185,13 @@ bool URedwoodServerGameSubsystem::ApplyCurrencyReload(
     }
   }
 
-  // The loaded balance is committed, so the snapshot takes it, as it takes a flush's.
+  // The loaded balance is committed, so the snapshot takes it, as it takes a flush's. The keys
+  // too: they are the backend's whole set, read in the same transaction as the balance, so they
+  // replace the snapshot's (and carry a key that a flush committed but whose ack was lost).
   if (PlayerStateComponent) {
     PlayerStateComponent->RedwoodCharacter.CurrencyAmount = Balance;
     PlayerStateComponent->RedwoodCharacter.bCurrencyAmountUnknown = false;
+    PlayerStateComponent->RedwoodCharacter.GrantKeys = GrantKeys;
   }
 
   CharacterComponent->OnCurrencyRebased.Broadcast(Balance);
@@ -3367,7 +3364,8 @@ void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
   }
 
   int64 Balance = 0;
-  switch (ParseCurrencyReloadReply(Reply, Balance)) {
+  TArray<FString> GrantKeys;
+  switch (ParseCurrencyReloadReply(Reply, Balance, GrantKeys)) {
     case ERedwoodCurrencyReloadResult::GiveUp:
       GiveUpCurrencyReload(CharacterId, TEXT("this session no longer owns the character"));
       return;
@@ -3385,7 +3383,7 @@ void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
   for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Components) {
     URedwoodCharacterComponent *Component = WeakComponent.Get();
     if (IsValid(Component) && Component->IsCurrencyRebaseRequired() &&
-        !ApplyCurrencyReload(Component, WeakPlayerState.Get(), Balance)) {
+        !ApplyCurrencyReload(Component, WeakPlayerState.Get(), Balance, GrantKeys)) {
       RetryCurrencyReload(CharacterId);
       return;
     }

@@ -404,15 +404,24 @@ bool FRedwoodCurrencyReloadRebasesTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("The refusal holds the entries for a reload"), Component->IsCurrencyRebaseRequired());
 
   int64 Balance = 0;
+  TArray<FString> GrantKeys;
   const ERedwoodCurrencyReloadResult Result = URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
     Fixture::ParseJson(TEXT(R"({"error":null,"items":[],"currency":{"amount":"2000","grants":["quest:Q1"]}})")),
-    Balance
+    Balance,
+    GrantKeys
   );
   TestTrue(TEXT("The reply parses"), Result == ERedwoodCurrencyReloadResult::Applied);
   TestEqual(TEXT("The balance is read exactly"), Balance, (int64)2000);
+  TestTrue(TEXT("The used keys are read"), GrantKeys == TArray<FString>{Fixture::QuestGrantKey});
+  TestEqual(TEXT("The snapshot lacks the key before"), PlayerState->RedwoodCharacter.GrantKeys.Num(), 0);
   TestTrue(
     TEXT("The reload applies"),
-    URedwoodServerGameSubsystem::ApplyCurrencyReload(Component, PlayerState, Balance)
+    URedwoodServerGameSubsystem::ApplyCurrencyReload(Component, PlayerState, Balance, GrantKeys)
+  );
+  // A key that a batch committed while its ack was lost reaches the snapshot only through here.
+  TestTrue(
+    TEXT("The snapshot takes the reloaded keys"),
+    PlayerState->RedwoodCharacter.GrantKeys == TArray<FString>{Fixture::QuestGrantKey}
   );
 
   TestFalse(TEXT("The hold ends"), Component->IsCurrencyRebaseRequired());
@@ -451,27 +460,33 @@ bool FRedwoodCurrencyReloadReplyParseTest::RunTest(const FString &Parameters) {
     TEXT(R"({"error":null,"items":[],"currency":{"amount":"-5","grants":[]}})"),
     TEXT(R"({"error":null,"items":[],"currency":{"amount":2000,"grants":[]}})"),
     TEXT(R"({"items":[],"currency":{"amount":"2000","grants":[]}})"),
+    // The keys are part of the loaded state, so a reply without readable keys fails too.
+    TEXT(R"({"error":null,"items":[],"currency":{"amount":"2000"}})"),
+    TEXT(R"({"error":null,"items":[],"currency":{"amount":"2000","grants":[5]}})"),
   };
   for (const TCHAR *ReplyText : RetriedReplies) {
     int64 Balance = 0;
+    TArray<FString> GrantKeys;
     TestTrue(
       FString::Printf(TEXT("Retried: %s"), ReplyText),
-      URedwoodServerGameSubsystem::ParseCurrencyReloadReply(Fixture::ParseJson(ReplyText), Balance) ==
+      URedwoodServerGameSubsystem::ParseCurrencyReloadReply(Fixture::ParseJson(ReplyText), Balance, GrantKeys) ==
         ERedwoodCurrencyReloadResult::Retry
     );
   }
 
   int64 Balance = 0;
+  TArray<FString> GrantKeys;
   TestTrue(
     TEXT("An unreadable reply is retried"),
-    URedwoodServerGameSubsystem::ParseCurrencyReloadReply(TSharedPtr<FJsonObject>(), Balance) ==
+    URedwoodServerGameSubsystem::ParseCurrencyReloadReply(TSharedPtr<FJsonObject>(), Balance, GrantKeys) ==
       ERedwoodCurrencyReloadResult::Retry
   );
   TestTrue(
     TEXT("A lost writer fence gives up at once"),
     URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
       Fixture::ParseJson(TEXT(R"({"error":"character not bound to this instance","writerFenceLost":true,"items":[],"currency":{"amount":"0","grants":[]}})")),
-      Balance
+      Balance,
+      GrantKeys
     ) == ERedwoodCurrencyReloadResult::GiveUp
   );
 

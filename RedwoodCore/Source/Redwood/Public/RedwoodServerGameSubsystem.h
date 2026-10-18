@@ -403,19 +403,21 @@ public:
     const FRedwoodItemFlushSent &Sent
   );
 
-  // Reads the balance off a realm:characters:items:load reply. Anything but Applied leaves
-  // OutBalance unusable.
+  // Reads the balance and the used grant keys off a realm:characters:items:load reply. Anything
+  // but Applied leaves both outputs unusable.
   static ERedwoodCurrencyReloadResult ParseCurrencyReloadReply(
-    const TSharedPtr<FJsonObject> &Reply, int64 &OutBalance
+    const TSharedPtr<FJsonObject> &Reply, int64 &OutBalance, TArray<FString> &OutGrantKeys
   );
 
   // Applies a parsed reload to one component that asked for it: rebases its held currency from
-  // Balance, writes the balance to the snapshot, and tells the game (OnCurrencyRebased). Returns
-  // false when the rebase cannot apply; the component is then unchanged and stays held.
+  // Balance, writes the balance and the grant keys to the snapshot, and tells the game
+  // (OnCurrencyRebased). Returns false when the rebase cannot apply; the component and the
+  // snapshot are then unchanged and it stays held.
   static bool ApplyCurrencyReload(
     URedwoodCharacterComponent *CharacterComponent,
     URedwoodPlayerStateComponent *PlayerStateComponent,
-    int64 Balance
+    int64 Balance,
+    const TArray<FString> &GrantKeys
   );
 
   // FORK(hollowed-oath): the per-character freeze after a final refusal. A frozen character sends
