@@ -367,8 +367,8 @@ public:
   // which staged change depended on the refused one. The character freezes (see
   // FreezeAfterFinalRefusal) until it is hydrated again from the database.
   //
-  // Returns false when anything was refused: every entry and key while the character is frozen,
-  // or an entry whose id the backend would refuse. The caller must not count a refused amount.
+  // Returns false when anything was refused: every entry and key while the character is frozen or
+  // its writer fence is lost, or an entry whose id the backend would refuse. The caller must not count a refused amount.
   bool QueueCurrency(
     const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
   );

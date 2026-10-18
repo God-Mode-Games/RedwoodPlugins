@@ -854,18 +854,24 @@ bool URedwoodCharacterComponent::QueueCurrency(
   const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
 ) {
   // Frozen, per component (this one was refused) or per character (another component of it was):
-  // an amount staged now would be chained from a balance nobody can vouch for.
+  // an amount staged now would be chained from a balance nobody can vouch for. A lost writer fence
+  // is refused the same way: this component never sends again, and an entry accepted here would be
+  // money the game believes saved.
   UGameInstance *GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
   const URedwoodServerGameSubsystem *ServerSubsystem =
     GameInstance ? GameInstance->GetSubsystem<URedwoodServerGameSubsystem>() : nullptr;
-  if (bFrozenAfterFinalRefusal ||
-      (ServerSubsystem && ServerSubsystem->IsCharacterFrozen(RedwoodCharacterId))) {
+  const bool bFrozen = bFrozenAfterFinalRefusal ||
+    (ServerSubsystem && ServerSubsystem->IsCharacterFrozen(RedwoodCharacterId));
+  if (bFrozen || bWriterFenceLost) {
+    const TCHAR *Why = bFrozen ? TEXT("is frozen after a final refusal")
+                               : TEXT("lost its writer fence (another session owns it)");
     for (const FRedwoodCurrencyEntry &Entry : Entries) {
       UE_LOG(
         LogRedwood,
         Error,
-        TEXT("QueueCurrency: character %s is frozen after a final refusal; refused entry %s delta %lld reason %s"),
+        TEXT("QueueCurrency: character %s %s; refused entry %s delta %lld reason %s"),
         *RedwoodCharacterId,
+        Why,
         *Entry.Id,
         Entry.Delta,
         *Entry.Reason
@@ -875,8 +881,9 @@ bool URedwoodCharacterComponent::QueueCurrency(
       UE_LOG(
         LogRedwood,
         Error,
-        TEXT("QueueCurrency: character %s is frozen after a final refusal; refused grant %s"),
+        TEXT("QueueCurrency: character %s %s; refused grant %s"),
         *RedwoodCharacterId,
+        Why,
         *GrantKey
       );
     }

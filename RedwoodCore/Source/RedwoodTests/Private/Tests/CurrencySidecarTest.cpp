@@ -1064,6 +1064,11 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencySidecarFlushWriterFenceLostTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
+  AddExpectedErrorPlain(
+    TEXT("lost its writer fence (another session owns it); refused entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
@@ -1090,6 +1095,13 @@ bool FRedwoodCurrencySidecarFlushWriterFenceLostTest::RunTest(const FString &Par
   TestEqual(TEXT("A later barrier settles at once"), SettleCount, 2);
   TestTrue(TEXT("No further frame leaves"), Harness.IsQuiet());
   TestEqual(TEXT("Nothing is dropped"), Component->GetPendingCurrencyEntries().Num(), 1);
+
+  // New currency is refused, not silently held: it would never be sent.
+  TestFalse(
+    TEXT("New currency is refused"),
+    Component->QueueCurrency({MakeEntry(EntryIdB, 100, 1600, LootReason)}, {})
+  );
+  TestEqual(TEXT("Nothing new is queued"), Component->GetPendingCurrencyEntries().Num(), 1);
   return true;
 }
 
