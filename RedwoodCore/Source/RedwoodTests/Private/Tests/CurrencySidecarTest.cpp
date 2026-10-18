@@ -1796,6 +1796,12 @@ bool FRedwoodCurrencyTradeTimeoutResendTest::RunTest(const FString &Parameters) 
   TestEqual(TEXT("The held flush has not settled"), SettleCount, 0);
   TestNotNull(TEXT("The trade is still pending"), FAccess::Trade(*Harness.Subsystem, TradeId));
 
+  // Everything a rebuilt payload would read changes now: the payer's snapshot balance (its
+  // balanceAfter) and both writer tokens. A resend that rebuilt the request would differ from the
+  // first send.
+  From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount = FromBalance * 5;
+  From.Component->SeedWriterToken(TEXT("writer-token-from-changed"));
+  To.Component->SeedWriterToken(TEXT("writer-token-to-changed"));
   FAccess::ResendTradeNow(*Harness.Subsystem, TradeId);
   FRequest Second;
   if (!Harness.ReadRequest(TradeEvent, Second)) {
@@ -2045,6 +2051,9 @@ bool FRedwoodCurrencyTradeItemOnlyCommitUnknownTest::RunTest(const FString &Para
   TestEqual(TEXT("The trade is not settled"), Result.Calls, 0);
   TestFalse(TEXT("Nobody is frozen"), Harness.Subsystem->IsCharacterFrozen(FromId));
 
+  // A rebuilt payload would carry these tokens; the resend must still carry the first send's.
+  From.Component->SeedWriterToken(TEXT("writer-token-from-changed"));
+  To.Component->SeedWriterToken(TEXT("writer-token-to-changed"));
   FAccess::ResendTradeNow(*Harness.Subsystem, TradeId);
   FRequest Second;
   if (!Harness.ReadRequest(TradeEvent, Second)) {
