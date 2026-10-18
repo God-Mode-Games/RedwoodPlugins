@@ -255,19 +255,28 @@ bool FRedwoodCurrencyUnknownErrorKeepsBatchTest::RunTest(const FString &Paramete
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodCurrencyFinalRefusalDropsSentTest,
-  "Redwood.Currency.FinalRefusalDropsSent",
+  FRedwoodCurrencyFinalRefusalFreezesTest,
+  "Redwood.Currency.FinalRefusalFreezes",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-bool FRedwoodCurrencyFinalRefusalDropsSentTest::RunTest(const FString &Parameters) {
+// A final refusal is a desync: everything staged is dropped and logged, nothing is repaired, the
+// component refuses new currency, and the game hears it once, with the character.
+bool FRedwoodCurrencyFinalRefusalFreezesTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyPersistenceTest;
+  // One line per dropped entry and key, then one per refused entry while frozen.
+  AddExpectedError(TEXT("dropped currency entry"), EAutomationExpectedErrorFlags::Contains, 2);
+  AddExpectedError(TEXT("dropped grant"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedError(TEXT("is frozen after a final refusal"), EAutomationExpectedErrorFlags::Contains, 1);
   URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
+  Component->RedwoodCharacterId = TEXT("character-1");
 
+  FString ReceivedCharacterId;
   FString ReceivedError;
   int32 BroadcastCount = 0;
   Component->OnItemFlushRefusedFinal.AddLambda(
-    [&ReceivedError, &BroadcastCount](const FString &Error) {
+    [&ReceivedCharacterId, &ReceivedError, &BroadcastCount](const FString &CharacterId, const FString &Error) {
+      ReceivedCharacterId = CharacterId;
       ReceivedError = Error;
       ++BroadcastCount;
     }
@@ -279,38 +288,34 @@ bool FRedwoodCurrencyFinalRefusalDropsSentTest::RunTest(const FString &Parameter
   int64 BatchSeq = 0;
   TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
   TArray<TPair<FString, uint64>> SentUpserts;
-  SentUpserts.Add(TPair<FString, uint64>(Fixture::ItemId, 1));
+  SentUpserts.Add(TPair<FString, uint64>(Fixture::ItemId, Component->GetDirtyItemGenerations().FindRef(Fixture::ItemId)));
 
+  // Staged after the claim, so it may depend on the purchase (a sale of the bought item).
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 100, 300)}, {});
 
-  // A plain error never drops an entry; only an explicit final refusal does.
+  // A plain error never drops anything; only an explicit final refusal does.
   Component->CompleteItemFlush(TEXT("overdraft"), 0, SentUpserts, Fixture::NoItems, 1, 1, false);
   TestEqual(TEXT("A non-final error keeps both entries"), Component->GetPendingCurrencyEntries().Num(), 2);
   TestEqual(TEXT("No final broadcast for a plain error"), BroadcastCount, 0);
+  TestFalse(TEXT("No freeze for a plain error"), Component->IsFrozenAfterFinalRefusal());
 
   TestTrue(TEXT("Retry claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
   Component->CompleteItemFlush(TEXT("overdraft"), 0, SentUpserts, Fixture::NoItems, 1, 1, true);
 
-  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
-  TestEqual(TEXT("Only the refused entry is dropped"), Pending.Num(), 1);
-  if (Pending.Num() == 1) {
-    TestEqual(TEXT("The unsent entry stays"), Pending[0].Id, Fixture::EntryIdB);
-  }
-  TestEqual(TEXT("The refused key is dropped"), Component->GetPendingGrantKeys().Num(), 0);
-  TestFalse(
-    TEXT("The refused purchase's item row is not re-sent without its debit"),
-    Component->GetDirtyItemGenerations().Contains(Fixture::ItemId)
-  );
+  TestTrue(TEXT("The component is frozen"), Component->IsFrozenAfterFinalRefusal());
+  TestEqual(TEXT("Every entry is dropped, sent or not"), Component->GetPendingCurrencyEntries().Num(), 0);
+  TestEqual(TEXT("The key is dropped"), Component->GetPendingGrantKeys().Num(), 0);
+  TestFalse(TEXT("No item row stays dirty"), Component->IsItemsDirty());
+  TestFalse(TEXT("No reload is asked for: nothing is repaired"), Component->IsCurrencyRebaseRequired());
   TestEqual(TEXT("The refusal is broadcast once"), BroadcastCount, 1);
+  TestEqual(TEXT("The broadcast names the character"), ReceivedCharacterId, FString(TEXT("character-1")));
   TestEqual(TEXT("The broadcast carries the error"), ReceivedError, FString(TEXT("overdraft")));
 
-  // B was chained on top of the refused debit, so it waits for the reload.
-  TestTrue(TEXT("A rebase is required"), Component->IsCurrencyRebaseRequired());
-  TestEqual(TEXT("Nothing is sent before the rebase"), Component->GetCurrencyEntriesToSendCount(), 0);
-  Component->RebaseCurrency(500);
-  if (Pending.Num() == 1) {
-    TestEqual(TEXT("B re-chained from the reloaded balance"), Pending[0].BalanceAfter, (int64)600);
-  }
+  TestFalse(
+    TEXT("New currency is refused while frozen"),
+    Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 50, 50)}, {})
+  );
+  TestEqual(TEXT("Nothing is queued while frozen"), Component->GetPendingCurrencyEntries().Num(), 0);
 
   return true;
 }
@@ -470,16 +475,15 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FRedwoodCurrencyEntryIdShapeTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyPersistenceTest;
-  // Each refusal ensures and logs an error on purpose. An ensure fires once per session, so the
-  // count is open.
-  AddExpectedError(TEXT("not 32 uppercase hex digits"), EAutomationExpectedErrorFlags::Contains, 0);
+  // Each refusal logs an error on purpose: three bad ids.
+  AddExpectedError(TEXT("not 32 uppercase hex digits"), EAutomationExpectedErrorFlags::Contains, 3);
 
   const FString MadeId = MakeCurrencyEntryId();
   TestTrue(TEXT("A made id has the shape the backend checks"), IsValidCurrencyEntryId(MadeId));
   TestNotEqual(TEXT("Two made ids differ"), MadeId, MakeCurrencyEntryId());
 
   URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
-  Component->QueueCurrency(
+  const bool bAllQueued = Component->QueueCurrency(
     {
       Fixture::MakeEntry(TEXT("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), 1, 1),
       Fixture::MakeEntry(TEXT("AAAA"), 1, 1),
@@ -489,6 +493,7 @@ bool FRedwoodCurrencyEntryIdShapeTest::RunTest(const FString &Parameters) {
     {}
   );
 
+  TestFalse(TEXT("The caller hears that entries were refused"), bAllQueued);
   const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
   TestEqual(TEXT("Only the valid entry is queued"), Pending.Num(), 1);
   if (Pending.Num() == 1) {

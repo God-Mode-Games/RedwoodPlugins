@@ -327,43 +327,6 @@ bool FRedwoodCurrencySequenceGapLowersSnapshotTest::RunTest(const FString &Param
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-  FRedwoodCurrencyFinalRefusalKeepsLaterTest,
-  "Redwood.Currency.FinalRefusalKeepsLater",
-  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
-);
-
-// A final refusal drops the sent batch, keeps what was queued after it, and holds it for a reload.
-bool FRedwoodCurrencyFinalRefusalKeepsLaterTest::RunTest(const FString &Parameters) {
-  namespace Fixture = RedwoodCurrencyFlushTest;
-  URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(3);
-  URedwoodPlayerStateComponent *PlayerState = Fixture::MakePlayerStateComponent(3, 1000);
-
-  FString FinalError;
-  Component->OnItemFlushRefusedFinal.AddLambda([&FinalError](const FString &Error) {
-    FinalError = Error;
-  });
-
-  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, -2000, -1000)}, {});
-  const FRedwoodItemFlushSent Sent = Fixture::ClaimBatch(*this, Component);
-  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 100, -900)}, {});
-
-  FRedwoodItemFlushReply Reply = Fixture::MakeReply(TEXT("balance below zero"), 3);
-  Reply.bFinal = true;
-  URedwoodServerGameSubsystem::ApplyItemsFlushReply(Component, PlayerState, Reply, Sent);
-
-  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
-  TestEqual(TEXT("Only the later entry remains"), Pending.Num(), 1);
-  if (Pending.Num() == 1) {
-    TestEqual(TEXT("The later entry is B"), Pending[0].Id, Fixture::EntryIdB);
-  }
-  TestTrue(TEXT("The later entry waits for a reload"), Component->IsCurrencyRebaseRequired());
-  TestEqual(TEXT("The refusal reaches the game"), FinalError, FString(TEXT("balance below zero")));
-  TestEqual(TEXT("A refused balance never reaches the snapshot"), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)1000);
-
-  return true;
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   FRedwoodCurrencyFlushAlertsBroadcastTest,
   "Redwood.Currency.FlushAlertsBroadcast",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
@@ -429,17 +392,15 @@ bool FRedwoodCurrencyReloadRebasesTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("The refusal holds the entries for a reload"), Component->IsCurrencyRebaseRequired());
 
   int64 Balance = 0;
-  TArray<FRedwoodItemRecord> Items;
   const ERedwoodCurrencyReloadResult Result = URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
     Fixture::ParseJson(TEXT(R"({"error":null,"items":[],"currency":{"amount":"2000","grants":["quest:Q1"]}})")),
-    Balance,
-    Items
+    Balance
   );
   TestTrue(TEXT("The reply parses"), Result == ERedwoodCurrencyReloadResult::Applied);
   TestEqual(TEXT("The balance is read exactly"), Balance, (int64)2000);
   TestTrue(
     TEXT("The reload applies"),
-    URedwoodServerGameSubsystem::ApplyCurrencyReload(Component, PlayerState, Balance, Items)
+    URedwoodServerGameSubsystem::ApplyCurrencyReload(Component, PlayerState, Balance)
   );
 
   TestFalse(TEXT("The hold ends"), Component->IsCurrencyRebaseRequired());
@@ -462,16 +423,18 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// A reload that lacks a readable balance or its rows is a failed load, retried. An error reply's
-// filler "0" must never be used. A stale writer token can never succeed, so it gives up at once.
+// A reload that lacks a readable balance is a failed load, retried. An error reply's filler "0"
+// must never be used. Only the realm's writerFenceLost flag gives up at once: a "not bound" error
+// without it is retriable, since the instance binding comes back after a sidecar restart.
 bool FRedwoodCurrencyReloadReplyParseTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyFlushTest;
   AddExpectedError(TEXT("Currency reload failed"), EAutomationExpectedErrorFlags::Contains, 0);
 
   const TCHAR *RetriedReplies[] = {
     TEXT(R"({"error":"Item load request timed out.","items":[],"currency":{"amount":"0","grants":[]}})"),
+    TEXT(R"({"error":"character not bound to this instance","items":[],"currency":{"amount":"0","grants":[]}})"),
+    TEXT(R"({"error":"character not bound to this instance","writerFenceLost":false,"items":[],"currency":{"amount":"0","grants":[]}})"),
     TEXT(R"({"error":null,"items":[]})"),
-    TEXT(R"({"error":null,"currency":{"amount":"2000","grants":[]}})"),
     TEXT(R"({"error":null,"items":[],"currency":{"amount":"1e3","grants":[]}})"),
     TEXT(R"({"error":null,"items":[],"currency":{"amount":"-5","grants":[]}})"),
     TEXT(R"({"error":null,"items":[],"currency":{"amount":2000,"grants":[]}})"),
@@ -479,27 +442,24 @@ bool FRedwoodCurrencyReloadReplyParseTest::RunTest(const FString &Parameters) {
   };
   for (const TCHAR *ReplyText : RetriedReplies) {
     int64 Balance = 0;
-    TArray<FRedwoodItemRecord> Items;
     TestTrue(
       FString::Printf(TEXT("Retried: %s"), ReplyText),
-      URedwoodServerGameSubsystem::ParseCurrencyReloadReply(Fixture::ParseJson(ReplyText), Balance, Items) ==
+      URedwoodServerGameSubsystem::ParseCurrencyReloadReply(Fixture::ParseJson(ReplyText), Balance) ==
         ERedwoodCurrencyReloadResult::Retry
     );
   }
 
   int64 Balance = 0;
-  TArray<FRedwoodItemRecord> Items;
   TestTrue(
     TEXT("An unreadable reply is retried"),
-    URedwoodServerGameSubsystem::ParseCurrencyReloadReply(TSharedPtr<FJsonObject>(), Balance, Items) ==
+    URedwoodServerGameSubsystem::ParseCurrencyReloadReply(TSharedPtr<FJsonObject>(), Balance) ==
       ERedwoodCurrencyReloadResult::Retry
   );
   TestTrue(
-    TEXT("A stale token gives up at once"),
+    TEXT("A lost writer fence gives up at once"),
     URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
-      Fixture::ParseJson(TEXT(R"({"error":"character not bound to this instance","items":[],"currency":{"amount":"0","grants":[]}})")),
-      Balance,
-      Items
+      Fixture::ParseJson(TEXT(R"({"error":"character not bound to this instance","writerFenceLost":true,"items":[],"currency":{"amount":"0","grants":[]}})")),
+      Balance
     ) == ERedwoodCurrencyReloadResult::GiveUp
   );
 
