@@ -886,16 +886,16 @@ void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
     const bool bOverflows = Entry.Delta > 0 ? Running > MAX_int64 - Entry.Delta
                                             : Running < MIN_int64 - Entry.Delta;
     if (bOverflows) {
-      // Leave this entry and the rest as they are: the backend refuses the stale value as final
-      // and raises an alert, which is the right outcome for a balance that cannot exist.
+      // Keep the rebase pending: sending would mix this entry's stale BalanceAfter with re-chained
+      // ones. The queue is held, not dropped, until a reload yields a balance that fits.
       UE_LOG(
         LogRedwood,
         Error,
-        TEXT("RebaseCurrency: entry %s overflows int64 from balance %lld"),
+        TEXT("RebaseCurrency: entry %s overflows int64 from balance %lld; currency stays held"),
         *Entry.Id,
         Running
       );
-      break;
+      return;
     }
     Running += Entry.Delta;
     Entry.BalanceAfter = Running;
