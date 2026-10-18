@@ -200,6 +200,12 @@ struct FRedwoodTradeRootPlacement {
   // in RedwoodCommonGameSubsystem.cpp) -- empty here means JSON null on the wire, not "".
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   FString ParentId;
+
+  // FORK(hollowed-oath): the character this item leaves, the trade's from or to character; the item
+  // moves to the other one. Empty means the trade's from character. Both directions in one trade
+  // make a swap one atomic request with its currency.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  FString FromCharacterId;
 };
 // FORK(hollowed-oath) END
 

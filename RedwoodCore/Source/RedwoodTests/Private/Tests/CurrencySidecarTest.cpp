@@ -2065,7 +2065,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 // once, nothing is held, and no request leaves.
 bool FRedwoodCurrencyTradeRefusedBeforeSendTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencyTradeTest;
-  AddExpectedErrorPlain(TEXT("refused before sending"), EAutomationExpectedErrorFlags::Contains, 9);
+  AddExpectedErrorPlain(TEXT("refused before sending"), EAutomationExpectedErrorFlags::Contains, 10);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
@@ -2129,6 +2129,19 @@ bool FRedwoodCurrencyTradeRefusedBeforeSendTest::RunTest(const FString &Paramete
   WrongReason[0].Value.Reason = LootReason;
   ExpectRefused(TEXT("wrong reason"), [](FParty &) {}, &WrongReason);
   ExpectRefused(TEXT("bad trade id"), [](FParty &) {}, nullptr, TEXT("dddddddddddddddddddddddddddddddd"));
+
+  // A placement that leaves a character outside the trade.
+  FParty Stranger;
+  if (MakeParty(Harness, TEXT("character-payer-10"), FromToken, FromSeq, FromBalance, Stranger)) {
+    FRedwoodTradeRootPlacement Placement;
+    Placement.Id = OwnedItemId;
+    Placement.Domain = TEXT("general");
+    Placement.FromCharacterId = TEXT("character-stranger");
+    FTradeResult Result;
+    Harness.Subsystem->EmitItemsTrade(Stranger.Component, To.Component, {Placement}, {}, TradeId, Capture(Result));
+    TestEqual(TEXT("outside placement: the caller hears at once"), Result.Calls, 1);
+    TestFalse(TEXT("outside placement: with an error"), Result.Error.IsEmpty());
+  }
 
   TestTrue(TEXT("No request leaves"), Harness.IsQuiet());
   TestEqual(TEXT("The payee's lane is untouched"), To.Component->GetLastCommittedItemSeq(), ToSeq);
@@ -2355,6 +2368,63 @@ bool FRedwoodCurrencyTradeOtherComponentInFlightTest::RunTest(const FString &Par
     From.PlayerStateComponent->RedwoodCharacter.bCurrencyAmountUnknown
   );
   TestEqual(TEXT("The payer's balance"), From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, FromBalance + LootAmount - TradedAmount);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeTwoWayTest,
+  "Redwood.Currency.Trade.TwoWaySwapIsOneRequest",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A swap of an item each way plus currency goes out as ONE request, each placement naming the side
+// it leaves, and settles both sides from that one reply.
+bool FRedwoodCurrencyTradeTwoWayTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  FRedwoodTradeRootPlacement Given;
+  Given.Id = OwnedItemId;
+  Given.Domain = TEXT("general");
+  Given.Slot = 2;
+  FRedwoodTradeRootPlacement Received;
+  Received.Id = PurchasedItemId;
+  Received.Domain = TEXT("general");
+  Received.Slot = 3;
+  Received.FromCharacterId = ToId;
+  FTradeResult Result;
+  Harness.Subsystem->EmitItemsTrade(
+    From.Component, To.Component, {Given, Received}, MakeTradeCurrency(TradedAmount, TradedAmount), TradeId,
+    Capture(Result)
+  );
+  FRequest Trade;
+  if (!Harness.ReadRequest(TradeEvent, Trade)) {
+    return false;
+  }
+  const TArray<TSharedPtr<FJsonValue>> *Placements = nullptr;
+  if (!TestTrue(TEXT("Both placements go out"), Trade.Payload->TryGetArrayField(TEXT("rootPlacements"), Placements) && Placements->Num() == 2)) {
+    return false;
+  }
+  TestEqual(TEXT("The first item leaves the payer"), (*Placements)[0]->AsObject()->GetStringField(TEXT("fromCharacterId")), FromId);
+  TestEqual(TEXT("The second item leaves the payee"), (*Placements)[1]->AsObject()->GetStringField(TEXT("fromCharacterId")), ToId);
+  TestEqual(TEXT("The currency rides the same request"), CountArray(Trade.Payload, TEXT("currency")), 2);
+  TestTrue(TEXT("No second request goes out"), Harness.IsQuiet());
+
+  Harness.Answer(Trade, CommittedReply(FromSeq + 1, ToSeq + 1));
+  TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
+  TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
+  TestEqual(TEXT("The payer's lane takes the fence"), From.Component->GetLastCommittedItemSeq(), FromSeq + 1);
+  TestEqual(TEXT("The payee's lane takes the fence"), To.Component->GetLastCommittedItemSeq(), ToSeq + 1);
+  TestEqual(TEXT("The payer's balance"), From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, FromBalance - TradedAmount);
+  TestEqual(TEXT("The payee's balance"), To.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, ToBalance + TradedAmount);
   return true;
 }
 

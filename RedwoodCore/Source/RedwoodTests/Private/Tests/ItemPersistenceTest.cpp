@@ -642,6 +642,8 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     ChildPlacement.Domain = TEXT("content");
     ChildPlacement.Slot = 0;
     ChildPlacement.ParentId = RedwoodItemPersistenceTest::TestParentId;
+    // FORK(hollowed-oath): this one goes the other way.
+    ChildPlacement.FromCharacterId = TEXT("character-to");
 
     // FORK(hollowed-oath): both sides' entries, the giver's with a source ref.
     FRedwoodCurrencyEntry Paid;
@@ -783,6 +785,18 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
           TEXT("trade: content-child ParentId survives"),
           (*Child)->GetStringField(TEXT("parentId")),
           RedwoodItemPersistenceTest::TestParentId
+        );
+        // FORK(hollowed-oath): every placement names the side it leaves; an empty one is the
+        // trade's from character.
+        TestEqual(
+          TEXT("trade: a placement with no source leaves the from character"),
+          (*Root)->GetStringField(TEXT("fromCharacterId")),
+          FString(TEXT("character-from"))
+        );
+        TestEqual(
+          TEXT("trade: a placement can leave the to character"),
+          (*Child)->GetStringField(TEXT("fromCharacterId")),
+          FString(TEXT("character-to"))
         );
       }
     } else {

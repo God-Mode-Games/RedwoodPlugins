@@ -2652,6 +2652,11 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsTradePayload(
     } else {
       PlacementObject->SetStringField(TEXT("parentId"), Placement.ParentId);
     }
+    // FORK(hollowed-oath): always named, so the backend never has to guess the direction.
+    PlacementObject->SetStringField(
+      TEXT("fromCharacterId"),
+      Placement.FromCharacterId.IsEmpty() ? FromCharacterId : Placement.FromCharacterId
+    );
     RootPlacementsJsonArray.Add(
       MakeShareable(new FJsonValueObject(PlacementObject))
     );
@@ -3897,6 +3902,17 @@ void URedwoodServerGameSubsystem::EmitItemsTrade(
   if (SentItemTradeIds.Contains(TradeId)) {
     Refuse(TEXT("the trade id was already used; make a fresh one for every trade"));
     return;
+  }
+  for (const FRedwoodTradeRootPlacement &Placement : RootPlacements) {
+    if (!Placement.FromCharacterId.IsEmpty() && Placement.FromCharacterId != Trade.From.CharacterId &&
+        Placement.FromCharacterId != Trade.To.CharacterId) {
+      Refuse(FString::Printf(
+        TEXT("placement %s leaves character %s, who is outside the trade"),
+        *Placement.Id,
+        *Placement.FromCharacterId
+      ));
+      return;
+    }
   }
   if (!ChainTradeCurrency(CurrencyByCharacter, Trade.From, Trade.To, Error)) {
     Refuse(Error);

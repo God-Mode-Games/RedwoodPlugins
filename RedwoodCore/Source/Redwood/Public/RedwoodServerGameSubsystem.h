@@ -397,7 +397,9 @@ public:
 
   // Emit realm:characters:items:trade: atomically moves the given root items (each identified by a
   // (Domain, Slot) placement, optionally with a ParentId for a content-child destination -- see
-  // FRedwoodTradeRootPlacement) from one character to another on the backend. RootPlacements name
+  // FRedwoodTradeRootPlacement) from one character to another on the backend.
+  // FORK(hollowed-oath): a placement's FromCharacterId (empty = the from character) lets one trade
+  // move items both ways, so a swap and its currency are one atomic request. RootPlacements name
   // only the root rows being handed over; the backend re-parents each root and its nested children
   // in one transaction, and bumps BOTH characters' InventorySeq.
   //
