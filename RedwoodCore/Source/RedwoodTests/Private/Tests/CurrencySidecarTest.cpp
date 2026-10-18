@@ -1858,8 +1858,8 @@ bool FRedwoodCurrencyTradeRefusalAfterTimeoutTest::RunTest(const FString &Parame
     return false;
   }
   TArray<FString> FrozenIds;
-  auto CountFreeze = [&FrozenIds](const FString &CharacterId, const FString &Error) {
-    FrozenIds.Add(CharacterId);
+  auto CountFreeze = [&FrozenIds](const FString &FrozenCharacterId, const FString &Error) {
+    FrozenIds.Add(FrozenCharacterId);
   };
   From.Component->OnItemFlushRefusedFinal.AddLambda(CountFreeze);
   To.Component->OnItemFlushRefusedFinal.AddLambda(CountFreeze);
