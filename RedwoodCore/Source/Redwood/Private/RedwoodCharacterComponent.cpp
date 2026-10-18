@@ -611,6 +611,10 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
     if (bUseItems) {
       const FString &IncomingCharacterId = RedwoodCharacterBackend.Id;
       if (HydratedItemsCharacterId != IncomingCharacterId) {
+        // FORK(hollowed-oath): I6. A component reused for another character starts clean.
+        if (!HydratedItemsCharacterId.IsEmpty()) {
+          ResetCurrencyForNewCharacter(HydratedItemsCharacterId, IncomingCharacterId);
+        }
         TArray<FRedwoodItemRecord> *RecordsArray =
           URedwoodCommonGameSubsystem::ResolveItemsRecordsArray(this);
         if (RecordsArray) {
@@ -1293,6 +1297,46 @@ void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay() {
   UnconfirmedCurrencyCount = 0;
   UnconfirmedGrantCount = 0;
   bCurrencyRebaseRequired = false;
+}
+
+void URedwoodCharacterComponent::ResetCurrencyForNewCharacter(
+  const FString &OldCharacterId, const FString &NewCharacterId
+) {
+  const FString Why = FString::Printf(TEXT("its component now plays character %s"), *NewCharacterId);
+  int32 FirstLoggedEntry = 0;
+  int32 FirstLoggedGrant = 0;
+  if (bItemFlushInFlight) {
+    // The in-flight batch's reply logs its own entries, and writes nothing to the snapshot, which
+    // now holds the new character. The slot is free again for the new character's batches.
+    FirstLoggedEntry = FMath::Clamp(InFlightCurrencyCount, 0, PendingCurrencyEntries.Num());
+    FirstLoggedGrant = FMath::Clamp(InFlightGrantCount, 0, PendingGrantKeys.Num());
+    if (URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem()) {
+      ServerSubsystem->DetachItemFlushesFromComponent(this);
+    }
+    bItemFlushInFlight = false;
+  }
+  const int32 UnknownEntryCount =
+    bCurrencyBatchUnconfirmed && FirstLoggedEntry == 0 ? UnconfirmedCurrencyCount : 0;
+  const int32 UnknownGrantCount =
+    bCurrencyBatchUnconfirmed && FirstLoggedGrant == 0 ? UnconfirmedGrantCount : 0;
+  LogCurrencyForStaff(
+    OldCharacterId,
+    Why,
+    MakeArrayView(PendingCurrencyEntries).RightChop(FirstLoggedEntry),
+    UnknownEntryCount,
+    MakeArrayView(PendingGrantKeys).RightChop(FirstLoggedGrant),
+    UnknownGrantCount
+  );
+
+  PendingCurrencyEntries.Empty();
+  PendingGrantKeys.Empty();
+  bCurrencyBatchUnconfirmed = false;
+  UnconfirmedCurrencyCount = 0;
+  UnconfirmedGrantCount = 0;
+  bCurrencyRebaseRequired = false;
+  bWriterFenceLost = false;
+  bFrozenAfterFinalRefusal = false;
+  ClearItemsDirtyState();
 }
 
 bool URedwoodCharacterComponent::AdoptHandedOffCurrency(FRedwoodCharacterBackend &Snapshot) {

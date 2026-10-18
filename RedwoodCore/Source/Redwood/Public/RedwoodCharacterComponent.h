@@ -734,6 +734,11 @@ private:
   // The server subsystem of this component's game instance, or null (no world, or a client).
   URedwoodServerGameSubsystem *GetServerSubsystem() const;
 
+  // I6: this component is hydrated for another character. Everything staged for the old one is
+  // logged under its id and dropped, with its item dirt: none of it may go out under the new
+  // character's id, seq or token. A batch in flight is left to its reply, as a gone component's.
+  void ResetCurrencyForNewCharacter(const FString &OldCharacterId, const FString &NewCharacterId);
+
   void ClearSentItemGenerations(
     const TArray<TPair<FString, uint64>> &SentUpserts,
     const TArray<TPair<FString, uint64>> &SentDeletes

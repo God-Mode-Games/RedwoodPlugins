@@ -3649,4 +3649,94 @@ bool FRedwoodCurrencySidecarEndPlayInFlightTest::RunTest(const FString &Paramete
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarRehydrateResetsTest,
+  "Redwood.Currency.Sidecar.RehydrateForAnotherCharacterResets",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// I6: a component reused for another character carries nothing of the first one into it. What the
+// first one left (an unconfirmed entry and a staged one, behind a lost writer fence) is logged
+// under the first character's id and dropped, and the component sends the second character's
+// batch as an ordinary one, from that character's seq and token.
+bool FRedwoodCurrencySidecarRehydrateResetsTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  const FString SecondCharacterId = TEXT("character-2");
+  const FString SecondToken = TEXT("writer-token-2");
+  constexpr int64 SecondSeq = 9;
+  AddExpectedErrorPlain(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 1);
+  // The lost fence logs both first, then the reset logs both again under the first character.
+  AddExpectedErrorPlain(TEXT("outcome UNKNOWN (it may be saved): writer fence lost"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedErrorPlain(TEXT("NOT saved: writer fence lost"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedErrorPlain(
+    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component now plays character character-2"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  AddExpectedErrorPlain(
+    TEXT("character character-1 entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB delta 200 reason Currency.Reason.Loot, NOT saved: its component now plays character character-2"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyLoadTestPlayerState *PlayerState = nullptr;
+  URedwoodPlayerStateComponent *PlayerStateComponent = nullptr;
+  if (!MakeSnapshotOwner(Harness, PlayerState, PlayerStateComponent)) {
+    return false;
+  }
+  URedwoodCharacterComponent *Component = HydrateOnPlayerState(PlayerState);
+
+  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {});
+  Harness.Subsystem->FlushItemsForCharacterComponent(PlayerStateComponent, Component);
+  FRequest First;
+  if (!Harness.ReadRequest(FlushEvent, First)) {
+    return false;
+  }
+  Harness.Answer(First, TEXT(R"({"error":"Item flush request timed out.","committedSeq":-1,"timedOut":true})"));
+  Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+  Component->QueueCurrency({MakeEntry(EntryIdB, 200, 1700, LootReason)}, {});
+  Component->MarkWriterFenceLost();
+  if (!TestTrue(TEXT("The first character's batch is unconfirmed"), Component->IsCurrencyBatchUnconfirmed()) ||
+      !TestTrue(TEXT("And its fence is lost"), Component->IsWriterFenceLost())) {
+    return false;
+  }
+
+  // The PlayerState moves to another character, and the component hydrates for it.
+  FRedwoodCharacterBackend Second;
+  Second.Id = SecondCharacterId;
+  Second.InventorySeq = SecondSeq;
+  Second.CurrencyAmount = 300;
+  Second.WriterToken = SecondToken;
+  PlayerStateComponent->RedwoodCharacter = Second;
+  Component->ProcessEvent(Component->FindFunctionChecked(TEXT("RedwoodPlayerStateCharacterUpdated")), nullptr);
+
+  TestEqual(TEXT("The component plays the second character"), Component->RedwoodCharacterId, SecondCharacterId);
+  TestEqual(TEXT("Nothing of the first one is staged"), Component->GetPendingCurrencyEntries().Num(), 0);
+  TestFalse(TEXT("No batch is unconfirmed"), Component->IsCurrencyBatchUnconfirmed());
+  TestFalse(TEXT("No rebase is held"), Component->IsCurrencyRebaseRequired());
+  TestFalse(TEXT("The fence is the new session's"), Component->IsWriterFenceLost());
+  TestFalse(TEXT("Nothing is frozen"), Component->IsFrozenAfterFinalRefusal());
+
+  TestTrue(
+    TEXT("The second character takes currency"),
+    Component->QueueCurrency({MakeEntry(CreditEntryId, 25, 325, SellReason)}, {})
+  );
+  Harness.Subsystem->FlushItemsForCharacterComponent(PlayerStateComponent, Component);
+  FRequest Next;
+  if (!Harness.ReadRequest(FlushEvent, Next)) {
+    return false;
+  }
+  TestFalse(TEXT("An ordinary batch, not the first character's probe"), Next.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("For the second character"), Next.Payload->GetStringField(TEXT("characterId")), SecondCharacterId);
+  TestEqual(TEXT("From its seq"), BatchSeqOfFlush(Next.Payload), SecondSeq + 1);
+  TestEqual(TEXT("With its token"), Next.Payload->GetStringField(TEXT("writerToken")), SecondToken);
+  TestEqual(TEXT("Carrying only its entry"), CountArray(Next.Payload, TEXT("currency")), 1);
+  Harness.Answer(Next, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SecondSeq + 1));
+  Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER
