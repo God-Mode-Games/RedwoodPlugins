@@ -984,6 +984,7 @@ void URedwoodCharacterComponent::MarkWriterFenceLost() {
   LogStagedCurrency(
     FString::Printf(TEXT("Writer fence lost: character %s left unsent"), *RedwoodCharacterId)
   );
+  OnWriterFenceLost.Broadcast(RedwoodCharacterId);
 }
 
 void URedwoodCharacterComponent::LogStagedCurrency(const FString &Lead) const {

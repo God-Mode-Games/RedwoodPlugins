@@ -452,6 +452,7 @@ public:
   FOnItemFlushRefusedFinal OnItemFlushRefusedFinal;
   FOnCurrencyAlerts OnCurrencyAlerts;
   FOnCurrencyRebased OnCurrencyRebased;
+  FOnWriterFenceLost OnWriterFenceLost;
   // FORK(hollowed-oath) END
 
   // Ack handler for the in-flight item flush. On success (Error empty) clears the SENT generations

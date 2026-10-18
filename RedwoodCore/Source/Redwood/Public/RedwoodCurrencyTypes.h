@@ -112,6 +112,11 @@ DECLARE_MULTICAST_DELEGATE_TwoParams(
   FOnItemFlushRefusedFinal, const FString & /*CharacterId*/, const FString & /*Error*/
 );
 
+// The realm said this session's writer token is stale: another session owns the character, and
+// nothing this server stages for it can be saved. The game must end this session for the
+// character, so the player does not keep playing on it.
+DECLARE_MULTICAST_DELEGATE_OneParam(FOnWriterFenceLost, const FString & /*CharacterId*/);
+
 // A reload gave the backend's balance, and every pending entry is now re-chained on top of it.
 // The game's running balance must restart from here: it is the last pending entry's BalanceAfter,
 // or Balance itself when nothing is pending. A game that keeps chaining from its old running

@@ -1082,6 +1082,12 @@ bool FRedwoodCurrencySidecarFlushWriterFenceLostTest::RunTest(const FString &Par
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
   Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {});
+  int32 FenceLostCount = 0;
+  FString FenceLostCharacterId;
+  Component->OnWriterFenceLost.AddLambda([&FenceLostCount, &FenceLostCharacterId](const FString &InCharacterId) {
+    ++FenceLostCount;
+    FenceLostCharacterId = InCharacterId;
+  });
 
   int32 SettleCount = 0;
   Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
@@ -1108,6 +1114,8 @@ bool FRedwoodCurrencySidecarFlushWriterFenceLostTest::RunTest(const FString &Par
     Component->QueueCurrency({MakeEntry(EntryIdB, 100, 1600, LootReason)}, {})
   );
   TestEqual(TEXT("Nothing new is queued"), Component->GetPendingCurrencyEntries().Num(), 1);
+  TestEqual(TEXT("The game hears it once"), FenceLostCount, 1);
+  TestEqual(TEXT("It names the character"), FenceLostCharacterId, CharacterId);
   return true;
 }
 
