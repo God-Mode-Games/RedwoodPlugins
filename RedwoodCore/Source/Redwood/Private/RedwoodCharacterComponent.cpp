@@ -679,7 +679,7 @@ void URedwoodCharacterComponent::CompleteItemFlush(
   SentCurrencyCount = FMath::Clamp(SentCurrencyCount, 0, PendingCurrencyEntries.Num());
   SentGrantCount = FMath::Clamp(SentGrantCount, 0, PendingGrantKeys.Num());
 
-  if (bNotApplied) {
+  if (bNotApplied && CommittedSeq >= SentSeq) {
     // FORK(hollowed-oath): the backend answered a probe: the batch never committed. The backend
     // has CONSUMED that seq with an empty commit (CommittedSeq), so a late original arriving under
     // it now fails instead of applying after the fact. The entries are simply pending again,
@@ -687,14 +687,20 @@ void URedwoodCharacterComponent::CompleteItemFlush(
     // claim is a normal batch after that fence, so the payment goes out WITH the current item
     // rows: both save or neither does.
     bCurrencyBatchUnconfirmed = false;
-    if (CommittedSeq >= 0) {
-      LastCommittedItemSeq = CommittedSeq;
-      NextBatchSeq = CommittedSeq + 1;
-    } else {
-      // No fence on the reply: the seq was not consumed, so the batch goes out under it again.
-      LastCommittedItemSeq = SentSeq - 1;
-      NextBatchSeq = SentSeq;
-    }
+    AdoptCommittedItemSeq(CommittedSeq);
+  } else if (bNotApplied) {
+    // FORK(hollowed-oath): notApplied without the consumed seq. While the seq is still free, the
+    // original attempt can arrive late and commit under it, so a normal batch there could pay the
+    // entries twice. Keep the batch unconfirmed: the next attempt is another probe, and no seq
+    // below the sent one is ever adopted.
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("CompleteItemFlush: notApplied with committedSeq %lld below the probed seq %lld; probing again"),
+      CommittedSeq,
+      SentSeq
+    );
+    MarkCurrencyBatchUnconfirmed(SentCurrencyCount, SentGrantCount, SentSeq);
   } else if (Error.IsEmpty()) {
     // Success: clear only the ids whose generation still matches what was sent, exactly as the
     // old container ack did -- if MarkItemsDirty/MarkItemsDeleted bumped an id again while the

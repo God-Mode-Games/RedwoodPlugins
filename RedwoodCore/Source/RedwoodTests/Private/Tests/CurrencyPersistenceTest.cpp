@@ -539,3 +539,51 @@ bool FRedwoodCurrencyFreezeMarksUnknownOutcomeTest::RunTest(const FString &Param
   TestTrue(TEXT("The component is frozen"), Component->IsFrozenAfterFinalRefusal());
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyNotAppliedNeedsConsumedSeqTest,
+  "Redwood.Currency.NotAppliedNeedsConsumedSeq",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A notApplied reply counts only with the consumed seq (committedSeq at or past the probed seq).
+// Without it, the original attempt could still commit under that seq, so the batch stays
+// unconfirmed, the next attempt is another probe, and the lane never moves below the probed seq.
+bool FRedwoodCurrencyNotAppliedNeedsConsumedSeqTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyPersistenceTest;
+  AddExpectedError(TEXT("probing again"), EAutomationExpectedErrorFlags::Contains, 2);
+  URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
+  Component->SeedItemSeqFromCharacter(4);
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 500, 500)}, {});
+
+  int64 BatchSeq = 0;
+  TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
+  TestEqual(TEXT("The first attempt uses seq 5"), BatchSeq, (int64)5);
+  Component->CompleteItemFlush(TEXT("socket closed"), -1, Fixture::NoItems, Fixture::NoItems, 1, 0);
+
+  // The old shape (committedSeq is the seq before the probe), then no fence at all.
+  const int64 OldShapeFences[] = {4, -1};
+  for (const int64 Fence : OldShapeFences) {
+    TestTrue(TEXT("Probe claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
+    TestTrue(TEXT("The claim is a probe"), Component->IsItemFlushReplayProbe());
+    TestEqual(TEXT("The probe uses the unconfirmed seq"), BatchSeq, (int64)5);
+    Component->CompleteItemFlush(
+      TEXT("batch was never applied"), Fence, Fixture::NoItems, Fixture::NoItems, 1, 0, false, false, true
+    );
+    TestEqual(TEXT("The entry is kept"), Component->GetPendingCurrencyEntries().Num(), 1);
+    TestEqual(TEXT("No seq below the probed one is adopted"), Component->GetLastCommittedItemSeq(), (int64)4);
+  }
+
+  TestTrue(TEXT("Next claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
+  TestTrue(TEXT("The next attempt is another probe"), Component->IsItemFlushReplayProbe());
+  TestEqual(TEXT("At the same seq"), BatchSeq, (int64)5);
+
+  // The R31 shape: the probed seq is consumed, and the next batch goes after it.
+  Component->CompleteItemFlush(
+    TEXT("batch was never applied"), 5, Fixture::NoItems, Fixture::NoItems, 1, 0, false, false, true
+  );
+  TestTrue(TEXT("Claim after the consumed seq succeeds"), Component->TryBeginItemFlush(BatchSeq));
+  TestFalse(TEXT("It is a normal batch"), Component->IsItemFlushReplayProbe());
+  TestEqual(TEXT("After the consumed seq"), BatchSeq, (int64)6);
+  return true;
+}

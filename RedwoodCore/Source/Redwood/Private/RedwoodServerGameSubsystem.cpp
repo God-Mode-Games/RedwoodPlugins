@@ -3041,7 +3041,8 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
     }
     // FORK(hollowed-oath): a notApplied reply also commits a seq (an empty one, that consumes the
     // probed seq), so the snapshot follows it for the same reason.
-    if (Reply.bNotApplied && Reply.CommittedSeq > Snapshot.InventorySeq) {
+    if (Reply.bNotApplied && Reply.CommittedSeq >= Sent.BatchSeq &&
+        Reply.CommittedSeq > Snapshot.InventorySeq) {
       Snapshot.InventorySeq = Reply.CommittedSeq;
     }
 
