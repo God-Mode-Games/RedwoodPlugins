@@ -144,8 +144,8 @@ struct FRedwoodCharacterBackend {
   bool bFrozenAfterFinalRefusal = false;
 
   // The one-time grant keys the backend holds for this character (a quest reward already paid).
-  // Loaded with the balance, extended when a flush that carried keys commits, and replaced by a
-  // currency reload. Read-only: only the backend's replies may change it. Do not test a key with
+  // Loaded with the balance, extended when a flush that carried keys commits, and merged with the
+  // keys a currency reload reads (never replaced: the backend never removes a key). Read-only: only the backend's replies may change it. Do not test a key with
   // this array: a Blueprint Contains ignores case (the backend does not), and a key that is staged
   // or in flight is not here yet. Call URedwoodCharacterComponent::HasGrantKey instead.
   UPROPERTY(BlueprintReadOnly, Category = "Redwood")

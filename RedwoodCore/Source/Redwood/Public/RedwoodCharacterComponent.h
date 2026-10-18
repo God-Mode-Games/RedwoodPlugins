@@ -352,16 +352,17 @@ public:
 
   // FORK(hollowed-oath) BEGIN: currency ledger staging. Entries and one-time grant keys wait here
   // until a flush carries them; they leave the queue only on an ack that proves the backend has
-  // them (success with a trustworthy seq) or on an explicit final refusal. Any other error keeps
+  // them (success with a trustworthy seq) or when a freeze drops them. Any other error keeps
   // them -- an error reply means NOT saved, whatever committedSeq says.
   //
   // Two rules keep an amount from being lost or applied twice when an ack is lost:
-  //  - Unconfirmed batch: after any error except the two below (a timeout, a dropped socket, a
-  //    "concurrent flush" refusal -- whatever committedSeq says), the next batch carries EXACTLY the same entries and keys under the SAME
-  //    seq. The backend then sees a replay and acks it from its ledger (all ids present) or refuses
-  //    it retriably (none present). Adding a newer entry to that resend would turn a committed
-  //    replay into a mixed batch that the backend refuses, and the recovery below would then
-  //    re-chain the committed entry on top of itself.
+  //  - Unconfirmed batch: after a reply whose outcome is unknown (a timeout, a dropped socket, a
+  //    "concurrent flush" refusal -- whatever committedSeq says), the batch goes out again as a
+  //    probe: EXACTLY the same entries and keys under the SAME seq, and no item rows. The backend
+  //    never applies a probe. It acks a committed batch from its ledger, or consumes the seq and
+  //    answers notApplied; the entries then go out in a normal batch with the current rows.
+  //    Adding a newer entry to the probe would turn a committed replay into a mixed batch that
+  //    the backend refuses.
   //  - Rebase: after an error with `rebaseRequired` (the backend's replay-mismatch refusal: a trade
   //    used the seq and the batch did not apply), the backend balance is not what the pending
   //    entries were chained from. No currency is sent until the caller reloads the balance and
@@ -371,7 +372,8 @@ public:
   // FreezeAfterFinalRefusal) until it is hydrated again from the database.
   //
   // Returns false when anything was refused: every entry and key while the character is frozen or
-  // its writer fence is lost, or an entry whose id the backend would refuse. The caller must not count a refused amount.
+  // its writer fence is lost, or an entry whose id the backend would refuse. The caller must not
+  // count a refused amount.
   // FORK(hollowed-oath): also a debit that would go below zero when an unsettled trade of this
   // character settles (URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalance).
   bool QueueCurrency(

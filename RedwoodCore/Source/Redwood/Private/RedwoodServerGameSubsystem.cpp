@@ -3278,11 +3278,13 @@ FRedwoodItemFlushReply URedwoodServerGameSubsystem::ParseItemsFlushReply(
   ReadSidecarDeliveryFlags(
     Reply, Parsed.Error, FlushTimedOutError, Parsed.bTimedOut, Parsed.bNotForwarded
   );
-  // The sidecar fills committedSeq with 0 on both. Read as a fence, that 0 is a sequence gap: the
-  // lane would realign to 0, and a batch of item rows re-sent at seq 1 is acked as a replay and
-  // never saved.
-  // commitUnknown is the realm's own "may have applied": an unknown outcome, so it is no refusal and
-  // no fence either, whatever else the reply says. The batch is then re-sent as a probe.
+  // A reply the sidecar makes itself (timedOut, notForwarded) knows no seq. Today it says -1, but
+  // an older sidecar said 0, and 0 read as a fence is a sequence gap: the lane would realign to 0,
+  // and a batch of item rows re-sent at seq 1 is acked as a replay and never saved. So these
+  // replies never carry a fence, whatever the field says.
+  // commitUnknown: the realm sends it only on trade replies today; no flush reply carries it. It
+  // is read here defensively, so that a flush reply that ever carries it is taken as the trade
+  // reply's flag is meant: an unknown outcome, no refusal and no fence, re-sent as a probe.
   Reply->TryGetBoolField(TEXT("commitUnknown"), Parsed.bCommitUnknown);
   if (Parsed.bCommitUnknown) {
     Parsed.bFinal = false;
