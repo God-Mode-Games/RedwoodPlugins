@@ -656,7 +656,8 @@ void URedwoodCharacterComponent::CompleteItemFlush(
   const TArray<TPair<FString, uint64>> &SentDeletes,
   int32 SentCurrencyCount,
   int32 SentGrantCount,
-  bool bFinalRefusal
+  bool bFinalRefusal,
+  bool bRebaseRequired
 ) {
   // The seq the just-completed flush stamped on its payload (claimed in TryBeginItemFlush).
   const int64 SentSeq = InFlightBatchSeq;
@@ -740,17 +741,24 @@ void URedwoodCharacterComponent::CompleteItemFlush(
     // keeps rejecting, so realign to the backend's committed fence.
     if (CommittedSeq >= SentSeq) {
       AdoptCommittedItemSeq(CommittedSeq);
-      // FORK(hollowed-oath): an error that carries a fence at or past the sent seq is the backend
-      // saying a trade used that seq and this batch did NOT apply (it checks the entry ids). The
-      // entries are NOT dropped -- an error reply means not saved, whatever committedSeq says. The
-      // trade moved the balance, so every pending BalanceAfter is stale and would be refused as
-      // final; hold currency until the caller reloads and rebases. The batch is no longer
-      // unconfirmed: its outcome is now known.
+    }
+    if (bRebaseRequired) {
+      // FORK(hollowed-oath): only the backend's replay-mismatch refusal sets rebaseRequired: a trade
+      // used this seq, and the backend checked that the batch's entry ids and keys are NOT all in
+      // its ledger. Exactly one batch is re-sent per seq (see the staging block in the header), so
+      // none of it applied. The entries are kept -- an error reply means not saved. The trade moved
+      // the balance, so every pending BalanceAfter is stale and would be refused as final. Hold
+      // currency until the caller reloads; the flag is the signal for the flush path (B2) to start
+      // that reload and then call RebaseCurrency.
       bCurrencyBatchUnconfirmed = false;
       bCurrencyRebaseRequired = true;
     } else {
-      // FORK(hollowed-oath): the outcome is unknown (a dropped socket, a timeout, a lost race).
-      // Re-send the same entries under the same seq; see the staging block in the header.
+      // FORK(hollowed-oath): any other error leaves the outcome unknown, WHATEVER committedSeq says.
+      // A "concurrent flush" refusal of a retry that raced its own still-running original reports
+      // the original's commit as the fence; treating that as "did not apply" and rebasing would
+      // re-chain the committed entry on top of itself, and its re-send would be refused as a
+      // duplicate. Re-send the identical batch under its seq instead: the backend acks it from its
+      // ledger if it committed.
       MarkCurrencyBatchUnconfirmed(SentCurrencyCount, SentGrantCount, SentSeq);
     }
   }

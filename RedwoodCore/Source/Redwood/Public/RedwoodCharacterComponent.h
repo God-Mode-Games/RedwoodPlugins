@@ -353,15 +353,15 @@ public:
   // them -- an error reply means NOT saved, whatever committedSeq says.
   //
   // Two rules keep an amount from being lost or applied twice when an ack is lost:
-  //  - Unconfirmed batch: after an error whose outcome the game server cannot know (a timeout,
-  //    a dropped socket), the next batch carries EXACTLY the same entries and keys under the SAME
+  //  - Unconfirmed batch: after any error except the two below (a timeout, a dropped socket, a
+  //    "concurrent flush" refusal -- whatever committedSeq says), the next batch carries EXACTLY the same entries and keys under the SAME
   //    seq. The backend then sees a replay and acks it from its ledger (all ids present) or refuses
   //    it retriably (none present). Adding a newer entry to that resend would turn a committed
   //    replay into a mixed batch that the backend refuses, and the recovery below would then
   //    re-chain the committed entry on top of itself.
-  //  - Rebase: after an error that moved the seq (the backend reports committedSeq >= the sent
-  //    seq: a trade used it) or a final refusal, the backend balance is not what the pending
-  //    entries were chained from. No currency is sent until the caller reloads the balance and
+  //  - Rebase: after an error with `rebaseRequired` (the backend's replay-mismatch refusal: a trade
+  //    used the seq and the batch did not apply) or a final refusal, the backend balance is not
+  //    what the pending entries were chained from. No currency is sent until the caller reloads the balance and
   //    calls RebaseCurrency.
   void QueueCurrency(
     const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
@@ -422,7 +422,8 @@ public:
   // pair each sent id with the GENERATION current for it at send time.
   // FORK(hollowed-oath): SentCurrencyCount/SentGrantCount are the counts the batch took from the
   // front of the currency queues. bFinalRefusal is the ack's `final` flag: only that drops the sent
-  // entries and keys on an error (see the currency staging block above).
+  // entries and keys on an error. bRebaseRequired is the ack's `rebaseRequired` flag: only that
+  // (or a final refusal) makes the queue wait for a reload (see the currency staging block above).
   void CompleteItemFlush(
     const FString &Error,
     int64 CommittedSeq,
@@ -430,7 +431,8 @@ public:
     const TArray<TPair<FString, uint64>> &SentDeletes,
     int32 SentCurrencyCount = 0,
     int32 SentGrantCount = 0,
-    bool bFinalRefusal = false
+    bool bFinalRefusal = false,
+    bool bRebaseRequired = false
   );
 
   // Seeds the committed-seq/next-batchSeq state from a freshly-loaded character's InventorySeq.

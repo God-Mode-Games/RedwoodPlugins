@@ -106,7 +106,7 @@ bool FRedwoodCurrencyReplayClearsSentTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("First attempt uses seq 2"), FirstSeq, (int64)2);
 
   // The backend committed seq 2, but the ack was lost: the game server sees only a dropped socket.
-  Component->CompleteItemFlush(TEXT("socket closed"), 0, Fixture::NoItems, Fixture::NoItems, 1, 1);
+  Component->CompleteItemFlush(TEXT("socket closed"), -1, Fixture::NoItems, Fixture::NoItems, 1, 1);
 
   // A newer entry staged before the retry must not join it.
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 200, 700)}, {});
@@ -155,10 +155,11 @@ bool FRedwoodCurrencyErrorKeepsEntriesTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
   TestEqual(TEXT("Claim uses seq 5"), BatchSeq, (int64)5);
 
-  // A trade used seq 5. The backend reports a fence AT the sent seq together with an error: the
-  // entries did not apply. Dropping them on committedSeq alone would lose the money.
+  // A trade used seq 5. The backend reports a fence AT the sent seq together with an error and
+  // rebaseRequired: the entries did not apply. Dropping them on committedSeq alone would lose the
+  // money.
   Component->CompleteItemFlush(
-    TEXT("batch seq was used by a trade"), 5, Fixture::NoItems, Fixture::NoItems, 2, 0
+    TEXT("batch seq was used by a trade"), 5, Fixture::NoItems, Fixture::NoItems, 2, 0, false, true
   );
 
   TestEqual(TEXT("Both entries are kept"), Component->GetPendingCurrencyEntries().Num(), 2);
@@ -195,7 +196,7 @@ bool FRedwoodCurrencyUnknownErrorKeepsBatchTest::RunTest(const FString &Paramete
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 500, 500)}, {});
   int64 BatchSeq = 0;
   TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
-  Component->CompleteItemFlush(TEXT("flush failed"), 0, Fixture::NoItems, Fixture::NoItems, 1, 0);
+  Component->CompleteItemFlush(TEXT("flush failed"), -1, Fixture::NoItems, Fixture::NoItems, 1, 0);
 
   const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
   TestEqual(TEXT("The entry is kept"), Pending.Num(), 1);
@@ -206,7 +207,9 @@ bool FRedwoodCurrencyUnknownErrorKeepsBatchTest::RunTest(const FString &Paramete
   }
   TestFalse(TEXT("No rebase for an unknown outcome"), Component->IsCurrencyRebaseRequired());
 
-  // A reload arriving now must not re-chain an entry that may already be committed.
+  // A reload arriving now must not re-chain an entry that may already be committed. The refusal
+  // warns; expect it in case the harness raises warnings to errors.
+  AddExpectedError(TEXT("no rebase is required"), EAutomationExpectedErrorFlags::Contains, 0);
   Component->RebaseCurrency(500);
   if (Pending.Num() == 1) {
     TestEqual(TEXT("A stray rebase leaves BalanceAfter alone"), Pending[0].BalanceAfter, (int64)500);
@@ -222,7 +225,7 @@ bool FRedwoodCurrencyUnknownErrorKeepsBatchTest::RunTest(const FString &Paramete
 
   // The batch never committed: the backend refuses the probe because the trade used its seq.
   Component->CompleteItemFlush(
-    TEXT("batch seq was used by a trade"), 3, Fixture::NoItems, Fixture::NoItems, 1, 0
+    TEXT("batch seq was used by a trade"), 3, Fixture::NoItems, Fixture::NoItems, 1, 0, false, true
   );
   TestEqual(TEXT("Still kept after the probe's refusal"), Component->GetPendingCurrencyEntries().Num(), 1);
   TestTrue(TEXT("Now a rebase is required"), Component->IsCurrencyRebaseRequired());
@@ -292,6 +295,66 @@ bool FRedwoodCurrencyFinalRefusalDropsSentTest::RunTest(const FString &Parameter
   if (Pending.Num() == 1) {
     TestEqual(TEXT("B re-chained from the reloaded balance"), Pending[0].BalanceAfter, (int64)600);
   }
+
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyConcurrentFlushIsUnconfirmedTest,
+  "Redwood.Currency.ConcurrentFlushIsUnconfirmed",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodCurrencyConcurrentFlushIsUnconfirmedTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyPersistenceTest;
+  URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
+  Component->SeedItemSeqFromCharacter(4);
+
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 500, 1500)}, {});
+  int64 FirstSeq = 0;
+  TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(FirstSeq));
+  TestEqual(TEXT("Batch N is seq 5"), FirstSeq, (int64)5);
+
+  // Batch N times out while the backend is still applying it.
+  Component->CompleteItemFlush(TEXT("socket closed"), -1, Fixture::NoItems, Fixture::NoItems, 1, 0);
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 200, 1700)}, {});
+
+  // The retry races the original; the original commits seq 5 first, and the retry is refused as a
+  // concurrent flush that reports the original's fence. That is NOT a "did not apply" reply.
+  int64 RetrySeq = 0;
+  TestTrue(TEXT("Retry claim succeeds"), Component->TryBeginItemFlush(RetrySeq));
+  TestEqual(TEXT("The retry re-uses seq 5"), RetrySeq, (int64)5);
+  Component->CompleteItemFlush(
+    TEXT("concurrent flush: inventorySeq or writer changed under fence"),
+    5,
+    Fixture::NoItems,
+    Fixture::NoItems,
+    1,
+    0
+  );
+  TestFalse(TEXT("No rebase: the outcome is unknown"), Component->IsCurrencyRebaseRequired());
+  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
+  TestEqual(TEXT("Both entries are kept"), Pending.Num(), 2);
+  if (Pending.Num() == 2) {
+    TestEqual(TEXT("A is not re-chained"), Pending[0].BalanceAfter, (int64)1500);
+  }
+
+  // The probe re-sends A alone under seq 5; the backend finds A in its ledger and acks it.
+  int64 ProbeSeq = 0;
+  TestTrue(TEXT("Probe claim succeeds"), Component->TryBeginItemFlush(ProbeSeq));
+  TestEqual(TEXT("The probe re-uses seq 5"), ProbeSeq, (int64)5);
+  TestEqual(TEXT("The probe carries only A"), Component->GetCurrencyEntriesToSendCount(), 1);
+  Component->CompleteItemFlush(TEXT(""), 5, Fixture::NoItems, Fixture::NoItems, 1, 0);
+
+  TestEqual(TEXT("A is dropped once, by the replay ack"), Pending.Num(), 1);
+  if (Pending.Num() == 1) {
+    TestEqual(TEXT("B survives"), Pending[0].Id, Fixture::EntryIdB);
+    TestEqual(TEXT("B keeps the chain the backend now holds"), Pending[0].BalanceAfter, (int64)1700);
+  }
+  int64 NextSeq = 0;
+  TestTrue(TEXT("Next claim succeeds"), Component->TryBeginItemFlush(NextSeq));
+  TestEqual(TEXT("B goes out under seq 6"), NextSeq, (int64)6);
+  TestEqual(TEXT("B is sent"), Component->GetCurrencyEntriesToSendCount(), 1);
 
   return true;
 }
