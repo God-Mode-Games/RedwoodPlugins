@@ -587,3 +587,42 @@ bool FRedwoodCurrencyNotAppliedNeedsConsumedSeqTest::RunTest(const FString &Para
   TestEqual(TEXT("After the consumed seq"), BatchSeq, (int64)6);
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyRechainBelowZeroTest,
+  "Redwood.Currency.RechainBelowZeroRefused",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A re-chain that would take the balance below zero writes nothing: a negative BalanceAfter is
+// refused for good, and that freezes the character. The queue waits for a reload instead, and a
+// later balance that fits re-chains it.
+bool FRedwoodCurrencyRechainBelowZeroTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyPersistenceTest;
+  AddExpectedErrorPlain(TEXT("below zero; currency stays held"), EAutomationExpectedErrorFlags::Contains, 2);
+  URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
+  // A purchase staged while 300 was still there.
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, -100, 200)}, {});
+  int32 RebasedCount = 0;
+  Component->OnCurrencyRebased.AddLambda([&RebasedCount](int64) { ++RebasedCount; });
+
+  // The trade took all 300.
+  Component->RechainCurrencyAfterTrade(0);
+  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
+  if (!TestEqual(TEXT("The purchase is kept"), Pending.Num(), 1)) {
+    return false;
+  }
+  TestEqual(TEXT("Its BalanceAfter is not re-chained below zero"), Pending[0].BalanceAfter, (int64)200);
+  TestTrue(TEXT("Currency waits for a reload"), Component->IsCurrencyRebaseRequired());
+  TestEqual(TEXT("Nothing goes out"), Component->GetCurrencyEntriesToSendCount(), 0);
+  TestEqual(TEXT("The game is not told a balance"), RebasedCount, 0);
+
+  // A reload that still cannot pay leaves it held; one that can re-chains it.
+  Component->RebaseCurrency(50);
+  TestEqual(TEXT("A short reload writes nothing"), Pending[0].BalanceAfter, (int64)200);
+  TestTrue(TEXT("It stays held"), Component->IsCurrencyRebaseRequired());
+  Component->RebaseCurrency(100);
+  TestEqual(TEXT("A reload that pays re-chains it"), Pending[0].BalanceAfter, (int64)0);
+  TestFalse(TEXT("And releases it"), Component->IsCurrencyRebaseRequired());
+  return true;
+}
