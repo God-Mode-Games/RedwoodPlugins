@@ -6,6 +6,8 @@
 #include "CoreMinimal.h"
 
 #include "Types/RedwoodTypes.h"
+// FORK(hollowed-oath): currency entries ride the item flush.
+#include "RedwoodCurrencyTypes.h"
 
 #include "RedwoodCharacterComponent.generated.h"
 
@@ -299,7 +301,10 @@ public:
   // race. Consumed by URedwoodServerGameSubsystem's item flush / offline append paths.
   UFUNCTION(BlueprintPure, Category = "Redwood")
   bool IsItemsDirty() const {
-    return DirtyItemGenerations.Num() > 0 || PendingDeletedItemGenerations.Num() > 0;
+    // FORK(hollowed-oath): staged currency counts as dirt, so a balance change with no item change
+    // still drives a flush.
+    return DirtyItemGenerations.Num() > 0 || PendingDeletedItemGenerations.Num() > 0 ||
+      PendingCurrencyEntries.Num() > 0 || PendingGrantKeys.Num() > 0;
   }
 
   // Drained by the server item-flush path when building the upsert payload; not BlueprintCallable
@@ -342,6 +347,72 @@ public:
   // past the seq we sent without being handed it explicitly.
   bool TryBeginItemFlush(int64 &OutBatchSeq);
 
+  // FORK(hollowed-oath) BEGIN: currency ledger staging. Entries and one-time grant keys wait here
+  // until a flush carries them; they leave the queue only on an ack that proves the backend has
+  // them (success with a trustworthy seq) or on an explicit final refusal. Any other error keeps
+  // them -- an error reply means NOT saved, whatever committedSeq says.
+  //
+  // Two rules keep an amount from being lost or applied twice when an ack is lost:
+  //  - Unconfirmed batch: after an error whose outcome the game server cannot know (a timeout,
+  //    a dropped socket), the next batch carries EXACTLY the same entries and keys under the SAME
+  //    seq. The backend then sees a replay and acks it from its ledger (all ids present) or refuses
+  //    it retriably (none present). Adding a newer entry to that resend would turn a committed
+  //    replay into a mixed batch that the backend refuses, and the recovery below would then
+  //    re-chain the committed entry on top of itself.
+  //  - Rebase: after an error that moved the seq (the backend reports committedSeq >= the sent
+  //    seq: a trade used it) or a final refusal, the backend balance is not what the pending
+  //    entries were chained from. No currency is sent until the caller reloads the balance and
+  //    calls RebaseCurrency.
+  void QueueCurrency(
+    const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
+  );
+
+  const TArray<FRedwoodCurrencyEntry> &GetPendingCurrencyEntries() const {
+    return PendingCurrencyEntries;
+  }
+
+  const TArray<FString> &GetPendingGrantKeys() const {
+    return PendingGrantKeys;
+  }
+
+  // How many entries / keys from the FRONT of the queues the next batch must carry. The flush
+  // snapshots exactly this many at claim time and passes the same counts to CompleteItemFlush.
+  // Zero while a rebase is required; exactly the unconfirmed batch while one is outstanding.
+  int32 GetCurrencyEntriesToSendCount() const;
+  int32 GetGrantKeysToSendCount() const;
+
+  // Read right after TryBeginItemFlush. True when the claimed batch re-sends an unconfirmed batch
+  // under a seq the lane has already moved past (a trade fence seeded the lane forward). Such a
+  // batch must carry NO item rows: the backend answers a seq at or below its fence as a replay and
+  // does not apply rows in it, yet its success ack would clear them.
+  bool IsItemFlushReplayProbe() const {
+    return bItemFlushInFlight && InFlightBatchSeq < NextBatchSeq;
+  }
+
+  bool IsCurrencyRebaseRequired() const {
+    return bCurrencyRebaseRequired;
+  }
+
+  // Re-chains every pending entry's BalanceAfter from Balance (the amount just loaded from the
+  // backend) and allows currency to be sent again. Ignored unless a rebase is required: at any
+  // other time a pending entry may already be committed, and re-chaining it would count it twice.
+  void RebaseCurrency(int64 Balance);
+
+  // The token the realm issued this session at auth. Every items:flush must carry it; the backend
+  // commits nothing for any other token.
+  const FString &GetWriterToken() const {
+    return WriterToken;
+  }
+
+  // Called at hydration, beside SeedItemSeqFromCharacter.
+  void SeedWriterToken(const FString &InWriterToken) {
+    WriterToken = InWriterToken;
+  }
+
+  FOnItemFlushRefusedFinal OnItemFlushRefusedFinal;
+  FOnCurrencyAlerts OnCurrencyAlerts;
+  // FORK(hollowed-oath) END
+
   // Ack handler for the in-flight item flush. On success (Error empty) clears the SENT generations
   // (generation-matched, exactly as the old container ack did) and advances the committed seq. On
   // error it normally leaves dirt in place so the next tick re-sends -- EXCEPT when the backend
@@ -349,11 +420,17 @@ public:
   // case NextBatchSeq is realigned to CommittedSeq + 1 so future flushes aren't wedged behind a
   // gap the backend will keep rejecting. ALWAYS releases the flight slot. SentUpserts/SentDeletes
   // pair each sent id with the GENERATION current for it at send time.
+  // FORK(hollowed-oath): SentCurrencyCount/SentGrantCount are the counts the batch took from the
+  // front of the currency queues. bFinalRefusal is the ack's `final` flag: only that drops the sent
+  // entries and keys on an error (see the currency staging block above).
   void CompleteItemFlush(
     const FString &Error,
     int64 CommittedSeq,
     const TArray<TPair<FString, uint64>> &SentUpserts,
-    const TArray<TPair<FString, uint64>> &SentDeletes
+    const TArray<TPair<FString, uint64>> &SentDeletes,
+    int32 SentCurrencyCount = 0,
+    int32 SentGrantCount = 0,
+    bool bFinalRefusal = false
   );
 
   // Seeds the committed-seq/next-batchSeq state from a freshly-loaded character's InventorySeq.
@@ -476,6 +553,30 @@ private:
   // the slot frees. Exactly one is held: the detached barrier makes a single attempt, and chaining
   // an unbounded queue here would be a worse failure than the interim settle it replaces (#1534).
   TFunction<void()> PendingItemFlushRetry;
+
+  // Currency ledger staging (see the public FORK block on QueueCurrency for the rules).
+  TArray<FRedwoodCurrencyEntry> PendingCurrencyEntries;
+  TArray<FString> PendingGrantKeys;
+
+  // An unconfirmed batch: the counts at the front of the queues and the seq it went out under.
+  bool bCurrencyBatchUnconfirmed = false;
+  int32 UnconfirmedCurrencyCount = 0;
+  int32 UnconfirmedGrantCount = 0;
+  int64 UnconfirmedBatchSeq = 0;
+
+  bool bCurrencyRebaseRequired = false;
+  FString WriterToken;
+
+  // Moves the committed seq and NextBatchSeq forward to CommittedSeq, never back: a replay probe
+  // goes out under an older seq than NextBatchSeq, and its ack must not rewind the lane.
+  void AdoptCommittedItemSeq(int64 CommittedSeq);
+
+  void ClearSentItemGenerations(
+    const TArray<TPair<FString, uint64>> &SentUpserts,
+    const TArray<TPair<FString, uint64>> &SentDeletes
+  );
+  void RemoveSentCurrency(int32 SentCurrencyCount, int32 SentGrantCount);
+  void MarkCurrencyBatchUnconfirmed(int32 SentCurrencyCount, int32 SentGrantCount, int64 SentSeq);
   // FORK(hollowed-oath) END
 
 public:

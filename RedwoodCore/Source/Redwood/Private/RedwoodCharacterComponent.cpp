@@ -640,8 +640,12 @@ bool URedwoodCharacterComponent::TryBeginItemFlush(int64 &OutBatchSeq) {
   }
 
   bItemFlushInFlight = true;
-  InFlightBatchSeq = NextBatchSeq;
-  OutBatchSeq = NextBatchSeq;
+  // FORK(hollowed-oath): an unconfirmed currency batch goes out again under its OWN seq, even if a
+  // trade fence has since seeded the lane forward. Only that seq lets the backend tell whether the
+  // batch committed (a replay it acks from its ledger) or not (a retriable refusal); under a new
+  // seq a committed entry would be refused as a duplicate and the batch lost with it.
+  InFlightBatchSeq = bCurrencyBatchUnconfirmed ? UnconfirmedBatchSeq : NextBatchSeq;
+  OutBatchSeq = InFlightBatchSeq;
   return true;
 }
 
@@ -649,10 +653,18 @@ void URedwoodCharacterComponent::CompleteItemFlush(
   const FString &Error,
   int64 CommittedSeq,
   const TArray<TPair<FString, uint64>> &SentUpserts,
-  const TArray<TPair<FString, uint64>> &SentDeletes
+  const TArray<TPair<FString, uint64>> &SentDeletes,
+  int32 SentCurrencyCount,
+  int32 SentGrantCount,
+  bool bFinalRefusal
 ) {
   // The seq the just-completed flush stamped on its payload (claimed in TryBeginItemFlush).
   const int64 SentSeq = InFlightBatchSeq;
+
+  // FORK(hollowed-oath): nothing leaves the queues between the claim and this ack except here, so
+  // the counts can only exceed the queues through a caller bug. Clamp rather than over-remove.
+  SentCurrencyCount = FMath::Clamp(SentCurrencyCount, 0, PendingCurrencyEntries.Num());
+  SentGrantCount = FMath::Clamp(SentGrantCount, 0, PendingGrantKeys.Num());
 
   if (Error.IsEmpty()) {
     // Success: clear only the ids whose generation still matches what was sent, exactly as the
@@ -668,18 +680,13 @@ void URedwoodCharacterComponent::CompleteItemFlush(
     // past it, and THAT ack (which passes the check below) clears them properly.
     const bool bSeqTrustworthy = CommittedSeq >= SentSeq;
     if (bSeqTrustworthy) {
-      for (const TPair<FString, uint64> &Sent : SentUpserts) {
-        uint64 *CurrentGeneration = DirtyItemGenerations.Find(Sent.Key);
-        if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
-          DirtyItemGenerations.Remove(Sent.Key);
-        }
-      }
-      for (const TPair<FString, uint64> &Sent : SentDeletes) {
-        uint64 *CurrentGeneration = PendingDeletedItemGenerations.Find(Sent.Key);
-        if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
-          PendingDeletedItemGenerations.Remove(Sent.Key);
-        }
-      }
+      ClearSentItemGenerations(SentUpserts, SentDeletes);
+      // FORK(hollowed-oath): the backend holds these entries -- committed now, or by the earlier
+      // attempt this batch replays (the backend acks a replay that carries currency only when
+      // every entry id is already in its ledger). Entries queued after the claim sit behind them
+      // and stay.
+      RemoveSentCurrency(SentCurrencyCount, SentGrantCount);
+      bCurrencyBatchUnconfirmed = false;
     }
 
     // FORK(hollowed-oath): defensive guard against a malformed SUCCESS ack. We otherwise trust the
@@ -705,9 +712,25 @@ void URedwoodCharacterComponent::CompleteItemFlush(
         SentSeq,
         NextBatchSeq
       );
+      // FORK(hollowed-oath): the same self-healing replay for currency -- keep the batch exactly as
+      // sent, under its seq, until an ack can be trusted.
+      MarkCurrencyBatchUnconfirmed(SentCurrencyCount, SentGrantCount, SentSeq);
     } else {
-      LastCommittedItemSeq = CommittedSeq;
-      NextBatchSeq = CommittedSeq + 1;
+      AdoptCommittedItemSeq(CommittedSeq);
+    }
+  } else if (bFinalRefusal) {
+    // FORK(hollowed-oath): the backend refused this batch for good, rolled ALL of it back, and
+    // raised an alert. Re-sending can never succeed, so the sent entries and keys go. The sent
+    // item rows go too: the batch is one unit (a purchase is its item row plus its debit), and
+    // re-sending the rows without the refused debit would hand the item out for free. The
+    // character must reload; until the caller rebases from that reload, the rest of the queue was
+    // chained from a balance that includes the refused entries and must not be sent.
+    ClearSentItemGenerations(SentUpserts, SentDeletes);
+    RemoveSentCurrency(SentCurrencyCount, SentGrantCount);
+    bCurrencyBatchUnconfirmed = false;
+    bCurrencyRebaseRequired = true;
+    if (CommittedSeq >= SentSeq) {
+      AdoptCommittedItemSeq(CommittedSeq);
     }
   } else {
     // Error: leave dirt in place so the next tick re-sends. Normally we also leave NextBatchSeq
@@ -716,13 +739,30 @@ void URedwoodCharacterComponent::CompleteItemFlush(
     // case keeping our old NextBatchSeq would wedge every future flush behind a gap the backend
     // keeps rejecting, so realign to the backend's committed fence.
     if (CommittedSeq >= SentSeq) {
-      LastCommittedItemSeq = CommittedSeq;
-      NextBatchSeq = CommittedSeq + 1;
+      AdoptCommittedItemSeq(CommittedSeq);
+      // FORK(hollowed-oath): an error that carries a fence at or past the sent seq is the backend
+      // saying a trade used that seq and this batch did NOT apply (it checks the entry ids). The
+      // entries are NOT dropped -- an error reply means not saved, whatever committedSeq says. The
+      // trade moved the balance, so every pending BalanceAfter is stale and would be refused as
+      // final; hold currency until the caller reloads and rebases. The batch is no longer
+      // unconfirmed: its outcome is now known.
+      bCurrencyBatchUnconfirmed = false;
+      bCurrencyRebaseRequired = true;
+    } else {
+      // FORK(hollowed-oath): the outcome is unknown (a dropped socket, a timeout, a lost race).
+      // Re-send the same entries under the same seq; see the staging block in the header.
+      MarkCurrencyBatchUnconfirmed(SentCurrencyCount, SentGrantCount, SentSeq);
     }
   }
 
   // Always release the flight slot, whatever the outcome.
   bItemFlushInFlight = false;
+
+  // FORK(hollowed-oath): after the state above is settled, so a listener that reacts (by starting
+  // the reload, or by returning the player to character select) sees the queues as they now are.
+  if (bFinalRefusal && !Error.IsEmpty()) {
+    OnItemFlushRefusedFinal.Broadcast(Error);
+  }
 
   // A flush attempt that arrived while this batch was outstanding PARKED itself here rather than
   // settling — see FlushItemsForCharacterComponent's single-flight branch. The slot is free again
@@ -741,5 +781,107 @@ void URedwoodCharacterComponent::CompleteItemFlush(
 void URedwoodCharacterComponent::SeedItemSeqFromCharacter(int64 InventorySeq) {
   LastCommittedItemSeq = InventorySeq;
   NextBatchSeq = InventorySeq + 1;
+}
+
+void URedwoodCharacterComponent::AdoptCommittedItemSeq(int64 CommittedSeq) {
+  if (CommittedSeq > LastCommittedItemSeq) {
+    LastCommittedItemSeq = CommittedSeq;
+  }
+  if (CommittedSeq + 1 > NextBatchSeq) {
+    NextBatchSeq = CommittedSeq + 1;
+  }
+}
+
+void URedwoodCharacterComponent::ClearSentItemGenerations(
+  const TArray<TPair<FString, uint64>> &SentUpserts,
+  const TArray<TPair<FString, uint64>> &SentDeletes
+) {
+  for (const TPair<FString, uint64> &Sent : SentUpserts) {
+    uint64 *CurrentGeneration = DirtyItemGenerations.Find(Sent.Key);
+    if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
+      DirtyItemGenerations.Remove(Sent.Key);
+    }
+  }
+  for (const TPair<FString, uint64> &Sent : SentDeletes) {
+    uint64 *CurrentGeneration = PendingDeletedItemGenerations.Find(Sent.Key);
+    if (CurrentGeneration && *CurrentGeneration == Sent.Value) {
+      PendingDeletedItemGenerations.Remove(Sent.Key);
+    }
+  }
+}
+
+void URedwoodCharacterComponent::QueueCurrency(
+  const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
+) {
+  // Appended, never merged or de-duplicated: the backend checks each BalanceAfter in order, and a
+  // repeated grant key must reach the backend so it refuses the second reward instead of the game
+  // server quietly paying it without its guard.
+  PendingCurrencyEntries.Append(Entries);
+  PendingGrantKeys.Append(GrantKeys);
+}
+
+int32 URedwoodCharacterComponent::GetCurrencyEntriesToSendCount() const {
+  if (bCurrencyRebaseRequired) {
+    return 0;
+  }
+  return bCurrencyBatchUnconfirmed ? UnconfirmedCurrencyCount : PendingCurrencyEntries.Num();
+}
+
+int32 URedwoodCharacterComponent::GetGrantKeysToSendCount() const {
+  if (bCurrencyRebaseRequired) {
+    return 0;
+  }
+  return bCurrencyBatchUnconfirmed ? UnconfirmedGrantCount : PendingGrantKeys.Num();
+}
+
+void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
+  if (!bCurrencyRebaseRequired) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("RebaseCurrency: no rebase is required; ignoring the reloaded balance %lld"),
+      Balance
+    );
+    return;
+  }
+
+  int64 Running = Balance;
+  for (FRedwoodCurrencyEntry &Entry : PendingCurrencyEntries) {
+    const bool bOverflows = Entry.Delta > 0 ? Running > MAX_int64 - Entry.Delta
+                                            : Running < MIN_int64 - Entry.Delta;
+    if (bOverflows) {
+      // Leave this entry and the rest as they are: the backend refuses the stale value as final
+      // and raises an alert, which is the right outcome for a balance that cannot exist.
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("RebaseCurrency: entry %s overflows int64 from balance %lld"),
+        *Entry.Id,
+        Running
+      );
+      break;
+    }
+    Running += Entry.Delta;
+    Entry.BalanceAfter = Running;
+  }
+  bCurrencyRebaseRequired = false;
+}
+
+void URedwoodCharacterComponent::RemoveSentCurrency(int32 SentCurrencyCount, int32 SentGrantCount) {
+  // The queues only grow at the back, so the sent entries are still the front ones.
+  PendingCurrencyEntries.RemoveAt(0, SentCurrencyCount);
+  PendingGrantKeys.RemoveAt(0, SentGrantCount);
+}
+
+void URedwoodCharacterComponent::MarkCurrencyBatchUnconfirmed(
+  int32 SentCurrencyCount, int32 SentGrantCount, int64 SentSeq
+) {
+  if (SentCurrencyCount == 0 && SentGrantCount == 0) {
+    return;
+  }
+  bCurrencyBatchUnconfirmed = true;
+  UnconfirmedCurrencyCount = SentCurrencyCount;
+  UnconfirmedGrantCount = SentGrantCount;
+  UnconfirmedBatchSeq = SentSeq;
 }
 // FORK(hollowed-oath) END
