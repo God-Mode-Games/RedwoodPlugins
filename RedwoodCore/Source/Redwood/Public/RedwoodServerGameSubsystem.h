@@ -48,7 +48,8 @@ struct FRedwoodItemFlushSent {
   TArray<TPair<FString, uint64>> Upserts;
   TArray<TPair<FString, uint64>> Deletes;
   int32 CurrencyCount = 0;
-  int32 GrantCount = 0;
+  // The keys themselves, not only their count: a commit adds them to the snapshot's GrantKeys.
+  TArray<FString> GrantKeys;
   // The last sent entry's BalanceAfter: the balance the backend holds once this batch commits.
   bool bHasBalanceAfter = false;
   int64 BalanceAfter = 0;

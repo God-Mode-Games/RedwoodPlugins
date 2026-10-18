@@ -56,7 +56,7 @@ namespace RedwoodCurrencyFlushTest {
     TArray<FString> GrantKeys;
     URedwoodServerGameSubsystem::ClaimCurrencyToSend(Component, Entries, GrantKeys);
     Sent.CurrencyCount = Entries.Num();
-    Sent.GrantCount = GrantKeys.Num();
+    Sent.GrantKeys = GrantKeys;
     if (Entries.Num() > 0) {
       Sent.bHasBalanceAfter = true;
       Sent.BalanceAfter = Entries.Last().BalanceAfter;
@@ -203,7 +203,7 @@ bool FRedwoodCurrencyClaimTakesToSendCountsTest::RunTest(const FString &Paramete
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 500, 500)}, {Fixture::QuestGrantKey});
   const FRedwoodItemFlushSent First = Fixture::ClaimBatch(*this, Component);
   TestEqual(TEXT("The first batch carries the entry"), First.CurrencyCount, 1);
-  TestEqual(TEXT("The first batch carries the key"), First.GrantCount, 1);
+  TestEqual(TEXT("The first batch carries the key"), First.GrantKeys.Num(), 1);
   TestEqual(TEXT("The balance the batch commits"), First.BalanceAfter, (int64)500);
 
   // The outcome is unknown, and B is staged before the retry.
@@ -214,7 +214,7 @@ bool FRedwoodCurrencyClaimTakesToSendCountsTest::RunTest(const FString &Paramete
 
   const FRedwoodItemFlushSent Retry = Fixture::ClaimBatch(*this, Component);
   TestEqual(TEXT("The retry carries only the unconfirmed entry"), Retry.CurrencyCount, 1);
-  TestEqual(TEXT("The retry carries the unconfirmed key"), Retry.GrantCount, 1);
+  TestEqual(TEXT("The retry carries the unconfirmed key"), Retry.GrantKeys.Num(), 1);
   TestEqual(TEXT("The retry goes under the same seq"), Retry.BatchSeq, First.BatchSeq);
   TestEqual(TEXT("The retry's balance is A's, not B's"), Retry.BalanceAfter, (int64)500);
 
@@ -512,5 +512,47 @@ bool FRedwoodCurrencyNotAppliedConsumesSeqTest::RunTest(const FString &Parameter
   TestFalse(TEXT("The next batch is not a probe"), Component->IsItemFlushReplayProbe());
   TestEqual(TEXT("It goes out after the consumed seq"), Next.BatchSeq, Probe.BatchSeq + 1);
   TestEqual(TEXT("It carries the entry"), Next.CurrencyCount, 1);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyFlushCommitAddsGrantKeysTest,
+  "Redwood.Currency.FlushCommitAddsGrantKeys",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A grant key joins the snapshot's used keys, and a balance the snapshot's balance, only when the
+// batch commits, so game code on a recreated component neither pays a reward twice nor skips one
+// that never saved.
+bool FRedwoodCurrencyFlushCommitAddsGrantKeysTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyFlushTest;
+  URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(4);
+  URedwoodPlayerStateComponent *PlayerState = Fixture::MakePlayerStateComponent(4, 1000);
+
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 250, 1250)}, {Fixture::QuestGrantKey});
+  const FRedwoodItemFlushSent First = Fixture::ClaimBatch(*this, Component);
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+    Component, PlayerState, Fixture::MakeReply(TEXT("socket closed"), -1), First
+  );
+  TestEqual(TEXT("An unknown outcome adds no key"), PlayerState->RedwoodCharacter.GrantKeys.Num(), 0);
+
+  const FRedwoodItemFlushSent Probe = Fixture::ClaimBatch(*this, Component);
+  FRedwoodItemFlushReply NotApplied = Fixture::MakeReply(FString(), Probe.BatchSeq);
+  // Without the error text the backend sends with it, so only the flag can keep the key out.
+  NotApplied.bNotApplied = true;
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(Component, PlayerState, NotApplied, Probe);
+  TestEqual(TEXT("A batch that never applied adds no key"), PlayerState->RedwoodCharacter.GrantKeys.Num(), 0);
+  TestEqual(TEXT("Nor moves the snapshot balance"), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)1000);
+
+  const FRedwoodItemFlushSent Normal = Fixture::ClaimBatch(*this, Component);
+  // A later fence: a trade committed after this batch, which still committed.
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+    Component, PlayerState, Fixture::MakeReply(FString(), Normal.BatchSeq + 1), Normal
+  );
+  TestTrue(
+    TEXT("The committed key joins the snapshot"),
+    PlayerState->RedwoodCharacter.GrantKeys == TArray<FString>{Fixture::QuestGrantKey}
+  );
+  TestEqual(TEXT("And leaves the queue"), Component->GetPendingGrantKeys().Num(), 0);
   return true;
 }

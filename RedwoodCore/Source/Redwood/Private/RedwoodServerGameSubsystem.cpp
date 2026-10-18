@@ -2772,7 +2772,7 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   TArray<FString> SentGrantKeys;
   ClaimCurrencyToSend(CharacterComponent, SentCurrencyEntries, SentGrantKeys);
   Sent.CurrencyCount = SentCurrencyEntries.Num();
-  Sent.GrantCount = SentGrantKeys.Num();
+  Sent.GrantKeys = SentGrantKeys;
   if (SentCurrencyEntries.Num() > 0) {
     Sent.bHasBalanceAfter = true;
     Sent.BalanceAfter = SentCurrencyEntries.Last().BalanceAfter;
@@ -3020,8 +3020,11 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
 ) {
   // A saved batch behind a later fence: the entries are committed, but the balance after them is
   // not known (see the snapshot write below).
+  // FORK(hollowed-oath): a notApplied reply is never a commit, whatever its error text, so it
+  // writes no balance below.
+  const bool bCommitted = Reply.Error.IsEmpty() && !Reply.bNotApplied;
   const bool bBalanceUnconfirmed =
-    Reply.Error.IsEmpty() && Sent.bHasBalanceAfter && Reply.CommittedSeq > Sent.BatchSeq;
+    bCommitted && Sent.bHasBalanceAfter && Reply.CommittedSeq > Sent.BatchSeq;
 
   // The snapshot is updated BEFORE CompleteItemFlush, because CompleteItemFlush runs a parked flush
   // attempt, and that attempt seeds its seq forward from the snapshot.
@@ -3050,11 +3053,21 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
     // entries from it. Only when the fence is exactly this batch's seq: a later fence means
     // something else (a trade) committed after it, and the last BalanceAfter is then not the
     // balance. The snapshot then says so, and the reload below sets it again.
-    if (Reply.Error.IsEmpty() && Sent.bHasBalanceAfter && Reply.CommittedSeq == Sent.BatchSeq) {
+    if (bCommitted && Sent.bHasBalanceAfter && Reply.CommittedSeq == Sent.BatchSeq) {
       Snapshot.CurrencyAmount = Sent.BalanceAfter;
       Snapshot.bCurrencyAmountUnknown = false;
     } else if (bBalanceUnconfirmed) {
       Snapshot.bCurrencyAmountUnknown = true;
+    }
+
+    // FORK(hollowed-oath): the committed grant keys, for the same reason: game code on a recreated
+    // component checks the snapshot before it stages a one-time reward, and the backend refuses a
+    // reused key for good. These are exactly the replies on which CompleteItemFlush drops the sent
+    // keys as saved; a later fence still means this batch committed.
+    if (bCommitted && Reply.CommittedSeq >= Sent.BatchSeq) {
+      for (const FString &GrantKey : Sent.GrantKeys) {
+        Snapshot.GrantKeys.AddUnique(GrantKey);
+      }
     }
 
     // On a sequence gap the component realigns its lane back to the backend's fence. The snapshot
@@ -3080,7 +3093,7 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
     Sent.Upserts,
     Sent.Deletes,
     Sent.CurrencyCount,
-    Sent.GrantCount,
+    Sent.GrantKeys.Num(),
     Reply.bFinal,
     Reply.bRebaseRequired,
     Reply.bNotApplied
