@@ -2010,9 +2010,8 @@ bool FRedwoodCurrencyTradeRefusedBeforeSendTest::RunTest(const FString &Paramete
     From.PlayerStateComponent->RedwoodCharacter.bCurrencyAmountUnknown = true;
   });
 
-  const FString PayerId = TEXT("character-payer-6");
   const TArray<TPair<FString, FRedwoodCurrencyEntry>> Overdraft =
-    MakeTradeCurrency(FromBalance + 1, FromBalance + 1, PayerId);
+    MakeTradeCurrency(FromBalance + 1, FromBalance + 1, TEXT("character-payer-6"));
   ExpectRefused(TEXT("cannot pay"), [](FParty &) {}, &Overdraft);
   const TArray<TPair<FString, FRedwoodCurrencyEntry>> Unbalanced =
     MakeTradeCurrency(TradedAmount, TradedAmount - 1, TEXT("character-payer-7"));
