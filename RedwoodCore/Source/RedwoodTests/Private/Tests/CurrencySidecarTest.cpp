@@ -1388,6 +1388,8 @@ bool FRedwoodCurrencySidecarComponentGoneErrorTest::RunTest(const FString &Param
   }
   URedwoodPlayerStateComponent *PlayerStateComponent = NewObject<URedwoodPlayerStateComponent>();
   FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+  // The flush takes the character id from the snapshot when it has one to give.
+  Snapshot.Id = CharacterId;
   Snapshot.InventorySeq = SeededInventorySeq;
   Snapshot.CurrencyAmount = SnapshotBalance;
 
