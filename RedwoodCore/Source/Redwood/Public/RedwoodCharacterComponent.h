@@ -424,6 +424,8 @@ public:
   // front of the currency queues. bFinalRefusal is the ack's `final` flag: only that drops the sent
   // entries and keys on an error. bRebaseRequired is the ack's `rebaseRequired` flag: only that
   // (or a final refusal) makes the queue wait for a reload (see the currency staging block above).
+  // A negative CommittedSeq means the reply carried no fence; a fence below SentSeq - 1 on an
+  // error is a sequence gap, and the lane realigns to it.
   void CompleteItemFlush(
     const FString &Error,
     int64 CommittedSeq,

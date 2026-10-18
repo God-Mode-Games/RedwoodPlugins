@@ -409,3 +409,36 @@ bool FRedwoodCurrencyResendCarriesNoRowsTest::RunTest(const FString &Parameters)
 
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySequenceGapRealignsTest,
+  "Redwood.Currency.SequenceGapRealigns",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodCurrencySequenceGapRealignsTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyPersistenceTest;
+  URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
+  Component->SeedItemSeqFromCharacter(9);
+
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, 500, 500)}, {});
+  int64 BatchSeq = 0;
+  TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
+  TestEqual(TEXT("Claim uses seq 10"), BatchSeq, (int64)10);
+
+  // The backend has committed only seq 7: seq 10 is a gap and did not apply.
+  Component->CompleteItemFlush(TEXT("sequence gap"), 7, Fixture::NoItems, Fixture::NoItems, 1, 0);
+
+  TestEqual(TEXT("The entry is kept"), Component->GetPendingCurrencyEntries().Num(), 1);
+  TestFalse(TEXT("No rebase: the balance did not move"), Component->IsCurrencyRebaseRequired());
+  TestEqual(TEXT("The committed seq follows the backend"), Component->GetLastCommittedItemSeq(), (int64)7);
+
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdB, 200, 700)}, {});
+  int64 NextSeq = 0;
+  TestTrue(TEXT("Next claim succeeds"), Component->TryBeginItemFlush(NextSeq));
+  TestEqual(TEXT("The next batch continues from the backend fence, not the gapped seq"), NextSeq, (int64)8);
+  TestFalse(TEXT("Not a probe: the gapped batch is known not applied"), Component->IsItemFlushReplayProbe());
+  TestEqual(TEXT("Both entries go out"), Component->GetCurrencyEntriesToSendCount(), 2);
+
+  return true;
+}

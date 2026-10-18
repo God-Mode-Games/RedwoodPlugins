@@ -753,6 +753,15 @@ void URedwoodCharacterComponent::CompleteItemFlush(
       // that reload and then call RebaseCurrency.
       bCurrencyBatchUnconfirmed = false;
       bCurrencyRebaseRequired = true;
+    } else if (CommittedSeq >= 0 && CommittedSeq < SentSeq - 1) {
+      // FORK(hollowed-oath): a sequence gap. The backend is behind the seq we sent, so this batch
+      // (and any earlier attempt of it under the same seq) cannot have committed. Re-sending the
+      // gapped seq would be refused forever; realign to the backend's fence, as the success path
+      // does, and send the kept entries as an ordinary batch there. Negative means the reply had no
+      // fence at all (a dropped socket), which is not a gap.
+      LastCommittedItemSeq = CommittedSeq;
+      NextBatchSeq = CommittedSeq + 1;
+      bCurrencyBatchUnconfirmed = false;
     } else {
       // FORK(hollowed-oath): any other error leaves the outcome unknown, WHATEVER committedSeq says.
       // A "concurrent flush" refusal of a retry that raced its own still-running original reports

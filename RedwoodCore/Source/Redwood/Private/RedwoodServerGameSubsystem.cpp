@@ -2728,10 +2728,13 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
       TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
       FString Error = MessageStruct->GetStringField(TEXT("error"));
       // committedSeq rides both success and error (fence/replay) responses; TryGetNumberField
-      // leaves the 0 default when absent (e.g. some error responses), which the error path treats
+      // leaves the default when absent (e.g. some error responses), which the error path treats
       // as "no fence ahead of us" and leaves NextBatchSeq alone -- and avoids a spurious missing-
       // field warning that GetNumberField would log.
-      double CommittedSeqValue = 0.0;
+      // FORK(hollowed-oath): the default is -1, not 0. CompleteItemFlush reads a fence below the
+      // sent seq as a sequence gap and realigns to it; 0 is a real fence (a new character), so an
+      // absent field must not look like one.
+      double CommittedSeqValue = -1.0;
       MessageStruct->TryGetNumberField(TEXT("committedSeq"), CommittedSeqValue);
       int64 CommittedSeq = static_cast<int64>(CommittedSeqValue);
 
