@@ -4326,6 +4326,16 @@ void URedwoodServerGameSubsystem::HandleItemsTradeReply(
       // refusals before the transaction are the same on every attempt, so the first attempt was
       // refused too, except the two that depend on this server's session: those say nothing about
       // the earlier attempt, so the trade is sent again.
+      if (Trade->Attempts > 1 && Parsed.Error.Equals(TradeIdReusedError, ESearchCase::CaseSensitive)) {
+        UE_LOG(
+          LogRedwood,
+          Error,
+          TEXT("Trade %s: the realm says a resend differs from its first send, but a resend is the same request. This is a bug."),
+          *TradeId
+        );
+        GiveUpItemsTrade(TradeId, TEXT("a resend was refused as a reused trade id"));
+        return;
+      }
       if (Trade->bOutcomeUnknown && Parsed.bSessionRefused) {
         RetryItemsTrade(TradeId, Parsed.Error);
         return;

@@ -2538,4 +2538,121 @@ bool FRedwoodCurrencyTradeOtherComponentUnconfirmedTest::RunTest(const FString &
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeIdReusedTest,
+  "Redwood.Currency.Trade.ReusedIdRefusal",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// "trade id reused with different contents" on a first send is a refusal: NOT applied, nobody
+// freezes. On a resend it cannot happen, because a resend is the first send again; when it does, it
+// is a bug, the earlier attempt's outcome is unknown, and both characters freeze.
+bool FRedwoodCurrencyTradeIdReusedTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, 3);
+  AddExpectedErrorPlain(TEXT("a resend is the same request. This is a bug."), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedErrorPlain(TEXT("Its outcome is UNKNOWN"), EAutomationExpectedErrorFlags::Contains, 1);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  const FString ReusedReply = ErrorReply(URedwoodServerGameSubsystem::TradeIdReusedError);
+
+  FTradeResult FirstResult;
+  FRequest First;
+  if (!SendTrade(Harness, From, To, FirstResult, First)) {
+    return false;
+  }
+  Harness.Answer(First, ReusedReply);
+  TestTrue(TEXT("The first trade settles"), Harness.PumpUntil([&FirstResult]() { return FirstResult.Calls > 0; }));
+  TestFalse(TEXT("It was refused"), FirstResult.Error.IsEmpty());
+  TestFalse(TEXT("A refused first send freezes nobody"), Harness.Subsystem->IsCharacterFrozen(FromId));
+  TestEqual(TEXT("And moves no seq"), From.Component->GetLastCommittedItemSeq(), FromSeq);
+
+  FTradeResult SecondResult;
+  Harness.Subsystem->EmitItemsTrade(
+    From.Component, To.Component, {}, MakeTradeCurrency(TradedAmount, TradedAmount), FreshTradeId,
+    Capture(SecondResult)
+  );
+  FRequest Second;
+  if (!Harness.ReadRequest(TradeEvent, Second)) {
+    return false;
+  }
+  Harness.Answer(Second, TimedOutReply());
+  PumpFor(QuietWindowSeconds);
+  FAccess::ResendTradeNow(*Harness.Subsystem, FreshTradeId);
+  FRequest Resend;
+  if (!Harness.ReadRequest(TradeEvent, Resend)) {
+    return false;
+  }
+  Harness.Answer(Resend, ReusedReply);
+  TestTrue(TEXT("The second trade settles"), Harness.PumpUntil([&SecondResult]() { return SecondResult.Calls > 0; }));
+  TestFalse(TEXT("With an error"), SecondResult.Error.IsEmpty());
+  TestTrue(TEXT("The payer is frozen"), Harness.Subsystem->IsCharacterFrozen(FromId));
+  TestTrue(TEXT("The payee is frozen"), Harness.Subsystem->IsCharacterFrozen(ToId));
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeCommitUnknownEveryAttemptTest,
+  "Redwood.Currency.Trade.CommitUnknownEveryAttemptGivesUp",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A realm that answers commitUnknown every time (the same throw on every send) is ended by the
+// attempt cap: each commitUnknown uses an attempt, as a timeout does, and after TradeMaxAttempts the
+// trade gives up, logs its entries and freezes both characters.
+bool FRedwoodCurrencyTradeCommitUnknownEveryAttemptTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  const int32 MaxAttempts = URedwoodServerGameSubsystem::TradeMaxAttempts;
+  AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, MaxAttempts);
+  AddExpectedErrorPlain(TEXT("Its outcome is UNKNOWN"), EAutomationExpectedErrorFlags::Contains, 1);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  const FString CommitUnknownReply =
+    TEXT(R"({"error":"TypeError: x is undefined","fromCommittedSeq":-1,"toCommittedSeq":-1,"commitUnknown":true})");
+  FTradeResult Result;
+  FRequest Request;
+  if (!SendTrade(Harness, From, To, Result, Request)) {
+    return false;
+  }
+  for (int32 Attempt = 1; Attempt <= MaxAttempts; ++Attempt) {
+    if (Attempt > 1) {
+      TestEqual(TEXT("Not settled while attempts remain"), Result.Calls, 0);
+      TestFalse(TEXT("Nobody is frozen yet"), Harness.Subsystem->IsCharacterFrozen(FromId));
+      FAccess::ResendTradeNow(*Harness.Subsystem, TradeId);
+      if (!Harness.ReadRequest(TradeEvent, Request)) {
+        return false;
+      }
+    }
+    const FRedwoodPendingItemTrade *Pending = FAccess::Trade(*Harness.Subsystem, TradeId);
+    TestEqual(TEXT("Each send uses an attempt"), Pending ? Pending->Attempts : -1, Attempt);
+    Harness.Answer(Request, CommitUnknownReply);
+    Harness.PumpUntil([&Harness, &Result]() {
+      const FRedwoodPendingItemTrade *Open = FAccess::Trade(*Harness.Subsystem, TradeId);
+      return Result.Calls > 0 || (Open && Open->Generation == 0);
+    });
+  }
+  TestEqual(TEXT("The trade gives up after the last attempt"), Result.Calls, 1);
+  TestFalse(TEXT("With an error"), Result.Error.IsEmpty());
+  TestTrue(TEXT("The payer is frozen"), Harness.Subsystem->IsCharacterFrozen(FromId));
+  TestTrue(TEXT("The payee is frozen"), Harness.Subsystem->IsCharacterFrozen(ToId));
+  TestTrue(TEXT("No further attempt goes out"), Harness.IsQuiet());
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER
