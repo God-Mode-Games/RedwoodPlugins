@@ -393,6 +393,15 @@ public:
 
   static FRedwoodItemFlushReply ParseItemsFlushReply(const TSharedPtr<FJsonObject> &Reply);
 
+  // FORK(hollowed-oath): the snapshot half of a COMMITTED reply: the seq (forward only), the
+  // balance (or the unknown mark behind a later fence) and the grant keys. Writes nothing for an
+  // error or notApplied reply. Also used when the component that sent the batch is gone.
+  static void WriteCommittedFlushToSnapshot(
+    FRedwoodCharacterBackend &Snapshot,
+    const FRedwoodItemFlushReply &Reply,
+    const FRedwoodItemFlushSent &Sent
+  );
+
   // Hands the reply to CompleteItemFlush and keeps the PlayerState snapshot (nullable) in step:
   // the committed seq and balance on success, a lowered seq on a sequence gap. Broadcasts the
   // reply's alerts.

@@ -2915,6 +2915,15 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
             LogRedwood, Error, TEXT("Failed to flush items (component gone): %s"), *Reply.Error
           );
         }
+        // FORK(hollowed-oath): a committed batch is still committed. The component that sent it
+        // is gone, but the snapshot outlives it, and the next component hydrates from it: without
+        // the commit's seq, balance and grant keys there, it would reuse the seq, chain from a
+        // stale balance, and stage a reward whose key is already used, which the backend refuses
+        // for good. An error reply writes nothing here: what it would change lives on the
+        // component that is gone.
+        if (URedwoodPlayerStateComponent *LivePlayerStateComponent = WeakPlayerStateComponent.Get()) {
+          WriteCommittedFlushToSnapshot(LivePlayerStateComponent->RedwoodCharacter, Reply, Sent);
+        }
         // Still settle: the detached release barrier must not stall forever just because the
         // component died mid-flight -- the attempt HAS resolved.
         if (OnAckSettled) {
@@ -3037,64 +3046,81 @@ FRedwoodItemFlushReply URedwoodServerGameSubsystem::ParseItemsFlushReply(
   return Parsed;
 }
 
+// FORK(hollowed-oath): a notApplied reply is never a commit, whatever its error text.
+static bool IsItemsFlushReplyCommitted(const FRedwoodItemFlushReply &Reply) {
+  return Reply.Error.IsEmpty() && !Reply.bNotApplied;
+}
+
+// A saved batch behind a later fence: the entries are committed, but the balance after them is
+// not known (see WriteCommittedFlushToSnapshot).
+static bool IsItemsFlushBalanceUnconfirmed(
+  const FRedwoodItemFlushReply &Reply, const FRedwoodItemFlushSent &Sent
+) {
+  return IsItemsFlushReplyCommitted(Reply) && Sent.bHasBalanceAfter &&
+    Reply.CommittedSeq > Sent.BatchSeq;
+}
+
+void URedwoodServerGameSubsystem::WriteCommittedFlushToSnapshot(
+  FRedwoodCharacterBackend &Snapshot,
+  const FRedwoodItemFlushReply &Reply,
+  const FRedwoodItemFlushSent &Sent
+) {
+  const bool bCommitted = IsItemsFlushReplyCommitted(Reply);
+
+  // Write the committed fence back onto the PlayerState snapshot. Only the COMPONENT's seq state
+  // advances in CompleteItemFlush; the snapshot would otherwise stay at its login value. A
+  // character component recreated later in the session -- a respawn re-creating a pawn-owned
+  // component is the ordinary case -- seeds itself from that snapshot
+  // (SeedItemSeqFromCharacter), so it would send an ALREADY USED batchSeq. The backend no-ops
+  // that batch as a replay, and the no-op's success ack then clears the new component's dirty
+  // rows: the mutation is lost with every side reporting success.
+  if (Reply.Error.IsEmpty() && Reply.CommittedSeq > 0 &&
+      Snapshot.InventorySeq < Reply.CommittedSeq) {
+    Snapshot.InventorySeq = Reply.CommittedSeq;
+  }
+  // The committed balance, for the same reason: a recreated component and the game chain new
+  // entries from it. Only when the fence is exactly this batch's seq: a later fence means
+  // something else (a trade) committed after it, and the last BalanceAfter is then not the
+  // balance. The snapshot then says so, and a reload sets it again.
+  if (bCommitted && Sent.bHasBalanceAfter && Reply.CommittedSeq == Sent.BatchSeq) {
+    Snapshot.CurrencyAmount = Sent.BalanceAfter;
+    Snapshot.bCurrencyAmountUnknown = false;
+  } else if (IsItemsFlushBalanceUnconfirmed(Reply, Sent)) {
+    Snapshot.bCurrencyAmountUnknown = true;
+  }
+
+  // FORK(hollowed-oath): the committed grant keys, for the same reason: game code on a recreated
+  // component checks the snapshot before it stages a one-time reward, and the backend refuses a
+  // reused key for good. These are exactly the replies on which CompleteItemFlush drops the sent
+  // keys as saved; a later fence still means this batch committed.
+  if (bCommitted && Reply.CommittedSeq >= Sent.BatchSeq) {
+    for (const FString &GrantKey : Sent.GrantKeys) {
+      if (!ContainsGrantKey(Snapshot.GrantKeys, GrantKey)) {
+        Snapshot.GrantKeys.Add(GrantKey);
+      }
+    }
+  }
+}
+
 void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
   URedwoodCharacterComponent *CharacterComponent,
   URedwoodPlayerStateComponent *PlayerStateComponent,
   const FRedwoodItemFlushReply &Reply,
   const FRedwoodItemFlushSent &Sent
 ) {
-  // A saved batch behind a later fence: the entries are committed, but the balance after them is
-  // not known (see the snapshot write below).
-  // FORK(hollowed-oath): a notApplied reply is never a commit, whatever its error text, so it
-  // writes no balance below.
-  const bool bCommitted = Reply.Error.IsEmpty() && !Reply.bNotApplied;
-  const bool bBalanceUnconfirmed =
-    bCommitted && Sent.bHasBalanceAfter && Reply.CommittedSeq > Sent.BatchSeq;
+  const bool bBalanceUnconfirmed = IsItemsFlushBalanceUnconfirmed(Reply, Sent);
 
   // The snapshot is updated BEFORE CompleteItemFlush, because CompleteItemFlush runs a parked flush
   // attempt, and that attempt seeds its seq forward from the snapshot.
   if (PlayerStateComponent) {
     FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+    WriteCommittedFlushToSnapshot(Snapshot, Reply, Sent);
 
-    // Write the committed fence back onto the PlayerState snapshot. Only the COMPONENT's seq state
-    // advances in CompleteItemFlush; the snapshot would otherwise stay at its login value. A
-    // character component recreated later in the session -- a respawn re-creating a pawn-owned
-    // component is the ordinary case -- seeds itself from that snapshot
-    // (SeedItemSeqFromCharacter), so it would send an ALREADY USED batchSeq. The backend no-ops
-    // that batch as a replay, and the no-op's success ack then clears the new component's dirty
-    // rows: the mutation is lost with every side reporting success.
-    if (Reply.Error.IsEmpty() && Reply.CommittedSeq > 0 &&
-        Snapshot.InventorySeq < Reply.CommittedSeq) {
-      Snapshot.InventorySeq = Reply.CommittedSeq;
-    }
     // FORK(hollowed-oath): a notApplied reply also commits a seq (an empty one, that consumes the
     // probed seq), so the snapshot follows it for the same reason.
     if (Reply.bNotApplied && Reply.CommittedSeq >= Sent.BatchSeq &&
         Reply.CommittedSeq > Snapshot.InventorySeq) {
       Snapshot.InventorySeq = Reply.CommittedSeq;
-    }
-
-    // The committed balance, for the same reason: a recreated component and the game chain new
-    // entries from it. Only when the fence is exactly this batch's seq: a later fence means
-    // something else (a trade) committed after it, and the last BalanceAfter is then not the
-    // balance. The snapshot then says so, and the reload below sets it again.
-    if (bCommitted && Sent.bHasBalanceAfter && Reply.CommittedSeq == Sent.BatchSeq) {
-      Snapshot.CurrencyAmount = Sent.BalanceAfter;
-      Snapshot.bCurrencyAmountUnknown = false;
-    } else if (bBalanceUnconfirmed) {
-      Snapshot.bCurrencyAmountUnknown = true;
-    }
-
-    // FORK(hollowed-oath): the committed grant keys, for the same reason: game code on a recreated
-    // component checks the snapshot before it stages a one-time reward, and the backend refuses a
-    // reused key for good. These are exactly the replies on which CompleteItemFlush drops the sent
-    // keys as saved; a later fence still means this batch committed.
-    if (bCommitted && Reply.CommittedSeq >= Sent.BatchSeq) {
-      for (const FString &GrantKey : Sent.GrantKeys) {
-        if (!ContainsGrantKey(Snapshot.GrantKeys, GrantKey)) {
-          Snapshot.GrantKeys.Add(GrantKey);
-        }
-      }
     }
 
     // On a sequence gap the component realigns its lane back to the backend's fence. The snapshot

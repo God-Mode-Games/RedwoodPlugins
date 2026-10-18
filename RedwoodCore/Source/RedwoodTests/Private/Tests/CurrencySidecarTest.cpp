@@ -1310,4 +1310,111 @@ bool FRedwoodCurrencySidecarHasGrantKeyTest::RunTest(const FString &Parameters) 
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarComponentGoneCommitTest,
+  "Redwood.Currency.Sidecar.ComponentGoneCommitReachesSnapshot",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The pawn respawns while a quest reward's batch is in flight. The batch commits, but the
+// component that sent it is gone. The snapshot must still take the commit's seq, balance and key,
+// or the new component reuses the seq and the game stages the reward again, which the backend
+// refuses for good.
+bool FRedwoodCurrencySidecarComponentGoneCommitTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  const FString RewardKey = TEXT("quest:Q1");
+  constexpr int64 SnapshotBalance = 1000;
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyLoadTestPlayerState *PlayerState =
+    Harness.World->SpawnActor<ARedwoodCurrencyLoadTestPlayerState>();
+  if (!TestNotNull(TEXT("The PlayerState spawns"), PlayerState)) {
+    return false;
+  }
+  URedwoodPlayerStateComponent *PlayerStateComponent =
+    NewObject<URedwoodPlayerStateComponent>(PlayerState);
+  FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+  Snapshot.Id = CharacterId;
+  Snapshot.InventorySeq = SeededInventorySeq;
+  Snapshot.CurrencyAmount = SnapshotBalance;
+
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Sender = Harness.MakeComponent(Actor);
+  Sender->QueueCurrency(
+    {MakeEntry(EntryIdA, 500, SnapshotBalance + 500, LootReason)}, {RewardKey}
+  );
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(
+    PlayerStateComponent, Sender, [&SettleCount]() { ++SettleCount; }
+  );
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+
+  // The respawn: the sending component is destroyed before its reply arrives.
+  Sender->MarkAsGarbage();
+  Harness.Answer(
+    Flush, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SeededInventorySeq + 1)
+  );
+  TestTrue(TEXT("The reply settles"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
+  TestEqual(TEXT("The snapshot takes the committed seq"), Snapshot.InventorySeq, SeededInventorySeq + 1);
+  TestEqual(TEXT("The snapshot takes the committed balance"), Snapshot.CurrencyAmount, SnapshotBalance + 500);
+  TestFalse(TEXT("The balance is known"), Snapshot.bCurrencyAmountUnknown);
+
+  // The respawned pawn's component sees the reward as paid.
+  URedwoodCharacterComponent *Respawned = NewObject<URedwoodCharacterComponent>(PlayerState);
+  TestTrue(TEXT("The new component sees the committed key"), Respawned->HasGrantKey(RewardKey));
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarComponentGoneErrorTest,
+  "Redwood.Currency.Sidecar.ComponentGoneErrorWritesNothing",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// An error reply for a component that is gone changes nothing on the snapshot.
+bool FRedwoodCurrencySidecarComponentGoneErrorTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedError(TEXT("Failed to flush items (component gone)"), EAutomationExpectedErrorFlags::Contains, 1);
+  const FString RewardKey = TEXT("quest:Q1");
+  constexpr int64 SnapshotBalance = 1000;
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  URedwoodPlayerStateComponent *PlayerStateComponent = NewObject<URedwoodPlayerStateComponent>();
+  FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+  Snapshot.InventorySeq = SeededInventorySeq;
+  Snapshot.CurrencyAmount = SnapshotBalance;
+
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Sender = Harness.MakeComponent(Actor);
+  Sender->QueueCurrency(
+    {MakeEntry(EntryIdA, 500, SnapshotBalance + 500, LootReason)}, {RewardKey}
+  );
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(
+    PlayerStateComponent, Sender, [&SettleCount]() { ++SettleCount; }
+  );
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  Sender->MarkAsGarbage();
+  // committedSeq at the sent seq: on the success path this would write the seq and the balance.
+  Harness.Answer(
+    Flush,
+    FString::Printf(TEXT(R"({"error":"concurrent flush","committedSeq":%lld})"), SeededInventorySeq + 1)
+  );
+  TestTrue(TEXT("The reply settles"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
+  TestEqual(TEXT("The seq is unchanged"), Snapshot.InventorySeq, SeededInventorySeq);
+  TestEqual(TEXT("The balance is unchanged"), Snapshot.CurrencyAmount, SnapshotBalance);
+  TestEqual(TEXT("No key is added"), Snapshot.GrantKeys.Num(), 0);
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER
