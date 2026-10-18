@@ -3149,9 +3149,47 @@ FRedwoodItemFlushReply URedwoodServerGameSubsystem::ParseItemsFlushReply(
   Reply->TryGetBoolField(TEXT("rebaseRequired"), Parsed.bRebaseRequired);
   Reply->TryGetBoolField(TEXT("notApplied"), Parsed.bNotApplied);
   Reply->TryGetBoolField(TEXT("writerFenceLost"), Parsed.bWriterFenceLost);
+  ReadSidecarDeliveryFlags(
+    Reply, Parsed.Error, FlushTimedOutError, Parsed.bTimedOut, Parsed.bNotForwarded
+  );
+  // The sidecar fills committedSeq with 0 on both. Read as a fence, that 0 is a sequence gap: the
+  // lane would realign to 0, and a batch of item rows re-sent at seq 1 is acked as a replay and
+  // never saved.
+  if (Parsed.bTimedOut || Parsed.bNotForwarded) {
+    Parsed.CommittedSeq = -1;
+  }
 
   ParseCurrencyAlerts(Reply, Parsed.Alerts);
   return Parsed;
+}
+
+void URedwoodServerGameSubsystem::ReadSidecarDeliveryFlags(
+  const TSharedPtr<FJsonObject> &Reply,
+  const FString &Error,
+  const TCHAR *TimedOutError,
+  bool &OutTimedOut,
+  bool &OutNotForwarded
+) {
+  OutTimedOut = false;
+  OutNotForwarded = false;
+  const bool bHasTimedOut = Reply->TryGetBoolField(TEXT("timedOut"), OutTimedOut);
+  const bool bHasNotForwarded = Reply->TryGetBoolField(TEXT("notForwarded"), OutNotForwarded);
+  if (bHasTimedOut || bHasNotForwarded || Error.IsEmpty()) {
+    return;
+  }
+  if (Error.Equals(TimedOutError, ESearchCase::CaseSensitive)) {
+    OutTimedOut = true;
+  } else if (Error.Equals(SidecarRealmNotConnectedError, ESearchCase::CaseSensitive)) {
+    OutNotForwarded = true;
+  } else {
+    return;
+  }
+  UE_LOG(
+    LogRedwood,
+    Warning,
+    TEXT("Sidecar reply has no timedOut or notForwarded flag; read the outcome from its text: \"%s\". Update the sidecar."),
+    *Error
+  );
 }
 
 // FORK(hollowed-oath): a notApplied reply is never a commit, whatever its error text.
@@ -3257,7 +3295,8 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
     Sent.GrantKeys.Num(),
     Reply.bFinal,
     Reply.bRebaseRequired,
-    Reply.bNotApplied
+    Reply.bNotApplied,
+    Reply.bNotForwarded
   );
 
   if (Reply.Alerts.Num() > 0) {
@@ -4166,7 +4205,7 @@ ERedwoodItemTradeOutcome URedwoodServerGameSubsystem::ClassifyItemsTradeReply(
   if (Reply.Error.Equals(TradeTimedOutError, ESearchCase::CaseSensitive)) {
     return ERedwoodItemTradeOutcome::Unknown;
   }
-  if (Reply.Error.Equals(TradeRealmNotConnectedError, ESearchCase::CaseSensitive)) {
+  if (Reply.Error.Equals(SidecarRealmNotConnectedError, ESearchCase::CaseSensitive)) {
     return ERedwoodItemTradeOutcome::NotForwarded;
   }
   return ERedwoodItemTradeOutcome::Refused;

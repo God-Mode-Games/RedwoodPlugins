@@ -439,7 +439,7 @@ bool FRedwoodCurrencySidecarResendCarriesNoRowsTest::RunTest(const FString &Para
   TestEqual(TEXT("The first attempt carries the row"), CountArray(First.Payload, TEXT("upserts")), 1);
   TestFalse(TEXT("The first attempt is not a probe"), First.Payload->HasField(TEXT("probe")));
   // The outcome is unknown: no fence.
-  Harness.Answer(First, TEXT(R"({"error":"Item flush request timed out."})"));
+  Harness.Answer(First, TEXT(R"({"error":"Item flush request timed out.","committedSeq":0,"timedOut":true})"));
   Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
 
   Component->MarkItemsDirty({LaterItemId});
@@ -980,7 +980,7 @@ bool FRedwoodCurrencySidecarProbeNotAppliedTest::RunTest(const FString &Paramete
   if (!Harness.ReadRequest(FlushEvent, First)) {
     return false;
   }
-  Harness.Answer(First, TEXT(R"({"error":"Item flush request timed out."})"));
+  Harness.Answer(First, TEXT(R"({"error":"Item flush request timed out.","committedSeq":0,"timedOut":true})"));
   Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
 
   Component->MarkItemsDirty({LaterItemId});

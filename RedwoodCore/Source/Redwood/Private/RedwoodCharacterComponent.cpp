@@ -673,7 +673,8 @@ void URedwoodCharacterComponent::CompleteItemFlush(
   int32 SentGrantCount,
   bool bFinalRefusal,
   bool bRebaseRequired,
-  bool bNotApplied
+  bool bNotApplied,
+  bool bNotSent
 ) {
   // The seq the just-completed flush stamped on its payload (claimed in TryBeginItemFlush).
   const int64 SentSeq = InFlightBatchSeq;
@@ -683,7 +684,12 @@ void URedwoodCharacterComponent::CompleteItemFlush(
   SentCurrencyCount = FMath::Clamp(SentCurrencyCount, 0, PendingCurrencyEntries.Num());
   SentGrantCount = FMath::Clamp(SentGrantCount, 0, PendingGrantKeys.Num());
 
-  if (bNotApplied && CommittedSeq >= SentSeq) {
+  if (bNotSent) {
+    // FORK(hollowed-oath): the realm never saw this batch. Marking it unconfirmed would turn the
+    // next attempt into a probe that carries no rows, for no reason; clearing an earlier unconfirmed
+    // state would send that batch's entries as new under a seq that may hold them already. Leave
+    // both as they are: the rows stay dirty and the entries stay queued.
+  } else if (bNotApplied && CommittedSeq >= SentSeq) {
     // FORK(hollowed-oath): the backend answered a probe: the batch never committed. The backend
     // has CONSUMED that seq with an empty commit (CommittedSeq), so a late original arriving under
     // it now fails instead of applying after the fact. The entries are simply pending again,

@@ -175,9 +175,43 @@ bool FRedwoodItemFlushReplyParseTest::RunTest(const FString &Parameters) {
 
   // A dropped socket's reply has no fence. -1, never 0: 0 is a real fence and would read as a gap.
   const FRedwoodItemFlushReply NoFence = URedwoodServerGameSubsystem::ParseItemsFlushReply(
-    Fixture::ParseJson(TEXT(R"({"error":"Item flush request timed out."})"))
+    Fixture::ParseJson(TEXT(R"({"error":"socket closed"})"))
   );
   TestEqual(TEXT("A missing committedSeq reads as -1"), NoFence.CommittedSeq, (int64)-1);
+  TestFalse(TEXT("timedOut defaults to false"), NoFence.bTimedOut);
+  TestFalse(TEXT("notForwarded defaults to false"), NoFence.bNotForwarded);
+
+  // FORK(hollowed-oath): the sidecar's flags decide, not its text, and its filler fence of 0 is
+  // dropped: read as a fence it would be a sequence gap.
+  const FRedwoodItemFlushReply TimedOut = URedwoodServerGameSubsystem::ParseItemsFlushReply(
+    Fixture::ParseJson(TEXT(R"({"error":"any text","committedSeq":0,"timedOut":true})"))
+  );
+  TestTrue(TEXT("timedOut is read from the flag"), TimedOut.bTimedOut);
+  TestFalse(TEXT("A timeout was forwarded"), TimedOut.bNotForwarded);
+  TestEqual(TEXT("A timeout's filler fence is dropped"), TimedOut.CommittedSeq, (int64)-1);
+  const FRedwoodItemFlushReply NotForwarded = URedwoodServerGameSubsystem::ParseItemsFlushReply(
+    Fixture::ParseJson(TEXT(R"({"error":"any text","committedSeq":0,"notForwarded":true})"))
+  );
+  TestTrue(TEXT("notForwarded is read from the flag"), NotForwarded.bNotForwarded);
+  TestFalse(TEXT("An unsent batch did not time out"), NotForwarded.bTimedOut);
+  TestEqual(TEXT("An unsent batch's filler fence is dropped"), NotForwarded.CommittedSeq, (int64)-1);
+  const FRedwoodItemFlushReply FlagWins = URedwoodServerGameSubsystem::ParseItemsFlushReply(
+    Fixture::ParseJson(TEXT(R"({"error":"Item flush request timed out.","committedSeq":0,"timedOut":false,"notForwarded":true})"))
+  );
+  TestFalse(TEXT("A present flag wins over the text"), FlagWins.bTimedOut);
+  TestTrue(TEXT("The other flag is read"), FlagWins.bNotForwarded);
+
+  // A sidecar that predates the flags: the text decides, with a Warning.
+  AddExpectedErrorPlain(TEXT("read the outcome from its text"), EAutomationExpectedErrorFlags::Contains, 2);
+  const FRedwoodItemFlushReply OldTimedOut = URedwoodServerGameSubsystem::ParseItemsFlushReply(
+    Fixture::ParseJson(TEXT(R"({"error":"Item flush request timed out.","committedSeq":0})"))
+  );
+  TestTrue(TEXT("An old sidecar's timeout is read from its text"), OldTimedOut.bTimedOut);
+  TestEqual(TEXT("And its filler fence is dropped"), OldTimedOut.CommittedSeq, (int64)-1);
+  const FRedwoodItemFlushReply OldNotForwarded = URedwoodServerGameSubsystem::ParseItemsFlushReply(
+    Fixture::ParseJson(TEXT(R"({"error":"Realm server not connected","committedSeq":0})"))
+  );
+  TestTrue(TEXT("An old sidecar's unsent batch is read from its text"), OldNotForwarded.bNotForwarded);
 
   // No reply object at all: an error, so the batch is kept.
   const FRedwoodItemFlushReply Unreadable =
@@ -572,5 +606,68 @@ bool FRedwoodCurrencyFlushCommitAddsGrantKeysTest::RunTest(const FString &Parame
     PlayerState->RedwoodCharacter.GrantKeys == TArray<FString>{Fixture::QuestGrantKey}
   );
   TestEqual(TEXT("And leaves the queue"), Component->GetPendingGrantKeys().Num(), 0);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyFlushDeliveryFlagsTest,
+  "Redwood.Currency.FlushDeliveryFlags",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// What the sidecar's two flags do to the lane. notForwarded: the batch never left the sidecar, so
+// it goes out again as a normal batch under the same seq, rows and all. timedOut: it may have
+// applied, so the next attempt is a probe. Neither reply's filler fence of 0 reads as a gap.
+bool FRedwoodCurrencyFlushDeliveryFlagsTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyFlushTest;
+  constexpr int64 SeqBefore = 6;
+  URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(SeqBefore);
+  URedwoodPlayerStateComponent *PlayerState = Fixture::MakePlayerStateComponent(SeqBefore, 1000);
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, -250, 750)}, {});
+
+  FRedwoodItemFlushSent Sent = Fixture::ClaimBatch(*this, Component);
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+    Component,
+    PlayerState,
+    URedwoodServerGameSubsystem::ParseItemsFlushReply(Fixture::ParseJson(
+      TEXT(R"({"error":"Realm server not connected","committedSeq":0,"notForwarded":true})")
+    )),
+    Sent
+  );
+  TestEqual(TEXT("The unsent entry is kept"), Component->GetPendingCurrencyEntries().Num(), 1);
+  TestFalse(TEXT("An unsent batch is not unconfirmed"), Component->IsCurrencyBatchUnconfirmed());
+  TestEqual(TEXT("The lane is not realigned to the filler 0"), Component->GetLastCommittedItemSeq(), SeqBefore);
+  TestEqual(TEXT("The snapshot is not lowered to it"), PlayerState->RedwoodCharacter.InventorySeq, SeqBefore);
+  Sent = Fixture::ClaimBatch(*this, Component);
+  TestFalse(TEXT("The next attempt is a normal batch"), Component->IsItemFlushReplayProbe());
+  TestEqual(TEXT("Under the same seq"), Sent.BatchSeq, SeqBefore + 1);
+
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+    Component,
+    PlayerState,
+    URedwoodServerGameSubsystem::ParseItemsFlushReply(Fixture::ParseJson(
+      TEXT(R"({"error":"Item flush request timed out.","committedSeq":0,"timedOut":true})")
+    )),
+    Sent
+  );
+  TestTrue(TEXT("A timed-out batch is unconfirmed"), Component->IsCurrencyBatchUnconfirmed());
+  TestEqual(TEXT("Its filler 0 is not a gap either"), Component->GetLastCommittedItemSeq(), SeqBefore);
+
+  // An unsent re-send of the unconfirmed batch leaves it unconfirmed: the timed-out attempt may
+  // still have applied.
+  Sent = Fixture::ClaimBatch(*this, Component);
+  TestTrue(TEXT("The re-send is a probe"), Component->IsItemFlushReplayProbe());
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+    Component,
+    PlayerState,
+    URedwoodServerGameSubsystem::ParseItemsFlushReply(Fixture::ParseJson(
+      TEXT(R"({"error":"Realm server not connected","committedSeq":0,"notForwarded":true})")
+    )),
+    Sent
+  );
+  TestTrue(TEXT("It stays unconfirmed"), Component->IsCurrencyBatchUnconfirmed());
+  Sent = Fixture::ClaimBatch(*this, Component);
+  TestTrue(TEXT("The next attempt is a probe again"), Component->IsItemFlushReplayProbe());
+  TestEqual(TEXT("At the timed-out seq"), Sent.BatchSeq, SeqBefore + 1);
   return true;
 }

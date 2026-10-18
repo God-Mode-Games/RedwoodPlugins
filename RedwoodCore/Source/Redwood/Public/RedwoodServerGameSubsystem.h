@@ -39,6 +39,10 @@ struct FRedwoodItemFlushReply {
   bool bNotApplied = false;
   // The writer token this session sent is stale: another session owns the character.
   bool bWriterFenceLost = false;
+  // Set by the sidecar: it sent the batch and no answer came, so the batch MAY have applied.
+  bool bTimedOut = false;
+  // Set by the sidecar: it had no realm to send the batch to, so the batch did NOT apply.
+  bool bNotForwarded = false;
   TArray<TSharedPtr<FJsonObject>> Alerts;
 };
 
@@ -497,6 +501,20 @@ public:
   // currency.
   bool GetUnsettledTradeFloorBalance(const FString &CharacterId, int64 &OutFloorBalance) const;
 
+  // FORK(hollowed-oath): the sidecar's `timedOut` and `notForwarded` reply flags. On a sidecar
+  // that predates them, the reply's error text is matched instead, with a Warning: these are the
+  // texts sidecar/src/routes/game-server/items.ts sends. A reply with either one carries a filler
+  // committedSeq of 0, which is not a fence.
+  static void ReadSidecarDeliveryFlags(
+    const TSharedPtr<FJsonObject> &Reply,
+    const FString &Error,
+    const TCHAR *TimedOutError,
+    bool &OutTimedOut,
+    bool &OutNotForwarded
+  );
+  static constexpr const TCHAR *FlushTimedOutError = TEXT("Item flush request timed out.");
+  static constexpr const TCHAR *SidecarRealmNotConnectedError = TEXT("Realm server not connected");
+
   // The only reason the backend takes on a trade entry.
   static constexpr const TCHAR *TradeCurrencyReason = TEXT("Currency.Reason.Trade");
   // The sidecar's replies when its realm request timed out, and when it had no realm to send to
@@ -504,7 +522,6 @@ public:
   // means the realm never saw the attempt. Pinned by test: a changed text on either side turns a
   // timeout into a refusal.
   static constexpr const TCHAR *TradeTimedOutError = TEXT("Item trade request timed out.");
-  static constexpr const TCHAR *TradeRealmNotConnectedError = TEXT("Realm server not connected");
   // A trade with no reply by then counts as timed out. The sidecar answers within its own realm
   // timeout (10 seconds), so a longer silence means the socket dropped and no reply will come.
   static constexpr float TradeReplyTimeoutSeconds = 30.f;

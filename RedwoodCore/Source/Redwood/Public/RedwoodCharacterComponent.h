@@ -517,6 +517,9 @@ public:
   // (FreezeAfterFinalRefusal). bRebaseRequired is the ack's `rebaseRequired` flag: only that makes
   // the queue wait for a reload (see the currency staging block above). bNotApplied is the ack's
   // `notApplied` flag on a probe: the batch never committed, so it goes out again as a normal batch.
+  // bNotSent is the sidecar's `notForwarded`: the batch never left the sidecar, so nothing about it
+  // changes. An earlier attempt whose outcome is unknown stays unknown; otherwise the same rows and
+  // entries go out again as a normal batch, with no probe.
   // A negative CommittedSeq means the reply carried no fence; a fence below SentSeq - 1 on an
   // error is a sequence gap, and the lane realigns to it.
   void CompleteItemFlush(
@@ -528,7 +531,8 @@ public:
     int32 SentGrantCount = 0,
     bool bFinalRefusal = false,
     bool bRebaseRequired = false,
-    bool bNotApplied = false
+    bool bNotApplied = false,
+    bool bNotSent = false
   );
 
   // Seeds the committed-seq/next-batchSeq state from a freshly-loaded character's InventorySeq.
