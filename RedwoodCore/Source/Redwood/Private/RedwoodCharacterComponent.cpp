@@ -1000,7 +1000,9 @@ void URedwoodCharacterComponent::RechainCurrencyAfterTrade(int64 Balance) {
 
 bool URedwoodCharacterComponent::TryRechainPendingCurrency(int64 Balance) {
   // Checked before anything is written: a batch that mixes stale and re-chained values is refused
-  // for good.
+  // for good. So is a chain below zero, and a final refusal freezes the character: keep such a
+  // chain out of every batch instead. The caller holds the queue for a reload, and the reload's
+  // give-up logs what stays unsaved.
   int64 Running = Balance;
   for (const FRedwoodCurrencyEntry &Entry : PendingCurrencyEntries) {
     const bool bOverflows = Entry.Delta > 0 ? Running > MAX_int64 - Entry.Delta
@@ -1016,6 +1018,19 @@ bool URedwoodCharacterComponent::TryRechainPendingCurrency(int64 Balance) {
       return false;
     }
     Running += Entry.Delta;
+    if (Running < 0) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Re-chaining currency: entry %s (delta %lld) of character %s takes the balance from %lld to %lld, below zero; currency stays held"),
+        *Entry.Id,
+        Entry.Delta,
+        *RedwoodCharacterId,
+        Balance,
+        Running
+      );
+      return false;
+    }
   }
   Running = Balance;
   for (FRedwoodCurrencyEntry &Entry : PendingCurrencyEntries) {
