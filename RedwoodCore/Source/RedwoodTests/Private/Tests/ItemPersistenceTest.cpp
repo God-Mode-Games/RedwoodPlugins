@@ -174,26 +174,29 @@ bool FRedwoodItemGenerationMatchedAckTest::RunTest(const FString &Parameters) {
   int64 BatchSeq = 0;
   TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
 
-  // The flush captured generation 1 for both ids at send time.
+  // The flush captures each id's generation at send time, as the flush path does. Read, not
+  // assumed: generations come from ONE counter shared by every id (see MarkItemsDirty), so A and B
+  // hold different values.
+  const uint64 SentGenerationA = Component->GetDirtyItemGenerations().FindRef(Fixture::TestItemIdA);
+  const uint64 SentGenerationB = Component->GetDirtyItemGenerations().FindRef(Fixture::TestItemIdB);
   TArray<TPair<FString, uint64>> SentUpserts;
-  SentUpserts.Add(TPair<FString, uint64>(Fixture::TestItemIdA, 1));
-  SentUpserts.Add(TPair<FString, uint64>(Fixture::TestItemIdB, 1));
+  SentUpserts.Add(TPair<FString, uint64>(Fixture::TestItemIdA, SentGenerationA));
+  SentUpserts.Add(TPair<FString, uint64>(Fixture::TestItemIdB, SentGenerationB));
   TArray<TPair<FString, uint64>> SentDeletes;
 
-  // A mutates again while the send is still in flight -- its generation moves to 2 before the ack
-  // arrives.
+  // A mutates again while the send is still in flight -- its generation moves past the sent one
+  // before the ack arrives.
   Component->MarkItemsDirty({Fixture::TestItemIdA});
   const uint64 *MidFlightGeneration =
     Component->GetDirtyItemGenerations().Find(Fixture::TestItemIdA);
   TestTrue(TEXT("A re-dirtied mid-flight"), MidFlightGeneration != nullptr);
-  if (MidFlightGeneration) {
-    TestEqual(TEXT("A generation bumped to 2 mid-flight"), *MidFlightGeneration, (uint64)2);
-  }
+  const uint64 NewerGenerationA = MidFlightGeneration ? *MidFlightGeneration : 0;
+  TestTrue(TEXT("A's generation moved past the sent one mid-flight"), NewerGenerationA > SentGenerationA);
 
   Component->CompleteItemFlush(TEXT(""), BatchSeq, SentUpserts, SentDeletes);
 
-  // A's current generation (2) no longer matches what was sent (1), so the ack must not clear it
-  // -- the re-dirty that raced the send is not allowed to be silently lost.
+  // A's current generation no longer matches what was sent, so the ack must not clear it -- the
+  // re-dirty that raced the send is not allowed to be silently lost.
   TestTrue(
     TEXT("A survives the ack, still dirty"),
     Component->GetDirtyItemGenerations().Contains(Fixture::TestItemIdA)
@@ -201,7 +204,7 @@ bool FRedwoodItemGenerationMatchedAckTest::RunTest(const FString &Parameters) {
   const uint64 *SurvivingGeneration =
     Component->GetDirtyItemGenerations().Find(Fixture::TestItemIdA);
   if (SurvivingGeneration) {
-    TestEqual(TEXT("A's newer generation preserved"), *SurvivingGeneration, (uint64)2);
+    TestEqual(TEXT("A's newer generation preserved"), *SurvivingGeneration, NewerGenerationA);
   }
 
   // B was untouched during the flight, so its sent generation still matches current -- the ack
