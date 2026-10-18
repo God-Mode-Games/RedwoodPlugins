@@ -2633,9 +2633,13 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
 
   // FORK(hollowed-oath): a final refusal froze this character. Nothing staged can be trusted, so
   // whatever this component staged since is dropped (and logged), and the attempt settles with
-  // nothing left to save: a detached pawn's write binding releases as usual.
+  // nothing left to save: a detached pawn's write binding releases as usual. With a batch of this
+  // component in flight, its reply drops instead, AFTER it has removed what committed: dropping
+  // now would log saved entries as lost, and staff would pay them twice.
   if (CharacterComponent->IsFrozenAfterFinalRefusal() || FrozenCharacterIds.Contains(CharacterId)) {
-    CharacterComponent->FreezeAfterFinalRefusal(TEXT("the character is frozen"));
+    if (!CharacterComponent->IsItemFlushInFlight()) {
+      CharacterComponent->FreezeAfterFinalRefusal(TEXT("the character is frozen"));
+    }
     Settle();
     return;
   }
@@ -2900,12 +2904,19 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
         CharacterComponent, WeakPlayerStateComponent.Get(), Reply, Sent
       );
 
-      if (CharacterComponent->IsCurrencyRebaseRequired()) {
+      URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
+      if (Subsystem && Subsystem->IsCharacterFrozen(CharacterId)) {
+        // FORK(hollowed-oath): the character froze while this batch was in flight. Its reply has
+        // removed what committed; drop the rest now.
+        if (!CharacterComponent->IsFrozenAfterFinalRefusal()) {
+          CharacterComponent->FreezeAfterFinalRefusal(TEXT("the character is frozen"));
+        }
+      } else if (CharacterComponent->IsCurrencyRebaseRequired()) {
         // A trade used the seq, or the reply could not confirm the balance: a reload must land
         // before anything is sent. Start it from this reply, and hand this attempt's settle to
         // it: for a detached pawn the entries are not saved yet, and releasing the write binding
         // now would refuse the resumed flush that saves them.
-        if (URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get()) {
+        if (Subsystem) {
           Subsystem->HoldItemFlushForCurrencyReload(
             CharacterId, WeakPlayerStateComponent.Get(), CharacterComponent, OnAckSettled
           );

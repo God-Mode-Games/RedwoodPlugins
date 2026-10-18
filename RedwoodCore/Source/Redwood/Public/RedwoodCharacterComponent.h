@@ -406,7 +406,10 @@ public:
   }
 
   // Drops EVERYTHING staged: dirty rows, pending deletes, entries and grant keys, sent or not,
-  // and logs every dropped entry at Error so staff can rebuild it. Repair is not attempted: a
+  // and logs every dropped entry at Error so staff can rebuild it. An entry of an unconfirmed
+  // batch is logged as "outcome unknown": it may be saved. Never call it while a batch is in
+  // flight (except for the refused batch itself): that batch's reply decides its entries.
+  // Repair is not attempted: a
   // staged change may depend on the refused one (a sale of a refused purchase, whose credit would
   // otherwise commit from nothing), and only the database knows the truth. The game sends the
   // player back through character select, which hydrates again and clears the freeze.

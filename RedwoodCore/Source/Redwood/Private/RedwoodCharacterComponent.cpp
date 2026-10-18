@@ -946,27 +946,35 @@ void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
 
 void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) {
   // One line per dropped entry and key: the backend has the refusal alert, and these lines are
-  // what staff rebuild the rest from.
-  for (const FRedwoodCurrencyEntry &Entry : PendingCurrencyEntries) {
+  // what staff rebuild the rest from. The front of an unconfirmed batch may have committed (its
+  // ack was lost), so it is told apart: re-granting a saved amount would pay it twice. A re-grant
+  // reuses the logged entry id either way, so the backend's duplicate-id check refuses a copy.
+  const int32 UnknownEntryCount = bCurrencyBatchUnconfirmed ? UnconfirmedCurrencyCount : 0;
+  const int32 UnknownGrantCount = bCurrencyBatchUnconfirmed ? UnconfirmedGrantCount : 0;
+  for (int32 Index = 0; Index < PendingCurrencyEntries.Num(); ++Index) {
+    const FRedwoodCurrencyEntry &Entry = PendingCurrencyEntries[Index];
     UE_LOG(
       LogRedwood,
       Error,
-      TEXT("Final refusal (%s): character %s dropped currency entry %s delta %lld reason %s"),
+      TEXT("Final refusal (%s): character %s dropped currency entry %s delta %lld reason %s, %s. A re-grant must reuse entry id %s, so the backend refuses a second copy."),
       *Reason,
       *RedwoodCharacterId,
       *Entry.Id,
       Entry.Delta,
-      *Entry.Reason
+      *Entry.Reason,
+      Index < UnknownEntryCount ? TEXT("outcome UNKNOWN (it may be saved)") : TEXT("NOT saved"),
+      *Entry.Id
     );
   }
-  for (const FString &GrantKey : PendingGrantKeys) {
+  for (int32 Index = 0; Index < PendingGrantKeys.Num(); ++Index) {
     UE_LOG(
       LogRedwood,
       Error,
-      TEXT("Final refusal (%s): character %s dropped grant %s"),
+      TEXT("Final refusal (%s): character %s dropped grant %s, %s"),
       *Reason,
       *RedwoodCharacterId,
-      *GrantKey
+      *PendingGrantKeys[Index],
+      Index < UnknownGrantCount ? TEXT("outcome UNKNOWN (it may be saved)") : TEXT("NOT saved")
     );
   }
   PendingCurrencyEntries.Empty();
