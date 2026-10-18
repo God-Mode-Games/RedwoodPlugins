@@ -151,7 +151,7 @@ void URedwoodCharacterComponent::BeginPlay() {
 // component still knows its character.
 void URedwoodCharacterComponent::EndPlay(const EEndPlayReason::Type EndPlayReason) {
   if (GetOwnerRole() == ROLE_Authority) {
-    HandOffCurrencyAtEndPlay();
+    HandOffCurrencyAtEndPlay(EndPlayReason);
   }
   Super::EndPlay(EndPlayReason);
 }
@@ -1208,7 +1208,7 @@ void URedwoodCharacterComponent::DropAllStaged(const FString &Why) {
   ClearItemsDirtyState();
 }
 
-void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay() {
+void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay(EEndPlayReason::Type EndPlayReason) {
   if (!bItemFlushInFlight && !bCurrencyBatchUnconfirmed && PendingCurrencyEntries.Num() == 0 &&
       PendingGrantKeys.Num() == 0) {
     return;
@@ -1269,7 +1269,10 @@ void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay() {
     // can still change, and a frozen or fenced character must not send at all.
     const bool bFrozen = bFrozenAfterFinalRefusal ||
       (ServerSubsystem && ServerSubsystem->IsCharacterFrozen(RedwoodCharacterId));
-    const TCHAR *Unsafe = !bSnapshotOutlivesComponent ? TEXT("no PlayerState of the character outlives the component")
+    const bool bWorldEnding = EndPlayReason != EEndPlayReason::Destroyed &&
+      EndPlayReason != EEndPlayReason::RemovedFromWorld;
+    const TCHAR *Unsafe = bWorldEnding ? TEXT("the world is ending")
+      : !bSnapshotOutlivesComponent ? TEXT("no PlayerState of the character outlives the component")
       : bItemFlushInFlight ? TEXT("a batch was in flight, so the balance they chain from waits on its reply")
       : bFrozen ? TEXT("the character is frozen")
       : bWriterFenceLost ? TEXT("the writer fence is lost")

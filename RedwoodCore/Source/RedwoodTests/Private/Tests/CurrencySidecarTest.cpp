@@ -3563,7 +3563,7 @@ bool FRedwoodCurrencySidecarEndPlayHandsOffTest::RunTest(const FString &Paramete
   );
 
   Party.DetachForEndPlay();
-  Party.Component->HandOffCurrencyAtEndPlay();
+  Party.Component->HandOffCurrencyAtEndPlay(EEndPlayReason::Destroyed);
   TestEqual(TEXT("The entry is handed to the snapshot"), Snapshot.HandedOffCurrencyEntries.Num(), 1);
   TestEqual(TEXT("And the key"), Snapshot.HandedOffGrantKeys.Num(), 1);
   TestEqual(TEXT("The ended component keeps nothing"), Party.Component->GetPendingCurrencyEntries().Num(), 0);
@@ -3642,7 +3642,7 @@ bool FRedwoodCurrencySidecarEndPlayInFlightTest::RunTest(const FString &Paramete
   Party.Component->QueueCurrency({MakeEntry(EntryIdB, 200, 1700, LootReason)}, {});
 
   Party.DetachForEndPlay();
-  Party.Component->HandOffCurrencyAtEndPlay();
+  Party.Component->HandOffCurrencyAtEndPlay(EEndPlayReason::Destroyed);
   TestEqual(TEXT("Nothing is handed off behind an open batch"), Snapshot.HandedOffCurrencyEntries.Num(), 0);
   TestTrue(TEXT("The ended component never opens a second batch"), Party.Component->IsItemFlushInFlight());
 

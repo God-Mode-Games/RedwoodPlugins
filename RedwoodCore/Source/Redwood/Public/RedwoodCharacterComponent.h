@@ -518,9 +518,10 @@ public:
   // logged as UNKNOWN and its seq marked on the snapshot. Entries and keys never sent are handed to
   // the PlayerState snapshot when that is safe, for the next component of the character to send;
   // otherwise they are logged as NOT saved, with why. Every entry and key is logged either way.
-  // Public for the tests: an automation test cannot run EndPlay on a component that never began
-  // play.
-  void HandOffCurrencyAtEndPlay();
+  // Only a component destroyed on its own (a respawn) hands anything off: when the world ends,
+  // the PlayerState ends with it. Public for the tests: an automation test cannot run EndPlay on a
+  // component that never began play.
+  void HandOffCurrencyAtEndPlay(EEndPlayReason::Type EndPlayReason);
 
   // Takes the currency a destroyed component of this character handed to Snapshot, in front of
   // its own queue, and holds all currency for a reload: the handed-off chain was built on a balance
