@@ -178,6 +178,8 @@ inline TSharedPtr<FJsonObject> MakeCurrencyLoadObject(
 // A flush the backend refused for good (`final: true`). The backend has raised an alert, and the
 // character is frozen with everything staged dropped and logged. The game must send the player
 // back through character select: only a fresh hydration from the database repairs the state.
+// Also fired, with the same freeze, for both characters of a trade whose outcome could not be
+// learned (see URedwoodServerGameSubsystem::EmitItemsTrade).
 DECLARE_MULTICAST_DELEGATE_TwoParams(
   FOnItemFlushRefusedFinal, const FString & /*CharacterId*/, const FString & /*Error*/
 );

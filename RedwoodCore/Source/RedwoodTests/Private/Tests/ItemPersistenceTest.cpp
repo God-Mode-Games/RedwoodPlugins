@@ -643,11 +643,117 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     ChildPlacement.Slot = 0;
     ChildPlacement.ParentId = RedwoodItemPersistenceTest::TestParentId;
 
+    // FORK(hollowed-oath): both sides' entries, the giver's with a source ref.
+    FRedwoodCurrencyEntry Paid;
+    Paid.Id = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    Paid.Delta = -300;
+    Paid.BalanceAfter = 700;
+    Paid.Reason = TEXT("Currency.Reason.Trade");
+    Paid.SourceRef = TEXT("trade:offer-1");
+    FRedwoodCurrencyEntry Received;
+    Received.Id = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+    Received.Delta = 300;
+    Received.BalanceAfter = 500;
+    Received.Reason = TEXT("Currency.Reason.Trade");
+    const FString TradeId = TEXT("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
+
     TSharedPtr<FJsonObject> Payload =
       URedwoodServerGameSubsystem::BuildItemsTradePayload(
-        TEXT("character-from"), TEXT("character-to"), {RootPlacement, ChildPlacement}
+        TEXT("character-from"),
+        TEXT("character-to"),
+        {RootPlacement, ChildPlacement},
+        {TPair<FString, FRedwoodCurrencyEntry>(TEXT("character-from"), Paid),
+         TPair<FString, FRedwoodCurrencyEntry>(TEXT("character-to"), Received)},
+        TEXT("writer-token-from"),
+        TEXT("writer-token-to"),
+        TradeId
       );
     TestEnvelopeId(TEXT("trade"), Payload);
+
+    // FORK(hollowed-oath): without both tokens the backend refuses every trade, and without the
+    // trade id every trade with currency.
+    TestEqual(
+      TEXT("trade: fromWriterToken"),
+      Payload->GetStringField(TEXT("fromWriterToken")),
+      FString(TEXT("writer-token-from"))
+    );
+    TestEqual(
+      TEXT("trade: toWriterToken"),
+      Payload->GetStringField(TEXT("toWriterToken")),
+      FString(TEXT("writer-token-to"))
+    );
+    TestEqual(TEXT("trade: tradeId"), Payload->GetStringField(TEXT("tradeId")), TradeId);
+    const TArray<TSharedPtr<FJsonValue>> *TradeCurrency = nullptr;
+    TestTrue(
+      TEXT("trade: currency array present"),
+      Payload->TryGetArrayField(TEXT("currency"), TradeCurrency)
+    );
+    if (TradeCurrency && TradeCurrency->Num() == 2) {
+      const TCHAR *const ExpectedCharacterIds[] = {TEXT("character-from"), TEXT("character-to")};
+      const TCHAR *const ExpectedDeltas[] = {TEXT("-300"), TEXT("300")};
+      const TCHAR *const ExpectedBalances[] = {TEXT("700"), TEXT("500")};
+      const FString ExpectedIds[] = {Paid.Id, Received.Id};
+      for (int32 Index = 0; Index < 2; ++Index) {
+        const TSharedPtr<FJsonObject> *Side = nullptr;
+        const TSharedPtr<FJsonObject> *SideEntry = nullptr;
+        if (!(*TradeCurrency)[Index]->TryGetObject(Side) ||
+            !(*Side)->TryGetObjectField(TEXT("entry"), SideEntry)) {
+          AddError(FString::Printf(TEXT("trade: currency[%d] is not {characterId, entry}"), Index));
+          continue;
+        }
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].characterId"), Index),
+          (*Side)->GetStringField(TEXT("characterId")),
+          FString(ExpectedCharacterIds[Index])
+        );
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].entry.id"), Index),
+          (*SideEntry)->GetStringField(TEXT("id")),
+          ExpectedIds[Index]
+        );
+        TestTrue(
+          FString::Printf(TEXT("trade: currency[%d] amounts are strings"), Index),
+          (*SideEntry)->HasTypedField<EJson::String>(TEXT("delta")) &&
+            (*SideEntry)->HasTypedField<EJson::String>(TEXT("balanceAfter"))
+        );
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].entry.delta"), Index),
+          (*SideEntry)->GetStringField(TEXT("delta")),
+          FString(ExpectedDeltas[Index])
+        );
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].entry.balanceAfter"), Index),
+          (*SideEntry)->GetStringField(TEXT("balanceAfter")),
+          FString(ExpectedBalances[Index])
+        );
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].entry.reason"), Index),
+          (*SideEntry)->GetStringField(TEXT("reason")),
+          FString(TEXT("Currency.Reason.Trade"))
+        );
+      }
+      const TSharedPtr<FJsonObject> *ReceivedEntry = nullptr;
+      const TSharedPtr<FJsonObject> *PaidEntry = nullptr;
+      if ((*TradeCurrency)[1]->AsObject()->TryGetObjectField(TEXT("entry"), ReceivedEntry) &&
+          (*TradeCurrency)[0]->AsObject()->TryGetObjectField(TEXT("entry"), PaidEntry)) {
+        TestEqual(
+          TEXT("trade: a set sourceRef is sent"),
+          (*PaidEntry)->GetStringField(TEXT("sourceRef")),
+          Paid.SourceRef
+        );
+        TestFalse(
+          TEXT("trade: an empty sourceRef is left out, never null"),
+          (*ReceivedEntry)->HasField(TEXT("sourceRef"))
+        );
+        TestFalse(
+          TEXT("trade: an empty actorAccountId is left out, never null"),
+          (*ReceivedEntry)->HasField(TEXT("actorAccountId"))
+        );
+      }
+    } else {
+      AddError(TEXT("trade: expected exactly two currency entries"));
+    }
+
     TestEqual(
       TEXT("trade: fromCharacterId"),
       Payload->GetStringField(TEXT("fromCharacterId")),
