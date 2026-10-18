@@ -1451,6 +1451,8 @@ namespace RedwoodCurrencyTradeTest {
   const FString FromToken = TEXT("writer-token-from");
   const FString ToToken = TEXT("writer-token-to");
   const FString TradeId = TEXT("DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD");
+  // A second trade in one test needs its own id: a reused one is refused.
+  const FString FreshTradeId = TEXT("D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0");
   const FString PaidEntryId = TEXT("EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE");
   const FString ReceivedEntryId = TEXT("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
   const FString TradeReason = TEXT("Currency.Reason.Trade");
@@ -2425,6 +2427,82 @@ bool FRedwoodCurrencyTradeTwoWayTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("The payee's lane takes the fence"), To.Component->GetLastCommittedItemSeq(), ToSeq + 1);
   TestEqual(TEXT("The payer's balance"), From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, FromBalance - TradedAmount);
   TestEqual(TEXT("The payee's balance"), To.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, ToBalance + TradedAmount);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeOtherComponentUnconfirmedTest,
+  "Redwood.Currency.Trade.OtherComponentUnconfirmedRefuses",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A batch whose outcome is unknown, on ANY component of the payer, refuses the trade: the probe that
+// settles it may find it committed or not, so the balance before the trade is a guess. Once the
+// probe settles it, the trade goes out from the committed balance.
+bool FRedwoodCurrencyTradeOtherComponentUnconfirmedTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  AddExpectedErrorPlain(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedErrorPlain(TEXT("has an item flush in flight or unconfirmed"), EAutomationExpectedErrorFlags::Contains, 1);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *PawnActor = nullptr;
+  URedwoodCharacterComponent *PawnComponent = Harness.MakeComponent(PawnActor, FromId);
+  PawnComponent->QueueCurrency({MakeEntry(EntryIdA, LootAmount, FromBalance + LootAmount, LootReason)}, {});
+  Harness.Subsystem->FlushItemsForCharacterComponent(From.PlayerStateComponent, PawnComponent);
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  Harness.Answer(Flush, TEXT(R"({"error":"Item flush request timed out.","committedSeq":0,"timedOut":true})"));
+  if (!TestTrue(
+        TEXT("The loot batch is unconfirmed"),
+        Harness.PumpUntil([PawnComponent]() { return PawnComponent->IsCurrencyBatchUnconfirmed(); })
+      )) {
+    return false;
+  }
+
+  FTradeResult Refused;
+  Harness.Subsystem->EmitItemsTrade(
+    From.Component, To.Component, {}, MakeTradeCurrency(TradedAmount, TradedAmount), TradeId, Capture(Refused)
+  );
+  TestEqual(TEXT("The trade is refused at once"), Refused.Calls, 1);
+  TestTrue(TEXT("No trade leaves"), Harness.IsQuiet());
+
+  // The probe finds the loot committed.
+  Harness.Subsystem->FlushItemsForCharacterComponent(From.PlayerStateComponent, PawnComponent);
+  FRequest Probe;
+  if (!Harness.ReadRequest(FlushEvent, Probe)) {
+    return false;
+  }
+  TestTrue(TEXT("The re-send is a probe"), Probe.Payload->HasField(TEXT("probe")));
+  Harness.Answer(Probe, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), FromSeq + 1));
+  TestTrue(
+    TEXT("The probe settles the batch"),
+    Harness.PumpUntil([PawnComponent]() { return !PawnComponent->IsCurrencyBatchUnconfirmed(); })
+  );
+
+  FTradeResult Result;
+  Harness.Subsystem->EmitItemsTrade(
+    From.Component, To.Component, {}, MakeTradeCurrency(TradedAmount, TradedAmount), FreshTradeId, Capture(Result)
+  );
+  FRequest Trade;
+  if (!Harness.ReadRequest(TradeEvent, Trade)) {
+    return false;
+  }
+  TestEqual(TEXT("The trade is not refused now"), Result.Calls, 0);
+  TestEqual(
+    TEXT("It chains from the balance the probe confirmed"),
+    TradeCurrencyField(Trade.Payload, 0, TEXT("balanceAfter")),
+    FString(TEXT("750"))
+  );
   return true;
 }
 

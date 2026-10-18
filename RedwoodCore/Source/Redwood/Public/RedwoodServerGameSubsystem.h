@@ -930,6 +930,11 @@ private:
   // up, as it leaves the component's own flight slot claimed.
   TMap<FString, int32> InFlightItemFlushesByCharacter;
   void EndItemFlushInFlight(const FString &CharacterId);
+  // The components whose last flush reply left a batch unconfirmed (its outcome unknown), per
+  // character. A trade must not start while any still is: the probe that settles it could find the
+  // batch committed or not, so the balance before the trade is a guess.
+  TMap<FString, TArray<TWeakObjectPtr<URedwoodCharacterComponent>>> UnconfirmedCurrencyComponentsByCharacter;
+  bool HasUnconfirmedCurrencyBatch(const FString &CharacterId);
 
   // The unsettled trade that holds this character, or null.
   FRedwoodPendingItemTrade *FindItemTradeOfCharacter(const FString &CharacterId);

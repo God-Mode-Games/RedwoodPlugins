@@ -3081,6 +3081,12 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
       );
 
       URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
+      // FORK(hollowed-oath): per character, so a trade sees an unknown outcome on any component.
+      if (Subsystem && CharacterComponent->IsCurrencyBatchUnconfirmed()) {
+        Subsystem->UnconfirmedCurrencyComponentsByCharacter.FindOrAdd(CharacterId).AddUnique(
+          CharacterComponent
+        );
+      }
       if (CharacterComponent->IsWriterFenceLost()) {
         // Nothing more to do: no reload or freeze for a session that no longer owns the character.
       } else if (Subsystem && Subsystem->IsCharacterFrozen(CharacterId)) {
@@ -4010,8 +4016,9 @@ bool URedwoodServerGameSubsystem::PrepareItemTradeSide(
   // A batch whose reply is open, or whose outcome is unknown, would commit before or after the
   // trade: the balance and the seq before the trade would then be guesses.
   if (CharacterComponent->IsItemFlushInFlight() || CharacterComponent->IsCurrencyBatchUnconfirmed() ||
-      InFlightItemFlushesByCharacter.Contains(CharacterId)) {
-    OutError = FString::Printf(TEXT("character %s has an item flush in flight"), *CharacterId);
+      InFlightItemFlushesByCharacter.Contains(CharacterId) ||
+      HasUnconfirmedCurrencyBatch(CharacterId)) {
+    OutError = FString::Printf(TEXT("character %s has an item flush in flight or unconfirmed"), *CharacterId);
     return false;
   }
 
@@ -4099,6 +4106,25 @@ bool URedwoodServerGameSubsystem::ChainTradeCurrency(
   }
   From.Entries = MoveTemp(FromEntries);
   To.Entries = MoveTemp(ToEntries);
+  return true;
+}
+
+bool URedwoodServerGameSubsystem::HasUnconfirmedCurrencyBatch(const FString &CharacterId) {
+  TArray<TWeakObjectPtr<URedwoodCharacterComponent>> *Components =
+    UnconfirmedCurrencyComponentsByCharacter.Find(CharacterId);
+  if (!Components) {
+    return false;
+  }
+  // Read live: a later reply, a freeze or a destroyed component ends the unknown outcome without
+  // telling this list.
+  Components->RemoveAll([](const TWeakObjectPtr<URedwoodCharacterComponent> &Weak) {
+    const URedwoodCharacterComponent *Component = Weak.Get();
+    return !IsValid(Component) || !Component->IsCurrencyBatchUnconfirmed();
+  });
+  if (Components->Num() == 0) {
+    UnconfirmedCurrencyComponentsByCharacter.Remove(CharacterId);
+    return false;
+  }
   return true;
 }
 
