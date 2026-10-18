@@ -33,6 +33,19 @@ namespace RedwoodCurrencyPersistenceTest {
   }
 
   const TArray<TPair<FString, uint64>> NoItems;
+
+  // The row half of the flush payload, as the flush path must build it: every dirty row, except in
+  // a re-send of an unconfirmed currency batch, which carries none.
+  TArray<TPair<FString, uint64>> CollectSentRows(const URedwoodCharacterComponent *Component) {
+    TArray<TPair<FString, uint64>> SentRows;
+    if (Component->IsItemFlushReplayProbe()) {
+      return SentRows;
+    }
+    for (const TPair<FString, uint64> &Dirty : Component->GetDirtyItemGenerations()) {
+      SentRows.Add(Dirty);
+    }
+    return SentRows;
+  }
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -208,7 +221,10 @@ bool FRedwoodCurrencyUnknownErrorKeepsBatchTest::RunTest(const FString &Paramete
   TestFalse(TEXT("No rebase for an unknown outcome"), Component->IsCurrencyRebaseRequired());
 
   // A reload arriving now must not re-chain an entry that may already be committed. The refusal
-  // warns; expect it in case the harness raises warnings to errors.
+  // logs a Warning, which AddExpectedError matches: it registers the pattern at Warning verbosity,
+  // inclusive of errors (UE 5.8 Runtime/Core/Private/Misc/AutomationTest.cpp:1973-1974,
+  // IsExpectedMessage at 2700-2708). Occurrences 0 means "at least once", so the refusal must
+  // happen for the test to pass.
   AddExpectedError(TEXT("no rebase is required"), EAutomationExpectedErrorFlags::Contains, 0);
   Component->RebaseCurrency(500);
   if (Pending.Num() == 1) {
@@ -390,8 +406,11 @@ bool FRedwoodCurrencyResendCarriesNoRowsTest::RunTest(const FString &Parameters)
   TestEqual(TEXT("Same seq"), RetrySeq, BatchSeq);
   TestTrue(TEXT("A same-seq re-send is a probe"), Component->IsItemFlushReplayProbe());
 
-  // Purchase 1 had committed; the backend acks the replay.
-  Component->CompleteItemFlush(TEXT(""), BatchSeq, Fixture::NoItems, Fixture::NoItems, 1, 0);
+  // Purchase 1 had committed; the backend acks the replay. The reply clears whatever rows the
+  // re-send carried, so the checks below fail if the probe flag lets rows into it.
+  const TArray<TPair<FString, uint64>> ResentRows = Fixture::CollectSentRows(Component);
+  TestEqual(TEXT("The re-send carries no rows"), ResentRows.Num(), 0);
+  Component->CompleteItemFlush(TEXT(""), BatchSeq, ResentRows, Fixture::NoItems, 1, 0);
 
   TestEqual(TEXT("The debit is acknowledged"), Component->GetPendingCurrencyEntries().Num(), 0);
   TestTrue(
