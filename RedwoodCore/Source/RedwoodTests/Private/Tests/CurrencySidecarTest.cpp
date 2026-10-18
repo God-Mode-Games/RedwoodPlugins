@@ -692,6 +692,7 @@ bool FRedwoodCurrencySidecarCharacterHoldTest::RunTest(const FString &Parameters
   Harness.Answer(Load, MakeLoadReply(TEXT("2000")));
   bool bRowSent = false;
   bool bEntrySent = false;
+  TArray<FRequest> ResumedFlushes;
   for (int32 Index = 0; Index < 2; ++Index) {
     FRequest Resumed;
     if (!Harness.ReadRequest(FlushEvent, Resumed)) {
@@ -699,9 +700,17 @@ bool FRedwoodCurrencySidecarCharacterHoldTest::RunTest(const FString &Parameters
     }
     bRowSent |= CountArray(Resumed.Payload, TEXT("upserts")) == 1;
     bEntrySent |= FirstBalanceAfter(Resumed.Payload) == TEXT("2500");
+    ResumedFlushes.Add(Resumed);
   }
   TestTrue(TEXT("The held row goes out after the reload"), bRowSent);
   TestTrue(TEXT("The re-chained entry goes out after the reload"), bEntrySent);
+  // Answered, so no flush is open at teardown (the shutdown logs an open one's entries as unknown).
+  for (const FRequest &Resumed : ResumedFlushes) {
+    Harness.Answer(Resumed, TEXT(R"({"error":null,"committedSeq":6})"));
+  }
+  Harness.PumpUntil([CurrencyComponent, ItemComponent]() {
+    return !CurrencyComponent->IsItemFlushInFlight() && !ItemComponent->IsItemFlushInFlight();
+  });
   return true;
 }
 
@@ -1024,6 +1033,9 @@ bool FRedwoodCurrencySidecarProbeNotAppliedTest::RunTest(const FString &Paramete
   TestEqual(TEXT("It carries both dirty rows"), CountArray(Normal.Payload, TEXT("upserts")), 2);
   TestEqual(TEXT("It carries the entry"), CountArray(Normal.Payload, TEXT("currency")), 1);
   TestEqual(TEXT("The entry keeps its balance"), FirstBalanceAfter(Normal.Payload), FString(TEXT("750")));
+  // Answered, so no flush is open at teardown (the shutdown logs an open one's entries as unknown).
+  Harness.Answer(Normal, TEXT(R"({"error":null,"committedSeq":6})"));
+  Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
   return true;
 }
 
@@ -1844,6 +1856,9 @@ bool FRedwoodCurrencyTradeTimeoutResendTest::RunTest(const FString &Parameters) 
   }
   TestEqual(TEXT("The held flush goes out after the trade's seq"), BatchSeqOf(Flush.Payload), ToSeq + 2);
   TestEqual(TEXT("The loot keeps its chain on the payee's new balance"), FirstBalanceAfter(Flush.Payload), FString(TEXT("550")));
+  // Answered, so no flush is open at teardown (the shutdown logs an open one's entries as unknown).
+  Harness.Answer(Flush, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), ToSeq + 2));
+  Harness.PumpUntil([&To]() { return !To.Component->IsItemFlushInFlight(); });
   return true;
 }
 
@@ -2826,6 +2841,52 @@ bool FRedwoodCurrencySidecarReconnectProbesTest::RunTest(const FString &Paramete
   TestEqual(TEXT("A late reply settles nothing"), SettleCount, 1);
   TestEqual(TEXT("A late reply drops nothing"), Component->GetPendingCurrencyEntries().Num(), 1);
   TestTrue(TEXT("A late reply clears no row"), Component->GetDirtyItemGenerations().Contains(OwnedItemId));
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarShutdownOpenFlushTest,
+  "Redwood.Currency.Sidecar.ShutdownSettlesOpenFlush",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A server that shuts down with a flush unanswered settles it, so a detached pawn's barrier ends,
+// and logs each entry and key of it as UNKNOWN with the reuse-id rule, for staff.
+bool FRedwoodCurrencySidecarShutdownOpenFlushTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  const FString RewardKey = TEXT("quest:Q1");
+  AddExpectedErrorPlain(
+    FString::Printf(
+      TEXT("left in flight currency entry %s delta 500 reason %s, outcome UNKNOWN (it may be saved). A re-grant must reuse entry id %s"),
+      *EntryIdA,
+      *LootReason,
+      *EntryIdA
+    ),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  AddExpectedErrorPlain(
+    FString::Printf(TEXT("left in flight grant %s, outcome UNKNOWN"), *RewardKey),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
+  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {RewardKey});
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  TestEqual(TEXT("Open while unanswered"), SettleCount, 0);
+
+  Harness.ShutDown();
+  TestEqual(TEXT("Shutdown settles the open flush once"), SettleCount, 1);
   return true;
 }
 

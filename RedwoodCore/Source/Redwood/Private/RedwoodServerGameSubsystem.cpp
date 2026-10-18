@@ -213,6 +213,38 @@ void URedwoodServerGameSubsystem::Deinitialize() {
   for (const FString &CharacterId : ReloadingCharacterIds) {
     GiveUpCurrencyReload(CharacterId, TEXT("the server is shutting down"));
   }
+  // Last, after the give-ups above, which can resume held flushes. A flush still open has no reply
+  // coming: its batch may or may not be saved, so it is logged as unknown for staff, the way a
+  // freeze logs, and its settle fires so a detached pawn's barrier ends.
+  TMap<uint64, FRedwoodInFlightItemFlush> OpenFlushes = MoveTemp(InFlightItemFlushes);
+  InFlightItemFlushes.Reset();
+  for (TPair<uint64, FRedwoodInFlightItemFlush> &Pair : OpenFlushes) {
+    FRedwoodInFlightItemFlush &Flight = Pair.Value;
+    for (const FRedwoodCurrencyEntry &Entry : Flight.CurrencyEntries) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Server shutting down: character %s left in flight currency entry %s delta %lld reason %s, outcome UNKNOWN (it may be saved). A re-grant must reuse entry id %s, so the backend refuses a second copy."),
+        *Flight.CharacterId,
+        *Entry.Id,
+        Entry.Delta,
+        *Entry.Reason,
+        *Entry.Id
+      );
+    }
+    for (const FString &GrantKey : Flight.Sent.GrantKeys) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Server shutting down: character %s left in flight grant %s, outcome UNKNOWN (it may be saved)"),
+        *Flight.CharacterId,
+        *GrantKey
+      );
+    }
+    if (Flight.OnAckSettled) {
+      Flight.OnAckSettled();
+    }
+  }
 
   Super::Deinitialize();
 
@@ -3010,6 +3042,7 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   Flight.PlayerStateComponent = PlayerStateComponent;
   Flight.CharacterId = CharacterId;
   Flight.Sent = MoveTemp(Sent);
+  Flight.CurrencyEntries = SentCurrencyEntries;
   Flight.OnAckSettled = MoveTemp(OnAckSettled);
 
   TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);

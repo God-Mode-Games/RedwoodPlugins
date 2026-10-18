@@ -68,6 +68,8 @@ struct FRedwoodInFlightItemFlush {
   TWeakObjectPtr<URedwoodPlayerStateComponent> PlayerStateComponent;
   FString CharacterId;
   FRedwoodItemFlushSent Sent;
+  // The entries the batch carried, for the shutdown log: the component may be gone by then.
+  TArray<FRedwoodCurrencyEntry> CurrencyEntries;
   TFunction<void()> OnAckSettled;
 };
 
