@@ -606,6 +606,25 @@ public:
     FrozenCharacterIds.Remove(CharacterId);
   }
 
+  // R35: the default reaction to a desync the game does not handle (OnItemFlushRefusedFinal or
+  // OnWriterFenceLost fired with no handler bound). The character is frozen or fenced, so nothing
+  // it does is saved, yet it stays in the world: an item it drops there is not in the database,
+  // and the copy it drops can be picked up while the database still holds the original. So the
+  // player is kicked, through KickPlayerOrDestroyController. A detached pawn has no player: that
+  // is only logged. Why goes to the log.
+  void KickPlayerAfterCurrencyDesync(
+    URedwoodCharacterComponent *CharacterComponent, const FString &Why
+  );
+
+  // The kick of the incomplete-auth join, shared with the desync kick: the game session's kick,
+  // or with no game session the two steps AGameSession::KickPlayer takes for a remote player (tell
+  // the client, then destroy its controller, which ends the connection).
+  static void KickPlayerOrDestroyController(APlayerController *PlayerController, const FText &Reason);
+
+  // What a player kicked by KickPlayerAfterCurrencyDesync is told.
+  static constexpr const TCHAR *CurrencyDesyncKickMessage =
+    TEXT("This character could not be saved. Sign in again to load it.");
+
   // A failed reload is retried on a timer: a reload fails for a realm hiccup or a sidecar
   // reconnect, which clear in seconds, and nothing else would re-run it for a detached pawn.
   static constexpr float CurrencyReloadRetrySeconds = 5.f;

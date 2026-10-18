@@ -9,6 +9,7 @@
 #include "Engine/GameInstance.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/GameSession.h"
+#include "GameFramework/PlayerController.h" // FORK(hollowed-oath): the desync kick
 #include "GameFramework/PlayerState.h"
 #include "Kismet/GameplayStatics.h"
 // FORK(hollowed-oath): NetCore PushModel include for the push-model rep conversion + the
@@ -802,7 +803,7 @@ void URedwoodCharacterComponent::CompleteItemFlush(
   // FORK(hollowed-oath): after the state above is settled, so a listener that reacts (by returning
   // the player to character select) sees the component frozen and empty.
   if (Outcome == ERedwoodItemFlushOutcome::FinalRefusal) {
-    OnItemFlushRefusedFinal.Broadcast(RedwoodCharacterId, Reply.Error);
+    NotifyItemFlushRefusedFinal(Reply.Error);
   }
 
   // A flush attempt that arrived while this batch was outstanding PARKED itself here rather than
@@ -862,6 +863,19 @@ URedwoodPlayerStateComponent *URedwoodCharacterComponent::FindPlayerStateCompone
                               : nullptr;
 }
 
+APlayerController *URedwoodCharacterComponent::FindPlayerController() const {
+  if (const APawn *Pawn = Cast<APawn>(GetOwner())) {
+    return Cast<APlayerController>(Pawn->GetController());
+  }
+  const APlayerState *PlayerState = Cast<APlayerState>(GetOwner());
+  return IsValid(PlayerState) ? PlayerState->GetPlayerController() : nullptr;
+}
+
+URedwoodServerGameSubsystem *URedwoodCharacterComponent::GetServerSubsystem() const {
+  UGameInstance *GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
+  return GameInstance ? GameInstance->GetSubsystem<URedwoodServerGameSubsystem>() : nullptr;
+}
+
 bool URedwoodCharacterComponent::HasGrantKey(const FString &GrantKey) const {
   if (ContainsGrantKey(PendingGrantKeys, GrantKey)) {
     return true;
@@ -878,9 +892,7 @@ bool URedwoodCharacterComponent::QueueCurrency(
   // an amount staged now would be chained from a balance nobody can vouch for. A lost writer fence
   // is refused the same way: this component never sends again, and an entry accepted here would be
   // money the game believes saved.
-  UGameInstance *GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
-  const URedwoodServerGameSubsystem *ServerSubsystem =
-    GameInstance ? GameInstance->GetSubsystem<URedwoodServerGameSubsystem>() : nullptr;
+  const URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem();
   const bool bFrozen = bFrozenAfterFinalRefusal ||
     (ServerSubsystem && ServerSubsystem->IsCharacterFrozen(RedwoodCharacterId));
   if (bFrozen || bWriterFenceLost) {
@@ -1092,7 +1104,21 @@ void URedwoodCharacterComponent::MarkWriterFenceLost() {
   // Kept, not dropped, but never sent from here: the same lines a freeze writes, so staff can tell
   // what may need a re-grant.
   LogStagedCurrencyForStaff(TEXT("writer fence lost, another session owns the character"));
-  OnWriterFenceLost.Broadcast(RedwoodCharacterId);
+  if (OnWriterFenceLost.IsBound()) {
+    OnWriterFenceLost.Broadcast(RedwoodCharacterId);
+  } else if (URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem()) {
+    ServerSubsystem->KickPlayerAfterCurrencyDesync(this, TEXT("its writer fence is lost"));
+  }
+}
+
+void URedwoodCharacterComponent::NotifyItemFlushRefusedFinal(const FString &Error) {
+  if (OnItemFlushRefusedFinal.IsBound()) {
+    OnItemFlushRefusedFinal.Broadcast(RedwoodCharacterId, Error);
+  } else if (URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem()) {
+    ServerSubsystem->KickPlayerAfterCurrencyDesync(
+      this, FString::Printf(TEXT("it is frozen after a final refusal (%s)"), *Error)
+    );
+  }
 }
 
 void URedwoodCharacterComponent::LogStagedCurrencyForStaff(const FString &Why) const {

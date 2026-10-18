@@ -22,6 +22,7 @@
   #include "RedwoodEditorSettings.h"
 #endif
 
+#include "Async/Async.h" // FORK(hollowed-oath): the deferred desync kick
 #include "Engine/AssetManager.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/GameSession.h"
@@ -3487,6 +3488,58 @@ bool URedwoodServerGameSubsystem::ApplyCurrencyReload(
   return true;
 }
 
+void URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync(
+  URedwoodCharacterComponent *CharacterComponent, const FString &Why
+) {
+  APlayerController *PlayerController =
+    IsValid(CharacterComponent) ? CharacterComponent->FindPlayerController() : nullptr;
+  const FString CharacterId =
+    IsValid(CharacterComponent) ? CharacterComponent->RedwoodCharacterId : FString();
+  if (!IsValid(PlayerController)) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("Character %s cannot be saved (%s) and the game handles nothing for it, but it has no player to kick (a detached pawn)"),
+      *CharacterId,
+      *Why
+    );
+    return;
+  }
+  UE_LOG(
+    LogRedwood,
+    Warning,
+    TEXT("Character %s cannot be saved (%s) and the game handles nothing for it: kicking the player"),
+    *CharacterId,
+    *Why
+  );
+  // Deferred to the next game-thread task run: the events fire from inside a flush or trade
+  // reply, and the kick destroys the controller, and with it the PlayerState and the pawn, while
+  // that reply is still being handled.
+  TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
+  AsyncTask(ENamedThreads::GameThread, [WeakPlayerController]() {
+    if (APlayerController *LivePlayerController = WeakPlayerController.Get()) {
+      KickPlayerOrDestroyController(
+        LivePlayerController, FText::FromString(CurrencyDesyncKickMessage)
+      );
+    }
+  });
+}
+
+void URedwoodServerGameSubsystem::KickPlayerOrDestroyController(
+  APlayerController *PlayerController, const FText &Reason
+) {
+  UWorld *World = PlayerController->GetWorld();
+  AGameModeBase *GameMode = World ? World->GetAuthGameMode() : nullptr;
+  if (IsValid(GameMode) && IsValid(GameMode->GameSession)) {
+    GameMode->GameSession->KickPlayer(PlayerController, Reason);
+    return;
+  }
+  // Nothing else would end this player's session, and it must not stay connected.
+  UE_LOG(LogRedwood, Error, TEXT("No GameSession to kick the player; destroying its PlayerController"));
+  PlayerController->ClientWasKicked(Reason);
+  PlayerController->Destroy();
+}
+
 void URedwoodServerGameSubsystem::FreezeCharacter(
   const FString &CharacterId, URedwoodPlayerStateComponent *PlayerStateComponent
 ) {
@@ -4580,7 +4633,7 @@ void URedwoodServerGameSubsystem::GiveUpItemsTrade(const FString &TradeId, const
   }
   for (const FRedwoodItemTradeSide &Side : Sides) {
     if (URedwoodCharacterComponent *Component = Side.CharacterComponent.Get()) {
-      Component->OnItemFlushRefusedFinal.Broadcast(Side.CharacterId, Error);
+      Component->NotifyItemFlushRefusedFinal(Error);
     }
   }
   FinishItemsTrade(TradeId, Error, -1, -1);

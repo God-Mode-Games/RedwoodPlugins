@@ -14,6 +14,8 @@
 #include "Dom/JsonValue.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "GameFramework/GameModeBase.h"
+#include "GameFramework/PlayerController.h"
 #include "Misc/AutomationTest.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/JsonReader.h"
@@ -29,6 +31,7 @@
 #include "RedwoodServerGameSubsystem.h"
 #include "SocketIOClient.h"
 #include "SocketIONative.h"
+#include "TransferAbortListener.h"
 
 #if WITH_AUTOMATION_WORKER
 
@@ -3121,6 +3124,132 @@ bool FRedwoodCurrencyTradeReconnectResendsTest::RunTest(const FString &Parameter
   Harness.Answer(Resend, CommittedReply(FromSeq + 1, ToSeq + 1));
   TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
   TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
+  return true;
+}
+
+namespace RedwoodCurrencySidecarTest {
+  // A player with its own controller, and the character component on its PlayerState: the
+  // component reaches its player the way a live one does.
+  struct FPlayerParty {
+    APlayerController *PlayerController = nullptr;
+    ARedwoodCurrencyLoadTestPlayerState *PlayerState = nullptr;
+    URedwoodCharacterComponent *Component = nullptr;
+  };
+
+  bool MakePlayerParty(FSidecarHarness &Harness, const FString &InCharacterId, FPlayerParty &OutParty) {
+    OutParty.PlayerController = Harness.World->SpawnActor<APlayerController>();
+    if (!Harness.Test.TestNotNull(TEXT("The controller spawns"), OutParty.PlayerController)) {
+      return false;
+    }
+    FActorSpawnParameters Params;
+    Params.Owner = OutParty.PlayerController;
+    OutParty.PlayerState = Harness.World->SpawnActor<ARedwoodCurrencyLoadTestPlayerState>(Params);
+    if (!Harness.Test.TestNotNull(TEXT("The PlayerState spawns"), OutParty.PlayerState)) {
+      return false;
+    }
+    OutParty.PlayerController->PlayerState = OutParty.PlayerState;
+    OutParty.Component = NewObject<URedwoodCharacterComponent>(OutParty.PlayerState);
+    OutParty.Component->bUseItems = true;
+    OutParty.Component->RedwoodCharacterId = InCharacterId;
+    OutParty.Component->SeedWriterToken(WriterToken);
+    OutParty.Component->SeedItemSeqFromCharacter(SeededInventorySeq);
+    return true;
+  }
+
+  // The kick goes through the authority game mode's game session, and a bare test world has
+  // neither; the probe session counts the kicks (see ZoneTravelHardeningTest).
+  ARedwoodKickProbeGameSession *InstallKickProbe(FSidecarHarness &Harness) {
+    Harness.World->SetGameMode(FURL());
+    AGameModeBase *GameMode = Harness.World->GetAuthGameMode();
+    ARedwoodKickProbeGameSession *KickProbe =
+      Harness.World->SpawnActor<ARedwoodKickProbeGameSession>();
+    if (!Harness.Test.TestNotNull(TEXT("The world has a game mode"), GameMode) ||
+        !Harness.Test.TestNotNull(TEXT("The kick probe spawns"), KickProbe)) {
+      return nullptr;
+    }
+    GameMode->GameSession = KickProbe;
+    return KickProbe;
+  }
+
+  // Stages a debit the character cannot pay, flushes it, and answers it as a final refusal.
+  bool RefuseFlushForGood(FSidecarHarness &Harness, URedwoodCharacterComponent *Component) {
+    Component->QueueCurrency({MakeEntry(EntryIdA, -2000, -1000, LootReason)}, {});
+    Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+    FRequest Flush;
+    return Harness.ReadRequest(FlushEvent, Flush) && Harness.Answer(Flush, FinalRefusalReply) &&
+      Harness.PumpUntil([Component]() { return Component->IsFrozenAfterFinalRefusal(); });
+  }
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarUnhandledDesyncKicksTest,
+  "Redwood.Currency.Sidecar.UnhandledDesyncKicks",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// R35: until the game binds them, a lost writer fence and a final refusal kick the player. A frozen
+// or fenced character that stays in the world saves nothing, and an item it drops there can be
+// picked up while the database still holds the original. A bound handler owns the reaction, and
+// then nothing is kicked.
+bool FRedwoodCurrencySidecarUnhandledDesyncKicksTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedErrorPlain(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 2);
+  AddExpectedErrorPlain(
+    TEXT("NOT saved: dropped by the freeze after a final refusal"), EAutomationExpectedErrorFlags::Contains, 2
+  );
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodKickProbeGameSession *KickProbe = InstallKickProbe(Harness);
+  FPlayerParty Fenced;
+  FPlayerParty FencedHandled;
+  FPlayerParty Refused;
+  FPlayerParty RefusedHandled;
+  // One character each: a freeze is per character.
+  if (!KickProbe || !MakePlayerParty(Harness, TEXT("character-fenced"), Fenced) ||
+      !MakePlayerParty(Harness, TEXT("character-fenced-handled"), FencedHandled) ||
+      !MakePlayerParty(Harness, TEXT("character-refused"), Refused) ||
+      !MakePlayerParty(Harness, TEXT("character-refused-handled"), RefusedHandled)) {
+    return false;
+  }
+
+  Fenced.Component->MarkWriterFenceLost();
+  TestTrue(
+    TEXT("An unhandled lost fence kicks the player"),
+    Harness.PumpUntil([KickProbe]() { return KickProbe->KickCount == 1; })
+  );
+  TestEqual(
+    TEXT("The kick says why"),
+    KickProbe->LastKickReason,
+    FString(URedwoodServerGameSubsystem::CurrencyDesyncKickMessage)
+  );
+
+  int32 FenceLostCount = 0;
+  FencedHandled.Component->OnWriterFenceLost.AddLambda([&FenceLostCount](const FString &) { ++FenceLostCount; });
+  FencedHandled.Component->MarkWriterFenceLost();
+  PumpFor(QuietWindowSeconds);
+  TestEqual(TEXT("The handler hears the lost fence"), FenceLostCount, 1);
+  TestEqual(TEXT("A handled lost fence kicks nobody"), KickProbe->KickCount, 1);
+
+  if (!RefuseFlushForGood(Harness, Refused.Component)) {
+    return false;
+  }
+  TestTrue(
+    TEXT("An unhandled final refusal kicks the player"),
+    Harness.PumpUntil([KickProbe]() { return KickProbe->KickCount == 2; })
+  );
+
+  int32 RefusalCount = 0;
+  RefusedHandled.Component->OnItemFlushRefusedFinal.AddLambda(
+    [&RefusalCount](const FString &, const FString &) { ++RefusalCount; }
+  );
+  if (!RefuseFlushForGood(Harness, RefusedHandled.Component)) {
+    return false;
+  }
+  PumpFor(QuietWindowSeconds);
+  TestEqual(TEXT("The handler hears the final refusal"), RefusalCount, 1);
+  TestEqual(TEXT("A handled final refusal kicks nobody"), KickProbe->KickCount, 2);
   return true;
 }
 

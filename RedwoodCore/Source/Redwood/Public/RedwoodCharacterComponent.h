@@ -14,6 +14,9 @@
 class USIOJsonObject;
 // FORK(hollowed-oath): the snapshot owner FindPlayerStateComponent returns.
 class URedwoodPlayerStateComponent;
+// FORK(hollowed-oath): the player FindPlayerController returns, for the desync kick.
+class APlayerController;
+class URedwoodServerGameSubsystem;
 
 UCLASS(
   Blueprintable,
@@ -447,8 +450,15 @@ public:
     return bWriterFenceLost;
   }
 
-  // Logs a warning the first time only.
+  // Logs a warning the first time only. Tells the game through OnWriterFenceLost; with no handler
+  // bound, the server kicks the player (see
+  // URedwoodServerGameSubsystem::KickPlayerAfterCurrencyDesync).
   void MarkWriterFenceLost();
+
+  // Tells the game that this character is frozen (OnItemFlushRefusedFinal). With no handler bound,
+  // the server kicks the player instead (R35): until the game handles it, a frozen character that
+  // stays in the world can still change it, and an item dropped there is not in the database.
+  void NotifyItemFlushRefusedFinal(const FString &Error);
 
   // Logs every staged entry and grant key through LogCurrencyForStaff, so staff can rebuild what
   // this server will never save. Why says what happened to them.
@@ -502,6 +512,10 @@ public:
   // controller, or the owner itself when this component sits on the PlayerState. Null for a
   // detached pawn.
   URedwoodPlayerStateComponent *FindPlayerStateComponent() const;
+
+  // The player who plays this character: the pawn's controller, or the PlayerState's owner. Null
+  // for a detached pawn.
+  APlayerController *FindPlayerController() const;
 
   // The token the realm issued this session at auth. Every items:flush must carry it; the backend
   // commits nothing for any other token.
@@ -682,6 +696,9 @@ private:
   // Re-chains every pending entry from Balance. Returns false, with nothing changed, when an entry
   // would overflow int64 or take the balance below zero.
   bool TryRechainPendingCurrency(int64 Balance);
+
+  // The server subsystem of this component's game instance, or null (no world, or a client).
+  URedwoodServerGameSubsystem *GetServerSubsystem() const;
 
   void ClearSentItemGenerations(
     const TArray<TPair<FString, uint64>> &SentUpserts,
