@@ -29,6 +29,7 @@ namespace RedwoodCurrencyLoadTest {
   // Kept in the outputs of a refused parse, to show that it wrote nothing.
   constexpr int64 UntouchedAmount = 77;
   const FString UntouchedGrantKey = TEXT("untouched");
+  const FString SentinelCharacterId = TEXT("character-before");
 
   TSharedPtr<FJsonObject> ParseJson(const FString &Text) {
     TSharedPtr<FJsonObject> Object;
@@ -194,20 +195,25 @@ bool FRedwoodCurrencyAuthLoadTest::RunTest(const FString &Parameters) {
     {TEXT("no character"), TEXT(R"({"error":"","character":null,"currency":{"amount":"5","grants":[]},"writerToken":"t"})")},
   };
   for (const FIncompleteReply &Case : Incomplete) {
+    // A snapshot already in place, so that any write by the failed load shows.
     URedwoodPlayerStateComponent *Refused = MakePlayerStateComponent();
+    Refused->RedwoodCharacter.Id = SentinelCharacterId;
+    Refused->RedwoodCharacter.CurrencyAmount = UntouchedAmount;
     FString CaseError;
     TestFalse(
       FString::Printf(TEXT("A reply with %s fails the load"), Case.What),
       URedwoodGameModeComponent::ApplyPlayerAuthCharacter(nullptr, Refused, ParseJson(Case.Reply), CaseError)
     );
     TestFalse(FString::Printf(TEXT("A reply with %s says why"), Case.What), CaseError.IsEmpty());
-    TestTrue(
-      FString::Printf(TEXT("A reply with %s sets no character"), Case.What), Refused->RedwoodCharacter.Id.IsEmpty()
+    TestEqual(
+      FString::Printf(TEXT("A reply with %s sets no character"), Case.What),
+      Refused->RedwoodCharacter.Id,
+      SentinelCharacterId
     );
     TestEqual(
       FString::Printf(TEXT("A reply with %s sets no balance"), Case.What),
       Refused->RedwoodCharacter.CurrencyAmount,
-      (int64)0
+      UntouchedAmount
     );
   }
   return true;
