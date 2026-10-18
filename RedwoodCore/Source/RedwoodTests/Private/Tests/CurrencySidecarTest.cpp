@@ -937,8 +937,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// The backend says a probed batch never committed: its entry is pending again, unchanged, and the
-// next flush is a normal batch at the same seq that carries it WITH the current rows.
+// The backend says a probed batch never committed, and consumes the probed seq with an empty
+// commit: the entry is pending again, unchanged, and the next flush is a normal batch AFTER that
+// fence that carries it WITH the current rows.
 bool FRedwoodCurrencySidecarProbeNotAppliedTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
@@ -969,7 +970,8 @@ bool FRedwoodCurrencySidecarProbeNotAppliedTest::RunTest(const FString &Paramete
   TestTrue(TEXT("The re-send is a probe"), Probe.Payload->HasField(TEXT("probe")));
   TestEqual(TEXT("A probe carries no rows"), CountArray(Probe.Payload, TEXT("upserts")), 0);
 
-  Harness.Answer(Probe, TEXT(R"({"error":"batch was never applied","committedSeq":4,"notApplied":true})"));
+  TestEqual(TEXT("The probe goes out under the unconfirmed seq"), Probe.Payload->GetNumberField(TEXT("batchSeq")), 5.0);
+  Harness.Answer(Probe, TEXT(R"({"error":"batch was never applied","committedSeq":5,"notApplied":true})"));
   Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
   const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
   if (TestEqual(TEXT("notApplied drops no entry"), Pending.Num(), 1)) {
@@ -982,7 +984,7 @@ bool FRedwoodCurrencySidecarProbeNotAppliedTest::RunTest(const FString &Paramete
     return false;
   }
   TestFalse(TEXT("The next batch is not a probe"), Normal.Payload->HasField(TEXT("probe")));
-  TestEqual(TEXT("It goes out at the same seq"), Normal.Payload->GetNumberField(TEXT("batchSeq")), 5.0);
+  TestEqual(TEXT("It goes out after the consumed seq"), Normal.Payload->GetNumberField(TEXT("batchSeq")), 6.0);
   TestEqual(TEXT("It carries both dirty rows"), CountArray(Normal.Payload, TEXT("upserts")), 2);
   TestEqual(TEXT("It carries the entry"), CountArray(Normal.Payload, TEXT("currency")), 1);
   TestEqual(TEXT("The entry keeps its balance"), FirstBalanceAfter(Normal.Payload), FString(TEXT("750")));

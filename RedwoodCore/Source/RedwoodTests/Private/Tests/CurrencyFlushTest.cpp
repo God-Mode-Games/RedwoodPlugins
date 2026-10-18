@@ -471,3 +471,40 @@ bool FRedwoodCurrencyReloadReplyParseTest::RunTest(const FString &Parameters) {
 
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyNotAppliedConsumesSeqTest,
+  "Redwood.Currency.NotAppliedConsumesSeq",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A notApplied reply commits the probed seq empty. The lane and the snapshot move past it, and the
+// entry stays as it was.
+bool FRedwoodCurrencyNotAppliedConsumesSeqTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyFlushTest;
+  URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(4);
+  URedwoodPlayerStateComponent *PlayerState = Fixture::MakePlayerStateComponent(4, 1000);
+
+  Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, -250, 750)}, {});
+  const FRedwoodItemFlushSent First = Fixture::ClaimBatch(*this, Component);
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+    Component, PlayerState, Fixture::MakeReply(TEXT("socket closed"), -1), First
+  );
+
+  const FRedwoodItemFlushSent Probe = Fixture::ClaimBatch(*this, Component);
+  TestTrue(TEXT("The re-send is a probe"), Component->IsItemFlushReplayProbe());
+  FRedwoodItemFlushReply Reply = Fixture::MakeReply(TEXT("batch was never applied"), Probe.BatchSeq);
+  Reply.bNotApplied = true;
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(Component, PlayerState, Reply, Probe);
+
+  TestEqual(TEXT("The snapshot seq moves to the consumed seq"), PlayerState->RedwoodCharacter.InventorySeq, Probe.BatchSeq);
+  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
+  if (TestEqual(TEXT("The entry is kept"), Pending.Num(), 1)) {
+    TestEqual(TEXT("It is unchanged"), Pending[0].BalanceAfter, (int64)750);
+  }
+  const FRedwoodItemFlushSent Next = Fixture::ClaimBatch(*this, Component);
+  TestFalse(TEXT("The next batch is not a probe"), Component->IsItemFlushReplayProbe());
+  TestEqual(TEXT("It goes out after the consumed seq"), Next.BatchSeq, Probe.BatchSeq + 1);
+  TestEqual(TEXT("It carries the entry"), Next.CurrencyCount, 1);
+  return true;
+}

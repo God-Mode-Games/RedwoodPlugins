@@ -680,14 +680,21 @@ void URedwoodCharacterComponent::CompleteItemFlush(
   SentGrantCount = FMath::Clamp(SentGrantCount, 0, PendingGrantKeys.Num());
 
   if (bNotApplied) {
-    // FORK(hollowed-oath): the backend answered a probe: that seq never committed and nothing was
-    // written. The unconfirmed batch did not apply, so its entries are simply pending again,
-    // unchanged (their BalanceAfter still holds: nothing moved the balance). The next claim is a
-    // normal batch at that same seq, so the payment goes out WITH the current item rows: both
-    // save or neither does.
+    // FORK(hollowed-oath): the backend answered a probe: the batch never committed. The backend
+    // has CONSUMED that seq with an empty commit (CommittedSeq), so a late original arriving under
+    // it now fails instead of applying after the fact. The entries are simply pending again,
+    // unchanged: the empty commit moved no balance, so their BalanceAfter still holds. The next
+    // claim is a normal batch after that fence, so the payment goes out WITH the current item
+    // rows: both save or neither does.
     bCurrencyBatchUnconfirmed = false;
-    LastCommittedItemSeq = SentSeq - 1;
-    NextBatchSeq = SentSeq;
+    if (CommittedSeq >= 0) {
+      LastCommittedItemSeq = CommittedSeq;
+      NextBatchSeq = CommittedSeq + 1;
+    } else {
+      // No fence on the reply: the seq was not consumed, so the batch goes out under it again.
+      LastCommittedItemSeq = SentSeq - 1;
+      NextBatchSeq = SentSeq;
+    }
   } else if (Error.IsEmpty()) {
     // Success: clear only the ids whose generation still matches what was sent, exactly as the
     // old container ack did -- if MarkItemsDirty/MarkItemsDeleted bumped an id again while the

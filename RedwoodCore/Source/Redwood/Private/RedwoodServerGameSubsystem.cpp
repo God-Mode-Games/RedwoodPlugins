@@ -3023,6 +3023,11 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
         Snapshot.InventorySeq < Reply.CommittedSeq) {
       Snapshot.InventorySeq = Reply.CommittedSeq;
     }
+    // FORK(hollowed-oath): a notApplied reply also commits a seq (an empty one, that consumes the
+    // probed seq), so the snapshot follows it for the same reason.
+    if (Reply.bNotApplied && Reply.CommittedSeq > Snapshot.InventorySeq) {
+      Snapshot.InventorySeq = Reply.CommittedSeq;
+    }
 
     // The committed balance, for the same reason: a recreated component and the game chain new
     // entries from it. Only when the fence is exactly this batch's seq: a later fence means
