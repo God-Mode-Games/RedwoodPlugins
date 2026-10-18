@@ -72,6 +72,18 @@ public:
       Subsystem.HandleItemsTradeTimeout(TradeId, Pending->Generation);
     }
   }
+  static uint64 LastFlushGeneration(URedwoodServerGameSubsystem &Subsystem) {
+    return Subsystem.LastItemFlushGeneration;
+  }
+  // A reply to a flush attempt by its generation, as the socket callback delivers it.
+  static void ReplyToFlush(
+    URedwoodServerGameSubsystem &Subsystem, uint64 Generation, const FString &ReplyJson
+  ) {
+    TSharedPtr<FJsonObject> Reply;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ReplyJson);
+    FJsonSerializer::Deserialize(Reader, Reply);
+    Subsystem.HandleItemsFlushReply(Generation, Reply);
+  }
   // The trade's resend timer firing, without waiting for it.
   static void ResendTradeNow(URedwoodServerGameSubsystem &Subsystem, const FString &TradeId) {
     Subsystem.SendItemsTrade(TradeId);
@@ -2670,8 +2682,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// A flush whose connection drops before its reply never gets one. Its open-flush count must not
-// block the character's trades for the rest of the session: the reconnect clears it.
+// A flush whose connection drops before its reply never gets one. It must not block the character's
+// trades for the rest of the session: the reconnect turns it into a probe, and once the probe is
+// answered the trade goes out.
 bool FRedwoodCurrencyTradeReconnectClearsOpenFlushTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencyTradeTest;
   AddExpectedErrorPlain(TEXT("has an item flush in flight"), EAutomationExpectedErrorFlags::Contains, 1);
@@ -2707,6 +2720,12 @@ bool FRedwoodCurrencyTradeReconnectClearsOpenFlushTest::RunTest(const FString &P
       !Harness.AcceptAndWait()) {
     return false;
   }
+  FRequest Probe;
+  if (!Harness.ReadRequest(FlushEvent, Probe)) {
+    return false;
+  }
+  Harness.Answer(Probe, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), FromSeq + 1));
+  Harness.PumpUntil([PawnComponent]() { return !PawnComponent->IsItemFlushInFlight(); });
 
   FTradeResult Result;
   FRequest Trade;
@@ -2717,6 +2736,76 @@ bool FRedwoodCurrencyTradeReconnectClearsOpenFlushTest::RunTest(const FString &P
   Harness.Answer(Trade, CommittedReply(FromSeq + 1, ToSeq + 1));
   TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
   TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarReconnectProbesTest,
+  "Redwood.Currency.Sidecar.ReconnectProbesOpenFlush",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// R34. The connection drops with a batch in flight, so its reply never comes. The reconnect marks
+// the batch unconfirmed and re-sends it at once as a probe: the same entries, no rows, the same
+// seq, carrying the attempt's settle. The probe's success drops the entries exactly once, and a
+// late reply from the old connection changes nothing.
+bool FRedwoodCurrencySidecarReconnectProbesTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FAccess::BindConnectedCallback(*Harness.Subsystem);
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
+  Actor->Items = {MakeRecord(OwnedItemId)};
+  Component->MarkItemsDirty({OwnedItemId});
+  Component->QueueCurrency({MakeEntry(EntryIdA, -250, 750, LootReason)}, {});
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
+  FRequest First;
+  if (!Harness.ReadRequest(FlushEvent, First)) {
+    return false;
+  }
+  const uint64 OldGeneration = FAccess::LastFlushGeneration(*Harness.Subsystem);
+  TestEqual(TEXT("The first attempt carries the row"), CountArray(First.Payload, TEXT("upserts")), 1);
+
+  TSharedPtr<FSocketIONative> Socket = Harness.SidecarCopy;
+  if (!TestTrue(TEXT("The sidecar restarts"), Harness.Server->CloseWithCode(ServiceRestartCloseCode)) ||
+      !TestTrue(TEXT("The socket sees it"), Harness.PumpUntil([Socket]() { return !Socket->bIsConnected; })) ||
+      !Harness.AcceptAndWait()) {
+    return false;
+  }
+  FRequest Probe;
+  if (!Harness.ReadRequest(FlushEvent, Probe)) {
+    return false;
+  }
+  TestTrue(TEXT("The re-send is a probe"), Probe.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("At the same seq"), Probe.Payload->GetNumberField(TEXT("batchSeq")), First.Payload->GetNumberField(TEXT("batchSeq")));
+  TestEqual(TEXT("With no rows"), CountArray(Probe.Payload, TEXT("upserts")), 0);
+  TestEqual(TEXT("With the same entries"), CountArray(Probe.Payload, TEXT("currency")), 1);
+  TestEqual(TEXT("The same entry, unchanged"), FirstBalanceAfter(Probe.Payload), FirstBalanceAfter(First.Payload));
+  TestEqual(TEXT("The attempt has not settled"), SettleCount, 0);
+
+  // Staged after the probe went out: it must survive both replies.
+  Component->QueueCurrency({MakeEntry(EntryIdB, 100, 850, LootReason)}, {});
+  Harness.Answer(Probe, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SeededInventorySeq + 1));
+  TestTrue(TEXT("The probe settles the attempt"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
+  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
+  if (TestEqual(TEXT("The probed entry is dropped once"), Pending.Num(), 1)) {
+    TestEqual(TEXT("The later entry stays"), Pending[0].Id, EntryIdB);
+  }
+  TestTrue(TEXT("The row the probe did not carry stays dirty"), Component->GetDirtyItemGenerations().Contains(OwnedItemId));
+
+  // The old connection's reply, late: it would drop the later entry and clear the row.
+  FAccess::ReplyToFlush(
+    *Harness.Subsystem,
+    OldGeneration,
+    FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SeededInventorySeq + 1)
+  );
+  TestEqual(TEXT("A late reply settles nothing"), SettleCount, 1);
+  TestEqual(TEXT("A late reply drops nothing"), Component->GetPendingCurrencyEntries().Num(), 1);
+  TestTrue(TEXT("A late reply clears no row"), Component->GetDirtyItemGenerations().Contains(OwnedItemId));
   return true;
 }
 

@@ -258,11 +258,10 @@ void URedwoodServerGameSubsystem::HandleSidecarConnected() {
       true, // loop
       0.f // immediately trigger first one
     );
-    // FORK(hollowed-oath): a reply to a request sent on the dropped connection never comes, so the
-    // open-flush counts it raised would block those characters' trades for the rest of the
-    // session. The sidecar answers every request it gets within its realm timeout, so a lost reply
-    // only follows a dropped connection, and every count still raised now is one.
-    InFlightItemFlushesByCharacter.Reset();
+    // FORK(hollowed-oath): a reply to a flush sent on the dropped connection never comes. The
+    // sidecar answers every request it gets within its realm timeout, so every flush still open
+    // now is one of those: re-send each as a probe (R34).
+    RequeueItemFlushesAfterReconnect();
     // FORK(hollowed-oath): currency reloads and trade resends that waited for the sidecar go out
     // now.
     ResumeCurrencyReloadsAfterSidecarConnect();
@@ -3000,126 +2999,181 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     bReplayProbe
   );
 
-  TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = CharacterComponent;
-  // FORK(hollowed-oath): carried into the ack so the committed seq and balance can be written back
-  // onto the PlayerState snapshot -- see ApplyItemsFlushReply for why a stale snapshot loses items.
-  TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerStateComponent = PlayerStateComponent;
-  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
+  // FORK(hollowed-oath): the attempt is kept here under a generation, not in the reply callback. A
+  // reconnect must be able to take it back (RequeueItemFlushesAfterReconnect), and a reply that then
+  // arrives from the old connection must find nothing to act on.
+  const uint64 Generation = ++LastItemFlushGeneration;
+  FRedwoodInFlightItemFlush &Flight = InFlightItemFlushes.Add(Generation);
+  Flight.CharacterComponent = CharacterComponent;
+  // Carried into the ack so the committed seq and balance can be written back onto the PlayerState
+  // snapshot -- see ApplyItemsFlushReply for why a stale snapshot loses items.
+  Flight.PlayerStateComponent = PlayerStateComponent;
+  Flight.CharacterId = CharacterId;
+  Flight.Sent = MoveTemp(Sent);
+  Flight.OnAckSettled = MoveTemp(OnAckSettled);
 
-  // FORK(hollowed-oath): counted per character, not per component, so a trade sees a batch that
-  // another component of the character has open (see PrepareItemTradeSide).
-  ++InFlightItemFlushesByCharacter.FindOrAdd(CharacterId);
+  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
   Sidecar->Emit(
     TEXT("realm:characters:items:flush"),
     Payload,
-    [WeakSubsystem,
-     WeakCharacterComponent,
-     WeakPlayerStateComponent,
-     CharacterId,
-     Sent,
-     OnAckSettled](auto Response) {
+    [WeakSubsystem, Generation](auto Response) {
+      URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
+      if (!Subsystem) {
+        return;
+      }
       // FORK(hollowed-oath): an unreadable reply parses as an error with no fence: the outcome is
       // unknown, so the batch is kept and re-sent.
       const TSharedPtr<FJsonObject> *ReplyObject =
         URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
-      const FRedwoodItemFlushReply Reply =
-        ParseItemsFlushReply(ReplyObject ? *ReplyObject : TSharedPtr<FJsonObject>());
-      // FORK(hollowed-oath): first, so a parked attempt or a trade started from this reply counts
-      // the batch as answered.
-      if (URedwoodServerGameSubsystem *AnsweredSubsystem = WeakSubsystem.Get()) {
-        AnsweredSubsystem->EndItemFlushInFlight(CharacterId);
-      }
-
-      URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
-      if (!IsValid(CharacterComponent)) {
-        // The player disconnected (or the pawn/PlayerState was destroyed) while this request was
-        // in flight -- the single-flight slot lives on that now-dead component, so there is
-        // nothing to release or clear. (Inherited exposure: the flush barrier that bounds a
-        // detached pawn's lifetime keeps this from leaking a live component's slot.)
-        if (!Reply.Error.IsEmpty()) {
-          UE_LOG(
-            LogRedwood, Error, TEXT("Failed to flush items (component gone): %s"), *Reply.Error
-          );
-        }
-        // FORK(hollowed-oath): a committed batch is still committed. The component that sent it
-        // is gone, but the snapshot outlives it, and the next component hydrates from it: without
-        // the commit's seq, balance and grant keys there, it would reuse the seq, chain from a
-        // stale balance, and stage a reward whose key is already used, which the backend refuses
-        // for good. An error reply writes nothing here: what it would change lives on the
-        // component that is gone.
-        if (URedwoodPlayerStateComponent *LivePlayerStateComponent = WeakPlayerStateComponent.Get()) {
-          WriteCommittedFlushToSnapshot(LivePlayerStateComponent->RedwoodCharacter, Reply, Sent);
-        }
-        // Still settle: the detached release barrier must not stall forever just because the
-        // component died mid-flight -- the attempt HAS resolved.
-        if (OnAckSettled) {
-          OnAckSettled();
-        }
-        return;
-      }
-
-      if (!Reply.Error.IsEmpty()) {
-        UE_LOG(LogRedwood, Error, TEXT("Failed to flush items: %s"), *Reply.Error);
-      }
-
-      // FORK(hollowed-oath): before the component takes the reply, so the parked attempt it runs
-      // already sees that this session no longer owns the character.
-      if (Reply.bWriterFenceLost) {
-        CharacterComponent->MarkWriterFenceLost();
-      }
-
-      // FORK(hollowed-oath): a final refusal freezes the whole character, BEFORE the component
-      // takes the reply. CompleteItemFlush then freezes the component (dropping and logging all it
-      // staged) and tells the game; by then every other component of the character, and a parked
-      // attempt it runs, already sees the freeze. This attempt then settles with nothing to save.
-      if (!Reply.Error.IsEmpty() && Reply.bFinal) {
-        if (URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get()) {
-          Subsystem->FreezeCharacter(CharacterId, WeakPlayerStateComponent.Get());
-        }
-      }
-
-      // ALWAYS complete (success or error): CompleteItemFlush (inside) releases the single-flight
-      // slot and, on success, clears only the generation-matched sent ids and advances the
-      // committed seq; on error it leaves the dirt for the next flush.
-      ApplyItemsFlushReply(
-        CharacterComponent, WeakPlayerStateComponent.Get(), Reply, Sent
+      Subsystem->HandleItemsFlushReply(
+        Generation, ReplyObject ? *ReplyObject : TSharedPtr<FJsonObject>()
       );
-
-      URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get();
-      // FORK(hollowed-oath): per character, so a trade sees an unknown outcome on any component.
-      if (Subsystem && CharacterComponent->IsCurrencyBatchUnconfirmed()) {
-        Subsystem->UnconfirmedCurrencyComponentsByCharacter.FindOrAdd(CharacterId).AddUnique(
-          CharacterComponent
-        );
-      }
-      if (CharacterComponent->IsWriterFenceLost()) {
-        // Nothing more to do: no reload or freeze for a session that no longer owns the character.
-      } else if (Subsystem && Subsystem->IsCharacterFrozen(CharacterId)) {
-        // FORK(hollowed-oath): the character froze while this batch was in flight. Its reply has
-        // removed what committed; drop the rest now.
-        if (!CharacterComponent->IsFrozenAfterFinalRefusal()) {
-          CharacterComponent->FreezeAfterFinalRefusal(TEXT("the character is frozen"));
-        }
-      } else if (CharacterComponent->IsCurrencyRebaseRequired()) {
-        // A trade used the seq, or the reply could not confirm the balance: a reload must land
-        // before anything is sent. Start it from this reply, and hand this attempt's settle to
-        // it: for a detached pawn the entries are not saved yet, and releasing the write binding
-        // now would refuse the resumed flush that saves them.
-        if (Subsystem) {
-          Subsystem->HoldItemFlushForCurrencyReload(
-            CharacterId, WeakPlayerStateComponent.Get(), CharacterComponent, OnAckSettled
-          );
-          return;
-        }
-      }
-
-      // Settle AFTER CompleteItemFlush, on both success and error: the release barrier's rule is
-      // "the attempt resolved", which is exactly here.
-      if (OnAckSettled) {
-        OnAckSettled();
-      }
     }
   );
+}
+
+void URedwoodServerGameSubsystem::HandleItemsFlushReply(
+  uint64 Generation, const TSharedPtr<FJsonObject> &ReplyObject
+) {
+  // Out of the map first: that is how a trade sees the batch as answered, and the parked attempt
+  // that CompleteItemFlush runs may send a new batch.
+  FRedwoodInFlightItemFlush Flight;
+  if (!InFlightItemFlushes.RemoveAndCopyValue(Generation, Flight)) {
+    // FORK(hollowed-oath): the connection it was sent on dropped, and the reconnect already marked
+    // the batch unconfirmed and sent its probe, settle and all (R34). Acting on it now would settle
+    // that attempt twice and could clear rows the probe has yet to decide.
+    UE_LOG(LogRedwood, Log, TEXT("Ignoring a late item flush reply from a dropped connection"));
+    return;
+  }
+  const TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = Flight.CharacterComponent;
+  const TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerStateComponent =
+    Flight.PlayerStateComponent;
+  const FString CharacterId = Flight.CharacterId;
+  const FRedwoodItemFlushSent &Sent = Flight.Sent;
+  TFunction<void()> OnAckSettled = MoveTemp(Flight.OnAckSettled);
+  const FRedwoodItemFlushReply Reply = ParseItemsFlushReply(ReplyObject);
+
+  URedwoodCharacterComponent *CharacterComponent = WeakCharacterComponent.Get();
+  if (!IsValid(CharacterComponent)) {
+    // The player disconnected (or the pawn/PlayerState was destroyed) while this request was
+    // in flight -- the single-flight slot lives on that now-dead component, so there is
+    // nothing to release or clear. (Inherited exposure: the flush barrier that bounds a
+    // detached pawn's lifetime keeps this from leaking a live component's slot.)
+    if (!Reply.Error.IsEmpty()) {
+      UE_LOG(
+        LogRedwood, Error, TEXT("Failed to flush items (component gone): %s"), *Reply.Error
+      );
+    }
+    // FORK(hollowed-oath): a committed batch is still committed. The component that sent it
+    // is gone, but the snapshot outlives it, and the next component hydrates from it: without
+    // the commit's seq, balance and grant keys there, it would reuse the seq, chain from a
+    // stale balance, and stage a reward whose key is already used, which the backend refuses
+    // for good. An error reply writes nothing here: what it would change lives on the
+    // component that is gone.
+    if (URedwoodPlayerStateComponent *LivePlayerStateComponent = WeakPlayerStateComponent.Get()) {
+      WriteCommittedFlushToSnapshot(LivePlayerStateComponent->RedwoodCharacter, Reply, Sent);
+    }
+    // Still settle: the detached release barrier must not stall forever just because the
+    // component died mid-flight -- the attempt HAS resolved.
+    if (OnAckSettled) {
+      OnAckSettled();
+    }
+    return;
+  }
+
+  if (!Reply.Error.IsEmpty()) {
+    UE_LOG(LogRedwood, Error, TEXT("Failed to flush items: %s"), *Reply.Error);
+  }
+
+  // FORK(hollowed-oath): before the component takes the reply, so the parked attempt it runs
+  // already sees that this session no longer owns the character.
+  if (Reply.bWriterFenceLost) {
+    CharacterComponent->MarkWriterFenceLost();
+  }
+
+  // FORK(hollowed-oath): a final refusal freezes the whole character, BEFORE the component
+  // takes the reply. CompleteItemFlush then freezes the component (dropping and logging all it
+  // staged) and tells the game; by then every other component of the character, and a parked
+  // attempt it runs, already sees the freeze. This attempt then settles with nothing to save.
+  if (!Reply.Error.IsEmpty() && Reply.bFinal) {
+    FreezeCharacter(CharacterId, WeakPlayerStateComponent.Get());
+  }
+
+  // ALWAYS complete (success or error): CompleteItemFlush (inside) releases the single-flight
+  // slot and, on success, clears only the generation-matched sent ids and advances the
+  // committed seq; on error it leaves the dirt for the next flush.
+  ApplyItemsFlushReply(
+    CharacterComponent, WeakPlayerStateComponent.Get(), Reply, Sent
+  );
+
+  // FORK(hollowed-oath): per character, so a trade sees an unknown outcome on any component.
+  if (CharacterComponent->IsCurrencyBatchUnconfirmed()) {
+    UnconfirmedCurrencyComponentsByCharacter.FindOrAdd(CharacterId).AddUnique(
+      CharacterComponent
+    );
+  }
+  if (CharacterComponent->IsWriterFenceLost()) {
+    // Nothing more to do: no reload or freeze for a session that no longer owns the character.
+  } else if (IsCharacterFrozen(CharacterId)) {
+    // FORK(hollowed-oath): the character froze while this batch was in flight. Its reply has
+    // removed what committed; drop the rest now.
+    if (!CharacterComponent->IsFrozenAfterFinalRefusal()) {
+      CharacterComponent->FreezeAfterFinalRefusal(TEXT("the character is frozen"));
+    }
+  } else if (CharacterComponent->IsCurrencyRebaseRequired()) {
+    // A trade used the seq, or the reply could not confirm the balance: a reload must land
+    // before anything is sent. Start it from this reply, and hand this attempt's settle to
+    // it: for a detached pawn the entries are not saved yet, and releasing the write binding
+    // now would refuse the resumed flush that saves them.
+    HoldItemFlushForCurrencyReload(
+      CharacterId, WeakPlayerStateComponent.Get(), CharacterComponent, MoveTemp(OnAckSettled)
+    );
+    return;
+  }
+
+  // Settle AFTER CompleteItemFlush, on both success and error: the release barrier's rule is
+  // "the attempt resolved", which is exactly here.
+  if (OnAckSettled) {
+    OnAckSettled();
+  }
+}
+
+void URedwoodServerGameSubsystem::RequeueItemFlushesAfterReconnect() {
+  // FORK(hollowed-oath): R34. Out of the map first: each probe sent below adds a new attempt.
+  TMap<uint64, FRedwoodInFlightItemFlush> Lost = MoveTemp(InFlightItemFlushes);
+  InFlightItemFlushes.Reset();
+  for (TPair<uint64, FRedwoodInFlightItemFlush> &Pair : Lost) {
+    FRedwoodInFlightItemFlush &Flight = Pair.Value;
+    URedwoodCharacterComponent *Component = Flight.CharacterComponent.Get();
+    if (!IsValid(Component)) {
+      // Nothing is left to re-send; the attempt has resolved as far as this server can tell.
+      if (Flight.OnAckSettled) {
+        Flight.OnAckSettled();
+      }
+      continue;
+    }
+    // The batch may have committed: unconfirmed, as after an unknown-outcome error, so the next
+    // attempt is a probe at its seq with the same entries and no rows.
+    Component->AbandonInFlightItemFlush(Flight.Sent.CurrencyCount, Flight.Sent.GrantKeys.Num());
+    if (Component->IsCurrencyBatchUnconfirmed()) {
+      UnconfirmedCurrencyComponentsByCharacter.FindOrAdd(Flight.CharacterId).AddUnique(Component);
+    }
+    // Sent now, with the attempt's settle, so a detached pawn's barrier waits for the probe, not
+    // for a tick it does not have. A parked attempt on the component stays parked until the probe
+    // is answered.
+    FlushItemsForCharacterComponent(
+      Flight.PlayerStateComponent.Get(), Component, MoveTemp(Flight.OnAckSettled)
+    );
+  }
+}
+
+bool URedwoodServerGameSubsystem::HasOpenItemFlush(const FString &CharacterId) const {
+  for (const TPair<uint64, FRedwoodInFlightItemFlush> &Pair : InFlightItemFlushes) {
+    if (Pair.Value.CharacterId == CharacterId) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // FORK(hollowed-oath): the currency ledger steps of the item flush. See the declarations.
@@ -4021,7 +4075,7 @@ bool URedwoodServerGameSubsystem::PrepareItemTradeSide(
   // A batch whose reply is open, or whose outcome is unknown, would commit before or after the
   // trade: the balance and the seq before the trade would then be guesses.
   if (CharacterComponent->IsItemFlushInFlight() || CharacterComponent->IsCurrencyBatchUnconfirmed() ||
-      InFlightItemFlushesByCharacter.Contains(CharacterId) ||
+      HasOpenItemFlush(CharacterId) ||
       HasUnconfirmedCurrencyBatch(CharacterId)) {
     OutError = FString::Printf(TEXT("character %s has an item flush in flight or unconfirmed"), *CharacterId);
     return false;
@@ -4131,17 +4185,6 @@ bool URedwoodServerGameSubsystem::HasUnconfirmedCurrencyBatch(const FString &Cha
     return false;
   }
   return true;
-}
-
-void URedwoodServerGameSubsystem::EndItemFlushInFlight(const FString &CharacterId) {
-  int32 *Count = InFlightItemFlushesByCharacter.Find(CharacterId);
-  if (!Count) {
-    return;
-  }
-  // Removed at zero, so Contains means "a batch is open".
-  if (--*Count <= 0) {
-    InFlightItemFlushesByCharacter.Remove(CharacterId);
-  }
 }
 
 bool URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalance(

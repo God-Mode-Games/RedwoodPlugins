@@ -61,6 +61,16 @@ struct FRedwoodItemFlushSent {
   int64 BalanceAfter = 0;
 };
 
+// A flush that went out and has not been answered.
+struct FRedwoodInFlightItemFlush {
+  TWeakObjectPtr<URedwoodCharacterComponent> CharacterComponent;
+  // Null on the detached-flush leg.
+  TWeakObjectPtr<URedwoodPlayerStateComponent> PlayerStateComponent;
+  FString CharacterId;
+  FRedwoodItemFlushSent Sent;
+  TFunction<void()> OnAckSettled;
+};
+
 // How a realm:characters:items:load reply ends a reload attempt.
 enum class ERedwoodCurrencyReloadResult : uint8 {
   Applied,
@@ -929,13 +939,17 @@ private:
   TSet<FString> SentItemTradeIds;
   uint64 LastItemTradeGeneration = 0;
 
-  // Item flushes sent and not yet answered, per character, over every component of it. A trade must
-  // not start while one is open: that batch would commit before or after the trade, so the seq and
-  // the balance the trade starts from would be guesses. The reply lowers it, also for a component
-  // that is gone; a reconnect of the sidecar clears it, since a reply lost with the old connection
-  // never comes.
-  TMap<FString, int32> InFlightItemFlushesByCharacter;
-  void EndItemFlushInFlight(const FString &CharacterId);
+  // Item flushes sent and not yet answered, by send generation. A reply takes its attempt out; a
+  // reply whose generation is gone is late, from a dropped connection, and is ignored. A trade must
+  // not start while a character has one open (HasOpenItemFlush): that batch would commit before or
+  // after the trade, so the seq and the balance the trade starts from would be guesses.
+  TMap<uint64, FRedwoodInFlightItemFlush> InFlightItemFlushes;
+  uint64 LastItemFlushGeneration = 0;
+  bool HasOpenItemFlush(const FString &CharacterId) const;
+  void HandleItemsFlushReply(uint64 Generation, const TSharedPtr<FJsonObject> &ReplyObject);
+  // R34: after a sidecar reconnect, every open flush is marked unconfirmed and re-sent as a probe,
+  // with its settle. Its old reply, if it ever comes, is ignored by generation.
+  void RequeueItemFlushesAfterReconnect();
   // The components whose last flush reply left a batch unconfirmed (its outcome unknown), per
   // character. A trade must not start while any still is: the probe that settles it could find the
   // batch committed or not, so the balance before the trade is a guess.

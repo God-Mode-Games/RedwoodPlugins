@@ -1081,6 +1081,18 @@ bool URedwoodCharacterComponent::TryRechainPendingCurrency(int64 Balance) {
   return true;
 }
 
+void URedwoodCharacterComponent::AbandonInFlightItemFlush(int32 SentCurrencyCount, int32 SentGrantCount) {
+  if (!bItemFlushInFlight) {
+    return;
+  }
+  MarkCurrencyBatchUnconfirmed(
+    FMath::Clamp(SentCurrencyCount, 0, PendingCurrencyEntries.Num()),
+    FMath::Clamp(SentGrantCount, 0, PendingGrantKeys.Num()),
+    InFlightBatchSeq
+  );
+  bItemFlushInFlight = false;
+}
+
 void URedwoodCharacterComponent::MarkWriterFenceLost() {
   if (bWriterFenceLost) {
     return;

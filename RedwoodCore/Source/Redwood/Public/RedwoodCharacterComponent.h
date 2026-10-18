@@ -446,6 +446,13 @@ public:
   // Logs a warning the first time only.
   void MarkWriterFenceLost();
 
+  // FORK(hollowed-oath): R34. The connection that carried the in-flight batch dropped, so its reply
+  // never comes. The batch may have committed: it becomes unconfirmed with the counts it took
+  // (exactly as after an unknown-outcome error), and the slot is released, so the next claim is a
+  // probe at its seq. A batch that carried no currency simply goes out again at its seq. A parked
+  // attempt is not run here: it runs when that next batch is answered.
+  void AbandonInFlightItemFlush(int32 SentCurrencyCount, int32 SentGrantCount);
+
   // Drops EVERYTHING staged: dirty rows, pending deletes, entries and grant keys, sent or not,
   // and logs every dropped entry at Error so staff can rebuild it. An entry of an unconfirmed
   // batch is logged as "outcome unknown": it may be saved. Never call it while a batch is in
