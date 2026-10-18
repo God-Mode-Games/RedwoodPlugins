@@ -360,10 +360,16 @@ public:
   //    replay into a mixed batch that the backend refuses, and the recovery below would then
   //    re-chain the committed entry on top of itself.
   //  - Rebase: after an error with `rebaseRequired` (the backend's replay-mismatch refusal: a trade
-  //    used the seq and the batch did not apply) or a final refusal, the backend balance is not
-  //    what the pending entries were chained from. No currency is sent until the caller reloads the balance and
+  //    used the seq and the batch did not apply), the backend balance is not what the pending
+  //    entries were chained from. No currency is sent until the caller reloads the balance and
   //    calls RebaseCurrency.
-  void QueueCurrency(
+  // A final refusal is different: the game and the backend disagree, and nothing here can tell
+  // which staged change depended on the refused one. The character freezes (see
+  // FreezeAfterFinalRefusal) until it is hydrated again from the database.
+  //
+  // Returns false when anything was refused: every entry and key while the character is frozen,
+  // or an entry whose id the backend would refuse. The caller must not count a refused amount.
+  bool QueueCurrency(
     const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
   );
 
@@ -393,27 +399,18 @@ public:
     return bCurrencyRebaseRequired;
   }
 
-  // The item rows of a batch the backend refused for good. The game still shows them as it staged
-  // them (a refused purchase's item is still in the records array), but the backend has none of
-  // that batch. Until a reload puts the backend's rows back, no flush of this character may go
-  // out: a later dirty mark would save the refused item with no debit.
-  bool IsItemsReloadRequired() const {
-    return ItemIdsToReload.Num() > 0;
+  // A final refusal froze this component: the backend refused a batch for good, so the game's
+  // staged state no longer matches the backend's. Cleared only by a fresh hydration.
+  bool IsFrozenAfterFinalRefusal() const {
+    return bFrozenAfterFinalRefusal;
   }
 
-  const TSet<FString> &GetItemIdsToReload() const {
-    return ItemIdsToReload;
-  }
-
-  // Called once the records array holds the backend's rows for GetItemIdsToReload. Drops the dirt
-  // and pending deletions of those ids at ANY generation: a mark made after the refusal describes
-  // the game's copy, which the reload has just replaced.
-  void CompleteItemsReload();
-
-  // A reload, of either kind, must land before this component sends anything.
-  bool IsReloadRequired() const {
-    return bCurrencyRebaseRequired || IsItemsReloadRequired();
-  }
+  // Drops EVERYTHING staged: dirty rows, pending deletes, entries and grant keys, sent or not,
+  // and logs every dropped entry at Error so staff can rebuild it. Repair is not attempted: a
+  // staged change may depend on the refused one (a sale of a refused purchase, whose credit would
+  // otherwise commit from nothing), and only the database knows the truth. The game sends the
+  // player back through character select, which hydrates again and clears the freeze.
+  void FreezeAfterFinalRefusal(const FString &Reason);
 
   // Holds currency until a reload rebases it: the balance the pending entries were chained from
   // is not known to be the backend's. Ignored while a batch is in flight or unconfirmed: a reload
@@ -452,9 +449,9 @@ public:
   // gap the backend will keep rejecting. ALWAYS releases the flight slot. SentUpserts/SentDeletes
   // pair each sent id with the GENERATION current for it at send time.
   // FORK(hollowed-oath): SentCurrencyCount/SentGrantCount are the counts the batch took from the
-  // front of the currency queues. bFinalRefusal is the ack's `final` flag: only that drops the sent
-  // entries and keys on an error. bRebaseRequired is the ack's `rebaseRequired` flag: only that
-  // (or a final refusal) makes the queue wait for a reload (see the currency staging block above).
+  // front of the currency queues. bFinalRefusal is the ack's `final` flag: it freezes the component
+  // (FreezeAfterFinalRefusal). bRebaseRequired is the ack's `rebaseRequired` flag: only that makes
+  // the queue wait for a reload (see the currency staging block above).
   // A negative CommittedSeq means the reply carried no fence; a fence below SentSeq - 1 on an
   // error is a sequence gap, and the lane realigns to it.
   void CompleteItemFlush(
@@ -604,8 +601,8 @@ private:
   bool bCurrencyRebaseRequired = false;
   FString WriterToken;
 
-  // See IsItemsReloadRequired.
-  TSet<FString> ItemIdsToReload;
+  // See IsFrozenAfterFinalRefusal.
+  bool bFrozenAfterFinalRefusal = false;
 
   // Moves the committed seq and NextBatchSeq forward to CommittedSeq, never back: a replay probe
   // goes out under an older seq than NextBatchSeq, and its ack must not rewind the lane.

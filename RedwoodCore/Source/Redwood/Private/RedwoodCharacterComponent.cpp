@@ -4,6 +4,7 @@
 #include "RedwoodCommonGameSubsystem.h"
 #include "RedwoodModule.h"
 #include "RedwoodPlayerStateComponent.h"
+#include "RedwoodServerGameSubsystem.h" // FORK(hollowed-oath): the per-character freeze
 
 #include "Engine/GameInstance.h"
 #include "GameFramework/GameModeBase.h"
@@ -612,6 +613,17 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         if (RedwoodCharacterBackend.bCurrencyAmountUnknown) {
           RequireCurrencyReload();
         }
+        // FORK(hollowed-oath): a final refusal froze the character. A snapshot the freeze marked
+        // (a respawn in the same session) stays frozen; a snapshot fresh from the database (a new
+        // sign-in after character select) is the repair, and ends the freeze for the character.
+        bFrozenAfterFinalRefusal = RedwoodCharacterBackend.bFrozenAfterFinalRefusal;
+        if (!bFrozenAfterFinalRefusal) {
+          UGameInstance *GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
+          if (URedwoodServerGameSubsystem *ServerSubsystem =
+                GameInstance ? GameInstance->GetSubsystem<URedwoodServerGameSubsystem>() : nullptr) {
+            ServerSubsystem->ThawCharacter(IncomingCharacterId);
+          }
+        }
         HydratedItemsCharacterId = IncomingCharacterId;
       }
     }
@@ -726,23 +738,10 @@ void URedwoodCharacterComponent::CompleteItemFlush(
     }
   } else if (bFinalRefusal) {
     // FORK(hollowed-oath): the backend refused this batch for good, rolled ALL of it back, and
-    // raised an alert. Re-sending can never succeed, so the sent entries and keys go. The sent
-    // item rows go too: the batch is one unit (a purchase is its item row plus its debit), and
-    // re-sending the rows without the refused debit would hand the item out for free. The
-    // character must reload; until the caller rebases from that reload, the rest of the queue was
-    // chained from a balance that includes the refused entries and must not be sent.
-    ClearSentItemGenerations(SentUpserts, SentDeletes);
-    RemoveSentCurrency(SentCurrencyCount, SentGrantCount);
-    bCurrencyBatchUnconfirmed = false;
-    bCurrencyRebaseRequired = true;
-    // The game's copy of these rows is what the backend refused, so it is replaced from the
-    // reload rather than trusted (see IsItemsReloadRequired).
-    for (const TPair<FString, uint64> &Sent : SentUpserts) {
-      ItemIdsToReload.Add(Sent.Key);
-    }
-    for (const TPair<FString, uint64> &Sent : SentDeletes) {
-      ItemIdsToReload.Add(Sent.Key);
-    }
+    // raised an alert. The game's state and the backend's now disagree, and a later staged change
+    // may depend on the refused one, so nothing staged can be trusted: freeze (see
+    // FreezeAfterFinalRefusal).
+    FreezeAfterFinalRefusal(Error);
     if (CommittedSeq >= SentSeq) {
       AdoptCommittedItemSeq(CommittedSeq);
     }
@@ -788,10 +787,10 @@ void URedwoodCharacterComponent::CompleteItemFlush(
   // Always release the flight slot, whatever the outcome.
   bItemFlushInFlight = false;
 
-  // FORK(hollowed-oath): after the state above is settled, so a listener that reacts (by starting
-  // the reload, or by returning the player to character select) sees the queues as they now are.
+  // FORK(hollowed-oath): after the state above is settled, so a listener that reacts (by returning
+  // the player to character select) sees the component frozen and empty.
   if (bFinalRefusal && !Error.IsEmpty()) {
-    OnItemFlushRefusedFinal.Broadcast(Error);
+    OnItemFlushRefusedFinal.Broadcast(RedwoodCharacterId, Error);
   }
 
   // A flush attempt that arrived while this batch was outstanding PARKED itself here rather than
@@ -840,20 +839,48 @@ void URedwoodCharacterComponent::ClearSentItemGenerations(
   }
 }
 
-void URedwoodCharacterComponent::QueueCurrency(
+bool URedwoodCharacterComponent::QueueCurrency(
   const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
 ) {
+  // Frozen, per component (this one was refused) or per character (another component of it was):
+  // an amount staged now would be chained from a balance nobody can vouch for.
+  UGameInstance *GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
+  const URedwoodServerGameSubsystem *ServerSubsystem =
+    GameInstance ? GameInstance->GetSubsystem<URedwoodServerGameSubsystem>() : nullptr;
+  if (bFrozenAfterFinalRefusal ||
+      (ServerSubsystem && ServerSubsystem->IsCharacterFrozen(RedwoodCharacterId))) {
+    for (const FRedwoodCurrencyEntry &Entry : Entries) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("QueueCurrency: character %s is frozen after a final refusal; refused entry %s delta %lld reason %s"),
+        *RedwoodCharacterId,
+        *Entry.Id,
+        Entry.Delta,
+        *Entry.Reason
+      );
+    }
+    for (const FString &GrantKey : GrantKeys) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("QueueCurrency: character %s is frozen after a final refusal; refused grant %s"),
+        *RedwoodCharacterId,
+        *GrantKey
+      );
+    }
+    return Entries.Num() == 0 && GrantKeys.Num() == 0;
+  }
+
   // Appended, never merged or de-duplicated: the backend checks each BalanceAfter in order, and a
   // repeated grant key must reach the backend so it refuses the second reward instead of the game
   // server quietly paying it without its guard.
+  bool bAllQueued = true;
   for (const FRedwoodCurrencyEntry &Entry : Entries) {
     // A bad id would make the backend refuse the whole batch for good, taking every valid entry
     // and item row sent with it. Refuse the one entry here instead, loudly: it is a caller bug.
-    if (!ensureMsgf(
-          IsValidCurrencyEntryId(Entry.Id),
-          TEXT("QueueCurrency: entry id '%s' is not 32 uppercase hex digits"),
-          *Entry.Id
-        )) {
+    // An Error log, not an ensure: the caller learns it from the return value.
+    if (!IsValidCurrencyEntryId(Entry.Id)) {
       UE_LOG(
         LogRedwood,
         Error,
@@ -861,11 +888,13 @@ void URedwoodCharacterComponent::QueueCurrency(
         *Entry.Id,
         Entry.Delta
       );
+      bAllQueued = false;
       continue;
     }
     PendingCurrencyEntries.Add(Entry);
   }
   PendingGrantKeys.Append(GrantKeys);
+  return bAllQueued;
 }
 
 int32 URedwoodCharacterComponent::GetCurrencyEntriesToSendCount() const {
@@ -915,12 +944,40 @@ void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
   bCurrencyRebaseRequired = false;
 }
 
-void URedwoodCharacterComponent::CompleteItemsReload() {
-  for (const FString &ItemId : ItemIdsToReload) {
-    DirtyItemGenerations.Remove(ItemId);
-    PendingDeletedItemGenerations.Remove(ItemId);
+void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) {
+  // One line per dropped entry and key: the backend has the refusal alert, and these lines are
+  // what staff rebuild the rest from.
+  for (const FRedwoodCurrencyEntry &Entry : PendingCurrencyEntries) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("Final refusal (%s): character %s dropped currency entry %s delta %lld reason %s"),
+      *Reason,
+      *RedwoodCharacterId,
+      *Entry.Id,
+      Entry.Delta,
+      *Entry.Reason
+    );
   }
-  ItemIdsToReload.Empty();
+  for (const FString &GrantKey : PendingGrantKeys) {
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("Final refusal (%s): character %s dropped grant %s"),
+      *Reason,
+      *RedwoodCharacterId,
+      *GrantKey
+    );
+  }
+  PendingCurrencyEntries.Empty();
+  PendingGrantKeys.Empty();
+  bCurrencyBatchUnconfirmed = false;
+  UnconfirmedCurrencyCount = 0;
+  UnconfirmedGrantCount = 0;
+  bCurrencyRebaseRequired = false;
+  DirtyItemGenerations.Empty();
+  PendingDeletedItemGenerations.Empty();
+  bFrozenAfterFinalRefusal = true;
 }
 
 void URedwoodCharacterComponent::RequireCurrencyReload(bool bBeforeSettlingReply) {

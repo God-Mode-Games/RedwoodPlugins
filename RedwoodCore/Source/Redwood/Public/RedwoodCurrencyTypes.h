@@ -105,9 +105,12 @@ inline bool TryParseCurrencyAmount(const FString &Text, int64 &OutAmount) {
   return true;
 }
 
-// A flush the backend refused for good (`final: true`). The sent entries are gone and the backend
-// has raised an alert; the character must reload before its balance can be trusted again.
-DECLARE_MULTICAST_DELEGATE_OneParam(FOnItemFlushRefusedFinal, const FString & /*Error*/);
+// A flush the backend refused for good (`final: true`). The backend has raised an alert, and the
+// character is frozen with everything staged dropped and logged. The game must send the player
+// back through character select: only a fresh hydration from the database repairs the state.
+DECLARE_MULTICAST_DELEGATE_TwoParams(
+  FOnItemFlushRefusedFinal, const FString & /*CharacterId*/, const FString & /*Error*/
+);
 
 // A reload gave the backend's balance, and every pending entry is now re-chained on top of it.
 // The game's running balance must restart from here: it is the last pending entry's BalanceAfter,

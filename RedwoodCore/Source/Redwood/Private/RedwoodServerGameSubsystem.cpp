@@ -199,6 +199,15 @@ void URedwoodServerGameSubsystem::OnShutdownMessage(
 }
 
 void URedwoodServerGameSubsystem::Deinitialize() {
+  // FORK(hollowed-oath): a held flush attempt must not outlive the server. Its settle releases a
+  // detached pawn's write binding, and its timer would fire on a dead game instance. The give-up
+  // logs what stays unsaved. Keys first: a settle can change the map.
+  TArray<FString> ReloadingCharacterIds;
+  CurrencyReloads.GetKeys(ReloadingCharacterIds);
+  for (const FString &CharacterId : ReloadingCharacterIds) {
+    GiveUpCurrencyReload(CharacterId, TEXT("the server is shutting down"));
+  }
+
   Super::Deinitialize();
 
   if (TimerHandle_UpdateSidecar.IsValid()) {
@@ -214,6 +223,37 @@ void URedwoodServerGameSubsystem::Deinitialize() {
   if (Sidecar.IsValid()) {
     ISocketIOClientModule::Get().ReleaseNativePointer(Sidecar);
     Sidecar = nullptr;
+  }
+}
+
+void URedwoodServerGameSubsystem::BindSidecarConnectedCallback() {
+  Sidecar->OnConnectedCallback =
+    [this](const FString &InSocketId, const FString &InSessionId) {
+      HandleSidecarConnected();
+    };
+}
+
+// FORK(hollowed-oath): the sidecar's connect event, which fires on every reconnect too.
+void URedwoodServerGameSubsystem::HandleSidecarConnected() {
+  if (Sidecar.IsValid()) {
+    GetGameInstance()->GetTimerManager().SetTimer(
+      TimerHandle_UpdateSidecarLoading,
+      this,
+      &URedwoodServerGameSubsystem::SendUpdateToSidecar,
+      UpdateSidecarLoadingRate,
+      true // loop
+    );
+
+    GetGameInstance()->GetTimerManager().SetTimer(
+      TimerHandle_UpdateSidecar,
+      this,
+      &URedwoodServerGameSubsystem::SendUpdateToSidecar,
+      UpdateSidecarRate,
+      true, // loop
+      0.f // immediately trigger first one
+    );
+    // FORK(hollowed-oath): currency reloads that waited for the sidecar go out now.
+    ResumeCurrencyReloadsAfterSidecarConnect();
   }
 }
 
@@ -566,29 +606,9 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
     }
   );
 
-  Sidecar->OnConnectedCallback =
-    [this](const FString &InSocketId, const FString &InSessionId) {
-      if (Sidecar.IsValid()) {
-        GetGameInstance()->GetTimerManager().SetTimer(
-          TimerHandle_UpdateSidecarLoading,
-          this,
-          &URedwoodServerGameSubsystem::SendUpdateToSidecar,
-          UpdateSidecarLoadingRate,
-          true // loop
-        );
-
-        GetGameInstance()->GetTimerManager().SetTimer(
-          TimerHandle_UpdateSidecar,
-          this,
-          &URedwoodServerGameSubsystem::SendUpdateToSidecar,
-          UpdateSidecarRate,
-          true, // loop
-          0.f // immediately trigger first one
-        );
-        // FORK(hollowed-oath): currency reloads that waited for the sidecar go out now.
-        ResumeCurrencyReloadsAfterSidecarConnect();
-      }
-    };
+  // FORK(hollowed-oath): the connect callback lives in BindSidecarConnectedCallback, so a test can
+  // install the real one on its own socket.
+  BindSidecarConnectedCallback();
 
   FString SidecarPort = TEXT("3020"); // default port
   FParse::Value(FCommandLine::Get(), TEXT("SidecarPort="), SidecarPort);
@@ -2597,6 +2617,29 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     }
   };
 
+  // FORK(hollowed-oath): a component that was never hydrated has no character to write for, and
+  // must never join a character's hold or reload (an empty id would join every other such one).
+  const FString CharacterId = PlayerStateComponent ? PlayerStateComponent->RedwoodCharacter.Id
+                                                   : CharacterComponent->RedwoodCharacterId;
+  if (CharacterId.IsEmpty()) {
+    if (CharacterComponent->IsItemsDirty()) {
+      UE_LOG(
+        LogRedwood, Error, TEXT("FlushItemsForCharacterComponent: the component has no character id; not flushing")
+      );
+    }
+    Settle();
+    return;
+  }
+
+  // FORK(hollowed-oath): a final refusal froze this character. Nothing staged can be trusted, so
+  // whatever this component staged since is dropped (and logged), and the attempt settles with
+  // nothing left to save: a detached pawn's write binding releases as usual.
+  if (CharacterComponent->IsFrozenAfterFinalRefusal() || FrozenCharacterIds.Contains(CharacterId)) {
+    CharacterComponent->FreezeAfterFinalRefusal(TEXT("the character is frozen"));
+    Settle();
+    return;
+  }
+
   // Early-out before claiming the flight slot: the detached-flush leg calls this without the
   // dispatch site's IsItemsDirty() pre-check, and a slot claimed here would never be released.
   if (!CharacterComponent->IsItemsDirty()) {
@@ -2645,14 +2688,10 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // FORK(hollowed-oath): while a reload is needed for this character, hold EVERY flush of it, from
   // every component, item rows included. A purchase is its item row plus its debit; with the debit
   // held for the reload, the row alone could commit, and if the debit is then refused for good the
-  // item is free. After a final refusal the game's records still hold the refused rows, so any row
-  // sent before the reload could save them. The flags are never set while this component has a
-  // batch in flight, so no reply is coming that would start the reload: start or join it now. Its
-  // reply resumes this attempt with its settle, so a detached pawn's barrier waits for the
-  // delivery rather than for the hold.
-  const FString CharacterId = PlayerStateComponent ? PlayerStateComponent->RedwoodCharacter.Id
-                                                   : CharacterComponent->RedwoodCharacterId;
-  if (CharacterComponent->IsReloadRequired() || CurrencyReloads.Contains(CharacterId)) {
+  // item is free. The flag is never set while this component has a batch in flight, so no reply is
+  // coming that would start the reload: start or join it now. Its reply resumes this attempt with
+  // its settle, so a detached pawn's barrier waits for the delivery rather than for the hold.
+  if (CharacterComponent->IsCurrencyRebaseRequired() || CurrencyReloads.Contains(CharacterId)) {
     HoldItemFlushForCurrencyReload(
       CharacterId, PlayerStateComponent, CharacterComponent, OnAckSettled
     );
@@ -2844,6 +2883,16 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
         UE_LOG(LogRedwood, Error, TEXT("Failed to flush items: %s"), *Reply.Error);
       }
 
+      // FORK(hollowed-oath): a final refusal freezes the whole character, BEFORE the component
+      // takes the reply. CompleteItemFlush then freezes the component (dropping and logging all it
+      // staged) and tells the game; by then every other component of the character, and a parked
+      // attempt it runs, already sees the freeze. This attempt then settles with nothing to save.
+      if (!Reply.Error.IsEmpty() && Reply.bFinal) {
+        if (URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get()) {
+          Subsystem->FreezeCharacter(CharacterId, WeakPlayerStateComponent.Get());
+        }
+      }
+
       // ALWAYS complete (success or error): CompleteItemFlush (inside) releases the single-flight
       // slot and, on success, clears only the generation-matched sent ids and advances the
       // committed seq; on error it leaves the dirt for the next flush.
@@ -2851,12 +2900,11 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
         CharacterComponent, WeakPlayerStateComponent.Get(), Reply, Sent
       );
 
-      // FORK(hollowed-oath): the backend refused the batch for good, a trade used its seq, or the
-      // reply could not confirm the balance: a reload must land before anything is sent. Start it
-      // from this reply, and hand this attempt's settle to it: for a detached pawn the entries
-      // are not saved yet, and releasing the write binding now would refuse the resumed flush
-      // that saves them.
-      if (CharacterComponent->IsReloadRequired()) {
+      if (CharacterComponent->IsCurrencyRebaseRequired()) {
+        // A trade used the seq, or the reply could not confirm the balance: a reload must land
+        // before anything is sent. Start it from this reply, and hand this attempt's settle to
+        // it: for a detached pawn the entries are not saved yet, and releasing the write binding
+        // now would refuse the resumed flush that saves them.
         if (URedwoodServerGameSubsystem *Subsystem = WeakSubsystem.Get()) {
           Subsystem->HoldItemFlushForCurrencyReload(
             CharacterId, WeakPlayerStateComponent.Get(), CharacterComponent, OnAckSettled
@@ -3000,12 +3048,10 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
 }
 
 ERedwoodCurrencyReloadResult URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
-  const TSharedPtr<FJsonObject> &Reply,
-  int64 &OutBalance,
-  TArray<FRedwoodItemRecord> &OutItems
+  const TSharedPtr<FJsonObject> &Reply, int64 &OutBalance
 ) {
-  // Every error reply also carries a filler balance of "0" and no rows, so the error is checked
-  // first: a rebase from that filler would chain every held entry from zero.
+  // Every error reply also carries a filler balance of "0", so the error is checked first: a
+  // rebase from that filler would chain every held entry from zero.
   if (!Reply.IsValid() || !Reply->HasField(TEXT("error"))) {
     UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: unreadable reply"));
     return ERedwoodCurrencyReloadResult::Retry;
@@ -3013,7 +3059,12 @@ ERedwoodCurrencyReloadResult URedwoodServerGameSubsystem::ParseCurrencyReloadRep
   // A JSON null error reads as empty: that is the backend's success shape.
   FString Error;
   Reply->TryGetStringField(TEXT("error"), Error);
-  if (Error == CharacterNotBoundError) {
+  // Only the machine-readable flag ends the reload: another session owns the character, and no
+  // retry changes that. A "not bound" error without it is retriable, since the instance binding
+  // comes back (after a sidecar restart, for one).
+  bool bWriterFenceLost = false;
+  Reply->TryGetBoolField(TEXT("writerFenceLost"), bWriterFenceLost);
+  if (!Error.IsEmpty() && bWriterFenceLost) {
     UE_LOG(LogRedwood, Error, TEXT("Currency reload failed for good: %s"), *Error);
     return ERedwoodCurrencyReloadResult::GiveUp;
   }
@@ -3037,36 +3088,14 @@ ERedwoodCurrencyReloadResult URedwoodServerGameSubsystem::ParseCurrencyReloadRep
     );
     return ERedwoodCurrencyReloadResult::Retry;
   }
-
-  // The rows are the backend's truth for any id a final refusal left behind. A reply without
-  // them cannot restore those ids, so it is a failed load too.
-  const TArray<TSharedPtr<FJsonValue>> *ItemValues = nullptr;
-  if (!Reply->TryGetArrayField(TEXT("items"), ItemValues) || !ItemValues) {
-    UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: the reply has no item rows"));
-    return ERedwoodCurrencyReloadResult::Retry;
-  }
-  OutItems = URedwoodCommonGameSubsystem::ParseItemRecords(*ItemValues);
   return ERedwoodCurrencyReloadResult::Applied;
 }
 
 bool URedwoodServerGameSubsystem::ApplyCurrencyReload(
   URedwoodCharacterComponent *CharacterComponent,
   URedwoodPlayerStateComponent *PlayerStateComponent,
-  int64 Balance,
-  const TArray<FRedwoodItemRecord> &Items
+  int64 Balance
 ) {
-  // Rows first, because they can fail without changing anything: a misconfigured records array
-  // cannot take the rows, and the refused ids must stay held rather than be sent as the game has
-  // them.
-  TArray<FRedwoodItemRecord> *RecordsArray = nullptr;
-  if (CharacterComponent->IsItemsReloadRequired()) {
-    RecordsArray = URedwoodCommonGameSubsystem::ResolveItemsRecordsArray(CharacterComponent);
-    if (!RecordsArray) {
-      UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: no records array to restore rows into"));
-      return false;
-    }
-  }
-
   if (CharacterComponent->IsCurrencyRebaseRequired()) {
     CharacterComponent->RebaseCurrency(Balance);
     if (CharacterComponent->IsCurrencyRebaseRequired()) {
@@ -3078,22 +3107,6 @@ bool URedwoodServerGameSubsystem::ApplyCurrencyReload(
     }
   }
 
-  // Only the ids the refused batch carried are put back. Every other row, dirty or not, is the
-  // game's newer state and still goes out: replacing it too would undo, say, a sale staged after
-  // the refusal while its credit stays queued, and the player would keep both.
-  if (RecordsArray) {
-    const TSet<FString> &ItemIdsToReload = CharacterComponent->GetItemIdsToReload();
-    RecordsArray->RemoveAll([&ItemIdsToReload](const FRedwoodItemRecord &Record) {
-      return ItemIdsToReload.Contains(Record.Id);
-    });
-    for (const FRedwoodItemRecord &Item : Items) {
-      if (ItemIdsToReload.Contains(Item.Id)) {
-        RecordsArray->Add(Item);
-      }
-    }
-    CharacterComponent->CompleteItemsReload();
-  }
-
   // The loaded balance is committed, so the snapshot takes it, as it takes a flush's.
   if (PlayerStateComponent) {
     PlayerStateComponent->RedwoodCharacter.CurrencyAmount = Balance;
@@ -3101,11 +3114,22 @@ bool URedwoodServerGameSubsystem::ApplyCurrencyReload(
   }
 
   CharacterComponent->OnCurrencyRebased.Broadcast(Balance);
-  if (RecordsArray) {
-    // The same event the load leg raises, so the game rereads its inventory from the records.
-    CharacterComponent->OnRedwoodCharacterUpdated.Broadcast();
-  }
   return true;
+}
+
+void URedwoodServerGameSubsystem::FreezeCharacter(
+  const FString &CharacterId, URedwoodPlayerStateComponent *PlayerStateComponent
+) {
+  FrozenCharacterIds.Add(CharacterId);
+  // A component created later from this snapshot (a respawn) starts frozen too.
+  if (PlayerStateComponent) {
+    PlayerStateComponent->RedwoodCharacter.bFrozenAfterFinalRefusal = true;
+  }
+  // A rebase is pointless now. Its held attempts settle; each held component drops its staged
+  // state on its next flush.
+  if (CurrencyReloads.Contains(CharacterId)) {
+    GiveUpCurrencyReload(CharacterId, TEXT("the character is frozen after a final refusal"));
+  }
 }
 
 void URedwoodServerGameSubsystem::HoldItemFlushForCurrencyReload(
@@ -3122,7 +3146,7 @@ void URedwoodServerGameSubsystem::HoldItemFlushForCurrencyReload(
   if (PlayerStateComponent) {
     Reload->PlayerStateComponent = PlayerStateComponent;
   }
-  if (CharacterComponent->IsReloadRequired()) {
+  if (CharacterComponent->IsCurrencyRebaseRequired()) {
     Reload->CharacterComponents.AddUnique(CharacterComponent);
   }
 
@@ -3259,8 +3283,7 @@ void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
   }
 
   int64 Balance = 0;
-  TArray<FRedwoodItemRecord> Items;
-  switch (ParseCurrencyReloadReply(Reply, Balance, Items)) {
+  switch (ParseCurrencyReloadReply(Reply, Balance)) {
     case ERedwoodCurrencyReloadResult::GiveUp:
       GiveUpCurrencyReload(CharacterId, TEXT("this session no longer owns the character"));
       return;
@@ -3277,8 +3300,8 @@ void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
   const TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerState = Reload->PlayerStateComponent;
   for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Components) {
     URedwoodCharacterComponent *Component = WeakComponent.Get();
-    if (IsValid(Component) && Component->IsReloadRequired() &&
-        !ApplyCurrencyReload(Component, WeakPlayerState.Get(), Balance, Items)) {
+    if (IsValid(Component) && Component->IsCurrencyRebaseRequired() &&
+        !ApplyCurrencyReload(Component, WeakPlayerState.Get(), Balance)) {
       RetryCurrencyReload(CharacterId);
       return;
     }
@@ -3389,9 +3412,6 @@ void URedwoodServerGameSubsystem::GiveUpCurrencyReload(
     }
     for (const FString &GrantKey : Component->GetPendingGrantKeys()) {
       HeldLines.Add(FString::Printf(TEXT("grant %s"), *GrantKey));
-    }
-    for (const FString &ItemId : Component->GetItemIdsToReload()) {
-      HeldLines.Add(FString::Printf(TEXT("refused item row %s"), *ItemId));
     }
   }
   UE_LOG(

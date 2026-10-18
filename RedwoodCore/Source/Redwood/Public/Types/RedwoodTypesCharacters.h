@@ -137,6 +137,11 @@ struct FRedwoodCharacterBackend {
   // a component seeded from this snapshot must reload before it sends any currency.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   bool bCurrencyAmountUnknown = false;
+
+  // Set when the backend refused one of this character's flushes for good. Every component
+  // hydrated from this snapshot starts frozen; only a fresh load from the database clears it.
+  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
+  bool bFrozenAfterFinalRefusal = false;
   // FORK(hollowed-oath) END
 };
 

@@ -55,7 +55,8 @@ enum class ERedwoodCurrencyReloadResult : uint8 {
   Applied,
   // A failed load that a later attempt can fix (a realm hiccup, a malformed reply).
   Retry,
-  // A load no attempt can fix: this session no longer owns the character.
+  // A load no attempt can fix: the realm says this session's writer token is stale
+  // (`writerFenceLost`), so another session owns the character.
   GiveUp,
 };
 
@@ -70,7 +71,7 @@ struct FRedwoodHeldItemFlush {
 // The reload of one CHARACTER: every component of that character is held while it runs, so a
 // pawn-owned component cannot send an item row whose debit waits on the PlayerState-owned one.
 struct FRedwoodCurrencyReload {
-  // The components that asked for the reload (IsReloadRequired) and take its result.
+  // The components that asked for the reload (IsCurrencyRebaseRequired) and take its result.
   TArray<TWeakObjectPtr<URedwoodCharacterComponent>> CharacterComponents;
   TWeakObjectPtr<URedwoodPlayerStateComponent> PlayerStateComponent;
   TArray<FRedwoodHeldItemFlush> HeldFlushes;
@@ -385,29 +386,31 @@ public:
     const FRedwoodItemFlushSent &Sent
   );
 
-  // Reads a realm:characters:items:load reply: the balance and the item rows. Anything but
-  // Applied leaves the outputs unusable.
+  // Reads the balance off a realm:characters:items:load reply. Anything but Applied leaves
+  // OutBalance unusable.
   static ERedwoodCurrencyReloadResult ParseCurrencyReloadReply(
-    const TSharedPtr<FJsonObject> &Reply,
-    int64 &OutBalance,
-    TArray<FRedwoodItemRecord> &OutItems
+    const TSharedPtr<FJsonObject> &Reply, int64 &OutBalance
   );
 
   // Applies a parsed reload to one component that asked for it: rebases its held currency from
-  // Balance, puts the backend's rows back for the item ids a final refusal left behind, and tells
-  // the game (OnCurrencyRebased, then OnRedwoodCharacterUpdated when rows changed). Returns false
-  // when the rebase cannot apply; the component is then unchanged and stays held.
+  // Balance, writes the balance to the snapshot, and tells the game (OnCurrencyRebased). Returns
+  // false when the rebase cannot apply; the component is then unchanged and stays held.
   static bool ApplyCurrencyReload(
     URedwoodCharacterComponent *CharacterComponent,
     URedwoodPlayerStateComponent *PlayerStateComponent,
-    int64 Balance,
-    const TArray<FRedwoodItemRecord> &Items
+    int64 Balance
   );
 
-  // The realm's answer to a load whose writer token is stale (another session owns the character)
-  // or whose character is not bound here. No retry can change it.
-  static constexpr const TCHAR *CharacterNotBoundError =
-    TEXT("character not bound to this instance");
+  // FORK(hollowed-oath): the per-character freeze after a final refusal. A frozen character sends
+  // nothing and takes no new currency until a fresh hydration from the database thaws it.
+  bool IsCharacterFrozen(const FString &CharacterId) const {
+    return FrozenCharacterIds.Contains(CharacterId);
+  }
+  // Called when a component hydrates from a snapshot that is not frozen: a new sign-in after
+  // character select, which is the repair.
+  void ThawCharacter(const FString &CharacterId) {
+    FrozenCharacterIds.Remove(CharacterId);
+  }
 
   // A failed reload is retried on a timer: a reload fails for a realm hiccup or a sidecar
   // reconnect, which clear in seconds, and nothing else would re-run it for a detached pawn.
@@ -665,12 +668,25 @@ private:
   TSharedPtr<FSocketIONative> Sidecar;
 
   // FORK(hollowed-oath) BEGIN: the currency reload that held item flushes wait on, keyed by
-  // character id. While any component of a character needs a reload (the backend refused a batch
-  // for good, or a trade used its seq), no flush of that character goes out, items included: an
-  // item row must not commit before the debit that pays for it. Its reply rebases the held
-  // entries, restores refused rows, and resumes every held attempt, settle barrier and all.
+  // character id. While any component of a character needs a rebase (a trade used its seq), no
+  // flush of that character goes out, items included: an item row must not commit before the
+  // debit that pays for it. Its reply rebases the held entries and resumes every held attempt,
+  // settle barrier and all.
   TMap<FString, FRedwoodCurrencyReload> CurrencyReloads;
   uint64 LastCurrencyReloadGeneration = 0;
+
+  // Characters frozen by a final refusal (see IsCharacterFrozen).
+  TSet<FString> FrozenCharacterIds;
+
+  // Freezes the character: every component that flushes from now on drops what it has staged.
+  // Ends any reload of the character; its held attempts settle with nothing left to save.
+  void FreezeCharacter(
+    const FString &CharacterId, URedwoodPlayerStateComponent *PlayerStateComponent
+  );
+
+  // The sidecar's connect event: the upstream update timers, then the reloads that waited.
+  void BindSidecarConnectedCallback();
+  void HandleSidecarConnected();
 
   // Joins the reload of this character, or starts one. OnAckSettled (nullable) is the held flush
   // attempt's settle; the reload resumes the flush with it.
