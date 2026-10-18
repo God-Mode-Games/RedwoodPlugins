@@ -3892,6 +3892,12 @@ void URedwoodServerGameSubsystem::EmitItemsTrade(
     Refuse(TEXT("the trade id must be 32 uppercase hex digits"));
     return;
   }
+  // A reused id is never a resend here (the subsystem resends by itself): it is a second trade,
+  // which the backend would take for the first one's replay, or refuse.
+  if (SentItemTradeIds.Contains(TradeId)) {
+    Refuse(TEXT("the trade id was already used; make a fresh one for every trade"));
+    return;
+  }
   if (!ChainTradeCurrency(CurrencyByCharacter, Trade.From, Trade.To, Error)) {
     Refuse(Error);
     return;
@@ -3932,6 +3938,7 @@ void URedwoodServerGameSubsystem::EmitItemsTrade(
     TradeId
   );
   Trade.OnComplete = MoveTemp(OnComplete);
+  SentItemTradeIds.Add(TradeId);
   PendingItemTrades.Add(TradeId, MoveTemp(Trade));
   SendItemsTrade(TradeId);
 }

@@ -410,8 +410,11 @@ public:
   //    character's snapshot, the only balance the backend can check it against. A side that pays
   //    or is paid must have no currency staged at send time (flush it first): the trade commits
   //    before anything staged, so a staged debit could go below zero once the trade has applied.
-  //  - TradeId: the game's id for the trade (32 uppercase hex digits, MakeCurrencyEntryId). It is
-  //    the backend's transfer id, and the backend knows a resend by it and the entry ids.
+  //  - TradeId: the game's id for the trade (32 uppercase hex digits). Make a FRESH one for every
+  //    trade (MakeCurrencyEntryId). It is the backend's transfer id and receipt key, and the backend
+  //    knows a resend by it: a resend with other contents is refused, and a new trade under a
+  //    committed id would be acked as that old trade's replay. An id this server already sent is
+  //    refused before send.
   //  - Both components need a PlayerState snapshot (FindPlayerStateComponent).
   //
   // Refused before anything is sent (OnComplete runs before this returns, with an error and -1
@@ -905,6 +908,8 @@ private:
 
   // Trades that went out and have not settled, keyed by trade id (see EmitItemsTrade).
   TMap<FString, FRedwoodPendingItemTrade> PendingItemTrades;
+  // Every trade id this server has sent. A reused id is refused (see EmitItemsTrade).
+  TSet<FString> SentItemTradeIds;
   uint64 LastItemTradeGeneration = 0;
 
   // Item flushes sent and not yet answered, per character, over every component of it. A trade must

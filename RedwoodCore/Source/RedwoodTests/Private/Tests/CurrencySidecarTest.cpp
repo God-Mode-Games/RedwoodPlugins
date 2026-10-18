@@ -1730,6 +1730,17 @@ bool FRedwoodCurrencyTradeRefusalTest::RunTest(const FString &Parameters) {
     FirstBalanceAfter(Flush.Payload),
     FString(TEXT("1050"))
   );
+
+  // A new trade under the same id is refused: the backend would take it for this one.
+  AddExpectedErrorPlain(TEXT("the trade id was already used"), EAutomationExpectedErrorFlags::Contains, 1);
+  Harness.Answer(Flush, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), FromSeq + 1));
+  Harness.PumpUntil([&From]() { return From.Component->GetPendingCurrencyEntries().Num() == 0; });
+  FTradeResult Reused;
+  Harness.Subsystem->EmitItemsTrade(
+    From.Component, To.Component, {}, MakeTradeCurrency(TradedAmount, TradedAmount), TradeId, Capture(Reused)
+  );
+  TestEqual(TEXT("A reused trade id is refused at once"), Reused.Calls, 1);
+  TestTrue(TEXT("Nothing leaves for it"), Harness.IsQuiet());
   return true;
 }
 
