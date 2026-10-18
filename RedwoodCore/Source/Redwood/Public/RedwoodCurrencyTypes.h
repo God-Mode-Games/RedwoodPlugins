@@ -66,6 +66,45 @@ inline bool IsValidCurrencyEntryId(const FString &Id) {
   return true;
 }
 
+// Reads a wire amount with the backend's own rule (parseAmount in currency-validator.ts): an
+// optional minus, then digits with no leading zero, within int64, and never "-0". A looser reading
+// (LexFromString takes " 5", "+5" and "1e3") would let the game server accept a value the backend
+// refuses, and an amount the two sides read differently is money that moves on one side only.
+inline bool TryParseCurrencyAmount(const FString &Text, int64 &OutAmount) {
+  const bool bNegative = Text.StartsWith(TEXT("-"));
+  const int32 FirstDigit = bNegative ? 1 : 0;
+  const int32 DigitCount = Text.Len() - FirstDigit;
+  if (DigitCount <= 0) {
+    return false;
+  }
+  if (Text[FirstDigit] == TEXT('0') && (DigitCount > 1 || bNegative)) {
+    return false;
+  }
+  // Accumulated as a negative number, so MIN_int64 (whose magnitude has no positive int64) fits.
+  int64 Negated = 0;
+  for (int32 Index = FirstDigit; Index < Text.Len(); ++Index) {
+    const TCHAR Character = Text[Index];
+    if (Character < TEXT('0') || Character > TEXT('9')) {
+      return false;
+    }
+    const int64 Digit = Character - TEXT('0');
+    // Integer division rounds toward zero, which for these negative values is the ceiling: the
+    // smallest Negated whose Negated * 10 - Digit still fits.
+    if (Negated < (MIN_int64 + Digit) / 10) {
+      return false;
+    }
+    Negated = Negated * 10 - Digit;
+  }
+  if (!bNegative) {
+    if (Negated == MIN_int64) {
+      return false;
+    }
+    Negated = -Negated;
+  }
+  OutAmount = Negated;
+  return true;
+}
+
 // A flush the backend refused for good (`final: true`). The sent entries are gone and the backend
 // has raised an alert; the character must reload before its balance can be trusted again.
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnItemFlushRefusedFinal, const FString & /*Error*/);
