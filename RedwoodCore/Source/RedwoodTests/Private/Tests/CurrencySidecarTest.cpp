@@ -2664,4 +2664,60 @@ bool FRedwoodCurrencyTradeCommitUnknownEveryAttemptTest::RunTest(const FString &
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeReconnectClearsOpenFlushTest,
+  "Redwood.Currency.Trade.ReconnectClearsOpenFlush",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A flush whose connection drops before its reply never gets one. Its open-flush count must not
+// block the character's trades for the rest of the session: the reconnect clears it.
+bool FRedwoodCurrencyTradeReconnectClearsOpenFlushTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  AddExpectedErrorPlain(TEXT("has an item flush in flight"), EAutomationExpectedErrorFlags::Contains, 1);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FAccess::BindConnectedCallback(*Harness.Subsystem);
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *PawnActor = nullptr;
+  URedwoodCharacterComponent *PawnComponent = Harness.MakeComponent(PawnActor, FromId);
+  PawnComponent->QueueCurrency({MakeEntry(EntryIdA, LootAmount, FromBalance + LootAmount, LootReason)}, {});
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, PawnComponent);
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  FTradeResult Refused;
+  Harness.Subsystem->EmitItemsTrade(
+    From.Component, To.Component, {}, MakeTradeCurrency(TradedAmount, TradedAmount), TradeId, Capture(Refused)
+  );
+  TestEqual(TEXT("While the flush is open, the trade is refused"), Refused.Calls, 1);
+
+  // The connection drops with the flush unanswered, and comes back.
+  TSharedPtr<FSocketIONative> Socket = Harness.SidecarCopy;
+  if (!TestTrue(TEXT("The sidecar restarts"), Harness.Server->CloseWithCode(ServiceRestartCloseCode)) ||
+      !TestTrue(TEXT("The socket sees it"), Harness.PumpUntil([Socket]() { return !Socket->bIsConnected; })) ||
+      !Harness.AcceptAndWait()) {
+    return false;
+  }
+
+  FTradeResult Result;
+  FRequest Trade;
+  if (!SendTrade(Harness, From, To, Result, Trade)) {
+    return false;
+  }
+  TestEqual(TEXT("After the reconnect the trade goes out"), Result.Calls, 0);
+  Harness.Answer(Trade, CommittedReply(FromSeq + 1, ToSeq + 1));
+  TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
+  TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
+  return true;
+}
+
 #endif // WITH_AUTOMATION_WORKER

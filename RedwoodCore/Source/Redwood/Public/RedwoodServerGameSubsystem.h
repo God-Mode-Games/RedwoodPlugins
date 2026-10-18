@@ -931,8 +931,9 @@ private:
 
   // Item flushes sent and not yet answered, per character, over every component of it. A trade must
   // not start while one is open: that batch would commit before or after the trade, so the seq and
-  // the balance the trade starts from would be guesses. A reply that never comes leaves the count
-  // up, as it leaves the component's own flight slot claimed.
+  // the balance the trade starts from would be guesses. The reply lowers it, also for a component
+  // that is gone; a reconnect of the sidecar clears it, since a reply lost with the old connection
+  // never comes.
   TMap<FString, int32> InFlightItemFlushesByCharacter;
   void EndItemFlushInFlight(const FString &CharacterId);
   // The components whose last flush reply left a batch unconfirmed (its outcome unknown), per

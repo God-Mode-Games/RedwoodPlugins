@@ -258,6 +258,11 @@ void URedwoodServerGameSubsystem::HandleSidecarConnected() {
       true, // loop
       0.f // immediately trigger first one
     );
+    // FORK(hollowed-oath): a reply to a request sent on the dropped connection never comes, so the
+    // open-flush counts it raised would block those characters' trades for the rest of the
+    // session. The sidecar answers every request it gets within its realm timeout, so a lost reply
+    // only follows a dropped connection, and every count still raised now is one.
+    InFlightItemFlushesByCharacter.Reset();
     // FORK(hollowed-oath): currency reloads and trade resends that waited for the sidecar go out
     // now.
     ResumeCurrencyReloadsAfterSidecarConnect();
