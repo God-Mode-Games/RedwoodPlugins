@@ -1974,7 +1974,11 @@ bool FRedwoodCurrencyTradeNoSettlingReplyTest::RunTest(const FString &Parameters
     if (!Harness.ReadRequest(TradeEvent, Resend)) {
       return false;
     }
-    Harness.Answer(Resend, ErrorReply(URedwoodServerGameSubsystem::TradeNotBoundError));
+    // The flag decides, so the text is one the plugin knows nothing of.
+    Harness.Answer(
+      Resend,
+      TEXT(R"({"error":"refused by this session","fromCommittedSeq":-1,"toCommittedSeq":-1,"sessionRefused":true})")
+    );
     Harness.PumpUntil([&Harness]() {
       const FRedwoodPendingItemTrade *Pending = FAccess::Trade(*Harness.Subsystem, TradeId);
       return !Pending || Pending->Generation == 0;
@@ -2162,7 +2166,7 @@ bool FRedwoodCurrencyTradeReplyClassifyTest::RunTest(const FString &Parameters) 
   using namespace RedwoodCurrencyTradeTest;
   // The two successes whose fences do not pass a seq, and the two old-sidecar fallbacks.
   AddExpectedErrorPlain(TEXT("do not pass the seqs before the trade"), EAutomationExpectedErrorFlags::Contains, 2);
-  AddExpectedErrorPlain(TEXT("read the outcome from its text"), EAutomationExpectedErrorFlags::Contains, 2);
+  AddExpectedErrorPlain(TEXT("read the outcome from its text"), EAutomationExpectedErrorFlags::Contains, 3);
 
   auto Classify = [](const FString &Json) {
     TSharedPtr<FJsonObject> Object;
@@ -2219,6 +2223,30 @@ bool FRedwoodCurrencyTradeReplyClassifyTest::RunTest(const FString &Parameters) 
       URedwoodServerGameSubsystem::ParseItemsTradeReply(nullptr), FromSeq, ToSeq
     ) == ERedwoodItemTradeOutcome::Unknown
   );
+  // sessionRefused: from the flag, whatever the text; from the text only when the flag is absent.
+  auto Parse = [](const FString &Json) {
+    TSharedPtr<FJsonObject> Object;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+    FJsonSerializer::Deserialize(Reader, Object);
+    return URedwoodServerGameSubsystem::ParseItemsTradeReply(Object);
+  };
+  TestTrue(
+    TEXT("sessionRefused is read from the flag"),
+    Parse(TEXT(R"({"error":"refused by this session","fromCommittedSeq":-1,"toCommittedSeq":-1,"sessionRefused":true})")).bSessionRefused
+  );
+  TestFalse(
+    TEXT("A present false flag beats the binding text"),
+    Parse(FString::Printf(
+      TEXT(R"({"error":"%s","fromCommittedSeq":-1,"toCommittedSeq":-1,"sessionRefused":false})"),
+      URedwoodServerGameSubsystem::TradeNotBoundError
+    )).bSessionRefused
+  );
+  TestFalse(TEXT("Another refusal is no session refusal"), Parse(ErrorReply(TEXT("empty trade"))).bSessionRefused);
+  TestTrue(
+    TEXT("An old realm's binding text is read, with a Warning"),
+    Parse(ErrorReply(URedwoodServerGameSubsystem::TradeNotBoundError)).bSessionRefused
+  );
+
   TestEqual(
     TEXT("Alerts are read"),
     URedwoodServerGameSubsystem::ParseItemsTradeReply([]() {

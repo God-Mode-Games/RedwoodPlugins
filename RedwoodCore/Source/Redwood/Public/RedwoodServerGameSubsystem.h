@@ -110,6 +110,9 @@ struct FRedwoodItemTradeReply {
   bool bNotForwarded = false;
   // Set by the realm: it could not tell whether its own commit went through, so it MAY have applied.
   bool bCommitUnknown = false;
+  // Set by the realm on its two refusals that depend on this server's session: they say nothing
+  // about an earlier attempt of the trade.
+  bool bSessionRefused = false;
   TArray<TSharedPtr<FJsonObject>> Alerts;
 };
 
@@ -531,13 +534,11 @@ public:
 
   // FORK(hollowed-oath): the realm's two trade refusals that run before its transaction and depend
   // on this server's session (its sidecar socket, the characters' binding), so a resend can get one
-  // although an earlier attempt committed (realm-backend/src/routes/sidecar/items.ts). Every other
-  // refusal is the same on every attempt or comes after the realm checked for a commit. The realm
-  // has no flag for these, so the texts are matched.
+  // although an earlier attempt committed. The realm flags them `sessionRefused`; these texts
+  // (realm-backend/src/routes/sidecar/items.ts) are read only from a realm too old to send the flag.
   static constexpr const TCHAR *TradeNotBoundError =
     TEXT("both characters must be bound to this instance");
   static constexpr const TCHAR *TradeNotAuthorizedError = TEXT("not authorized");
-  static bool IsItemsTradeSessionRefusal(const FString &Error);
 
   // The only reason the backend takes on a trade entry.
   static constexpr const TCHAR *TradeCurrencyReason = TEXT("Currency.Reason.Trade");

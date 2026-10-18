@@ -4238,13 +4238,19 @@ FRedwoodItemTradeReply URedwoodServerGameSubsystem::ParseItemsTradeReply(
     Reply, Parsed.Error, TradeTimedOutError, Parsed.bTimedOut, Parsed.bNotForwarded
   );
   Reply->TryGetBoolField(TEXT("commitUnknown"), Parsed.bCommitUnknown);
+  if (!Reply->TryGetBoolField(TEXT("sessionRefused"), Parsed.bSessionRefused) &&
+      (Parsed.Error.Equals(TradeNotBoundError, ESearchCase::CaseSensitive) ||
+       Parsed.Error.Equals(TradeNotAuthorizedError, ESearchCase::CaseSensitive))) {
+    Parsed.bSessionRefused = true;
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("Trade reply has no sessionRefused flag; read the outcome from its text: \"%s\". Update the realm."),
+      *Parsed.Error
+    );
+  }
   ParseCurrencyAlerts(Reply, Parsed.Alerts);
   return Parsed;
-}
-
-bool URedwoodServerGameSubsystem::IsItemsTradeSessionRefusal(const FString &Error) {
-  return Error.Equals(TradeNotBoundError, ESearchCase::CaseSensitive) ||
-    Error.Equals(TradeNotAuthorizedError, ESearchCase::CaseSensitive);
 }
 
 ERedwoodItemTradeOutcome URedwoodServerGameSubsystem::ClassifyItemsTradeReply(
@@ -4320,7 +4326,7 @@ void URedwoodServerGameSubsystem::HandleItemsTradeReply(
       // refusals before the transaction are the same on every attempt, so the first attempt was
       // refused too, except the two that depend on this server's session: those say nothing about
       // the earlier attempt, so the trade is sent again.
-      if (Trade->bOutcomeUnknown && IsItemsTradeSessionRefusal(Parsed.Error)) {
+      if (Trade->bOutcomeUnknown && Parsed.bSessionRefused) {
         RetryItemsTrade(TradeId, Parsed.Error);
         return;
       }
