@@ -1782,6 +1782,24 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
       CharacterObject->SetNumberField(
         TEXT("inventorySeq"), DetachedPSC->RedwoodCharacter.InventorySeq
       );
+      // FORK(hollowed-oath): the staged currency goes into the same write, as on the attached
+      // path.
+      ApplyOfflineCurrency(DetachedPSC->RedwoodCharacter, CharacterComponent);
+      URedwoodCommonGameSubsystem::WriteOfflineCurrency(
+        DetachedPSC->RedwoodCharacter, CharacterObject
+      );
+    } else if (CharacterComponent->GetPendingCurrencyEntries().Num() > 0 ||
+               CharacterComponent->GetPendingGrantKeys().Num() > 0) {
+      // FORK(hollowed-oath): with no PlayerState there is no balance to apply the entries to, so
+      // they go with the pawn, loudly. SaveCharacterJsonToDisk keeps the file's balance.
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Offline detached save: character %s has no PlayerState; %d currency entries and %d grant keys are NOT saved"),
+        *CharacterId,
+        CharacterComponent->GetPendingCurrencyEntries().Num(),
+        CharacterComponent->GetPendingGrantKeys().Num()
+      );
     }
     // FORK(hollowed-oath) END
     CharacterObject->SetStringField(TEXT("id"), CharacterId);
@@ -2403,10 +2421,12 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
               PlayerStateComponent, CharacterComponent
             );
           }
-        } else if (AppendOfflineItemRows(
-                     OfflineItemRows, CharacterComponent
-                   )) {
-          bHasOfflineItemRows = true;
+        } else {
+          if (AppendOfflineItemRows(OfflineItemRows, CharacterComponent)) {
+            bHasOfflineItemRows = true;
+          }
+          // The staged currency moves onto the snapshot, which the offline block below writes.
+          ApplyOfflineCurrency(PlayerStateComponent->RedwoodCharacter, CharacterComponent);
         }
         // FORK(hollowed-oath) END
 
@@ -2448,6 +2468,11 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
     if (!bUseBackend) {
       CharacterObject->SetNumberField(
         TEXT("inventorySeq"), PlayerStateComponent->RedwoodCharacter.InventorySeq
+      );
+      // The balance and grant keys ride the same whole-file write, from the snapshot the
+      // component loop above applied the staged currency to.
+      URedwoodCommonGameSubsystem::WriteOfflineCurrency(
+        PlayerStateComponent->RedwoodCharacter, CharacterObject
       );
     }
     // FORK(hollowed-oath) END
@@ -3551,6 +3576,104 @@ bool URedwoodServerGameSubsystem::AppendOfflineItemRows(
   CharacterComponent->ClearItemsDirtyState();
   return true;
 }
+
+// FORK(hollowed-oath) BEGIN: the offline currency save. See the declaration.
+bool URedwoodServerGameSubsystem::ApplyOfflineCurrency(
+  FRedwoodCharacterBackend &Character, URedwoodCharacterComponent *CharacterComponent
+) {
+  const int32 StagedEntryCount = CharacterComponent->GetPendingCurrencyEntries().Num();
+  const int32 StagedGrantCount = CharacterComponent->GetPendingGrantKeys().Num();
+  if (StagedEntryCount == 0 && StagedGrantCount == 0) {
+    return false;
+  }
+  if (Character.bCurrencyAmountUnknown) {
+    // Chaining from a guessed balance would write a wrong one. The entries stay staged, and the
+    // file keeps the balance it has.
+    UE_LOG(
+      LogRedwood,
+      Error,
+      TEXT("Offline save: character %s has an unknown balance; %d currency entries and %d grant keys stay staged"),
+      *Character.Id,
+      StagedEntryCount,
+      StagedGrantCount
+    );
+    return false;
+  }
+
+  TArray<FRedwoodCurrencyEntry> Entries;
+  TArray<FString> GrantKeys;
+  CharacterComponent->TakePendingCurrencyForOfflineSave(Entries, GrantKeys);
+
+  // The backend's flush rules, so offline play finds the same caller bugs a live server would.
+  FString Refusal;
+  int64 Balance = Character.CurrencyAmount;
+  for (const FRedwoodCurrencyEntry &Entry : Entries) {
+    if (Entry.Reason.IsEmpty()) {
+      Refusal = FString::Printf(TEXT("entry %s has no reason"), *Entry.Id);
+      break;
+    }
+    // Balance is never negative here, so only a credit can pass int64.
+    if (Entry.Delta > 0 && Balance > MAX_int64 - Entry.Delta) {
+      Refusal = FString::Printf(TEXT("entry %s takes the balance past int64"), *Entry.Id);
+      break;
+    }
+    Balance += Entry.Delta;
+    if (Balance < 0) {
+      Refusal = FString::Printf(TEXT("entry %s takes the balance below zero"), *Entry.Id);
+      break;
+    }
+    if (Balance != Entry.BalanceAfter) {
+      Refusal = FString::Printf(
+        TEXT("entry %s ends at %lld, not at its balanceAfter %lld"),
+        *Entry.Id,
+        Balance,
+        Entry.BalanceAfter
+      );
+      break;
+    }
+  }
+  TSet<FString> UsedGrantKeys;
+  UsedGrantKeys.Append(Character.GrantKeys);
+  for (const FString &GrantKey : GrantKeys) {
+    if (Refusal.IsEmpty() && UsedGrantKeys.Contains(GrantKey)) {
+      Refusal = FString::Printf(TEXT("grant key %s is already used"), *GrantKey);
+    }
+    UsedGrantKeys.Add(GrantKey);
+  }
+
+  if (!Refusal.IsEmpty()) {
+    // As a final refusal online: the whole batch is dropped, nothing moves, and each part is
+    // logged so it can be rebuilt by hand.
+    for (const FRedwoodCurrencyEntry &Entry : Entries) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Offline save refused (%s): character %s dropped currency entry %s delta %lld reason %s, NOT saved"),
+        *Refusal,
+        *Character.Id,
+        *Entry.Id,
+        Entry.Delta,
+        *Entry.Reason
+      );
+    }
+    for (const FString &GrantKey : GrantKeys) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Offline save refused (%s): character %s dropped grant key %s, NOT saved"),
+        *Refusal,
+        *Character.Id,
+        *GrantKey
+      );
+    }
+    return false;
+  }
+
+  Character.CurrencyAmount = Balance;
+  Character.GrantKeys.Append(GrantKeys);
+  return true;
+}
+// FORK(hollowed-oath) END
 
 // One-shot trade emit: atomically re-parents the named root items from one character to another on
 // the backend. rootPlacements carries only each root row's (id, domain, slot, parentId); the

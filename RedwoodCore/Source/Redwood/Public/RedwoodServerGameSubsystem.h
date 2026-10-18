@@ -314,6 +314,17 @@ public:
     URedwoodCharacterComponent *CharacterComponent
   );
 
+  // FORK(hollowed-oath): offline/PIE counterpart of the currency half of the item flush. Takes the
+  // component's staged entries and grant keys and applies them to the character snapshot, which
+  // the save then writes to the file (URedwoodCommonGameSubsystem::WriteOfflineCurrency). It refuses the whole batch, as the
+  // backend would, when an entry would take the balance below zero or past int64, does not end at
+  // its BalanceAfter, or has no reason, or a key is already used: the refused batch is dropped and
+  // logged, and the balance does not move. An unknown balance applies nothing and keeps the
+  // queues. Returns true when the snapshot changed.
+  static bool ApplyOfflineCurrency(
+    FRedwoodCharacterBackend &Character, URedwoodCharacterComponent *CharacterComponent
+  );
+
   // Emit realm:characters:items:trade: atomically moves the given root items (each identified by a
   // (Domain, Slot) placement, optionally with a ParentId for a content-child destination -- see
   // FRedwoodTradeRootPlacement) from one character to another on the backend. RootPlacements name

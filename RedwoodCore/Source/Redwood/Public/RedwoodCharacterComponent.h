@@ -381,6 +381,19 @@ public:
     return PendingGrantKeys;
   }
 
+  // Offline/PIE only: moves every staged entry and key out, for the save that writes them into the
+  // character file. That save is synchronous and writes the whole file, so nothing is in flight or
+  // unconfirmed and no ack will come: without this the queues would keep the component dirty for
+  // the whole session.
+  void TakePendingCurrencyForOfflineSave(
+    TArray<FRedwoodCurrencyEntry> &OutEntries, TArray<FString> &OutGrantKeys
+  ) {
+    OutEntries = MoveTemp(PendingCurrencyEntries);
+    OutGrantKeys = MoveTemp(PendingGrantKeys);
+    PendingCurrencyEntries.Reset();
+    PendingGrantKeys.Reset();
+  }
+
   // How many entries / keys from the FRONT of the queues the next batch must carry. The flush
   // snapshots exactly this many at claim time and passes the same counts to CompleteItemFlush.
   // Zero while a rebase is required; exactly the unconfirmed batch while one is outstanding.

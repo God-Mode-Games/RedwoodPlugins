@@ -1,8 +1,9 @@
 // Copyright 2026 God Mode Games, LLC. All Rights Reserved.
 
 // FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart. Pins how a character's
-// currency arrives: the `{ amount, grants }` load object, and the player-auth reply that must carry
-// it with the writer token (a reply without them is a failed load, never a zero balance).
+// currency arrives and is saved without a backend: the `{ amount, grants }` load object, the
+// player-auth reply that must carry it with the writer token (a reply without them is a failed
+// load, never a zero balance), and the offline save that applies staged entries to the snapshot.
 // CurrencySidecarTest.cpp drives the auth leg's thaw and the hydration in a world.
 
 #include "CoreMinimal.h"
@@ -20,6 +21,10 @@
 
 // Named, not anonymous, for the same unity-build reason as ItemPersistenceTest.cpp.
 namespace RedwoodCurrencyLoadTest {
+  const FString EntryIdA = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+  const FString EntryIdB = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+  const FString LootReason = TEXT("Currency.Reason.Loot");
+  const FString BuyReason = TEXT("Currency.Reason.Merchant.Buy");
   const FString QuestGrantKey = TEXT("quest:Q1");
   // Kept in the outputs of a refused parse, to show that it wrote nothing.
   constexpr int64 UntouchedAmount = 77;
@@ -30,6 +35,17 @@ namespace RedwoodCurrencyLoadTest {
     TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Text);
     FJsonSerializer::Deserialize(Reader, Object);
     return Object;
+  }
+
+  FRedwoodCurrencyEntry MakeEntry(
+    const FString &Id, int64 Delta, int64 BalanceAfter, const FString &Reason
+  ) {
+    FRedwoodCurrencyEntry Entry;
+    Entry.Id = Id;
+    Entry.Delta = Delta;
+    Entry.BalanceAfter = BalanceAfter;
+    Entry.Reason = Reason;
+    return Entry;
   }
 
   // The backend's player-auth success reply, with the parts a test removes or changes swapped in.
@@ -52,6 +68,13 @@ namespace RedwoodCurrencyLoadTest {
   // Headless: with no PlayerState owner the component only holds the snapshot.
   URedwoodPlayerStateComponent *MakePlayerStateComponent() {
     return NewObject<URedwoodPlayerStateComponent>();
+  }
+
+  // Headless: with no world QueueCurrency finds no subsystem, so nothing is frozen.
+  URedwoodCharacterComponent *MakeCharacterComponent() {
+    URedwoodCharacterComponent *Component = NewObject<URedwoodCharacterComponent>();
+    Component->bUseItems = true;
+    return Component;
   }
 }
 
@@ -190,3 +213,103 @@ bool FRedwoodCurrencyAuthLoadTest::RunTest(const FString &Parameters) {
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyOfflineSaveTest,
+  "Redwood.Currency.OfflineSave",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// Offline, the character file is the database: the save applies the staged entries to the
+// snapshot and writes `{ amount, grants }`, and the component is no longer dirty.
+bool FRedwoodCurrencyOfflineSaveTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyLoadTest;
+
+  FRedwoodCharacterBackend Character;
+  URedwoodCharacterComponent *Component = MakeCharacterComponent();
+  TestTrue(
+    TEXT("The entries are staged"),
+    Component->QueueCurrency(
+      {MakeEntry(EntryIdA, 500, 500, LootReason), MakeEntry(EntryIdB, -200, 300, BuyReason)}, {QuestGrantKey}
+    )
+  );
+  TestTrue(TEXT("The save applies them"), URedwoodServerGameSubsystem::ApplyOfflineCurrency(Character, Component));
+  TestEqual(TEXT("+500 then -200 from 0"), Character.CurrencyAmount, (int64)300);
+  TestTrue(TEXT("The key is used"), Character.GrantKeys == TArray<FString>{QuestGrantKey});
+  TestFalse(TEXT("Nothing stays staged"), Component->IsItemsDirty());
+
+  TSharedPtr<FJsonObject> CharacterObject = MakeShared<FJsonObject>();
+  URedwoodCommonGameSubsystem::WriteOfflineCurrency(Character, CharacterObject);
+  const TSharedPtr<FJsonObject> *Written = nullptr;
+  if (TestTrue(TEXT("The save writes a currency object"), CharacterObject->TryGetObjectField(TEXT("currency"), Written))) {
+    FString AmountText;
+    (*Written)->TryGetStringField(TEXT("amount"), AmountText);
+    TestEqual(TEXT("The amount is the string \"300\""), AmountText, FString(TEXT("300")));
+    int64 ReadAmount = 0;
+    TArray<FString> ReadKeys;
+    TestTrue(TEXT("The written object loads"), TryParseCurrencyLoad(*Written, ReadAmount, ReadKeys));
+    TestTrue(TEXT("It loads the key"), ReadKeys == TArray<FString>{QuestGrantKey});
+  }
+
+  TestFalse(
+    TEXT("Nothing staged applies nothing"), URedwoodServerGameSubsystem::ApplyOfflineCurrency(Character, Component)
+  );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyOfflineSaveRefusesTest,
+  "Redwood.Currency.OfflineSaveRefuses",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The offline save refuses what the backend refuses, for the whole batch: the balance does not
+// move, the batch is dropped and each part is logged. An unknown balance applies nothing and
+// keeps the batch staged, and writes no balance over the file's own.
+bool FRedwoodCurrencyOfflineSaveRefusesTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyLoadTest;
+  // Below zero (1 entry), a wrong balanceAfter (2 entries), a used key (1 entry, 1 key).
+  AddExpectedErrorPlain(TEXT("Offline save refused"), EAutomationExpectedErrorFlags::Contains, 5);
+  AddExpectedErrorPlain(TEXT("has an unknown balance"), EAutomationExpectedErrorFlags::Contains, 1);
+
+  struct FRefusedCase {
+    const TCHAR *What;
+    TArray<FRedwoodCurrencyEntry> Entries;
+    TArray<FString> GrantKeys;
+  };
+  const FRefusedCase Cases[] = {
+    {TEXT("an overdraft"), {MakeEntry(EntryIdA, -200, -100, BuyReason)}, {}},
+    {TEXT("a wrong balanceAfter"),
+     {MakeEntry(EntryIdA, 50, 150, LootReason), MakeEntry(EntryIdB, 50, 250, LootReason)},
+     {}},
+    {TEXT("a used grant key"), {MakeEntry(EntryIdA, 50, 150, LootReason)}, {QuestGrantKey}},
+  };
+  for (const FRefusedCase &Case : Cases) {
+    FRedwoodCharacterBackend Character;
+    Character.CurrencyAmount = 100;
+    Character.GrantKeys = {QuestGrantKey};
+    URedwoodCharacterComponent *Component = MakeCharacterComponent();
+    Component->QueueCurrency(Case.Entries, Case.GrantKeys);
+    TestFalse(
+      FString::Printf(TEXT("%s is refused"), Case.What),
+      URedwoodServerGameSubsystem::ApplyOfflineCurrency(Character, Component)
+    );
+    TestEqual(FString::Printf(TEXT("%s moves no balance"), Case.What), Character.CurrencyAmount, (int64)100);
+    TestTrue(FString::Printf(TEXT("%s uses no key"), Case.What), Character.GrantKeys == TArray<FString>{QuestGrantKey});
+    TestFalse(FString::Printf(TEXT("%s is dropped"), Case.What), Component->IsItemsDirty());
+  }
+
+  FRedwoodCharacterBackend Unknown;
+  Unknown.CurrencyAmount = 100;
+  Unknown.bCurrencyAmountUnknown = true;
+  URedwoodCharacterComponent *Component = MakeCharacterComponent();
+  Component->QueueCurrency({MakeEntry(EntryIdA, 50, 150, LootReason)}, {});
+  TestFalse(
+    TEXT("An unknown balance applies nothing"), URedwoodServerGameSubsystem::ApplyOfflineCurrency(Unknown, Component)
+  );
+  TestEqual(TEXT("The entry stays staged"), Component->GetPendingCurrencyEntries().Num(), 1);
+  TestEqual(TEXT("The balance does not move"), Unknown.CurrencyAmount, (int64)100);
+  TSharedPtr<FJsonObject> CharacterObject = MakeShared<FJsonObject>();
+  URedwoodCommonGameSubsystem::WriteOfflineCurrency(Unknown, CharacterObject);
+  TestFalse(TEXT("No guessed balance is written"), CharacterObject->HasField(TEXT("currency")));
+  return true;
+}
