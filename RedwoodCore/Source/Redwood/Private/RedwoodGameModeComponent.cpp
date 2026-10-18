@@ -775,10 +775,23 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
               *CharacterId,
               *LoadError
             );
+            const FText KickReason = FText::FromString(LoadError);
             if (IsValid(GameMode->GameSession)) {
-              GameMode->GameSession->KickPlayer(
-                PlayerController, FText::FromString(LoadError)
+              GameMode->GameSession->KickPlayer(PlayerController, KickReason);
+            } else {
+              // With no GameSession, the two steps AGameSession::KickPlayer takes for a remote
+              // player (there is no pawn yet): tell the client, then destroy its controller,
+              // which ends the connection. Nothing else would end this join, and it must not
+              // stay connected with no character. The return below keeps it from ever being
+              // marked server-ready either way.
+              UE_LOG(
+                LogRedwood,
+                Error,
+                TEXT("No GameSession to kick character %s; destroying its PlayerController"),
+                *CharacterId
               );
+              PlayerController->ClientWasKicked(KickReason);
+              PlayerController->Destroy();
             }
             return;
           }
