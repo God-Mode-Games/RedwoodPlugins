@@ -91,6 +91,10 @@ public:
   static void ResendTradeNow(URedwoodServerGameSubsystem &Subsystem, const FString &TradeId) {
     Subsystem.SendItemsTrade(TradeId);
   }
+  // A flush's reply timer firing, without waiting for it.
+  static void TimeOutFlush(URedwoodServerGameSubsystem &Subsystem, uint64 Generation) {
+    Subsystem.HandleItemsFlushTimeout(Generation);
+  }
 };
 
 // Named, not anonymous, for the same unity-build reason as ItemPersistenceTest.cpp.
@@ -3735,6 +3739,71 @@ bool FRedwoodCurrencySidecarRehydrateResetsTest::RunTest(const FString &Paramete
   TestEqual(TEXT("With its token"), Next.Payload->GetStringField(TEXT("writerToken")), SecondToken);
   TestEqual(TEXT("Carrying only its entry"), CountArray(Next.Payload, TEXT("currency")), 1);
   Harness.Answer(Next, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SecondSeq + 1));
+  Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarFlushReplyTimeoutTest,
+  "Redwood.Currency.Sidecar.FlushReplyTimeoutProbes",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// M5: a sidecar that hangs with its connection open never answers a flush. When the reply timer
+// fires, the batch becomes unconfirmed, the slot is released and the probe goes out at once, with
+// the attempt's settle. The timed-out send's reply, when it comes after all, is ignored.
+bool FRedwoodCurrencySidecarFlushReplyTimeoutTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedErrorPlain(TEXT("got no reply in 30 seconds"), EAutomationExpectedErrorFlags::Contains, 1);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Component = Harness.MakeComponent(Actor);
+  Actor->Items = {MakeRecord(OwnedItemId)};
+  Component->MarkItemsDirty({OwnedItemId});
+  Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {});
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component, [&SettleCount]() { ++SettleCount; });
+  FRequest First;
+  if (!Harness.ReadRequest(FlushEvent, First)) {
+    return false;
+  }
+  const int64 SentSeq = BatchSeqOfFlush(First.Payload);
+
+  FAccess::TimeOutFlush(*Harness.Subsystem, FAccess::LastFlushGeneration(*Harness.Subsystem));
+  FRequest Probe;
+  if (!Harness.ReadRequest(FlushEvent, Probe)) {
+    return false;
+  }
+  TestTrue(TEXT("The timeout probes the batch"), Probe.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("At its seq"), BatchSeqOfFlush(Probe.Payload), SentSeq);
+  TestEqual(TEXT("With its entry"), CountArray(Probe.Payload, TEXT("currency")), 1);
+  TestEqual(TEXT("And no rows"), CountArray(Probe.Payload, TEXT("upserts")), 0);
+  TestEqual(TEXT("The settle waits for the probe"), SettleCount, 0);
+
+  // The timed-out send's reply comes after all. It is ignored: the probe decides.
+  Harness.Answer(First, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SentSeq));
+  PumpFor(QuietWindowSeconds);
+  TestTrue(TEXT("The late reply leaves the probe in flight"), Component->IsItemFlushInFlight());
+  TestEqual(TEXT("And the entry staged"), Component->GetPendingCurrencyEntries().Num(), 1);
+  TestEqual(TEXT("And settles nothing"), SettleCount, 0);
+
+  Harness.Answer(Probe, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SentSeq));
+  TestTrue(TEXT("The probe's reply settles the attempt"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
+  TestEqual(TEXT("Once"), SettleCount, 1);
+  TestEqual(TEXT("The entry is saved"), Component->GetPendingCurrencyEntries().Num(), 0);
+  TestTrue(TEXT("The row stays dirty for a normal batch"), Component->GetDirtyItemGenerations().Contains(OwnedItemId));
+
+  // Answered, so no flush is open at teardown.
+  Harness.Subsystem->FlushItemsForCharacterComponent(nullptr, Component);
+  FRequest Normal;
+  if (!Harness.ReadRequest(FlushEvent, Normal)) {
+    return false;
+  }
+  TestEqual(TEXT("The row goes out after the seq"), BatchSeqOfFlush(Normal.Payload), SentSeq + 1);
+  Harness.Answer(Normal, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SentSeq + 1));
   Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); });
   return true;
 }

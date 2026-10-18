@@ -221,6 +221,7 @@ void URedwoodServerGameSubsystem::Deinitialize() {
   InFlightItemFlushes.Reset();
   for (TPair<uint64, FRedwoodInFlightItemFlush> &Pair : OpenFlushes) {
     FRedwoodInFlightItemFlush &Flight = Pair.Value;
+    GetGameInstance()->GetTimerManager().ClearTimer(Flight.ReplyTimer);
     LogCurrencyForStaff(
       Flight.CharacterId,
       TEXT("in flight when the server shut down"),
@@ -3071,6 +3072,17 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   Flight.Sent = MoveTemp(Sent);
   Flight.CurrencyEntries = SentCurrencyEntries;
   Flight.OnAckSettled = MoveTemp(OnAckSettled);
+  // FORK(hollowed-oath): M5, one timer per send (see FlushReplyTimeoutSeconds).
+  if (UGameInstance *GameInstance = GetGameInstance()) {
+    GameInstance->GetTimerManager().SetTimer(
+      Flight.ReplyTimer,
+      FTimerDelegate::CreateWeakLambda(
+        this, [this, Generation]() { HandleItemsFlushTimeout(Generation); }
+      ),
+      FlushReplyTimeoutSeconds,
+      false // no loop
+    );
+  }
 
   TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSubsystem(this);
   Sidecar->Emit(
@@ -3099,11 +3111,14 @@ void URedwoodServerGameSubsystem::HandleItemsFlushReply(
   // that CompleteItemFlush runs may send a new batch.
   FRedwoodInFlightItemFlush Flight;
   if (!InFlightItemFlushes.RemoveAndCopyValue(Generation, Flight)) {
-    // FORK(hollowed-oath): the connection it was sent on dropped, and the reconnect already marked
-    // the batch unconfirmed and sent its probe, settle and all (R34). Acting on it now would settle
-    // that attempt twice and could clear rows the probe has yet to decide.
-    UE_LOG(LogRedwood, Log, TEXT("Ignoring a late item flush reply from a dropped connection"));
+    // FORK(hollowed-oath): the connection it was sent on dropped, or its reply timed out, and the
+    // batch was already marked unconfirmed and its probe sent, settle and all (R34, M5). Acting on
+    // it now would settle that attempt twice and could clear rows the probe has yet to decide.
+    UE_LOG(LogRedwood, Log, TEXT("Ignoring a late item flush reply (its connection dropped, or it timed out)"));
     return;
+  }
+  if (UGameInstance *GameInstance = GetGameInstance()) {
+    GameInstance->GetTimerManager().ClearTimer(Flight.ReplyTimer);
   }
   const TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = Flight.CharacterComponent;
   const TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerStateComponent =
@@ -3194,27 +3209,52 @@ void URedwoodServerGameSubsystem::RequeueItemFlushesAfterReconnect() {
   InFlightItemFlushes.Reset();
   for (TPair<uint64, FRedwoodInFlightItemFlush> &Pair : Lost) {
     FRedwoodInFlightItemFlush &Flight = Pair.Value;
-    URedwoodCharacterComponent *Component = Flight.CharacterComponent.Get();
-    if (!IsValid(Component)) {
-      // Nothing is left to re-send; the attempt has resolved as far as this server can tell.
-      SettleItemFlushOfGoneComponent(
-        Flight, nullptr, TEXT("its component is gone and its reply was lost with the connection")
-      );
-      continue;
+    if (UGameInstance *GameInstance = GetGameInstance()) {
+      GameInstance->GetTimerManager().ClearTimer(Flight.ReplyTimer);
     }
-    // The batch may have committed: unconfirmed, as after an unknown-outcome error, so the next
-    // attempt is a probe at its seq with the same entries and no rows.
-    Component->AbandonInFlightItemFlush(Flight.Sent.CurrencyCount, Flight.Sent.GrantKeys.Num());
-    if (Component->IsCurrencyBatchUnconfirmed()) {
-      UnconfirmedCurrencyComponentsByCharacter.FindOrAdd(Flight.CharacterId).AddUnique(Component);
-    }
-    // Sent now, with the attempt's settle, so a detached pawn's barrier waits for the probe, not
-    // for a tick it does not have. A parked attempt on the component stays parked until the probe
-    // is answered.
-    FlushItemsForCharacterComponent(
-      Flight.PlayerStateComponent.Get(), Component, MoveTemp(Flight.OnAckSettled)
+    ProbeItemFlushWithLostReply(
+      Flight, TEXT("its component is gone and its reply was lost with the connection")
     );
   }
+}
+
+void URedwoodServerGameSubsystem::HandleItemsFlushTimeout(uint64 Generation) {
+  FRedwoodInFlightItemFlush Flight;
+  if (!InFlightItemFlushes.RemoveAndCopyValue(Generation, Flight)) {
+    return;
+  }
+  UE_LOG(
+    LogRedwood,
+    Error,
+    TEXT("Item flush of character %s at seq %lld got no reply in %.0f seconds; its outcome is unknown, so it is probed"),
+    *Flight.CharacterId,
+    Flight.Sent.BatchSeq,
+    FlushReplyTimeoutSeconds
+  );
+  ProbeItemFlushWithLostReply(Flight, TEXT("its component is gone and its flush got no reply"));
+}
+
+void URedwoodServerGameSubsystem::ProbeItemFlushWithLostReply(
+  FRedwoodInFlightItemFlush &Flight, const FString &LostReplyWhy
+) {
+  URedwoodCharacterComponent *Component = Flight.CharacterComponent.Get();
+  if (!IsValid(Component)) {
+    // Nothing is left to re-send; the attempt has resolved as far as this server can tell.
+    SettleItemFlushOfGoneComponent(Flight, nullptr, LostReplyWhy);
+    return;
+  }
+  // The batch may have committed: unconfirmed, as after an unknown-outcome error, so the next
+  // attempt is a probe at its seq with the same entries and no rows.
+  Component->AbandonInFlightItemFlush(Flight.Sent.CurrencyCount, Flight.Sent.GrantKeys.Num());
+  if (Component->IsCurrencyBatchUnconfirmed()) {
+    UnconfirmedCurrencyComponentsByCharacter.FindOrAdd(Flight.CharacterId).AddUnique(Component);
+  }
+  // Sent now, with the attempt's settle, so a detached pawn's barrier waits for the probe, not
+  // for a tick it does not have. A parked attempt on the component stays parked until the probe
+  // is answered.
+  FlushItemsForCharacterComponent(
+    Flight.PlayerStateComponent.Get(), Component, MoveTemp(Flight.OnAckSettled)
+  );
 }
 
 void URedwoodServerGameSubsystem::SettleItemFlushOfGoneComponent(

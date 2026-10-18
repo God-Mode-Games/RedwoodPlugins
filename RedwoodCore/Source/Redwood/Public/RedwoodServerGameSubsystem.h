@@ -39,6 +39,8 @@ struct FRedwoodInFlightItemFlush {
   // The entries the batch carried, for the shutdown log: the component may be gone by then.
   TArray<FRedwoodCurrencyEntry> CurrencyEntries;
   TFunction<void()> OnAckSettled;
+  // Fires once, FlushReplyTimeoutSeconds after the send, unless a reply takes the attempt first.
+  FTimerHandle ReplyTimer;
 };
 
 // How a realm:characters:items:load reply ends a reload attempt.
@@ -532,6 +534,13 @@ public:
   // The sidecar's text when its realm request for a trade timed out. Read only from a sidecar too
   // old to send the `timedOut` flag (see ReadSidecarDeliveryFlags).
   static constexpr const TCHAR *TradeTimedOutError = TEXT("Item trade request timed out.");
+  // M5: a flush with no reply by then is treated as one whose connection dropped (R34): its batch
+  // becomes unconfirmed, its slot is released, and it is probed at once. The sidecar answers every
+  // request within its own realm timeout (10 seconds), so a longer silence means a sidecar that
+  // hangs with its connection open, and without this the slot, and every currency entry staged
+  // behind it, would wait for good. A reply that comes after is ignored by generation.
+  static constexpr float FlushReplyTimeoutSeconds = 30.f;
+
   // A trade with no reply by then counts as timed out. The sidecar answers within its own realm
   // timeout (10 seconds), so a longer silence means the socket dropped and no reply will come.
   static constexpr float TradeReplyTimeoutSeconds = 30.f;
@@ -962,6 +971,12 @@ private:
   // R34: after a sidecar reconnect, every open flush is marked unconfirmed and re-sent as a probe,
   // with its settle. Its old reply, if it ever comes, is ignored by generation.
   void RequeueItemFlushesAfterReconnect();
+  // M5: the reply timer of one flush fired (see FlushReplyTimeoutSeconds).
+  void HandleItemsFlushTimeout(uint64 Generation);
+  // The shared step of a reconnect and a reply timeout, for one flush taken out of the map: its
+  // component marks the batch unconfirmed and probes it now, with the attempt's settle. A flush
+  // whose component is gone settles as one (SettleItemFlushOfGoneComponent, with LostReplyWhy).
+  void ProbeItemFlushWithLostReply(FRedwoodInFlightItemFlush &Flight, const FString &LostReplyWhy);
   // Settles a flush whose component is gone (a respawn): logs every entry and key the reply does
   // not prove saved, writes the reply to the snapshot, and marks the snapshot when the outcome is
   // unknown, so the next component probes the seq. Reply is null when no reply settles the flush;
