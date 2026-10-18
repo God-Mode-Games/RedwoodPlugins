@@ -3166,6 +3166,9 @@ bool FRedwoodCurrencyTradeReconnectResendsTest::RunTest(const FString &Parameter
 }
 
 namespace RedwoodCurrencySidecarTest {
+  // The owner of a stale binding (UnhandledDesyncKicks).
+  struct FStaleListener : public TSharedFromThis<FStaleListener> {};
+
   // A player with its own controller, and the character component on its PlayerState: the
   // component reaches its player the way a live one does.
   struct FPlayerParty {
@@ -3293,13 +3296,15 @@ bool FRedwoodCurrencySidecarUnhandledDesyncKicksTest::RunTest(const FString &Par
   TestEqual(TEXT("The handler hears the final refusal"), RefusalCount, 1);
   TestEqual(TEXT("A handled final refusal kicks nobody"), KickProbe->KickCount, 2);
 
-  // A listener whose object is gone handles nothing: the player is kicked all the same.
-  UObject *GoneListener = NewObject<UObject>();
+  // A listener whose owner is gone handles nothing: the player is kicked all the same. The owner
+  // is a shared object, released at once, so the binding is truly dead (a UObject that is only
+  // marked as garbage still counts for the engine until it is collected).
+  TSharedPtr<FStaleListener> GoneListener = MakeShared<FStaleListener>();
   int32 StaleCount = 0;
-  FencedStale.Component->OnWriterFenceLost.AddWeakLambda(
-    GoneListener, [&StaleCount](const FString &) { ++StaleCount; }
+  FencedStale.Component->OnWriterFenceLost.AddSPLambda(
+    GoneListener.Get(), [&StaleCount](const FString &) { ++StaleCount; }
   );
-  GoneListener->MarkAsGarbage();
+  GoneListener.Reset();
   FencedStale.Component->MarkWriterFenceLost();
   TestTrue(
     TEXT("A stale binding does not stop the kick"),
