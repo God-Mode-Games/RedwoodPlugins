@@ -674,7 +674,8 @@ void URedwoodCharacterComponent::CompleteItemFlush(
   int32 SentCurrencyCount,
   int32 SentGrantCount,
   bool bFinalRefusal,
-  bool bRebaseRequired
+  bool bRebaseRequired,
+  bool bNotApplied
 ) {
   // The seq the just-completed flush stamped on its payload (claimed in TryBeginItemFlush).
   const int64 SentSeq = InFlightBatchSeq;
@@ -684,7 +685,16 @@ void URedwoodCharacterComponent::CompleteItemFlush(
   SentCurrencyCount = FMath::Clamp(SentCurrencyCount, 0, PendingCurrencyEntries.Num());
   SentGrantCount = FMath::Clamp(SentGrantCount, 0, PendingGrantKeys.Num());
 
-  if (Error.IsEmpty()) {
+  if (bNotApplied) {
+    // FORK(hollowed-oath): the backend answered a probe: that seq never committed and nothing was
+    // written. The unconfirmed batch did not apply, so its entries are simply pending again,
+    // unchanged (their BalanceAfter still holds: nothing moved the balance). The next claim is a
+    // normal batch at that same seq, so the payment goes out WITH the current item rows: both
+    // save or neither does.
+    bCurrencyBatchUnconfirmed = false;
+    LastCommittedItemSeq = SentSeq - 1;
+    NextBatchSeq = SentSeq;
+  } else if (Error.IsEmpty()) {
     // Success: clear only the ids whose generation still matches what was sent, exactly as the
     // old container ack did -- if MarkItemsDirty/MarkItemsDeleted bumped an id again while the
     // request was in flight, leave it dirty (at its newer generation) so the next flush re-sends

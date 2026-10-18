@@ -2524,7 +2524,8 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsFlushPayload(
   const TArray<TSharedPtr<FJsonValue>> &Deletes,
   const TArray<FRedwoodCurrencyEntry> &CurrencyEntries,
   const TArray<FString> &GrantKeys,
-  const FString &WriterToken
+  const FString &WriterToken,
+  bool bProbe
 ) {
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("id"), ItemsEnvelopePlaceholderId);
@@ -2563,6 +2564,12 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsFlushPayload(
   Payload->SetArrayField(TEXT("grants"), GrantsJsonArray);
 
   Payload->SetStringField(TEXT("writerToken"), WriterToken);
+  // FORK(hollowed-oath): a re-send of an unconfirmed batch says so. The backend never applies a
+  // probe; it only answers whether the first attempt committed. Left out otherwise (never false or
+  // null), the way older senders send it.
+  if (bProbe) {
+    Payload->SetBoolField(TEXT("probe"), true);
+  }
   return Payload;
 }
 
@@ -2839,7 +2846,8 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
     DeletesJsonArray,
     SentCurrencyEntries,
     SentGrantKeys,
-    CharacterComponent->GetWriterToken()
+    CharacterComponent->GetWriterToken(),
+    bReplayProbe
   );
 
   TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacterComponent = CharacterComponent;
@@ -2974,6 +2982,7 @@ FRedwoodItemFlushReply URedwoodServerGameSubsystem::ParseItemsFlushReply(
   // Both optional: a backend that predates them sends neither, and both then mean false.
   Reply->TryGetBoolField(TEXT("final"), Parsed.bFinal);
   Reply->TryGetBoolField(TEXT("rebaseRequired"), Parsed.bRebaseRequired);
+  Reply->TryGetBoolField(TEXT("notApplied"), Parsed.bNotApplied);
 
   const TArray<TSharedPtr<FJsonValue>> *AlertValues = nullptr;
   if (Reply->TryGetArrayField(TEXT("alerts"), AlertValues)) {
@@ -3030,6 +3039,7 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
     // must follow, or the forward seed in FlushItemsForCharacterComponent moves the lane straight
     // back to the gapped seq, which the backend refuses forever.
     const bool bSequenceGap = !Reply.Error.IsEmpty() && !Reply.bFinal && !Reply.bRebaseRequired &&
+      !Reply.bNotApplied &&
       Reply.CommittedSeq >= 0 && Reply.CommittedSeq < Sent.BatchSeq - 1;
     if (bSequenceGap && Snapshot.InventorySeq > Reply.CommittedSeq) {
       Snapshot.InventorySeq = Reply.CommittedSeq;
@@ -3050,7 +3060,8 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
     Sent.CurrencyCount,
     Sent.GrantCount,
     Reply.bFinal,
-    Reply.bRebaseRequired
+    Reply.bRebaseRequired,
+    Reply.bNotApplied
   );
 
   if (Reply.Alerts.Num() > 0) {

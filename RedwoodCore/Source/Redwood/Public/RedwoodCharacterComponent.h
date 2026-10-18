@@ -454,7 +454,8 @@ public:
   // FORK(hollowed-oath): SentCurrencyCount/SentGrantCount are the counts the batch took from the
   // front of the currency queues. bFinalRefusal is the ack's `final` flag: it freezes the component
   // (FreezeAfterFinalRefusal). bRebaseRequired is the ack's `rebaseRequired` flag: only that makes
-  // the queue wait for a reload (see the currency staging block above).
+  // the queue wait for a reload (see the currency staging block above). bNotApplied is the ack's
+  // `notApplied` flag on a probe: the batch never committed, so it goes out again as a normal batch.
   // A negative CommittedSeq means the reply carried no fence; a fence below SentSeq - 1 on an
   // error is a sequence gap, and the lane realigns to it.
   void CompleteItemFlush(
@@ -465,7 +466,8 @@ public:
     int32 SentCurrencyCount = 0,
     int32 SentGrantCount = 0,
     bool bFinalRefusal = false,
-    bool bRebaseRequired = false
+    bool bRebaseRequired = false,
+    bool bNotApplied = false
   );
 
   // Seeds the committed-seq/next-batchSeq state from a freshly-loaded character's InventorySeq.

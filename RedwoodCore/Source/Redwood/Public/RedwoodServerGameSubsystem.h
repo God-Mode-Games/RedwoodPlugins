@@ -35,6 +35,8 @@ struct FRedwoodItemFlushReply {
   int64 CommittedSeq = -1;
   bool bFinal = false;
   bool bRebaseRequired = false;
+  // The backend's answer to a probe whose seq never committed: nothing was written.
+  bool bNotApplied = false;
   TArray<TSharedPtr<FJsonObject>> Alerts;
 };
 
@@ -354,7 +356,8 @@ public:
     const TArray<TSharedPtr<FJsonValue>> &Deletes,
     const TArray<FRedwoodCurrencyEntry> &CurrencyEntries,
     const TArray<FString> &GrantKeys,
-    const FString &WriterToken
+    const FString &WriterToken,
+    bool bProbe = false
   );
   static TSharedPtr<FJsonObject> BuildItemsTradePayload(
     const FString &FromCharacterId,
