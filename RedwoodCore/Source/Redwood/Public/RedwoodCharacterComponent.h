@@ -490,8 +490,9 @@ public:
   void RequireCurrencyReload(bool bBeforeSettlingReply = false);
 
   // Re-chains every pending entry's BalanceAfter from Balance (the amount just loaded from the
-  // backend) and allows currency to be sent again. Ignored unless a rebase is required: at any
-  // other time a pending entry may already be committed, and re-chaining it would count it twice.
+  // backend) and allows currency to be sent again. Ignored unless a rebase is required, and while a
+  // batch is in flight or unconfirmed: at any such time a pending entry may already be committed,
+  // and re-chaining it would count it twice.
   void RebaseCurrency(int64 Balance);
 
   // A trade of this character settled, and Balance is the backend balance after it: its own
@@ -503,6 +504,14 @@ public:
   // freezes (ensure). If a re-chained entry would overflow or go below zero, nothing is re-chained
   // and the queue waits for a reload instead (see RebaseCurrency).
   void RechainCurrencyAfterTrade(int64 Balance);
+
+  // A batch of another component of this character may have committed at Seq (the snapshot's
+  // bInventorySeqUnconfirmed): the next claim probes Seq, with no rows and no currency, before any
+  // normal batch. With bReloadAfterProbe, currency is then held for a reload too: the lost batch
+  // may have moved the balance, and the reload must read it only once the probe has settled the
+  // seq. Ignored (false) while a batch of this component is in flight or unconfirmed, or when Seq
+  // is already committed for this component.
+  bool RequireItemSeqProbe(int64 Seq, bool bReloadAfterProbe);
 
   // Moves the committed seq and NextBatchSeq forward to CommittedSeq, never back: a replay probe
   // goes out under an older seq than NextBatchSeq, and its ack must not rewind the lane. Public for

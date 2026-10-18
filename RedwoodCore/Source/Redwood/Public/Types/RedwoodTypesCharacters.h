@@ -138,6 +138,17 @@ struct FRedwoodCharacterBackend {
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   bool bCurrencyAmountUnknown = false;
 
+  // Set when a batch of a component that is gone (a respawn) may have committed at
+  // UnconfirmedInventorySeq: no reply settled it. A component that flushes from this snapshot
+  // probes that seq first, the way the gone one would have, and only then sends its own batch. A
+  // normal batch sent at that seq could be acked as a replay of the lost one, and its rows cleared
+  // unsaved (a consumed item would come back). Cleared once the committed seq reaches it.
+  UPROPERTY()
+  bool bInventorySeqUnconfirmed = false;
+
+  UPROPERTY()
+  int64 UnconfirmedInventorySeq = 0;
+
   // Set when the backend refused one of this character's flushes for good. Every component
   // hydrated from this snapshot starts frozen; only a fresh load from the database clears it.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")

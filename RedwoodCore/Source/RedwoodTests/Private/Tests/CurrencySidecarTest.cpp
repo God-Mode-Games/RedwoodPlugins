@@ -1478,13 +1478,25 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// An error reply for a component that is gone changes nothing on the snapshot.
+// An error reply whose outcome is unknown, for a component that is gone, writes no seq, balance or
+// key to the snapshot. It logs the entry and the key for staff, as UNKNOWN, and marks the seq so
+// the next component probes it.
 bool FRedwoodCurrencySidecarComponentGoneErrorTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   // Plain, not AddExpectedError: that one reads its pattern as a regex, where the parentheses are a
   // group and the logged text no longer matches.
   AddExpectedErrorPlain(
     TEXT("Failed to flush items (component gone): concurrent flush"), EAutomationExpectedErrorFlags::Contains, 1
+  );
+  AddExpectedErrorPlain(
+    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  AddExpectedErrorPlain(
+    TEXT("character character-1 grant quest:Q1, outcome UNKNOWN (it may be saved): its component is gone"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
   );
   const FString RewardKey = TEXT("quest:Q1");
   constexpr int64 SnapshotBalance = 1000;
@@ -1522,6 +1534,9 @@ bool FRedwoodCurrencySidecarComponentGoneErrorTest::RunTest(const FString &Param
   TestEqual(TEXT("The seq is unchanged"), Snapshot.InventorySeq, SeededInventorySeq);
   TestEqual(TEXT("The balance is unchanged"), Snapshot.CurrencyAmount, SnapshotBalance);
   TestEqual(TEXT("No key is added"), Snapshot.GrantKeys.Num(), 0);
+  TestTrue(TEXT("The seq is marked unconfirmed"), Snapshot.bInventorySeqUnconfirmed);
+  TestEqual(TEXT("At the sent seq"), Snapshot.UnconfirmedInventorySeq, SeededInventorySeq + 1);
+  TestTrue(TEXT("The balance it may have moved is unknown"), Snapshot.bCurrencyAmountUnknown);
   return true;
 }
 
@@ -3265,6 +3280,204 @@ bool FRedwoodCurrencySidecarUnhandledDesyncKicksTest::RunTest(const FString &Par
   PumpFor(QuietWindowSeconds);
   TestEqual(TEXT("The handler hears the final refusal"), RefusalCount, 1);
   TestEqual(TEXT("A handled final refusal kicks nobody"), KickProbe->KickCount, 2);
+  return true;
+}
+
+namespace RedwoodCurrencySidecarTest {
+  int64 BatchSeqOfFlush(const TSharedPtr<FJsonObject> &Payload) {
+    return Payload.IsValid() ? static_cast<int64>(Payload->GetNumberField(TEXT("batchSeq"))) : -1;
+  }
+
+  // A PlayerState with the snapshot of CharacterId at SeededInventorySeq.
+  bool MakeSnapshotOwner(
+    FSidecarHarness &Harness,
+    ARedwoodCurrencyLoadTestPlayerState *&OutPlayerState,
+    URedwoodPlayerStateComponent *&OutPlayerStateComponent
+  ) {
+    OutPlayerState = Harness.World->SpawnActor<ARedwoodCurrencyLoadTestPlayerState>();
+    if (!Harness.Test.TestNotNull(TEXT("The PlayerState spawns"), OutPlayerState)) {
+      return false;
+    }
+    OutPlayerStateComponent = NewObject<URedwoodPlayerStateComponent>(OutPlayerState);
+    FRedwoodCharacterBackend &Snapshot = OutPlayerStateComponent->RedwoodCharacter;
+    Snapshot.Id = CharacterId;
+    Snapshot.InventorySeq = SeededInventorySeq;
+    Snapshot.CurrencyAmount = 1000;
+    Snapshot.WriterToken = WriterToken;
+    return true;
+  }
+
+  // A component on the PlayerState, hydrated from its snapshot the way a live one is (the handler
+  // the PlayerState's OnRedwoodCharacterUpdated runs). Only the item channel: the others need data
+  // these tests do not give.
+  URedwoodCharacterComponent *HydrateOnPlayerState(ARedwoodCurrencyLoadTestPlayerState *PlayerState) {
+    URedwoodCharacterComponent *Component = NewObject<URedwoodCharacterComponent>(PlayerState);
+    Component->bUseCharacterCreatorData = false;
+    Component->bUseMetadata = false;
+    Component->bUseEquippedInventory = false;
+    Component->bUseNonequippedInventory = false;
+    Component->bUseData = false;
+    Component->bUseItems = true;
+    Component->ProcessEvent(
+      Component->FindFunctionChecked(TEXT("RedwoodPlayerStateCharacterUpdated")), nullptr
+    );
+    return Component;
+  }
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarGoneUnknownProbesFirstTest,
+  "Redwood.Currency.Sidecar.ComponentGoneUnknownProbesFirst",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// I3: the pawn respawns while a batch is in flight, and its reply says nothing about the outcome.
+// The batch had committed. The respawned component must not send a normal batch at that seq: the
+// backend would ack it as a replay and its row would be cleared unsaved. It probes the seq first,
+// then reloads the balance the lost batch moved, and only then sends its row after the seq.
+bool FRedwoodCurrencySidecarGoneUnknownProbesFirstTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  AddExpectedErrorPlain(
+    TEXT("Failed to flush items (component gone): Item flush request timed out."), EAutomationExpectedErrorFlags::Contains, 1
+  );
+  AddExpectedErrorPlain(
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  constexpr int64 SentSeq = SeededInventorySeq + 1;
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  ARedwoodCurrencyLoadTestPlayerState *PlayerState = nullptr;
+  URedwoodPlayerStateComponent *PlayerStateComponent = nullptr;
+  if (!MakeSnapshotOwner(Harness, PlayerState, PlayerStateComponent)) {
+    return false;
+  }
+  const FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Sender = Harness.MakeComponent(Actor);
+  Actor->Items = {MakeRecord(OwnedItemId)};
+  Sender->MarkItemsDirty({OwnedItemId});
+  Sender->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {});
+  Harness.Subsystem->FlushItemsForCharacterComponent(PlayerStateComponent, Sender);
+  FRequest First;
+  if (!Harness.ReadRequest(FlushEvent, First)) {
+    return false;
+  }
+  Sender->MarkAsGarbage();
+  Harness.Answer(First, TEXT(R"({"error":"Item flush request timed out.","committedSeq":-1,"timedOut":true})"));
+  if (!TestTrue(
+        TEXT("The unknown outcome reaches the snapshot"),
+        Harness.PumpUntil([&Snapshot]() { return Snapshot.bInventorySeqUnconfirmed; })
+      )) {
+    return false;
+  }
+  TestEqual(TEXT("At the lost batch's seq"), Snapshot.UnconfirmedInventorySeq, SentSeq);
+  TestEqual(TEXT("The committed seq is not guessed"), Snapshot.InventorySeq, SeededInventorySeq);
+  TestTrue(TEXT("Nor the balance"), Snapshot.bCurrencyAmountUnknown);
+
+  // The respawned pawn's component, and a row it changes.
+  URedwoodCharacterComponent *Respawned = HydrateOnPlayerState(PlayerState);
+  TestTrue(TEXT("The respawned component starts with the probe"), Respawned->IsCurrencyBatchUnconfirmed());
+  PlayerState->Items = {MakeRecord(LaterItemId)};
+  Respawned->MarkItemsDirty({LaterItemId});
+
+  Harness.Subsystem->FlushItemsForCharacterComponent(PlayerStateComponent, Respawned);
+  FRequest Probe;
+  if (!Harness.ReadRequest(FlushEvent, Probe)) {
+    return false;
+  }
+  TestTrue(TEXT("Its first batch is a probe"), Probe.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("At the marked seq"), BatchSeqOfFlush(Probe.Payload), SentSeq);
+  TestEqual(TEXT("With no rows"), CountArray(Probe.Payload, TEXT("upserts")), 0);
+  TestEqual(TEXT("And no currency"), CountArray(Probe.Payload, TEXT("currency")), 0);
+
+  // The lost batch had committed: a replay ack.
+  Harness.Answer(Probe, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SentSeq));
+  FRequest Load;
+  if (!Harness.ReadRequest(LoadEvent, Load)) {
+    return false;
+  }
+  TestFalse(TEXT("The settled seq clears the mark"), Snapshot.bInventorySeqUnconfirmed);
+  TestEqual(TEXT("The snapshot takes the settled seq"), Snapshot.InventorySeq, SentSeq);
+  TestTrue(TEXT("The row waits for the reload"), Respawned->GetDirtyItemGenerations().Contains(LaterItemId));
+  Harness.Answer(Load, MakeLoadReply(TEXT("1500")));
+
+  FRequest Normal;
+  if (!Harness.ReadRequest(FlushEvent, Normal)) {
+    return false;
+  }
+  TestFalse(TEXT("Then a normal batch"), Normal.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("After the settled seq"), BatchSeqOfFlush(Normal.Payload), SentSeq + 1);
+  TestEqual(TEXT("With the row"), CountArray(Normal.Payload, TEXT("upserts")), 1);
+  Harness.Answer(Normal, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SentSeq + 1));
+  Harness.PumpUntil([Respawned]() { return !Respawned->IsItemFlushInFlight(); });
+  TestFalse(TEXT("The row is saved"), Respawned->GetDirtyItemGenerations().Contains(LaterItemId));
+  TestEqual(TEXT("The snapshot takes the reloaded balance"), Snapshot.CurrencyAmount, (int64)1500);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarReconnectGoneComponentTest,
+  "Redwood.Currency.Sidecar.ReconnectGoneComponentLogsAndMarks",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// I2: the connection drops with a batch in flight whose component is gone. Nothing is left to
+// re-send, so the reconnect logs its entry and key for staff, as UNKNOWN, marks the seq on the
+// snapshot, and settles the attempt.
+bool FRedwoodCurrencySidecarReconnectGoneComponentTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  const FString RewardKey = TEXT("quest:Q1");
+  AddExpectedErrorPlain(
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone and its reply was lost with the connection"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  AddExpectedErrorPlain(
+    TEXT("grant quest:Q1, outcome UNKNOWN (it may be saved): its component is gone and its reply was lost with the connection"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FAccess::BindConnectedCallback(*Harness.Subsystem);
+  ARedwoodCurrencyLoadTestPlayerState *PlayerState = nullptr;
+  URedwoodPlayerStateComponent *PlayerStateComponent = nullptr;
+  if (!MakeSnapshotOwner(Harness, PlayerState, PlayerStateComponent)) {
+    return false;
+  }
+  const FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+  ARedwoodCurrencyFlushTestActor *Actor = nullptr;
+  URedwoodCharacterComponent *Sender = Harness.MakeComponent(Actor);
+  Sender->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {RewardKey});
+  int32 SettleCount = 0;
+  Harness.Subsystem->FlushItemsForCharacterComponent(
+    PlayerStateComponent, Sender, [&SettleCount]() { ++SettleCount; }
+  );
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  Sender->MarkAsGarbage();
+
+  TSharedPtr<FSocketIONative> Socket = Harness.SidecarCopy;
+  if (!TestTrue(TEXT("The sidecar restarts"), Harness.Server->CloseWithCode(ServiceRestartCloseCode)) ||
+      !TestTrue(TEXT("The socket sees it"), Harness.PumpUntil([Socket]() { return !Socket->bIsConnected; })) ||
+      !Harness.AcceptAndWait()) {
+    return false;
+  }
+  TestTrue(TEXT("The attempt settles"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
+  TestEqual(TEXT("Once"), SettleCount, 1);
+  TestTrue(TEXT("The seq is marked unconfirmed"), Snapshot.bInventorySeqUnconfirmed);
+  TestEqual(TEXT("At the lost batch's seq"), Snapshot.UnconfirmedInventorySeq, SeededInventorySeq + 1);
+  TestTrue(TEXT("The balance is unknown"), Snapshot.bCurrencyAmountUnknown);
+  TestTrue(TEXT("Nothing is re-sent for a component that is gone"), Harness.IsQuiet());
   return true;
 }
 

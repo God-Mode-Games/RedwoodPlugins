@@ -618,6 +618,13 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         if (RedwoodCharacterBackend.bCurrencyAmountUnknown) {
           RequireCurrencyReload();
         }
+        // FORK(hollowed-oath): a batch of the component this one replaces may have committed at
+        // the marked seq; probe it before anything else goes out (see bInventorySeqUnconfirmed).
+        if (RedwoodCharacterBackend.bInventorySeqUnconfirmed) {
+          RequireItemSeqProbe(
+            RedwoodCharacterBackend.UnconfirmedInventorySeq, RedwoodCharacterBackend.bCurrencyAmountUnknown
+          );
+        }
         // FORK(hollowed-oath): a snapshot the freeze marked (a respawn in the same session) starts
         // frozen. A hydration never thaws: only the auth leg's fresh database load does (see
         // URedwoodServerGameSubsystem::ThawCharacter), and the subsystem's per-character freeze
@@ -983,18 +990,20 @@ bool URedwoodCharacterComponent::QueueCurrency(
   return bAllQueued;
 }
 
+// The unconfirmed batch first: its probe goes out unchanged even while a reload waits behind it
+// (RequireItemSeqProbe), because the reload may read the balance only once the probe has settled.
 int32 URedwoodCharacterComponent::GetCurrencyEntriesToSendCount() const {
-  if (bCurrencyRebaseRequired) {
-    return 0;
+  if (bCurrencyBatchUnconfirmed) {
+    return UnconfirmedCurrencyCount;
   }
-  return bCurrencyBatchUnconfirmed ? UnconfirmedCurrencyCount : PendingCurrencyEntries.Num();
+  return bCurrencyRebaseRequired ? 0 : PendingCurrencyEntries.Num();
 }
 
 int32 URedwoodCharacterComponent::GetGrantKeysToSendCount() const {
-  if (bCurrencyRebaseRequired) {
-    return 0;
+  if (bCurrencyBatchUnconfirmed) {
+    return UnconfirmedGrantCount;
   }
-  return bCurrencyBatchUnconfirmed ? UnconfirmedGrantCount : PendingGrantKeys.Num();
+  return bCurrencyRebaseRequired ? 0 : PendingGrantKeys.Num();
 }
 
 void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
@@ -1003,6 +1012,15 @@ void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
       LogRedwood,
       Warning,
       TEXT("RebaseCurrency: no rebase is required; ignoring the reloaded balance %lld"),
+      Balance
+    );
+    return;
+  }
+  if (bItemFlushInFlight || bCurrencyBatchUnconfirmed) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("RebaseCurrency: a batch is in flight or unconfirmed; ignoring the reloaded balance %lld until it settles"),
       Balance
     );
     return;
@@ -1157,6 +1175,19 @@ void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) 
   DirtyItemGenerations.Empty();
   PendingDeletedItemGenerations.Empty();
   bFrozenAfterFinalRefusal = true;
+}
+
+bool URedwoodCharacterComponent::RequireItemSeqProbe(int64 Seq, bool bReloadAfterProbe) {
+  if (bItemFlushInFlight || bCurrencyBatchUnconfirmed || Seq <= LastCommittedItemSeq) {
+    return false;
+  }
+  // Set directly, past RequireCurrencyReload's guard: the probe below is what that guard waits
+  // for, and GetCurrencyEntriesToSendCount sends the probe before the reload is asked for.
+  if (bReloadAfterProbe) {
+    bCurrencyRebaseRequired = true;
+  }
+  MarkCurrencyBatchUnconfirmed(0, 0, Seq);
+  return true;
 }
 
 void URedwoodCharacterComponent::RequireCurrencyReload(bool bBeforeSettlingReply) {

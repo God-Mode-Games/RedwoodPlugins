@@ -2754,6 +2754,13 @@ static void CatchUpItemSeqFromSnapshot(
       CharacterComponent->RequireCurrencyReload();
     }
   }
+  // FORK(hollowed-oath): a batch of a component that is gone may have committed at the marked
+  // seq. This component probes it before its own batch could take that seq.
+  if (Snapshot.bInventorySeqUnconfirmed) {
+    CharacterComponent->RequireItemSeqProbe(
+      Snapshot.UnconfirmedInventorySeq, Snapshot.bCurrencyAmountUnknown
+    );
+  }
 }
 
 // FORK(hollowed-oath): keeps a flush attempt for later. Every attempt with a settle is kept, so
@@ -2891,7 +2898,11 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   // item is free. The flag is never set while this component has a batch in flight, so no reply is
   // coming that would start the reload: start or join it now. Its reply resumes this attempt with
   // its settle, so a detached pawn's barrier waits for the delivery rather than for the hold.
-  if (CharacterComponent->IsCurrencyRebaseRequired() || CurrencyReloads.Contains(CharacterId)) {
+  // An unconfirmed batch goes first, even with a rebase required behind it: the reload may read
+  // the balance only once the probe has settled whether that batch committed.
+  const bool bNeedsReload =
+    CharacterComponent->IsCurrencyRebaseRequired() && !CharacterComponent->IsCurrencyBatchUnconfirmed();
+  if (bNeedsReload || CurrencyReloads.Contains(CharacterId)) {
     HoldItemFlushForCurrencyReload(
       CharacterId, PlayerStateComponent, CharacterComponent, OnAckSettled
     );
@@ -3110,20 +3121,8 @@ void URedwoodServerGameSubsystem::HandleItemsFlushReply(
         LogRedwood, Error, TEXT("Failed to flush items (component gone): %s"), *Reply.Error
       );
     }
-    // FORK(hollowed-oath): a committed batch is still committed. The component that sent it
-    // is gone, but the snapshot outlives it, and the next component hydrates from it: without
-    // the commit's seq, balance and grant keys there, it would reuse the seq, chain from a
-    // stale balance, and stage a reward whose key is already used, which the backend refuses
-    // for good. An error reply writes nothing here: what it would change lives on the
-    // component that is gone.
-    if (URedwoodPlayerStateComponent *LivePlayerStateComponent = WeakPlayerStateComponent.Get()) {
-      WriteCommittedFlushToSnapshot(LivePlayerStateComponent->RedwoodCharacter, Reply, Sent);
-    }
-    // Still settle: the detached release barrier must not stall forever just because the
-    // component died mid-flight -- the attempt HAS resolved.
-    if (OnAckSettled) {
-      OnAckSettled();
-    }
+    Flight.OnAckSettled = MoveTemp(OnAckSettled);
+    SettleItemFlushOfGoneComponent(Flight, &Reply, FString());
     return;
   }
 
@@ -3166,11 +3165,13 @@ void URedwoodServerGameSubsystem::HandleItemsFlushReply(
     if (!CharacterComponent->IsFrozenAfterFinalRefusal()) {
       CharacterComponent->FreezeAfterFinalRefusal(TEXT("the character is frozen"));
     }
-  } else if (CharacterComponent->IsCurrencyRebaseRequired()) {
+  } else if (CharacterComponent->IsCurrencyRebaseRequired() &&
+             !CharacterComponent->IsCurrencyBatchUnconfirmed()) {
     // A trade used the seq, or the reply could not confirm the balance: a reload must land
-    // before anything is sent. Start it from this reply, and hand this attempt's settle to
-    // it: for a detached pawn the entries are not saved yet, and releasing the write binding
-    // now would refuse the resumed flush that saves them.
+    // before anything is sent. Start it from this reply, and hand this attempt's settle to it:
+    // for a detached pawn the entries are not saved yet, and releasing the write binding now
+    // would refuse the resumed flush that saves them. While a batch is unconfirmed, its probe goes
+    // first instead, and the reload follows once the probe has settled the seq.
     HoldItemFlushForCurrencyReload(
       CharacterId, WeakPlayerStateComponent.Get(), CharacterComponent, MoveTemp(OnAckSettled)
     );
@@ -3193,9 +3194,9 @@ void URedwoodServerGameSubsystem::RequeueItemFlushesAfterReconnect() {
     URedwoodCharacterComponent *Component = Flight.CharacterComponent.Get();
     if (!IsValid(Component)) {
       // Nothing is left to re-send; the attempt has resolved as far as this server can tell.
-      if (Flight.OnAckSettled) {
-        Flight.OnAckSettled();
-      }
+      SettleItemFlushOfGoneComponent(
+        Flight, nullptr, TEXT("its component is gone and its reply was lost with the connection")
+      );
       continue;
     }
     // The batch may have committed: unconfirmed, as after an unknown-outcome error, so the next
@@ -3210,6 +3211,61 @@ void URedwoodServerGameSubsystem::RequeueItemFlushesAfterReconnect() {
     FlushItemsForCharacterComponent(
       Flight.PlayerStateComponent.Get(), Component, MoveTemp(Flight.OnAckSettled)
     );
+  }
+}
+
+void URedwoodServerGameSubsystem::SettleItemFlushOfGoneComponent(
+  FRedwoodInFlightItemFlush &Flight, const FRedwoodItemFlushReply *Reply, const FString &LostReplyWhy
+) {
+  const FRedwoodItemFlushSent &Sent = Flight.Sent;
+  const ERedwoodItemFlushOutcome Outcome =
+    Reply ? ClassifyItemFlushReply(*Reply, Sent.BatchSeq) : ERedwoodItemFlushOutcome::Unknown;
+  // A refused or unsent probe says nothing about the first attempt it re-sends.
+  const bool bOutcomeUnknown = Outcome == ERedwoodItemFlushOutcome::Unknown ||
+    (Sent.bProbe &&
+     (Outcome == ERedwoodItemFlushOutcome::FinalRefusal || Outcome == ERedwoodItemFlushOutcome::NotSent));
+
+  // What the component would have kept and sent again dies with it, so staff get every entry and
+  // key the reply does not prove saved.
+  if (Outcome != ERedwoodItemFlushOutcome::Committed) {
+    const FString Why = Reply ? FString::Printf(
+                                  TEXT("its component is gone and the reply did not save it (%s)"),
+                                  *Reply->Error
+                                )
+                              : LostReplyWhy;
+    LogCurrencyForStaff(
+      Flight.CharacterId,
+      Why,
+      Flight.CurrencyEntries,
+      bOutcomeUnknown ? Flight.CurrencyEntries.Num() : 0,
+      Sent.GrantKeys,
+      bOutcomeUnknown ? Sent.GrantKeys.Num() : 0
+    );
+  }
+
+  // FORK(hollowed-oath): the snapshot outlives the component, and the next component hydrates
+  // from it. A committed batch is still committed: without its seq, balance and grant keys there,
+  // the next component would reuse the seq, chain from a stale balance, and stage a reward whose
+  // key is already used. An unknown outcome marks the seq, so the next component probes it first.
+  // Only for the same character: the PlayerState may have moved on to another one.
+  URedwoodPlayerStateComponent *PlayerStateComponent = Flight.PlayerStateComponent.Get();
+  if (PlayerStateComponent && PlayerStateComponent->RedwoodCharacter.Id == Flight.CharacterId) {
+    FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+    if (Reply) {
+      WriteFlushReplyToSnapshot(Snapshot, *Reply, Sent);
+    }
+    if (bOutcomeUnknown) {
+      MarkSnapshotSeqUnconfirmed(
+        Snapshot, Sent.BatchSeq, Sent.CurrencyCount > 0 || Sent.GrantKeys.Num() > 0
+      );
+    }
+  }
+
+  // Still settle: the detached release barrier must not stall forever just because the component
+  // died mid-flight -- the attempt HAS resolved, as far as this server can learn.
+  if (Flight.OnAckSettled) {
+    TFunction<void()> OnAckSettled = MoveTemp(Flight.OnAckSettled);
+    OnAckSettled();
   }
 }
 
@@ -3322,6 +3378,16 @@ void URedwoodServerGameSubsystem::ReadSidecarDeliveryFlags(
   );
 }
 
+// FORK(hollowed-oath): the snapshot's committed seq has reached the marked one, so that seq is
+// settled (committed by the lost batch, or consumed by something else) and needs no probe.
+static void ClearSettledSnapshotSeqProbe(FRedwoodCharacterBackend &Snapshot) {
+  if (Snapshot.bInventorySeqUnconfirmed &&
+      Snapshot.InventorySeq >= Snapshot.UnconfirmedInventorySeq) {
+    Snapshot.bInventorySeqUnconfirmed = false;
+    Snapshot.UnconfirmedInventorySeq = 0;
+  }
+}
+
 // FORK(hollowed-oath): a notApplied reply is never a commit, whatever its error text.
 static bool IsItemsFlushReplyCommitted(const FRedwoodItemFlushReply &Reply) {
   return Reply.Error.IsEmpty() && !Reply.bNotApplied;
@@ -3372,6 +3438,51 @@ void URedwoodServerGameSubsystem::WriteCommittedFlushToSnapshot(
   if (bCommitted && Reply.CommittedSeq >= Sent.BatchSeq) {
     MergeGrantKeys(Snapshot.GrantKeys, Sent.GrantKeys);
   }
+  ClearSettledSnapshotSeqProbe(Snapshot);
+}
+
+void URedwoodServerGameSubsystem::WriteFlushReplyToSnapshot(
+  FRedwoodCharacterBackend &Snapshot,
+  const FRedwoodItemFlushReply &Reply,
+  const FRedwoodItemFlushSent &Sent
+) {
+  WriteCommittedFlushToSnapshot(Snapshot, Reply, Sent);
+  switch (ClassifyItemFlushReply(Reply, Sent.BatchSeq)) {
+    case ERedwoodItemFlushOutcome::NotApplied:
+      // FORK(hollowed-oath): a notApplied reply also commits a seq (an empty one, that consumes
+      // the probed seq), so the snapshot follows it for the same reason.
+      if (Reply.CommittedSeq > Snapshot.InventorySeq) {
+        Snapshot.InventorySeq = Reply.CommittedSeq;
+      }
+      break;
+    case ERedwoodItemFlushOutcome::SequenceGap:
+      // On a sequence gap the component realigns its lane back to the backend's fence. The
+      // snapshot must follow, or the forward seed in FlushItemsForCharacterComponent moves the lane
+      // straight back to the gapped seq, which the backend refuses forever.
+      if (Snapshot.InventorySeq > Reply.CommittedSeq) {
+        Snapshot.InventorySeq = Reply.CommittedSeq;
+      }
+      break;
+    default:
+      break;
+  }
+  ClearSettledSnapshotSeqProbe(Snapshot);
+}
+
+void URedwoodServerGameSubsystem::MarkSnapshotSeqUnconfirmed(
+  FRedwoodCharacterBackend &Snapshot, int64 Seq, bool bCarriedCurrency
+) {
+  // The lowest unsettled seq is probed first; once the committed seq passes it, every later one
+  // is settled the same way.
+  if (Seq > Snapshot.InventorySeq &&
+      (!Snapshot.bInventorySeqUnconfirmed || Seq < Snapshot.UnconfirmedInventorySeq)) {
+    Snapshot.bInventorySeqUnconfirmed = true;
+    Snapshot.UnconfirmedInventorySeq = Seq;
+  }
+  // The batch may have moved the balance and used its keys, whatever its seq now says.
+  if (bCarriedCurrency) {
+    Snapshot.bCurrencyAmountUnknown = true;
+  }
 }
 
 void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
@@ -3385,25 +3496,7 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
   // The snapshot is updated BEFORE CompleteItemFlush, because CompleteItemFlush runs a parked flush
   // attempt, and that attempt seeds its seq forward from the snapshot.
   if (PlayerStateComponent) {
-    FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
-    WriteCommittedFlushToSnapshot(Snapshot, Reply, Sent);
-
-    // FORK(hollowed-oath): a notApplied reply also commits a seq (an empty one, that consumes the
-    // probed seq), so the snapshot follows it for the same reason.
-    if (Reply.bNotApplied && Reply.CommittedSeq >= Sent.BatchSeq &&
-        Reply.CommittedSeq > Snapshot.InventorySeq) {
-      Snapshot.InventorySeq = Reply.CommittedSeq;
-    }
-
-    // On a sequence gap the component realigns its lane back to the backend's fence. The snapshot
-    // must follow, or the forward seed in FlushItemsForCharacterComponent moves the lane straight
-    // back to the gapped seq, which the backend refuses forever.
-    const bool bSequenceGap = !Reply.Error.IsEmpty() && !Reply.bFinal && !Reply.bRebaseRequired &&
-      !Reply.bNotApplied &&
-      Reply.CommittedSeq >= 0 && Reply.CommittedSeq < Sent.BatchSeq - 1;
-    if (bSequenceGap && Snapshot.InventorySeq > Reply.CommittedSeq) {
-      Snapshot.InventorySeq = Reply.CommittedSeq;
-    }
+    WriteFlushReplyToSnapshot(PlayerStateComponent->RedwoodCharacter, Reply, Sent);
   }
 
   // Also before CompleteItemFlush: the parked attempt it runs must already see the hold, or it
@@ -3569,7 +3662,9 @@ void URedwoodServerGameSubsystem::HoldItemFlushForCurrencyReload(
   if (PlayerStateComponent) {
     Reload->PlayerStateComponent = PlayerStateComponent;
   }
-  if (CharacterComponent->IsCurrencyRebaseRequired()) {
+  // A component with an unconfirmed batch is only held: its probe goes out after the reload, and
+  // a rebase now could re-chain an entry that batch already committed.
+  if (CharacterComponent->IsCurrencyRebaseRequired() && !CharacterComponent->IsCurrencyBatchUnconfirmed()) {
     Reload->CharacterComponents.AddUnique(CharacterComponent);
   }
   AddHeldItemFlush(
@@ -3728,7 +3823,10 @@ void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
   const TWeakObjectPtr<URedwoodPlayerStateComponent> WeakPlayerState = Reload->PlayerStateComponent;
   for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Components) {
     URedwoodCharacterComponent *Component = WeakComponent.Get();
+    // A component whose batch is open or unconfirmed takes no rebase: that batch may hold entries
+    // the balance already counts. It asks for a reload again once its probe has settled.
     if (IsValid(Component) && Component->IsCurrencyRebaseRequired() &&
+        !Component->IsItemFlushInFlight() && !Component->IsCurrencyBatchUnconfirmed() &&
         !ApplyCurrencyReload(Component, WeakPlayerState.Get(), Balance, GrantKeys)) {
       RetryCurrencyReload(CharacterId);
       return;
@@ -4142,7 +4240,8 @@ bool URedwoodServerGameSubsystem::PrepareItemTradeSide(
   // trade: the balance and the seq before the trade would then be guesses.
   if (CharacterComponent->IsItemFlushInFlight() || CharacterComponent->IsCurrencyBatchUnconfirmed() ||
       HasOpenItemFlush(CharacterId) ||
-      HasUnconfirmedCurrencyBatch(CharacterId)) {
+      HasUnconfirmedCurrencyBatch(CharacterId) ||
+      PlayerStateComponent->RedwoodCharacter.bInventorySeqUnconfirmed) {
     OutError = FString::Printf(TEXT("character %s has an item flush in flight or unconfirmed"), *CharacterId);
     return false;
   }

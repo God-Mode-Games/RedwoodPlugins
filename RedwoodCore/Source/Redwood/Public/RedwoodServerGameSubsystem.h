@@ -567,6 +567,21 @@ public:
     const FRedwoodItemFlushSent &Sent
   );
 
+  // The whole snapshot half of a reply: the committed half above, the seq a notApplied consumed,
+  // and the seq a sequence gap lowers to. Also used when the component that sent the batch is gone.
+  static void WriteFlushReplyToSnapshot(
+    FRedwoodCharacterBackend &Snapshot,
+    const FRedwoodItemFlushReply &Reply,
+    const FRedwoodItemFlushSent &Sent
+  );
+
+  // A batch of a component that is gone may have committed at Seq: marks the snapshot (see
+  // FRedwoodCharacterBackend::bInventorySeqUnconfirmed), and its balance unknown when the batch
+  // carried currency or grant keys, so the next component probes the seq and then reloads.
+  static void MarkSnapshotSeqUnconfirmed(
+    FRedwoodCharacterBackend &Snapshot, int64 Seq, bool bCarriedCurrency
+  );
+
   // Hands the reply to CompleteItemFlush and keeps the PlayerState snapshot (nullable) in step:
   // the committed seq and balance on success, a lowered seq on a sequence gap. Broadcasts the
   // reply's alerts.
@@ -943,6 +958,13 @@ private:
   // R34: after a sidecar reconnect, every open flush is marked unconfirmed and re-sent as a probe,
   // with its settle. Its old reply, if it ever comes, is ignored by generation.
   void RequeueItemFlushesAfterReconnect();
+  // Settles a flush whose component is gone (a respawn): logs every entry and key the reply does
+  // not prove saved, writes the reply to the snapshot, and marks the snapshot when the outcome is
+  // unknown, so the next component probes the seq. Reply is null when no reply settles the flush;
+  // LostReplyWhy then says why.
+  void SettleItemFlushOfGoneComponent(
+    FRedwoodInFlightItemFlush &Flight, const FRedwoodItemFlushReply *Reply, const FString &LostReplyWhy
+  );
   // The components whose last flush reply left a batch unconfirmed (its outcome unknown), per
   // character. A trade must not start while any still is: the probe that settles it could find the
   // batch committed or not, so the balance before the trade is a guess.
