@@ -3185,13 +3185,19 @@ bool URedwoodServerGameSubsystem::ApplyCurrencyReload(
     }
   }
 
-  // The loaded balance is committed, so the snapshot takes it, as it takes a flush's. The keys
-  // too: they are the backend's whole set, read in the same transaction as the balance, so they
-  // replace the snapshot's (and carry a key that a flush committed but whose ack was lost).
+  // The loaded balance is committed, so the snapshot takes it, as it takes a flush's. The keys are
+  // merged in, not swapped in: the backend never removes a key, so every key on the snapshot is
+  // still used, and one that a racing batch committed after the reload read the database would be
+  // lost by a replace. The merge adds a key that a flush committed but whose ack was lost.
   if (PlayerStateComponent) {
-    PlayerStateComponent->RedwoodCharacter.CurrencyAmount = Balance;
-    PlayerStateComponent->RedwoodCharacter.bCurrencyAmountUnknown = false;
-    PlayerStateComponent->RedwoodCharacter.GrantKeys = GrantKeys;
+    FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+    Snapshot.CurrencyAmount = Balance;
+    Snapshot.bCurrencyAmountUnknown = false;
+    for (const FString &GrantKey : GrantKeys) {
+      if (!ContainsGrantKey(Snapshot.GrantKeys, GrantKey)) {
+        Snapshot.GrantKeys.Add(GrantKey);
+      }
+    }
   }
 
   CharacterComponent->OnCurrencyRebased.Broadcast(Balance);

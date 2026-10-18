@@ -413,15 +413,18 @@ bool FRedwoodCurrencyReloadRebasesTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("The reply parses"), Result == ERedwoodCurrencyReloadResult::Applied);
   TestEqual(TEXT("The balance is read exactly"), Balance, (int64)2000);
   TestTrue(TEXT("The used keys are read"), GrantKeys == TArray<FString>{Fixture::QuestGrantKey});
-  TestEqual(TEXT("The snapshot lacks the key before"), PlayerState->RedwoodCharacter.GrantKeys.Num(), 0);
+  // A key a racing batch committed after the reload read the database: on the snapshot, not in
+  // the reply. Keys are never removed, so it must stay.
+  const FString RacedGrantKey = TEXT("quest:Raced");
+  PlayerState->RedwoodCharacter.GrantKeys = {RacedGrantKey};
   TestTrue(
     TEXT("The reload applies"),
     URedwoodServerGameSubsystem::ApplyCurrencyReload(Component, PlayerState, Balance, GrantKeys)
   );
   // A key that a batch committed while its ack was lost reaches the snapshot only through here.
   TestTrue(
-    TEXT("The snapshot takes the reloaded keys"),
-    PlayerState->RedwoodCharacter.GrantKeys == TArray<FString>{Fixture::QuestGrantKey}
+    TEXT("The snapshot keeps its key and gains the reloaded one"),
+    PlayerState->RedwoodCharacter.GrantKeys == TArray<FString>{RacedGrantKey, Fixture::QuestGrantKey}
   );
 
   TestFalse(TEXT("The hold ends"), Component->IsCurrencyRebaseRequired());

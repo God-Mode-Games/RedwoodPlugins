@@ -410,7 +410,7 @@ public:
   );
 
   // Applies a parsed reload to one component that asked for it: rebases its held currency from
-  // Balance, writes the balance and the grant keys to the snapshot, and tells the game
+  // Balance, writes the balance to the snapshot and merges the grant keys into it, and tells the game
   // (OnCurrencyRebased). Returns false when the rebase cannot apply; the component and the
   // snapshot are then unchanged and it stays held.
   static bool ApplyCurrencyReload(
