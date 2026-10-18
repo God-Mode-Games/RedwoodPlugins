@@ -450,6 +450,10 @@ public:
   // Logs a warning the first time only.
   void MarkWriterFenceLost();
 
+  // Logs every staged entry and grant key through LogCurrencyForStaff, so staff can rebuild what
+  // this server will never save. Why says what happened to them.
+  void LogStagedCurrencyForStaff(const FString &Why) const;
+
   // FORK(hollowed-oath): R34. The connection that carried the in-flight batch dropped, so its reply
   // never comes. The batch may have committed: it becomes unconfirmed with the counts it took
   // (exactly as after an unknown-outcome error), and the slot is released, so the next claim is a
@@ -684,9 +688,6 @@ private:
     const TArray<TPair<FString, uint64>> &SentDeletes
   );
   void RemoveSentCurrency(int32 SentCurrencyCount, int32 SentGrantCount);
-  // One Error line per staged entry and grant key, each starting with Lead ("<Lead> currency entry
-  // ..."), so staff can rebuild what this server will never save.
-  void LogStagedCurrency(const FString &Lead) const;
   void MarkCurrencyBatchUnconfirmed(int32 SentCurrencyCount, int32 SentGrantCount, int64 SentSeq);
   // FORK(hollowed-oath) END
 

@@ -131,6 +131,29 @@ inline ERedwoodItemFlushOutcome ClassifyItemFlushReply(
   return ERedwoodItemFlushOutcome::Unknown;
 }
 
+// What staff can tell about an entry or a grant key this server will not save itself.
+enum class ERedwoodCurrencySaveState : uint8 {
+  // Its batch went out and no reply settled it: it may be saved. A re-grant without reusing its id
+  // would pay it twice.
+  Unknown,
+  // It never reached the database, or the backend refused it.
+  NotSaved,
+};
+
+// The one staff-rebuild log: one Error line per entry and per grant key, each with the character,
+// the save state, Why (what happened to it), and the reuse-id rule. Every place that gives up on
+// currency logs through it, so staff read one format. The first UnknownEntryCount entries and
+// UnknownGrantCount keys are logged as Unknown, the rest as NotSaved: the front of a queue is what
+// went out first.
+REDWOOD_API void LogCurrencyForStaff(
+  const FString &CharacterId,
+  const FString &Why,
+  TConstArrayView<FRedwoodCurrencyEntry> Entries,
+  int32 UnknownEntryCount,
+  TConstArrayView<FString> GrantKeys,
+  int32 UnknownGrantCount
+);
+
 // The backend refuses any other id shape for good, so the game server refuses it at the queue.
 constexpr int32 CurrencyEntryIdLength = 32;
 

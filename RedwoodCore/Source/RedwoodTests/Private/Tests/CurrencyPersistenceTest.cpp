@@ -304,9 +304,10 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 // component refuses new currency, and the game hears it once, with the character.
 bool FRedwoodCurrencyFinalRefusalFreezesTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyPersistenceTest;
-  // One line per dropped entry and key, then one per refused entry while frozen.
-  AddExpectedError(TEXT("dropped currency entry"), EAutomationExpectedErrorFlags::Contains, 2);
-  AddExpectedError(TEXT("dropped grant"), EAutomationExpectedErrorFlags::Contains, 1);
+  // One staff line per dropped entry and key, then one per refused entry while frozen.
+  AddExpectedErrorPlain(
+    TEXT("NOT saved: dropped by the freeze after a final refusal (overdraft)"), EAutomationExpectedErrorFlags::Contains, 3
+  );
   AddExpectedError(TEXT("is frozen after a final refusal"), EAutomationExpectedErrorFlags::Contains, 1);
   URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
   Component->RedwoodCharacterId = TEXT("character-1");
@@ -550,12 +551,12 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencyFreezeMarksUnknownOutcomeTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyPersistenceTest;
   AddExpectedErrorPlain(
-    TEXT("dropped currency entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved). A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): dropped by the freeze after a final refusal (refused). A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
   AddExpectedErrorPlain(
-    TEXT("dropped currency entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB delta 200 reason Currency.Reason.Loot, NOT saved"),
+    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB delta 200 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );

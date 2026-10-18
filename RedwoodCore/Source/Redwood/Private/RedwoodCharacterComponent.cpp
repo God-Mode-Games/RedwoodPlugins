@@ -1091,49 +1091,28 @@ void URedwoodCharacterComponent::MarkWriterFenceLost() {
   );
   // Kept, not dropped, but never sent from here: the same lines a freeze writes, so staff can tell
   // what may need a re-grant.
-  LogStagedCurrency(
-    FString::Printf(TEXT("Writer fence lost: character %s left unsent"), *RedwoodCharacterId)
-  );
+  LogStagedCurrencyForStaff(TEXT("writer fence lost, another session owns the character"));
   OnWriterFenceLost.Broadcast(RedwoodCharacterId);
 }
 
-void URedwoodCharacterComponent::LogStagedCurrency(const FString &Lead) const {
+void URedwoodCharacterComponent::LogStagedCurrencyForStaff(const FString &Why) const {
   // The backend has the refusal alert; these lines are what staff rebuild the rest from. The front
   // of an unconfirmed batch may have committed (its ack was lost), so it is told apart: re-granting
-  // a saved amount would pay it twice. A re-grant reuses the logged entry id either way, so the
-  // backend's duplicate-id check refuses a copy.
-  const int32 UnknownEntryCount = bCurrencyBatchUnconfirmed ? UnconfirmedCurrencyCount : 0;
-  const int32 UnknownGrantCount = bCurrencyBatchUnconfirmed ? UnconfirmedGrantCount : 0;
-  for (int32 Index = 0; Index < PendingCurrencyEntries.Num(); ++Index) {
-    const FRedwoodCurrencyEntry &Entry = PendingCurrencyEntries[Index];
-    UE_LOG(
-      LogRedwood,
-      Error,
-      TEXT("%s currency entry %s delta %lld reason %s, %s. A re-grant must reuse entry id %s, so the backend refuses a second copy."),
-      *Lead,
-      *Entry.Id,
-      Entry.Delta,
-      *Entry.Reason,
-      Index < UnknownEntryCount ? TEXT("outcome UNKNOWN (it may be saved)") : TEXT("NOT saved"),
-      *Entry.Id
-    );
-  }
-  for (int32 Index = 0; Index < PendingGrantKeys.Num(); ++Index) {
-    UE_LOG(
-      LogRedwood,
-      Error,
-      TEXT("%s grant %s, %s"),
-      *Lead,
-      *PendingGrantKeys[Index],
-      Index < UnknownGrantCount ? TEXT("outcome UNKNOWN (it may be saved)") : TEXT("NOT saved")
-    );
-  }
+  // a saved amount without its id would pay it twice.
+  LogCurrencyForStaff(
+    RedwoodCharacterId,
+    Why,
+    PendingCurrencyEntries,
+    bCurrencyBatchUnconfirmed ? UnconfirmedCurrencyCount : 0,
+    PendingGrantKeys,
+    bCurrencyBatchUnconfirmed ? UnconfirmedGrantCount : 0
+  );
 }
 
 void URedwoodCharacterComponent::FreezeAfterFinalRefusal(const FString &Reason) {
-  LogStagedCurrency(FString::Printf(
-    TEXT("Final refusal (%s): character %s dropped"), *Reason, *RedwoodCharacterId
-  ));
+  LogStagedCurrencyForStaff(
+    FString::Printf(TEXT("dropped by the freeze after a final refusal (%s)"), *Reason)
+  );
   PendingCurrencyEntries.Empty();
   PendingGrantKeys.Empty();
   bCurrencyBatchUnconfirmed = false;

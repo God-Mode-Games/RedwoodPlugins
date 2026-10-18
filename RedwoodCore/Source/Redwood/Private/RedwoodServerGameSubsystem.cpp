@@ -220,27 +220,14 @@ void URedwoodServerGameSubsystem::Deinitialize() {
   InFlightItemFlushes.Reset();
   for (TPair<uint64, FRedwoodInFlightItemFlush> &Pair : OpenFlushes) {
     FRedwoodInFlightItemFlush &Flight = Pair.Value;
-    for (const FRedwoodCurrencyEntry &Entry : Flight.CurrencyEntries) {
-      UE_LOG(
-        LogRedwood,
-        Error,
-        TEXT("Server shutting down: character %s left in flight currency entry %s delta %lld reason %s, outcome UNKNOWN (it may be saved). A re-grant must reuse entry id %s, so the backend refuses a second copy."),
-        *Flight.CharacterId,
-        *Entry.Id,
-        Entry.Delta,
-        *Entry.Reason,
-        *Entry.Id
-      );
-    }
-    for (const FString &GrantKey : Flight.Sent.GrantKeys) {
-      UE_LOG(
-        LogRedwood,
-        Error,
-        TEXT("Server shutting down: character %s left in flight grant %s, outcome UNKNOWN (it may be saved)"),
-        *Flight.CharacterId,
-        *GrantKey
-      );
-    }
+    LogCurrencyForStaff(
+      Flight.CharacterId,
+      TEXT("in flight when the server shut down"),
+      Flight.CurrencyEntries,
+      Flight.CurrencyEntries.Num(),
+      Flight.Sent.GrantKeys,
+      Flight.Sent.GrantKeys.Num()
+    );
     for (const TPair<FString, uint64> &Upsert : Flight.Sent.Upserts) {
       UE_LOG(
         LogRedwood,
@@ -3758,33 +3745,23 @@ void URedwoodServerGameSubsystem::GiveUpCurrencyReload(
     return;
   }
 
-  // Everything still held. A live component keeps it and tries again on its next flush; a
-  // detached pawn's is lost when the pawn goes, so this line is what staff rebuild it from.
-  TArray<FString> HeldLines;
-  for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Reload->CharacterComponents) {
-    const URedwoodCharacterComponent *Component = WeakComponent.Get();
-    if (!Component) {
-      continue;
-    }
-    for (const FRedwoodCurrencyEntry &Entry : Component->GetPendingCurrencyEntries()) {
-      HeldLines.Add(FString::Printf(
-        TEXT("entry %s delta %lld reason %s"), *Entry.Id, Entry.Delta, *Entry.Reason
-      ));
-    }
-    for (const FString &GrantKey : Component->GetPendingGrantKeys()) {
-      HeldLines.Add(FString::Printf(TEXT("grant %s"), *GrantKey));
-    }
-  }
   UE_LOG(
     LogRedwood,
     Error,
-    TEXT(
-      "Currency reload for character %s gave up (%s). Its held flushes now settle; these are NOT saved: [%s]"
-    ),
+    TEXT("Currency reload for character %s gave up (%s). Its held flushes now settle."),
     *CharacterId,
-    *Reason,
-    *FString::Join(HeldLines, TEXT("; "))
+    *Reason
   );
+  // Everything still held. A live component keeps it and tries again on its next flush; a
+  // detached pawn's is lost when the pawn goes, so these lines are what staff rebuild it from. A
+  // component whose writer fence is lost logged its currency when it lost it.
+  const FString Why = FString::Printf(TEXT("held by a currency reload that gave up (%s)"), *Reason);
+  for (const TWeakObjectPtr<URedwoodCharacterComponent> &WeakComponent : Reload->CharacterComponents) {
+    const URedwoodCharacterComponent *Component = WeakComponent.Get();
+    if (Component && !Component->IsWriterFenceLost()) {
+      Component->LogStagedCurrencyForStaff(Why);
+    }
+  }
   AbandonCurrencyReload(CharacterId);
 }
 
@@ -3929,28 +3906,9 @@ bool URedwoodServerGameSubsystem::ApplyOfflineCurrency(
   if (!Refusal.IsEmpty()) {
     // As a final refusal online: the whole batch is dropped, nothing moves, and each part is
     // logged so it can be rebuilt by hand.
-    for (const FRedwoodCurrencyEntry &Entry : Entries) {
-      UE_LOG(
-        LogRedwood,
-        Error,
-        TEXT("Offline save refused (%s): character %s dropped currency entry %s delta %lld reason %s, NOT saved"),
-        *Refusal,
-        *Character.Id,
-        *Entry.Id,
-        Entry.Delta,
-        *Entry.Reason
-      );
-    }
-    for (const FString &GrantKey : GrantKeys) {
-      UE_LOG(
-        LogRedwood,
-        Error,
-        TEXT("Offline save refused (%s): character %s dropped grant key %s, NOT saved"),
-        *Refusal,
-        *Character.Id,
-        *GrantKey
-      );
-    }
+    LogCurrencyForStaff(
+      Character.Id, FString::Printf(TEXT("Offline save refused (%s)"), *Refusal), Entries, 0, GrantKeys, 0
+    );
     return false;
   }
 
@@ -4592,26 +4550,21 @@ void URedwoodServerGameSubsystem::GiveUpItemsTrade(const FString &TradeId, const
     return;
   }
 
-  // Staff rebuild the trade from this line: it may have committed or not, and only the database
-  // can tell. A re-grant must reuse the entry ids, so the backend refuses a second copy.
-  TArray<FString> EntryLines;
-  for (const FRedwoodItemTradeSide *Side : {&Trade->From, &Trade->To}) {
-    for (const FRedwoodCurrencyEntry &Entry : Side->Entries) {
-      EntryLines.Add(FString::Printf(
-        TEXT("character %s entry %s delta %lld"), *Side->CharacterId, *Entry.Id, Entry.Delta
-      ));
-    }
-  }
+  // Staff rebuild the trade from these lines: it may have committed or not, and only the database
+  // can tell.
   UE_LOG(
     LogRedwood,
     Error,
-    TEXT("Trade %s (%s -> %s) gave up (%s). Its outcome is UNKNOWN; both characters freeze. Currency: [%s]"),
+    TEXT("Trade %s (%s -> %s) gave up (%s). Its outcome is UNKNOWN; both characters freeze."),
     *TradeId,
     *Trade->From.CharacterId,
     *Trade->To.CharacterId,
-    *Reason,
-    *FString::Join(EntryLines, TEXT("; "))
+    *Reason
   );
+  const FString Why = FString::Printf(TEXT("in trade %s, which gave up (%s)"), *TradeId, *Reason);
+  for (const FRedwoodItemTradeSide *Side : {&Trade->From, &Trade->To}) {
+    LogCurrencyForStaff(Side->CharacterId, Why, Side->Entries, Side->Entries.Num(), {}, 0);
+  }
 
   // The same freeze as a final refusal: the balance and the seq of both characters are unknown, so
   // nothing staged can be sent, and only a fresh load from the database repairs them. Nothing is in

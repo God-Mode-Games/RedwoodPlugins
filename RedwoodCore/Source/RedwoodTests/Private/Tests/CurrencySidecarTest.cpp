@@ -510,7 +510,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencySidecarFinalRefusalFreezesTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
-  AddExpectedError(TEXT("dropped currency entry"), EAutomationExpectedErrorFlags::Contains, 0);
+  AddExpectedErrorPlain(TEXT("dropped by the freeze after a final refusal"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedError(TEXT("is frozen after a final refusal"), EAutomationExpectedErrorFlags::Contains, 0);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
@@ -595,10 +595,14 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencySidecarSaleCreditNeverLeavesTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
-  AddExpectedError(TEXT("dropped currency entry AAAA"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedErrorPlain(
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta -2000 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
   // The credit is dropped, and logged so staff can see it never committed.
   AddExpectedErrorPlain(
-    TEXT("dropped currency entry CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC delta 25 reason Currency.Reason.Merchant.Sell"),
+    TEXT("entry CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC delta 25 reason Currency.Reason.Merchant.Sell, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -847,7 +851,10 @@ bool FRedwoodCurrencySidecarGiveUpTest::RunTest(const FString &Parameters) {
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedError(TEXT("Currency reload failed"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedErrorPlain(
-    TEXT("gave up (6 attempts failed). Its held flushes now settle; these are NOT saved: [entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot]"),
+    TEXT("gave up (6 attempts failed). Its held flushes now settle."), EAutomationExpectedErrorFlags::Contains, 1
+  );
+  AddExpectedErrorPlain(
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, NOT saved: held by a currency reload that gave up (6 attempts failed)"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -900,7 +907,16 @@ bool FRedwoodCurrencySidecarWriterFenceLostTest::RunTest(const FString &Paramete
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedError(TEXT("Currency reload failed"), EAutomationExpectedErrorFlags::Contains, 0);
-  AddExpectedErrorPlain(TEXT("gave up (this session no longer owns the character)"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedErrorPlain(
+    TEXT("gave up (this session no longer owns the character). Its held flushes now settle."),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
+  AddExpectedErrorPlain(
+    TEXT("NOT saved: held by a currency reload that gave up (this session no longer owns the character)"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
@@ -949,7 +965,14 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencySidecarShutdownTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
-  AddExpectedErrorPlain(TEXT("gave up (the server is shutting down)"), EAutomationExpectedErrorFlags::Contains, 1);
+  AddExpectedErrorPlain(
+    TEXT("gave up (the server is shutting down). Its held flushes now settle."), EAutomationExpectedErrorFlags::Contains, 1
+  );
+  AddExpectedErrorPlain(
+    TEXT("NOT saved: held by a currency reload that gave up (the server is shutting down)"),
+    EAutomationExpectedErrorFlags::Contains,
+    1
+  );
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
@@ -1071,7 +1094,7 @@ bool FRedwoodCurrencySidecarFreezeWaitsForReplyTest::RunTest(const FString &Para
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedErrorPlain(
-    TEXT("dropped currency entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta -2000 reason Currency.Reason.Loot, NOT saved"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta -2000 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -1138,7 +1161,7 @@ bool FRedwoodCurrencySidecarFlushWriterFenceLostTest::RunTest(const FString &Par
   );
   // The kept entry is logged once, the way a freeze logs it, for staff.
   AddExpectedErrorPlain(
-    TEXT("Writer fence lost: character character-1 left unsent currency entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, NOT saved. A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, NOT saved: writer fence lost, another session owns the character. A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -1990,6 +2013,8 @@ bool FRedwoodCurrencyTradeNoSettlingReplyTest::RunTest(const FString &Parameters
   AddExpectedErrorPlain(TEXT("got no reply"), EAutomationExpectedErrorFlags::Contains, 1);
   AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, Resends);
   AddExpectedErrorPlain(TEXT("Its outcome is UNKNOWN"), EAutomationExpectedErrorFlags::Contains, 1);
+  // A staff line for each side's entry.
+  AddExpectedErrorPlain(TEXT("outcome UNKNOWN (it may be saved): in trade"), EAutomationExpectedErrorFlags::Contains, 2);
   AddExpectedErrorPlain(TEXT("is frozen after a final refusal"), EAutomationExpectedErrorFlags::Contains, 1);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
@@ -2625,6 +2650,8 @@ bool FRedwoodCurrencyTradeIdReusedTest::RunTest(const FString &Parameters) {
   AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, 3);
   AddExpectedErrorPlain(TEXT("a resend is the same request. This is a bug."), EAutomationExpectedErrorFlags::Contains, 1);
   AddExpectedErrorPlain(TEXT("Its outcome is UNKNOWN"), EAutomationExpectedErrorFlags::Contains, 1);
+  // A staff line for each side's entry.
+  AddExpectedErrorPlain(TEXT("outcome UNKNOWN (it may be saved): in trade"), EAutomationExpectedErrorFlags::Contains, 2);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
@@ -2688,6 +2715,8 @@ bool FRedwoodCurrencyTradeCommitUnknownEveryAttemptTest::RunTest(const FString &
   const int32 MaxAttempts = URedwoodServerGameSubsystem::TradeMaxAttempts;
   AddExpectedErrorPlain(TEXT("Failed to trade items"), EAutomationExpectedErrorFlags::Contains, MaxAttempts);
   AddExpectedErrorPlain(TEXT("Its outcome is UNKNOWN"), EAutomationExpectedErrorFlags::Contains, 1);
+  // A staff line for each side's entry.
+  AddExpectedErrorPlain(TEXT("outcome UNKNOWN (it may be saved): in trade"), EAutomationExpectedErrorFlags::Contains, 2);
   FSidecarHarness Harness(*this);
   if (!Harness.Connect()) {
     return false;
@@ -2876,7 +2905,7 @@ bool FRedwoodCurrencySidecarShutdownOpenFlushTest::RunTest(const FString &Parame
   const FString RewardKey = TEXT("quest:Q1");
   AddExpectedErrorPlain(
     FString::Printf(
-      TEXT("left in flight currency entry %s delta 500 reason %s, outcome UNKNOWN (it may be saved). A re-grant must reuse entry id %s"),
+      TEXT("entry %s delta 500 reason %s, outcome UNKNOWN (it may be saved): in flight when the server shut down. A re-grant must reuse entry id %s"),
       *EntryIdA,
       *LootReason,
       *EntryIdA
@@ -2885,7 +2914,7 @@ bool FRedwoodCurrencySidecarShutdownOpenFlushTest::RunTest(const FString &Parame
     1
   );
   AddExpectedErrorPlain(
-    FString::Printf(TEXT("left in flight grant %s, outcome UNKNOWN"), *RewardKey),
+    FString::Printf(TEXT("grant %s, outcome UNKNOWN (it may be saved): in flight when the server shut down"), *RewardKey),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
