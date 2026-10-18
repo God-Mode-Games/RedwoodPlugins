@@ -3155,7 +3155,19 @@ FRedwoodItemFlushReply URedwoodServerGameSubsystem::ParseItemsFlushReply(
   // The sidecar fills committedSeq with 0 on both. Read as a fence, that 0 is a sequence gap: the
   // lane would realign to 0, and a batch of item rows re-sent at seq 1 is acked as a replay and
   // never saved.
-  if (Parsed.bTimedOut || Parsed.bNotForwarded) {
+  // commitUnknown is the realm's own "may have applied": an unknown outcome, so it is no refusal and
+  // no fence either, whatever else the reply says. The batch is then re-sent as a probe.
+  Reply->TryGetBoolField(TEXT("commitUnknown"), Parsed.bCommitUnknown);
+  if (Parsed.bCommitUnknown) {
+    Parsed.bFinal = false;
+    Parsed.bRebaseRequired = false;
+    Parsed.bNotApplied = false;
+    Parsed.bNotForwarded = false;
+    if (Parsed.Error.IsEmpty()) {
+      Parsed.Error = TEXT("the realm could not confirm the commit");
+    }
+  }
+  if (Parsed.bTimedOut || Parsed.bNotForwarded || Parsed.bCommitUnknown) {
     Parsed.CommittedSeq = -1;
   }
 
@@ -4174,6 +4186,10 @@ FRedwoodItemTradeReply URedwoodServerGameSubsystem::ParseItemsTradeReply(
   Reply->TryGetNumberField(TEXT("toCommittedSeq"), ToCommittedSeqValue);
   Parsed.FromCommittedSeq = static_cast<int64>(FromCommittedSeqValue);
   Parsed.ToCommittedSeq = static_cast<int64>(ToCommittedSeqValue);
+  ReadSidecarDeliveryFlags(
+    Reply, Parsed.Error, TradeTimedOutError, Parsed.bTimedOut, Parsed.bNotForwarded
+  );
+  Reply->TryGetBoolField(TEXT("commitUnknown"), Parsed.bCommitUnknown);
   ParseCurrencyAlerts(Reply, Parsed.Alerts);
   return Parsed;
 }
@@ -4181,8 +4197,13 @@ FRedwoodItemTradeReply URedwoodServerGameSubsystem::ParseItemsTradeReply(
 ERedwoodItemTradeOutcome URedwoodServerGameSubsystem::ClassifyItemsTradeReply(
   const FRedwoodItemTradeReply &Reply, int64 FromSeqBefore, int64 ToSeqBefore
 ) {
-  if (!Reply.bReadable) {
+  // The flags come first: a reply that says it may have applied is never read as a refusal, and
+  // never as a commit whose fences could be filler.
+  if (!Reply.bReadable || Reply.bTimedOut || Reply.bCommitUnknown) {
     return ERedwoodItemTradeOutcome::Unknown;
+  }
+  if (Reply.bNotForwarded) {
+    return ERedwoodItemTradeOutcome::NotForwarded;
   }
   if (Reply.Error.IsEmpty()) {
     // A success whose fences do not pass the seqs before the trade cannot be this trade's commit;
@@ -4201,12 +4222,6 @@ ERedwoodItemTradeOutcome URedwoodServerGameSubsystem::ClassifyItemsTradeReply(
       ToSeqBefore
     );
     return ERedwoodItemTradeOutcome::Unknown;
-  }
-  if (Reply.Error.Equals(TradeTimedOutError, ESearchCase::CaseSensitive)) {
-    return ERedwoodItemTradeOutcome::Unknown;
-  }
-  if (Reply.Error.Equals(SidecarRealmNotConnectedError, ESearchCase::CaseSensitive)) {
-    return ERedwoodItemTradeOutcome::NotForwarded;
   }
   return ERedwoodItemTradeOutcome::Refused;
 }

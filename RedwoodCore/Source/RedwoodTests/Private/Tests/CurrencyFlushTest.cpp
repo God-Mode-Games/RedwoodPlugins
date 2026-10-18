@@ -201,6 +201,16 @@ bool FRedwoodItemFlushReplyParseTest::RunTest(const FString &Parameters) {
   TestFalse(TEXT("A present flag wins over the text"), FlagWins.bTimedOut);
   TestTrue(TEXT("The other flag is read"), FlagWins.bNotForwarded);
 
+  // The realm's own "may have applied" is an unknown outcome: no refusal and no fence, whatever
+  // else the reply says, so the batch goes out again as a probe.
+  const FRedwoodItemFlushReply CommitUnknown = URedwoodServerGameSubsystem::ParseItemsFlushReply(
+    Fixture::ParseJson(TEXT(R"({"error":null,"committedSeq":7,"final":true,"commitUnknown":true})"))
+  );
+  TestTrue(TEXT("commitUnknown is read"), CommitUnknown.bCommitUnknown);
+  TestFalse(TEXT("commitUnknown is no success"), CommitUnknown.Error.IsEmpty());
+  TestFalse(TEXT("commitUnknown is no final refusal"), CommitUnknown.bFinal);
+  TestEqual(TEXT("commitUnknown carries no fence"), CommitUnknown.CommittedSeq, (int64)-1);
+
   // A sidecar that predates the flags: the text decides, with a Warning.
   AddExpectedErrorPlain(TEXT("read the outcome from its text"), EAutomationExpectedErrorFlags::Contains, 2);
   const FRedwoodItemFlushReply OldTimedOut = URedwoodServerGameSubsystem::ParseItemsFlushReply(

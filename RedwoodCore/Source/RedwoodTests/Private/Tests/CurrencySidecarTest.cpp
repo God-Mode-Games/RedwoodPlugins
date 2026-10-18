@@ -1527,6 +1527,14 @@ namespace RedwoodCurrencyTradeTest {
     );
   }
 
+  // The sidecar's reply to a trade it sent and got no answer for.
+  FString TimedOutReply() {
+    return FString::Printf(
+      TEXT(R"({"error":"%s","fromCommittedSeq":-1,"toCommittedSeq":-1,"timedOut":true})"),
+      URedwoodServerGameSubsystem::TradeTimedOutError
+    );
+  }
+
   FString ErrorReply(const FString &Error) {
     return FString::Printf(
       TEXT(R"({"error":"%s","fromCommittedSeq":-1,"toCommittedSeq":-1})"), *Error
@@ -1751,7 +1759,7 @@ bool FRedwoodCurrencyTradeTimeoutResendTest::RunTest(const FString &Parameters) 
   if (!SendTrade(Harness, From, To, Result, First)) {
     return false;
   }
-  Harness.Answer(First, ErrorReply(URedwoodServerGameSubsystem::TradeTimedOutError));
+  Harness.Answer(First, TimedOutReply());
   To.Component->QueueCurrency({MakeEntry(EntryIdA, LootAmount, ToBalance + TradedAmount + LootAmount, LootReason)}, {});
   int32 SettleCount = 0;
   Harness.Subsystem->FlushItemsForCharacterComponent(
@@ -1937,7 +1945,7 @@ bool FRedwoodCurrencyTradeItemOnlyTimeoutTest::RunTest(const FString &Parameters
   TestEqual(TEXT("The item-only trade carries an empty currency array"), CountArray(Trade.Payload, TEXT("currency")), 0);
   TestEqual(TEXT("It still carries the trade id"), Trade.Payload->GetStringField(TEXT("tradeId")), TradeId);
 
-  Harness.Answer(Trade, ErrorReply(URedwoodServerGameSubsystem::TradeTimedOutError));
+  Harness.Answer(Trade, TimedOutReply());
   TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
   TestFalse(TEXT("The caller gets an error"), Result.Error.IsEmpty());
   TestTrue(TEXT("The giver is frozen"), Harness.Subsystem->IsCharacterFrozen(FromId));
@@ -2033,13 +2041,13 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
 );
 
-// What each reply proves. The sidecar's two texts are pinned here: if either changes on one side
-// only, a timeout reads as a refusal (settled as not applied while it may have committed).
+// What each reply proves. The flags decide: a text that says one thing and a flag that says another
+// follow the flag, so a test that passes only through the text fallback fails here.
 bool FRedwoodCurrencyTradeReplyClassifyTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencyTradeTest;
-  AddExpectedErrorPlain(TEXT("fences"), EAutomationExpectedErrorFlags::Contains, 0);
-  TestEqual(TEXT("The sidecar's timeout text"), FString(URedwoodServerGameSubsystem::TradeTimedOutError), FString(TEXT("Item trade request timed out.")));
-  TestEqual(TEXT("The sidecar's no-realm text"), FString(URedwoodServerGameSubsystem::TradeRealmNotConnectedError), FString(TEXT("Realm server not connected")));
+  // The two successes whose fences do not pass a seq, and the two old-sidecar fallbacks.
+  AddExpectedErrorPlain(TEXT("do not pass the seqs before the trade"), EAutomationExpectedErrorFlags::Contains, 2);
+  AddExpectedErrorPlain(TEXT("read the outcome from its text"), EAutomationExpectedErrorFlags::Contains, 2);
 
   auto Classify = [](const FString &Json) {
     TSharedPtr<FJsonObject> Object;
@@ -2052,9 +2060,44 @@ bool FRedwoodCurrencyTradeReplyClassifyTest::RunTest(const FString &Parameters) 
   TestTrue(TEXT("A success past both seqs is a commit"), Classify(CommittedReply(FromSeq + 1, ToSeq + 1)) == ERedwoodItemTradeOutcome::Committed);
   TestTrue(TEXT("A success that does not pass a seq is unknown"), Classify(CommittedReply(FromSeq + 1, ToSeq)) == ERedwoodItemTradeOutcome::Unknown);
   TestTrue(TEXT("A success without fences is unknown"), Classify(TEXT(R"({"error":null})")) == ERedwoodItemTradeOutcome::Unknown);
-  TestTrue(TEXT("The sidecar's timeout is unknown"), Classify(ErrorReply(URedwoodServerGameSubsystem::TradeTimedOutError)) == ERedwoodItemTradeOutcome::Unknown);
-  TestTrue(TEXT("No realm is not forwarded"), Classify(ErrorReply(URedwoodServerGameSubsystem::TradeRealmNotConnectedError)) == ERedwoodItemTradeOutcome::NotForwarded);
+
+  // The flags, each with a text that would mean something else.
+  TestTrue(
+    TEXT("timedOut is unknown, whatever the text"),
+    Classify(TEXT(R"({"error":"empty trade","fromCommittedSeq":-1,"toCommittedSeq":-1,"timedOut":true})")) ==
+      ERedwoodItemTradeOutcome::Unknown
+  );
+  TestTrue(
+    TEXT("commitUnknown is unknown, whatever the text"),
+    Classify(TEXT(R"({"error":"empty trade","fromCommittedSeq":-1,"toCommittedSeq":-1,"commitUnknown":true})")) ==
+      ERedwoodItemTradeOutcome::Unknown
+  );
+  TestTrue(
+    TEXT("commitUnknown with a success shape is still unknown"),
+    Classify(TEXT(R"({"error":null,"fromCommittedSeq":5,"toCommittedSeq":10,"commitUnknown":true})")) ==
+      ERedwoodItemTradeOutcome::Unknown
+  );
+  TestTrue(
+    TEXT("notForwarded is not forwarded, whatever the text"),
+    Classify(TEXT(R"({"error":"empty trade","fromCommittedSeq":-1,"toCommittedSeq":-1,"notForwarded":true})")) ==
+      ERedwoodItemTradeOutcome::NotForwarded
+  );
+  TestTrue(
+    TEXT("A present false flag beats the timeout text"),
+    Classify(FString::Printf(
+      TEXT(R"({"error":"%s","fromCommittedSeq":-1,"toCommittedSeq":-1,"timedOut":false})"),
+      URedwoodServerGameSubsystem::TradeTimedOutError
+    )) == ERedwoodItemTradeOutcome::Refused
+  );
   TestTrue(TEXT("Any other error is a refusal"), Classify(ErrorReply(TEXT("empty trade"))) == ERedwoodItemTradeOutcome::Refused);
+
+  // A sidecar that predates the flags: its texts, with a Warning.
+  TestTrue(TEXT("An old sidecar's timeout is unknown"), Classify(ErrorReply(URedwoodServerGameSubsystem::TradeTimedOutError)) == ERedwoodItemTradeOutcome::Unknown);
+  TestTrue(
+    TEXT("An old sidecar's missing realm is not forwarded"),
+    Classify(ErrorReply(URedwoodServerGameSubsystem::SidecarRealmNotConnectedError)) == ERedwoodItemTradeOutcome::NotForwarded
+  );
+
   TestTrue(
     TEXT("An unreadable reply is unknown"),
     URedwoodServerGameSubsystem::ClassifyItemsTradeReply(

@@ -43,6 +43,8 @@ struct FRedwoodItemFlushReply {
   bool bTimedOut = false;
   // Set by the sidecar: it had no realm to send the batch to, so the batch did NOT apply.
   bool bNotForwarded = false;
+  // Set by the realm: it could not tell whether its own commit went through. Read like bTimedOut.
+  bool bCommitUnknown = false;
   TArray<TSharedPtr<FJsonObject>> Alerts;
 };
 
@@ -102,6 +104,12 @@ struct FRedwoodItemTradeReply {
   // -1 when the reply carried no fence, as every error reply does.
   int64 FromCommittedSeq = -1;
   int64 ToCommittedSeq = -1;
+  // Set by the sidecar: it sent the trade and no answer came, so it MAY have applied.
+  bool bTimedOut = false;
+  // Set by the sidecar: it had no realm to send the trade to, so it did NOT apply.
+  bool bNotForwarded = false;
+  // Set by the realm: it could not tell whether its own commit went through, so it MAY have applied.
+  bool bCommitUnknown = false;
   TArray<TSharedPtr<FJsonObject>> Alerts;
 };
 
@@ -113,8 +121,8 @@ enum class ERedwoodItemTradeOutcome : uint8 {
   Refused,
   // The sidecar did not pass this attempt to the realm.
   NotForwarded,
-  // The realm may have committed it or not: a timeout, an unreadable reply, or a success without
-  // a fence past each side's seq.
+  // The realm may have committed it or not: a timeout, a commit the realm could not confirm, an
+  // unreadable reply, or a success without a fence past each side's seq.
   Unknown,
 };
 
@@ -474,9 +482,10 @@ public:
     const FString &TradeId
   );
 
-  // FORK(hollowed-oath): the trade reply's parse and what it proves. Unknown and NotForwarded are
-  // told apart by the sidecar's own error texts (below). A success is Committed only with a fence
-  // past each side's seq before the trade: no other fence can come from this trade.
+  // FORK(hollowed-oath): the trade reply's parse and what it proves. Unknown and NotForwarded come
+  // from the reply's flags (`timedOut`, `commitUnknown`, `notForwarded`; see
+  // ReadSidecarDeliveryFlags for an older sidecar). A success is Committed only with a fence past
+  // each side's seq before the trade: no other fence can come from this trade.
   static FRedwoodItemTradeReply ParseItemsTradeReply(const TSharedPtr<FJsonObject> &Reply);
   static ERedwoodItemTradeOutcome ClassifyItemsTradeReply(
     const FRedwoodItemTradeReply &Reply, int64 FromSeqBefore, int64 ToSeqBefore
@@ -517,10 +526,8 @@ public:
 
   // The only reason the backend takes on a trade entry.
   static constexpr const TCHAR *TradeCurrencyReason = TEXT("Currency.Reason.Trade");
-  // The sidecar's replies when its realm request timed out, and when it had no realm to send to
-  // (sidecar/src/routes/game-server/items.ts). The first leaves the outcome unknown; the second
-  // means the realm never saw the attempt. Pinned by test: a changed text on either side turns a
-  // timeout into a refusal.
+  // The sidecar's text when its realm request for a trade timed out. Read only from a sidecar too
+  // old to send the `timedOut` flag (see ReadSidecarDeliveryFlags).
   static constexpr const TCHAR *TradeTimedOutError = TEXT("Item trade request timed out.");
   // A trade with no reply by then counts as timed out. The sidecar answers within its own realm
   // timeout (10 seconds), so a longer silence means the socket dropped and no reply will come.
