@@ -1379,7 +1379,11 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 // An error reply for a component that is gone changes nothing on the snapshot.
 bool FRedwoodCurrencySidecarComponentGoneErrorTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
-  AddExpectedError(TEXT("Failed to flush items (component gone)"), EAutomationExpectedErrorFlags::Contains, 1);
+  // Plain, not AddExpectedError: that one reads its pattern as a regex, where the parentheses are a
+  // group and the logged text no longer matches.
+  AddExpectedErrorPlain(
+    TEXT("Failed to flush items (component gone): concurrent flush"), EAutomationExpectedErrorFlags::Contains, 1
+  );
   const FString RewardKey = TEXT("quest:Q1");
   constexpr int64 SnapshotBalance = 1000;
   FSidecarHarness Harness(*this);
