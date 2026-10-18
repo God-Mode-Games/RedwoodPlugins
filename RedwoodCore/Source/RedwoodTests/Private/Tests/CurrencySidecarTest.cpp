@@ -3595,6 +3595,10 @@ bool FRedwoodCurrencySidecarEndPlayHandsOffTest::RunTest(const FString &Paramete
   TestEqual(TEXT("The entry is handed to the snapshot"), Snapshot.HandedOffCurrencyEntries.Num(), 1);
   TestEqual(TEXT("And the key"), Snapshot.HandedOffGrantKeys.Num(), 1);
   TestEqual(TEXT("The ended component keeps nothing"), Party.Component->GetPendingCurrencyEntries().Num(), 0);
+  // Before any component takes it, the handed-off key already counts as used.
+  URedwoodCharacterComponent *NotYetAdopted = NewObject<URedwoodCharacterComponent>(Party.PlayerState);
+  NotYetAdopted->RedwoodCharacterId = CharacterId;
+  TestTrue(TEXT("A handed-off key is used before it is taken"), NotYetAdopted->HasGrantKey(RewardKey));
 
   // The respawned component takes them, and holds them for a reload.
   URedwoodCharacterComponent *Respawned = HydrateOnPlayerState(Party.PlayerState);

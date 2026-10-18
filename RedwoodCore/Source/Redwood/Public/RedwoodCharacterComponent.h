@@ -392,8 +392,9 @@ public:
     return PendingGrantKeys;
   }
 
-  // Call before staging a one-time reward. True when the key is already used: committed (on the
-  // PlayerState snapshot), or staged, in flight or unconfirmed on this component (a key leaves the
+  // Call before staging a one-time reward. True when the key is already used: committed or handed
+  // off by a destroyed component (both on the PlayerState snapshot), or staged, in flight or
+  // unconfirmed on this component (a key leaves the
   // queue only when its batch commits). Case-sensitive, as the backend is. Staging a used key gets
   // the whole batch refused for good, which freezes the character. Keys staged on ANOTHER
   // component of the same character are not seen: stage rewards on one component.

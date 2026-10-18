@@ -907,9 +907,12 @@ bool URedwoodCharacterComponent::HasGrantKey(const FString &GrantKey) const {
   if (ContainsGrantKey(PendingGrantKeys, GrantKey)) {
     return true;
   }
+  // FORK(hollowed-oath): a key a destroyed component handed off is used too, though no
+  // component has taken it yet: staging it again would get the batch refused for good.
   const URedwoodPlayerStateComponent *PlayerStateComponent = FindPlayerStateComponent();
   return PlayerStateComponent &&
-    ContainsGrantKey(PlayerStateComponent->RedwoodCharacter.GrantKeys, GrantKey);
+    (ContainsGrantKey(PlayerStateComponent->RedwoodCharacter.GrantKeys, GrantKey) ||
+     ContainsGrantKey(PlayerStateComponent->RedwoodCharacter.HandedOffGrantKeys, GrantKey));
 }
 
 bool URedwoodCharacterComponent::QueueCurrency(
