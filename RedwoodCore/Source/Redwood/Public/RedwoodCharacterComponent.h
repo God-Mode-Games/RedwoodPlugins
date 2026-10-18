@@ -499,8 +499,9 @@ public:
   // Every entry staged during the trade comes after it on the backend, so it is re-chained from
   // Balance, and the game is told (OnCurrencyRebased): the game cannot know which balance its
   // running total should have used while the outcome was open. Nothing can be in flight here,
-  // because the trade held this character's flushes. If a re-chained entry would overflow or go
-  // below zero, nothing is re-chained and the queue waits for a reload instead (see RebaseCurrency).
+  // because the trade held this character's flushes; if one is, that is a bug, and the character
+  // freezes (ensure). If a re-chained entry would overflow or go below zero, nothing is re-chained
+  // and the queue waits for a reload instead (see RebaseCurrency).
   void RechainCurrencyAfterTrade(int64 Balance);
 
   // Moves the committed seq and NextBatchSeq forward to CommittedSeq, never back: a replay probe

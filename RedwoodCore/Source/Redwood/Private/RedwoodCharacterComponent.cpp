@@ -1016,17 +1016,26 @@ void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
 }
 
 void URedwoodCharacterComponent::RechainCurrencyAfterTrade(int64 Balance) {
-  // A batch whose reply is still open may or may not be in Balance; re-chaining its entries could
-  // count them twice. The trade's hold makes this unreachable, so say so loudly and let a reload
-  // decide once that reply is in.
-  if (bItemFlushInFlight || bCurrencyBatchUnconfirmed) {
-    UE_LOG(
-      LogRedwood,
-      Error,
-      TEXT("RechainCurrencyAfterTrade: character %s has a batch in flight or unconfirmed; waiting for a reload instead"),
-      *RedwoodCharacterId
-    );
-    RequireCurrencyReload(true);
+  // A batch whose reply is still open may or may not be in Balance, so no balance is known: a
+  // re-chain could count its entries twice, and a reload would chain the pending entries on top of
+  // that batch while it is still re-sent. The trade's hold makes this unreachable (a trade never
+  // starts with a batch open), so reaching it is a bug, and only the database can repair the
+  // state: freeze, as a final refusal does.
+  if (!ensureMsgf(
+        !bItemFlushInFlight && !bCurrencyBatchUnconfirmed,
+        TEXT("RechainCurrencyAfterTrade: character %s has a batch in flight or unconfirmed"),
+        *RedwoodCharacterId
+      )) {
+    const FString Reason = TEXT("a trade settled while a batch was in flight or unconfirmed");
+    if (URedwoodServerGameSubsystem *ServerSubsystem = GetServerSubsystem()) {
+      ServerSubsystem->FreezeCharacter(RedwoodCharacterId, FindPlayerStateComponent());
+    }
+    // With a batch in flight, its reply decides its entries; the reply then finds the character
+    // frozen and drops the rest (URedwoodServerGameSubsystem::HandleItemsFlushReply).
+    if (!bItemFlushInFlight) {
+      FreezeAfterFinalRefusal(Reason);
+    }
+    NotifyItemFlushRefusedFinal(Reason);
     return;
   }
   if (!TryRechainPendingCurrency(Balance)) {

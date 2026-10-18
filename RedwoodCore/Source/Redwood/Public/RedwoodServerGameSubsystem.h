@@ -606,6 +606,13 @@ public:
     FrozenCharacterIds.Remove(CharacterId);
   }
 
+  // Freezes the character: every component that flushes from now on drops what it has staged.
+  // Ends any reload of the character; its held attempts settle with nothing left to save.
+  // PlayerStateComponent (nullable) holds the snapshot that a later component hydrates from.
+  void FreezeCharacter(
+    const FString &CharacterId, URedwoodPlayerStateComponent *PlayerStateComponent
+  );
+
   // R35: the default reaction to a desync the game does not handle (OnItemFlushRefusedFinal or
   // OnWriterFenceLost fired with no handler bound). The character is frozen or fenced, so nothing
   // it does is saved, yet it stays in the world: an item it drops there is not in the database,
@@ -890,12 +897,6 @@ private:
 
   // Characters frozen by a final refusal (see IsCharacterFrozen).
   TSet<FString> FrozenCharacterIds;
-
-  // Freezes the character: every component that flushes from now on drops what it has staged.
-  // Ends any reload of the character; its held attempts settle with nothing left to save.
-  void FreezeCharacter(
-    const FString &CharacterId, URedwoodPlayerStateComponent *PlayerStateComponent
-  );
 
   // The sidecar's connect event: the upstream update timers, then the reloads that waited.
   void BindSidecarConnectedCallback();
