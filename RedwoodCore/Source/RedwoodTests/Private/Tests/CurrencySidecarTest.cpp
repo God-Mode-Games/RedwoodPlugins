@@ -21,6 +21,8 @@
 #include "FakeSocketIoServer.h"
 #include "RedwoodCharacterComponent.h"
 #include "RedwoodCurrencyTypes.h"
+#include "RedwoodGameModeComponent.h"
+#include "RedwoodPlayerStateComponent.h"
 #include "RedwoodServerGameSubsystem.h"
 #include "SocketIOClient.h"
 #include "SocketIONative.h"
@@ -51,6 +53,10 @@ public:
   // The same connect callback InitializeSidecar installs, on the test's socket.
   static void BindConnectedCallback(URedwoodServerGameSubsystem &Subsystem) {
     Subsystem.BindSidecarConnectedCallback();
+  }
+  // A final refusal's freeze, without driving one through a flush.
+  static void FreezeCharacter(URedwoodServerGameSubsystem &Subsystem, const FString &CharacterId) {
+    Subsystem.FreezeCharacter(CharacterId, nullptr);
   }
 };
 
@@ -1116,6 +1122,147 @@ bool FRedwoodCurrencySidecarFlushWriterFenceLostTest::RunTest(const FString &Par
   TestEqual(TEXT("Nothing new is queued"), Component->GetPendingCurrencyEntries().Num(), 1);
   TestEqual(TEXT("The game hears it once"), FenceLostCount, 1);
   TestEqual(TEXT("It names the character"), FenceLostCharacterId, CharacterId);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarAuthLoadThawsTest,
+  "Redwood.Currency.Sidecar.AuthLoadThawsAndSeedsToken",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The auth leg is the only fresh load from the database, so it is the only thaw, and only when the
+// load is complete: a reply with no balance or no writer token leaves the character frozen and
+// unset. The complete load's token then reaches the wire: the hydrated component carries it on its
+// flush, and the committed grant key joins the snapshot's keys.
+bool FRedwoodCurrencySidecarAuthLoadThawsTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  const FString AuthToken = TEXT("writer-token-from-auth");
+  const FString LoadedGrantKey = TEXT("quest:Q1");
+  const FString NewGrantKey = TEXT("quest:Q2");
+  constexpr int64 LoadedSeq = 7;
+  constexpr int64 LoadedBalance = 1500000;
+  const FString CharacterFields = FString::Printf(
+    TEXT(R"("character":{"id":"%s","playerId":"player-1","name":"Test Character","inventorySeq":%lld,)")
+    TEXT(R"("createdAt":"2026-07-20T00:00:00.000Z","updatedAt":"2026-07-20T00:00:00.000Z"})"),
+    *CharacterId,
+    LoadedSeq
+  );
+  const FString ItemsField = FString::Printf(
+    TEXT(R"("items":[{"id":"%s","parentId":null,"domain":"general","slot":0,"quantity":1,"templateId":"T","attributes":{}}])"),
+    *OwnedItemId
+  );
+  const FString CurrencyField = FString::Printf(
+    TEXT(R"("currency":{"amount":"%lld","grants":["%s"]})"), LoadedBalance, *LoadedGrantKey
+  );
+  const FString TokenField = FString::Printf(TEXT(R"("writerToken":"%s")"), *AuthToken);
+  auto MakeReply = [&CharacterFields, &ItemsField](const FString &Currency, const FString &Token) {
+    TArray<FString> Fields = {TEXT(R"("error":"")"), CharacterFields, ItemsField};
+    if (!Currency.IsEmpty()) {
+      Fields.Add(Currency);
+    }
+    if (!Token.IsEmpty()) {
+      Fields.Add(Token);
+    }
+    TSharedPtr<FJsonObject> Reply;
+    TSharedRef<TJsonReader<>> Reader =
+      TJsonReaderFactory<>::Create(TEXT("{") + FString::Join(Fields, TEXT(",")) + TEXT("}"));
+    FJsonSerializer::Deserialize(Reader, Reply);
+    return Reply;
+  };
+
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FAccess::FreezeCharacter(*Harness.Subsystem, CharacterId);
+
+  // Incomplete loads: refused, and the freeze stands.
+  URedwoodPlayerStateComponent *Refused = NewObject<URedwoodPlayerStateComponent>();
+  FString Error;
+  TestFalse(
+    TEXT("A reply with no currency fails the load"),
+    URedwoodGameModeComponent::ApplyPlayerAuthCharacter(
+      Harness.Subsystem, Refused, MakeReply(FString(), TokenField), Error
+    )
+  );
+  TestFalse(
+    TEXT("A reply with no writer token fails the load"),
+    URedwoodGameModeComponent::ApplyPlayerAuthCharacter(
+      Harness.Subsystem, Refused, MakeReply(CurrencyField, FString()), Error
+    )
+  );
+  TestTrue(TEXT("A failed load does not thaw"), Harness.Subsystem->IsCharacterFrozen(CharacterId));
+  TestTrue(TEXT("A failed load sets no character"), Refused->RedwoodCharacter.Id.IsEmpty());
+
+  // The complete load thaws.
+  URedwoodPlayerStateComponent *Loaded = NewObject<URedwoodPlayerStateComponent>();
+  TestTrue(
+    TEXT("A complete reply loads"),
+    URedwoodGameModeComponent::ApplyPlayerAuthCharacter(
+      Harness.Subsystem, Loaded, MakeReply(CurrencyField, TokenField), Error
+    )
+  );
+  TestFalse(TEXT("The complete load thaws"), Harness.Subsystem->IsCharacterFrozen(CharacterId));
+
+  // A PlayerState that holds the loaded snapshot, and a component that hydrates from it. Copied
+  // rather than set through SetRedwoodCharacter, which would also give the test PlayerState a net
+  // id through the online interface.
+  ARedwoodCurrencyLoadTestPlayerState *PlayerState =
+    Harness.World->SpawnActor<ARedwoodCurrencyLoadTestPlayerState>();
+  if (!TestNotNull(TEXT("The PlayerState spawns"), PlayerState)) {
+    return false;
+  }
+  URedwoodPlayerStateComponent *PlayerStateComponent =
+    NewObject<URedwoodPlayerStateComponent>(PlayerState);
+  PlayerStateComponent->RedwoodCharacter = Loaded->RedwoodCharacter;
+
+  URedwoodCharacterComponent *Component = NewObject<URedwoodCharacterComponent>(PlayerState);
+  // Only the item channel: the other channels need data this test does not give.
+  Component->bUseCharacterCreatorData = false;
+  Component->bUseMetadata = false;
+  Component->bUseEquippedInventory = false;
+  Component->bUseNonequippedInventory = false;
+  Component->bUseData = false;
+  Component->bUseItems = true;
+  // The handler that the PlayerState's OnRedwoodCharacterUpdated runs on a live component.
+  Component->ProcessEvent(
+    Component->FindFunctionChecked(TEXT("RedwoodPlayerStateCharacterUpdated")), nullptr
+  );
+  TestEqual(TEXT("The component hydrates the character"), Component->RedwoodCharacterId, CharacterId);
+  TestEqual(TEXT("It takes the session's writer token"), Component->GetWriterToken(), AuthToken);
+  TestEqual(TEXT("It takes the claim's seq"), Component->GetLastCommittedItemSeq(), LoadedSeq);
+  TestEqual(TEXT("It takes the claim's rows"), PlayerState->Items.Num(), 1);
+  TestFalse(TEXT("It is not frozen"), Component->IsFrozenAfterFinalRefusal());
+  TestFalse(TEXT("A known balance needs no reload"), Component->IsCurrencyRebaseRequired());
+
+  const FRedwoodCurrencyEntry Entry = MakeEntry(EntryIdA, 500, LoadedBalance + 500, LootReason);
+  TestTrue(TEXT("The thawed character takes currency"), Component->QueueCurrency({Entry}, {NewGrantKey}));
+  Harness.Subsystem->FlushItemsForCharacterComponent(PlayerStateComponent, Component);
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  FString SentToken;
+  Flush.Payload->TryGetStringField(TEXT("writerToken"), SentToken);
+  TestEqual(TEXT("The flush carries the auth token"), SentToken, AuthToken);
+  double SentSeq = 0.0;
+  Flush.Payload->TryGetNumberField(TEXT("batchSeq"), SentSeq);
+  TestEqual(TEXT("The flush continues the claim's seq"), static_cast<int64>(SentSeq), LoadedSeq + 1);
+
+  Harness.Answer(
+    Flush, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), LoadedSeq + 1)
+  );
+  TestTrue(
+    TEXT("The reply lands"),
+    Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); })
+  );
+  const FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+  TestEqual(TEXT("The snapshot balance follows the commit"), Snapshot.CurrencyAmount, LoadedBalance + 500);
+  TestTrue(
+    TEXT("The snapshot keeps the loaded key and adds the committed one"),
+    Snapshot.GrantKeys == TArray<FString>{LoadedGrantKey, NewGrantKey}
+  );
   return true;
 }
 

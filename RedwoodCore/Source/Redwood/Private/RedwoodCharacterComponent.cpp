@@ -609,6 +609,10 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         // Seeded alongside the snapshot for the same reason: re-seeding mid-session from the stale
         // login InventorySeq would rewind the fence behind flushes that have already committed.
         SeedItemSeqFromCharacter(RedwoodCharacterBackend.InventorySeq);
+        // FORK(hollowed-oath): the session's writer token, which every flush of this component
+        // carries. Taken from the snapshot, so a component recreated mid-session (a respawn)
+        // has it too.
+        SeedWriterToken(RedwoodCharacterBackend.WriterToken);
         // FORK(hollowed-oath): a snapshot whose balance is stale must not seed a currency chain.
         if (RedwoodCharacterBackend.bCurrencyAmountUnknown) {
           RequireCurrencyReload();
