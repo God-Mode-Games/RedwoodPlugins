@@ -28,6 +28,7 @@ void URedwoodClientInterface::Deinitialize() {
   EntryCallers.Reset();
   EntryRealms.Reset();
   FirstConnectCaller.Unbind();
+  ChatTopics.Reset();
   Session = FRedwoodClientSession();
 
   if (Connection.IsValid()) {
@@ -477,6 +478,17 @@ void URedwoodClientInterface::InitializeDirectorConnection(
       (*Subscribers)->Broadcast(Payload);
       return true;
     };
+  Connection->OnChatMessage = [WeakThis](const FRedwoodChatMessage &Message) {
+    if (URedwoodClientInterface *Self = WeakThis.Get()) {
+      Self->OnChatMessage.Broadcast(Message);
+    }
+  };
+  Connection->OnChatTopics = [WeakThis](const TArray<FString> &Topics) {
+    if (URedwoodClientInterface *Self = WeakThis.Get()) {
+      Self->ChatTopics = Topics;
+      Self->OnChatTopics.Broadcast(Self->ChatTopics);
+    }
+  };
 
   UE_LOG(LogRedwood, Log, TEXT("Connecting to Bifrost at %s"), *ConnectionUri);
   Connection->Connect(ConnectionUri);
@@ -522,6 +534,11 @@ void URedwoodClientInterface::Execute(const FRedwoodSessionEffect &Effect) {
     case EKind::ForgetSession:
       if (Connection.IsValid()) {
         Connection->ForgetSession();
+      }
+      return;
+    case EKind::ResumeChat:
+      if (Connection.IsValid()) {
+        ResumeChat();
       }
       return;
     case EKind::StartGrace: {
@@ -660,6 +677,14 @@ void URedwoodClientInterface::Execute(const FRedwoodSessionEffect &Effect) {
     case EKind::SessionCleared:
       // The next login can be another account, whose tickets are not ours.
       bLeaveTicketingOwed = false;
+      // Its chat starts live, with topics of its own.
+      if (Connection.IsValid()) {
+        Connection->ResetChat();
+      }
+      if (ChatTopics.Num() > 0) {
+        ChatTopics.Reset();
+        OnChatTopics.Broadcast(ChatTopics);
+      }
       return;
     case EKind::SaveCredentials:
       SaveCredentials(Effect.Username, Effect.Secret);
@@ -766,6 +791,166 @@ void URedwoodClientInterface::SaveCredentials(
 bool URedwoodClientInterface::IsDirectorConnected() {
   return Connection.IsValid() && Connection->IsConnected();
 }
+
+// FORK(hollowed-oath) BEGIN: chat over the session.
+void URedwoodClientInterface::SendChat(
+  const FString &Topic, const FString &Body, FRedwoodChatSendDelegate OnOutput
+) {
+  SendChatLine(
+    FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower),
+    Topic,
+    FString(),
+    Body,
+    OnOutput
+  );
+}
+
+void URedwoodClientInterface::SendWhisper(
+  const FString &ToPlayerId,
+  const FString &Body,
+  FRedwoodChatSendDelegate OnOutput
+) {
+  SendChatLine(
+    FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower),
+    FString(),
+    ToPlayerId,
+    Body,
+    OnOutput
+  );
+}
+
+// The gate holds the whole call, id included: a send held through a drop
+// goes out with the id it was given, and Bifrost posts one line per id.
+void URedwoodClientInterface::SendChatLine(
+  const FString &MsgId,
+  const FString &Topic,
+  const FString &ToPlayerId,
+  const FString &Body,
+  FRedwoodChatSendDelegate OnOutput
+) {
+  // HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
+        SendChatLine(MsgId, Topic, ToPlayerId, Body, OnOutput);
+      }, OnOutput)) {
+    return;
+  }
+
+  // HollowedOath#2886. See TrackReply.
+  const FRedwoodReplyCallback OnReply = TrackReply([OnOutput](auto Response) {
+    const TSharedPtr<FJsonObject> Reply = Response[0]->AsObject();
+    FRedwoodChatSendOutput Output;
+    Reply->TryGetStringField(TEXT("code"), Output.Code);
+    FString Message;
+    Reply->TryGetStringField(TEXT("error"), Message);
+    if (!Message.IsEmpty()) {
+      Output.Error = URedwoodClientInterface::ChatErrorText(Output.Code, Message);
+    }
+    Reply->TryGetStringField(TEXT("topic"), Output.Topic);
+    Reply->TryGetNumberField(TEXT("seq"), Output.Seq);
+    OnOutput.ExecuteIfBound(Output);
+  }, OnOutput);
+
+  if (ToPlayerId.IsEmpty()) {
+    Connection->ChatSend(MsgId, Topic, Body, OnReply);
+  } else {
+    Connection->ChatWhisper(MsgId, ToPlayerId, Body, OnReply);
+  }
+}
+
+void URedwoodClientInterface::ReportChat(
+  const FString &Topic,
+  int64 Seq,
+  const FString &Reason,
+  FRedwoodErrorOutputDelegate OnOutput
+) {
+  // HollowedOath#2854. See GateRealm.
+  if (GateRealm([=, this]() {
+        ReportChat(Topic, Seq, Reason, OnOutput);
+      }, OnOutput)) {
+    return;
+  }
+
+  // HollowedOath#2886. See TrackReply.
+  Connection->ChatReport(
+    Topic,
+    Seq,
+    Reason,
+    TrackReply([OnOutput](auto Response) {
+      const TSharedPtr<FJsonObject> Reply = Response[0]->AsObject();
+      FString Code;
+      FString Message;
+      Reply->TryGetStringField(TEXT("code"), Code);
+      Reply->TryGetStringField(TEXT("error"), Message);
+      OnOutput.ExecuteIfBound(
+        Message.IsEmpty()
+          ? FString()
+          : URedwoodClientInterface::ChatErrorText(Code, Message)
+      );
+    }, OnOutput)
+  );
+}
+
+// The session came back: the connection asks for the lines it missed, from
+// its cursors. The reply is tracked like any request. A reply lost with the
+// socket owes nothing: the next restore resumes again from the same cursors.
+void URedwoodClientInterface::ResumeChat() {
+  TWeakObjectPtr<URedwoodClientInterface> WeakThis(this);
+  Connection->ChatResume(Replies.Track(
+    [WeakThis](const TArray<TSharedPtr<FJsonValue>> &Response) {
+      URedwoodClientInterface *Self = WeakThis.Get();
+      if (!Self) {
+        return;
+      }
+      const TSharedPtr<FJsonObject> Reply = Response[0]->AsObject();
+      FString Error;
+      Reply->TryGetStringField(TEXT("error"), Error);
+      if (!Error.IsEmpty()) {
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT("The chat resume was refused: %s"),
+          *Error
+        );
+        return;
+      }
+      const TArray<FString> Truncated =
+        FRedwoodBifrostConnection::TruncatedTopics(Reply);
+      if (Truncated.Num() > 0) {
+        Self->OnChatTruncated.Broadcast(Truncated);
+      }
+    },
+    []() {}
+  ));
+}
+
+// The server's message is for its logs; the player reads a text of ours.
+FString URedwoodClientInterface::ChatErrorText(
+  const FString &Code, const FString &Message
+) {
+  if (Code == TEXT("muted")) {
+    return TEXT("You are muted and cannot send messages.");
+  }
+  if (Code == TEXT("not_available")) {
+    return TEXT("That player is not available.");
+  }
+  if (Code == TEXT("too_long")) {
+    return TEXT("That message is too long.");
+  }
+  if (Code == TEXT("forbidden")) {
+    return TEXT("You cannot send to that channel.");
+  }
+  if (Code == TEXT("rate_limited")) {
+    return TEXT("You are sending messages too fast. Wait a moment.");
+  }
+  if (Code == TEXT("invalid_request")) {
+    return TEXT("That message cannot be sent.");
+  }
+  if (Code == TEXT("unavailable")) {
+    return TEXT("The chat service did not answer. Try again.");
+  }
+  return Message.IsEmpty() ? Code : Message;
+}
+// FORK(hollowed-oath) END
 
 FRedwoodPushDelegate &URedwoodClientInterface::OnPush(const FString &Event) {
   TUniquePtr<FRedwoodPushDelegate> &Subscribers = PushSubscribers.FindOrAdd(Event);
