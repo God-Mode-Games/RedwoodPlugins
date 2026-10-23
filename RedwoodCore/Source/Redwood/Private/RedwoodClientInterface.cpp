@@ -796,13 +796,21 @@ bool URedwoodClientInterface::IsDirectorConnected() {
 void URedwoodClientInterface::SendChat(
   const FString &Topic, const FString &Body, FRedwoodChatSendDelegate OnOutput
 ) {
-  SendChatLine(
-    FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower),
+  SendChat(
     Topic,
-    FString(),
     Body,
+    FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower),
     OnOutput
   );
+}
+
+void URedwoodClientInterface::SendChat(
+  const FString &Topic,
+  const FString &Body,
+  const FString &MsgId,
+  FRedwoodChatSendDelegate OnOutput
+) {
+  SendChatLine(MsgId, Topic, FString(), Body, OnOutput);
 }
 
 void URedwoodClientInterface::SendWhisper(
@@ -810,13 +818,21 @@ void URedwoodClientInterface::SendWhisper(
   const FString &Body,
   FRedwoodChatSendDelegate OnOutput
 ) {
-  SendChatLine(
-    FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower),
-    FString(),
+  SendWhisper(
     ToPlayerId,
     Body,
+    FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower),
     OnOutput
   );
+}
+
+void URedwoodClientInterface::SendWhisper(
+  const FString &ToPlayerId,
+  const FString &Body,
+  const FString &MsgId,
+  FRedwoodChatSendDelegate OnOutput
+) {
+  SendChatLine(MsgId, FString(), ToPlayerId, Body, OnOutput);
 }
 
 // The gate holds the whole call, id included: a send held through a drop
@@ -828,15 +844,26 @@ void URedwoodClientInterface::SendChatLine(
   const FString &Body,
   FRedwoodChatSendDelegate OnOutput
 ) {
+  // The id is on every answer, the gate's and the lost reply's included, so
+  // the game can send the same line again.
+  const FRedwoodChatSendDelegate Answer =
+    FRedwoodChatSendDelegate::CreateLambda(
+      [MsgId, OnOutput](const FRedwoodChatSendOutput &In) {
+        FRedwoodChatSendOutput Output = In;
+        Output.MsgId = MsgId;
+        OnOutput.ExecuteIfBound(Output);
+      }
+    );
+
   // HollowedOath#2854. See GateRealm.
   if (GateRealm([=, this]() {
         SendChatLine(MsgId, Topic, ToPlayerId, Body, OnOutput);
-      }, OnOutput)) {
+      }, Answer)) {
     return;
   }
 
   // HollowedOath#2886. See TrackReply.
-  const FRedwoodReplyCallback OnReply = TrackReply([OnOutput](auto Response) {
+  const FRedwoodReplyCallback OnReply = TrackReply([Answer](auto Response) {
     const TSharedPtr<FJsonObject> Reply = Response[0]->AsObject();
     FRedwoodChatSendOutput Output;
     Reply->TryGetStringField(TEXT("code"), Output.Code);
@@ -847,8 +874,8 @@ void URedwoodClientInterface::SendChatLine(
     }
     Reply->TryGetStringField(TEXT("topic"), Output.Topic);
     Reply->TryGetNumberField(TEXT("seq"), Output.Seq);
-    OnOutput.ExecuteIfBound(Output);
-  }, OnOutput);
+    Answer.ExecuteIfBound(Output);
+  }, Answer);
 
   if (ToPlayerId.IsEmpty()) {
     Connection->ChatSend(MsgId, Topic, Body, OnReply);

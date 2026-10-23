@@ -2491,6 +2491,9 @@ bool FRedwoodBifrostClientChatSendTest::RunTest(const FString &Parameters) {
   TestEqual(
     TEXT("As not connected to the realm"), Early.Last.Error, NotConnectedToRealm
   );
+  TestFalse(
+    TEXT("The gate's answer carries the line's id"), Early.Last.MsgId.IsEmpty()
+  );
   TestEqual(
     TEXT("And nothing went out"), H.Socket()->CountSent(TEXT("chat.send")), 0
   );
@@ -2528,6 +2531,7 @@ bool FRedwoodBifrostClientChatSendTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("As a success"), Sent.Last.Error, FString());
   TestEqual(TEXT("With the line's seq"), Sent.Last.Seq, static_cast<int64>(4));
   TestEqual(TEXT("And its topic"), Sent.Last.Topic, Party);
+  TestEqual(TEXT("And the id it was sent under"), Sent.Last.MsgId, MsgId);
 
   // A line arrives: the session has a cursor to resume from.
   H.Socket()->ChatMessage(
@@ -2549,6 +2553,18 @@ bool FRedwoodBifrostClientChatSendTest::RunTest(const FString &Parameters) {
     URedwoodClientInterface::ChatErrorText(TEXT("muted"), FString())
   );
 
+  // The game sends the same line again under the id it was given: Bifrost
+  // posts one line per id, so a retry cannot post twice.
+  TCapture<FRedwoodChatSendOutput> Retry;
+  H.Client()->SendChat(
+    Party, TEXT("again"), Muted.Last.MsgId, Retry.Delegate()
+  );
+  TestEqual(
+    TEXT("A retry goes out under the game's id"),
+    H.Socket()->Last(TEXT("chat.send")).Payload->GetStringField(TEXT("msgId")),
+    Muted.Last.MsgId
+  );
+
   // A whisper names the player, not a topic.
   TCapture<FRedwoodChatSendOutput> Whisper;
   H.Client()->SendWhisper(TEXT("p2"), TEXT("psst"), Whisper.Delegate());
@@ -2568,6 +2584,10 @@ bool FRedwoodBifrostClientChatSendTest::RunTest(const FString &Parameters) {
     Whisper.Last.Error,
     FRedwoodPendingReplies::LostReplyError
   );
+  TestFalse(
+    TEXT("And carries its id for a retry"), Whisper.Last.MsgId.IsEmpty()
+  );
+  TestEqual(TEXT("The unanswered retry fails too"), Retry.Count, 1);
   TCapture<FRedwoodChatSendOutput> Held;
   H.Client()->SendChat(Party, TEXT("while down"), Held.Delegate());
   TestEqual(TEXT("A send in the gap is held"), H.HeldCount(), 1);
