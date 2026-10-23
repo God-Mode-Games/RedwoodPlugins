@@ -57,11 +57,43 @@ namespace {
 FRedwoodBifrostConnection::FSocketFactory
   FRedwoodBifrostConnection::CreateSocketOverride;
 
+bool FRedwoodChatMessage::Parse(
+  const TSharedPtr<FJsonObject> &Object, FRedwoodChatMessage &OutMessage
+) {
+  if (!Object.IsValid()) {
+    return false;
+  }
+  FRedwoodChatMessage Message;
+  if (
+    !Object->TryGetStringField(TEXT("topic"), Message.Topic) ||
+    !Object->TryGetNumberField(TEXT("seq"), Message.Seq) ||
+    !Object->TryGetStringField(TEXT("msgId"), Message.MsgId) ||
+    Message.Topic.IsEmpty() || Message.MsgId.IsEmpty()
+  ) {
+    return false;
+  }
+  Object->TryGetStringField(TEXT("category"), Message.Category);
+  const TSharedPtr<FJsonObject> *Sender = nullptr;
+  if (Object->TryGetObjectField(TEXT("sender"), Sender)) {
+    (*Sender)->TryGetStringField(
+      TEXT("characterId"), Message.SenderCharacterId
+    );
+    (*Sender)->TryGetStringField(TEXT("name"), Message.SenderName);
+  }
+  Object->TryGetStringField(TEXT("template"), Message.Template);
+  Object->TryGetStringArrayField(TEXT("args"), Message.Args);
+  FString SentAt;
+  if (Object->TryGetStringField(TEXT("sentAt"), SentAt)) {
+    FDateTime::ParseIso8601(*SentAt, Message.SentAt);
+  }
+  OutMessage = MoveTemp(Message);
+  return true;
+}
+
 FRedwoodBifrostConnection::FRedwoodBifrostConnection(
   FTimerManager &InTimerManager
 ) : TimerManager(InTimerManager) {
   ReconnectSocket = [this]() { OpenSocket(); };
-  SeenPushIds.SetNum(RememberedPushIds);
 }
 
 FRedwoodBifrostConnection::~FRedwoodBifrostConnection() {
@@ -344,6 +376,10 @@ void FRedwoodBifrostConnection::DropPending() {
   PendingReplies.Reset();
   TArray<FQueuedStep> Steps = MoveTemp(QueuedSteps);
   QueuedSteps.Reset();
+  // The resume went with the channel; the lines held for it are not lost:
+  // the cursors did not move, so the next resume replays them.
+  bChatResumePending = false;
+  ChatLinesHeldForResume.Reset();
 
   if (Join) {
     Join(false, LostJoinRefusal(FRedwoodPendingReplies::LostReplyError));
@@ -537,6 +573,210 @@ FString FRedwoodBifrostConnection::Push(
   return Ref;
 }
 
+// ── Chat ────────────────────────────────────────────────────────────────
+
+void FRedwoodBifrostConnection::ChatSend(
+  const FString &MsgId,
+  const FString &Topic,
+  const FString &Body,
+  FRedwoodReplyCallback Callback
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetStringField(TEXT("msgId"), MsgId);
+  Payload->SetStringField(TEXT("topic"), Topic);
+  Payload->SetStringField(TEXT("body"), Body);
+  Push(TEXT("chat.send"), Payload, MoveTemp(Callback));
+}
+
+void FRedwoodBifrostConnection::ChatWhisper(
+  const FString &MsgId,
+  const FString &ToPlayerId,
+  const FString &Body,
+  FRedwoodReplyCallback Callback
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetStringField(TEXT("msgId"), MsgId);
+  Payload->SetStringField(TEXT("to"), ToPlayerId);
+  Payload->SetStringField(TEXT("body"), Body);
+  Push(TEXT("chat.send"), Payload, MoveTemp(Callback));
+}
+
+void FRedwoodBifrostConnection::ChatResume(FRedwoodReplyCallback Callback) {
+  TSharedPtr<FJsonObject> Cursors = MakeShared<FJsonObject>();
+  for (const TPair<FString, int64> &Cursor : ChatCursors) {
+    Cursors->SetNumberField(Cursor.Key, static_cast<double>(Cursor.Value));
+  }
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetObjectField(TEXT("cursors"), Cursors);
+
+  TWeakPtr<FRedwoodBifrostConnection> Weak = AsShared();
+  const FString Ref = Push(
+    TEXT("chat.resume"),
+    Payload,
+    [Weak, Callback](const TArray<TSharedPtr<FJsonValue>> &Response) {
+      if (const TSharedPtr<FRedwoodBifrostConnection> Self = Weak.Pin()) {
+        Self->ApplyChatResume(Response);
+      }
+      if (Callback) {
+        Callback(Response);
+      }
+    }
+  );
+  // Only a resume that went out holds the live lines; one dropped before
+  // the join has no reply to wait for.
+  bChatResumePending = !Ref.IsEmpty();
+}
+
+void FRedwoodBifrostConnection::ChatReport(
+  const FString &Topic,
+  int64 Seq,
+  const FString &Reason,
+  FRedwoodReplyCallback Callback
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetStringField(TEXT("topic"), Topic);
+  Payload->SetNumberField(TEXT("seq"), static_cast<double>(Seq));
+  Payload->SetStringField(TEXT("reason"), Reason);
+  Push(TEXT("chat.report"), Payload, MoveTemp(Callback));
+}
+
+TArray<FString> FRedwoodBifrostConnection::TruncatedTopics(
+  const TSharedPtr<FJsonObject> &ResumeReply
+) {
+  TArray<FString> Truncated;
+  const TSharedPtr<FJsonObject> *Topics = nullptr;
+  if (
+    !ResumeReply.IsValid() ||
+    !ResumeReply->TryGetObjectField(TEXT("topics"), Topics)
+  ) {
+    return Truncated;
+  }
+  for (const TPair<FString, TSharedPtr<FJsonValue>> &Topic :
+       (*Topics)->Values) {
+    const TSharedPtr<FJsonObject> *Entry = nullptr;
+    bool bTruncated = false;
+    if (
+      Topic.Value.IsValid() && Topic.Value->TryGetObject(Entry) &&
+      (*Entry)->TryGetBoolField(TEXT("truncated"), bTruncated) && bTruncated
+    ) {
+      Truncated.Add(Topic.Key);
+    }
+  }
+  return Truncated;
+}
+
+void FRedwoodBifrostConnection::ResetChat() {
+  ChatCursors.Reset();
+  SeenChatMsgIds.Reset();
+  bChatResumePending = false;
+  ChatLinesHeldForResume.Reset();
+}
+
+// The replay of each topic is applied oldest first, whatever order Bifrost
+// listed it in, so the cursor moves through it and no line is dropped as
+// old by a later one. The lines held while the resume waited follow: a line
+// the replay also carried is dropped by its id.
+void FRedwoodBifrostConnection::ApplyChatResume(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  bChatResumePending = false;
+  const TSharedPtr<FJsonObject> Reply =
+    Response.Num() > 0 && Response[0].IsValid() ? Response[0]->AsObject()
+                                                : nullptr;
+  const TSharedPtr<FJsonObject> *Topics = nullptr;
+  if (Reply.IsValid() && Reply->TryGetObjectField(TEXT("topics"), Topics)) {
+    for (const TPair<FString, TSharedPtr<FJsonValue>> &Topic :
+         (*Topics)->Values) {
+      const TSharedPtr<FJsonObject> *Entry = nullptr;
+      const TArray<TSharedPtr<FJsonValue>> *Messages = nullptr;
+      if (
+        !Topic.Value.IsValid() || !Topic.Value->TryGetObject(Entry) ||
+        !(*Entry)->TryGetArrayField(TEXT("messages"), Messages)
+      ) {
+        continue;
+      }
+      TArray<FRedwoodChatMessage> Lines;
+      for (const TSharedPtr<FJsonValue> &Value : *Messages) {
+        const TSharedPtr<FJsonObject> *Object = nullptr;
+        FRedwoodChatMessage Line;
+        if (
+          Value.IsValid() && Value->TryGetObject(Object) &&
+          FRedwoodChatMessage::Parse(*Object, Line)
+        ) {
+          Lines.Add(MoveTemp(Line));
+        }
+      }
+      Lines.Sort([](
+                   const FRedwoodChatMessage &A, const FRedwoodChatMessage &B
+                 ) { return A.Seq < B.Seq; });
+      for (const FRedwoodChatMessage &Line : Lines) {
+        DeliverChatLine(Line);
+      }
+    }
+  }
+
+  TArray<FRedwoodChatMessage> Held = MoveTemp(ChatLinesHeldForResume);
+  ChatLinesHeldForResume.Reset();
+  for (const FRedwoodChatMessage &Line : Held) {
+    DeliverChatLine(Line);
+  }
+}
+
+bool FRedwoodBifrostConnection::DeliverChatLine(
+  const FRedwoodChatMessage &Message
+) {
+  const int64 *Cursor = ChatCursors.Find(Message.Topic);
+  if (
+    (Cursor && Message.Seq <= *Cursor) || SeenChatMsgIds.Contains(Message.MsgId)
+  ) {
+    UE_LOG(
+      LogRedwood,
+      Verbose,
+      TEXT("Dropped a chat line seen before (%s #%lld)."),
+      *Message.Topic,
+      Message.Seq
+    );
+    return false;
+  }
+  SeenChatMsgIds.Add(Message.MsgId);
+  // A topic with no cursor starts here: its first line is the first one
+  // this session can see.
+  ChatCursors.Add(Message.Topic, Message.Seq);
+  if (OnChatMessage) {
+    OnChatMessage(Message);
+  }
+  return true;
+}
+
+void FRedwoodBifrostConnection::HandleChatMessage(
+  const TSharedPtr<FJsonObject> &Payload
+) {
+  FRedwoodChatMessage Message;
+  if (!FRedwoodChatMessage::Parse(Payload, Message)) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT("Dropped a chat.msg with no topic, seq or msgId.")
+    );
+    return;
+  }
+  if (bChatResumePending) {
+    ChatLinesHeldForResume.Add(MoveTemp(Message));
+    return;
+  }
+  DeliverChatLine(Message);
+}
+
+void FRedwoodBifrostConnection::HandleChatTopics(
+  const TSharedPtr<FJsonObject> &Payload
+) {
+  TArray<FString> Topics;
+  Payload->TryGetStringArrayField(TEXT("topics"), Topics);
+  if (OnChatTopics) {
+    OnChatTopics(Topics);
+  }
+}
+
 void FRedwoodBifrostConnection::OnEvent(
   const FString &Event, FEventHandler Handler
 ) {
@@ -640,6 +880,10 @@ void FRedwoodBifrostConnection::HandleMessage(const FString &Text) {
     HandleReply(Ref, Payload);
   } else if (Event == TEXT("push")) {
     HandlePush(Payload);
+  } else if (Event == TEXT("chat.msg")) {
+    HandleChatMessage(Payload);
+  } else if (Event == TEXT("chat.topics")) {
+    HandleChatTopics(Payload);
   } else if (Event == TEXT("closed")) {
     HandleClosedByServer(Payload);
   } else if (Event == TEXT("phx_error") || Event == TEXT("phx_close")) {
@@ -703,8 +947,10 @@ void FRedwoodBifrostConnection::HandleReply(
 }
 
 // The shape the request handlers read: one element, an object with an
-// `error` string that is empty on success. Bifrost's own refusal becomes
-// that object too, with its code beside the message.
+// `error` string that is empty on success. A Redwood request's object comes
+// under `response`; an event Bifrost answers itself (`chat.*`) has no such
+// nesting, so its reply is the object, with the empty error added. Bifrost's
+// own refusal becomes that object too, with its code beside the message.
 TArray<TSharedPtr<FJsonValue>> FRedwoodBifrostConnection::ReplyAsResponse(
   const FString &Status, const TSharedPtr<FJsonObject> &Payload
 ) {
@@ -712,11 +958,13 @@ TArray<TSharedPtr<FJsonValue>> FRedwoodBifrostConnection::ReplyAsResponse(
   if (Status == TEXT("ok")) {
     const TSharedPtr<FJsonObject> *Reply = nullptr;
     const TSharedPtr<FJsonObject> *Response = nullptr;
-    if (
-      Payload->TryGetObjectField(TEXT("response"), Reply) &&
-      (*Reply)->TryGetObjectField(TEXT("response"), Response)
-    ) {
-      Object = *Response;
+    if (Payload->TryGetObjectField(TEXT("response"), Reply)) {
+      if ((*Reply)->TryGetObjectField(TEXT("response"), Response)) {
+        Object = *Response;
+      } else if (!(*Reply)->HasField(TEXT("response"))) {
+        Object = *Reply;
+        Object->SetStringField(TEXT("error"), TEXT(""));
+      }
     }
     if (!Object.IsValid()) {
       // An event that sends no reply (`response: null`).
@@ -757,8 +1005,7 @@ void FRedwoodBifrostConnection::HandlePush(
     if (SeenPushIds.Contains(PushId)) {
       return;
     }
-    SeenPushIds[NextSeenPushIdSlot] = PushId;
-    NextSeenPushIdSlot = (NextSeenPushIdSlot + 1) % RememberedPushIds;
+    SeenPushIds.Add(PushId);
   }
   const TSharedPtr<FJsonObject> *Inner = nullptr;
   const TSharedPtr<FJsonObject> Message =
