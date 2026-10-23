@@ -2494,6 +2494,10 @@ bool FRedwoodBifrostClientChatSendTest::RunTest(const FString &Parameters) {
   TestFalse(
     TEXT("The gate's answer carries the line's id"), Early.Last.MsgId.IsEmpty()
   );
+  TestTrue(
+    TEXT("With no code: nothing is resent into a closed gate"),
+    Early.Last.Code.IsEmpty()
+  );
   TestEqual(
     TEXT("And nothing went out"), H.Socket()->CountSent(TEXT("chat.send")), 0
   );
@@ -2598,6 +2602,11 @@ bool FRedwoodBifrostClientChatSendTest::RunTest(const FString &Parameters) {
   );
   TestFalse(
     TEXT("And carries its id for a retry"), Whisper.Last.MsgId.IsEmpty()
+  );
+  TestEqual(
+    TEXT("Under the client's lost-reply code"),
+    Whisper.Last.Code,
+    FRedwoodChatSendOutput::LostReplyCode
   );
   TestEqual(TEXT("The unanswered retry fails too"), Retry.Count, 1);
   TestEqual(TEXT("And the unanswered whisper by name"), ByName.Count, 1);
