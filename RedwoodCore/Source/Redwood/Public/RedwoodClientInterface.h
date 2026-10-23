@@ -35,10 +35,13 @@ DECLARE_MULTICAST_DELEGATE_OneParam(
 // The answer to a chat send. Error is the text the player reads, empty on
 // success; Code is the contract's error code beside it (muted, not_available,
 // too_long, forbidden, rate_limited, invalid_request, unavailable), so the
-// game can act on one. Topic and Seq name the posted line.
+// game can act on one. MsgId is the line's id, on every answer, so a send
+// that failed can be sent again as the same line. Topic and Seq name the
+// posted line.
 struct REDWOOD_API FRedwoodChatSendOutput {
   FString Error;
   FString Code;
+  FString MsgId;
   FString Topic;
   int64 Seq = 0;
 };
@@ -115,13 +118,27 @@ public:
   // resumed, so the player's line lands behind the lines they missed. The
   // line's id is made before the gate, so a held send goes out with the id
   // it was given and Bifrost posts it once. A whisper names a player; Bifrost
-  // writes it to both sides' character topics.
+  // writes it to both sides' character topics. The overloads with MsgId are
+  // for the game's own retry of a send that failed: the same id, and Bifrost
+  // posts the line once however many times it is sent.
   void SendChat(
     const FString &Topic, const FString &Body, FRedwoodChatSendDelegate OnOutput
+  );
+  void SendChat(
+    const FString &Topic,
+    const FString &Body,
+    const FString &MsgId,
+    FRedwoodChatSendDelegate OnOutput
   );
   void SendWhisper(
     const FString &ToPlayerId,
     const FString &Body,
+    FRedwoodChatSendDelegate OnOutput
+  );
+  void SendWhisper(
+    const FString &ToPlayerId,
+    const FString &Body,
+    const FString &MsgId,
     FRedwoodChatSendDelegate OnOutput
   );
   void ReportChat(
