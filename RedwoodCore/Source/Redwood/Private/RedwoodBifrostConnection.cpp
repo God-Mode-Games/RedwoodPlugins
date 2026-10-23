@@ -800,6 +800,13 @@ void FRedwoodBifrostConnection::HandleChatTopics(
   }
   TArray<FString> Topics;
   Payload->TryGetStringArrayField(TEXT("topics"), Topics);
+  // A topic the session left (a party, a guild) is not resumed: its cursor
+  // would ask for lines the session may not read, and never go away.
+  for (TMap<FString, int64>::TIterator Cursor(ChatCursors); Cursor; ++Cursor) {
+    if (!Topics.Contains(Cursor.Key())) {
+      Cursor.RemoveCurrent();
+    }
+  }
   if (OnChatTopics) {
     OnChatTopics(Topics);
   }
