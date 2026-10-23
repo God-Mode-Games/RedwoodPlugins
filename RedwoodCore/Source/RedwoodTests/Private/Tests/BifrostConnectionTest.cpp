@@ -1559,7 +1559,9 @@ bool FRedwoodBifrostChatTest::RunTest(const FString &Parameters) {
   }
   const TSharedPtr<FJsonObject> Cursors =
     Resume.Payload->GetObjectField(TEXT("cursors"));
-  TestEqual(TEXT("With a cursor per topic"), Cursors->Values.Num(), 3);
+  // The whisper topic's cursor went with the topics push that did not name
+  // it: only the party's and the guild's remain.
+  TestEqual(TEXT("With a cursor per topic"), Cursors->Values.Num(), 2);
   TestEqual(
     TEXT("The party's cursor"),
     static_cast<int32>(Cursors->GetNumberField(Party)),
