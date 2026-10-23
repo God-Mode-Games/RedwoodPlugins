@@ -22,8 +22,16 @@ struct REDWOOD_API FRedwoodChatMessage {
   int64 Seq = 0;
   FString MsgId;
   FString Category;
+  // The sender's player id is optional: empty when Bifrost sent none.
+  FString SenderPlayerId;
   FString SenderCharacterId;
   FString SenderName;
+  // The whisper's target, `to: {playerId, characterId, name}`: set on the
+  // copies of a whisper only, so the sender's own copy can name who it was
+  // for; empty on every other line.
+  FString ToPlayerId;
+  FString ToCharacterId;
+  FString ToName;
   FString Template;
   TArray<FString> Args;
   // The contract sends an ISO 8601 date-time string.

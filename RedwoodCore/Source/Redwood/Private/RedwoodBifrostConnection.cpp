@@ -75,10 +75,17 @@ bool FRedwoodChatMessage::Parse(
   Object->TryGetStringField(TEXT("category"), Message.Category);
   const TSharedPtr<FJsonObject> *Sender = nullptr;
   if (Object->TryGetObjectField(TEXT("sender"), Sender)) {
+    (*Sender)->TryGetStringField(TEXT("playerId"), Message.SenderPlayerId);
     (*Sender)->TryGetStringField(
       TEXT("characterId"), Message.SenderCharacterId
     );
     (*Sender)->TryGetStringField(TEXT("name"), Message.SenderName);
+  }
+  const TSharedPtr<FJsonObject> *To = nullptr;
+  if (Object->TryGetObjectField(TEXT("to"), To)) {
+    (*To)->TryGetStringField(TEXT("playerId"), Message.ToPlayerId);
+    (*To)->TryGetStringField(TEXT("characterId"), Message.ToCharacterId);
+    (*To)->TryGetStringField(TEXT("name"), Message.ToName);
   }
   Object->TryGetStringField(TEXT("template"), Message.Template);
   Object->TryGetStringArrayField(TEXT("args"), Message.Args);
