@@ -5,8 +5,8 @@
 #include "RedwoodBifrostConnection.h" // FORK(hollowed-oath)
 #include "RedwoodClientSession.h" // FORK(hollowed-oath)
 #include "RedwoodHeldRequests.h" // FORK(hollowed-oath): HollowedOath#2854.
-#include "RedwoodPendingReplies.h" // FORK(hollowed-oath): HollowedOath#2886.
 #include "RedwoodModule.h"
+#include "RedwoodPendingReplies.h" // FORK(hollowed-oath): HollowedOath#2886.
 #include "Types/RedwoodTypes.h"
 
 #include "CoreMinimal.h"
@@ -16,6 +16,12 @@
 #include "TimerManager.h"
 
 #include "RedwoodClientInterface.generated.h"
+
+// FORK(hollowed-oath): a Redwood push, as URedwoodClientInterface::OnPush
+// hands it to a subscriber: the push's payload object.
+DECLARE_MULTICAST_DELEGATE_OneParam(
+  FRedwoodPushDelegate, const TSharedPtr<FJsonObject> & /*Payload*/
+);
 
 // This class is separated from URedwoodClientGameSubsystem
 // so that we can use it in automated tests without instantiating
@@ -66,6 +72,20 @@ public:
   FRedwoodDynamicDelegate OnConnectionLost;
   FRedwoodDynamicDelegate OnConnectionReestablished;
   FRedwoodConnectionAuthFailedDynamicDelegate OnAuthFailed;
+
+  // FORK(hollowed-oath): the subscribers of one Redwood push, by its event
+  // name. The game owns features that ride on pushes this plugin does not
+  // interpret (a staff broadcast, for one), and Bifrost forwards only the
+  // events on its push allowlist, so a new event is agreed there and bound
+  // here, with no change to the plugin. The subscription lives on this
+  // object, not on the connection: it holds over a new connection and a
+  // resume, with no re-bind by the caller. A push the plugin handles itself
+  // reaches its own handler first, then the subscribers. Add with the
+  // delegate's Add methods and Remove with the handle before the subscriber
+  // goes away. The reference stays valid for the life of this object, so a
+  // subscriber may subscribe to another event from inside its own callback.
+  // The shape is the ability system's attribute change delegates.
+  FRedwoodPushDelegate &OnPush(const FString &Event);
 
   void Register(
     const FString &Username,
@@ -142,7 +162,8 @@ public:
 
   // FORK(hollowed-oath) BEGIN: character friend calls. Upstream has no
   // friendship between characters; the routes live in the RedwoodBackend fork.
-  void ListCharacterFriends(FRedwoodListCharacterFriendsOutputDelegate OnOutput
+  void ListCharacterFriends(
+    FRedwoodListCharacterFriendsOutputDelegate OnOutput
   );
 
   void RequestCharacterFriend(
@@ -454,6 +475,10 @@ private:
   FTimerHandle GraceTimer;
   void BindPushHandlers();
   void BindRealmPushHandlers();
+  // Each delegate is heap-allocated so it never moves: a broadcast runs in
+  // place, and a subscriber that subscribes to a new event from its callback
+  // grows the map under that broadcast.
+  TMap<FString, TUniquePtr<FRedwoodPushDelegate>> PushSubscribers;
   // The effects that reach Bifrost.
   void SendLogin(const FRedwoodSessionEffect &Effect);
   void SendEnterRealm(uint32 Seq, const FString &RealmId);
@@ -523,7 +548,9 @@ private:
   void NoteJoinSent();
   void NoteJoinAnswered(const FString &Error, uint32 Sequence);
   void NoteJoinLost();
-  TFunction<void()> MakeLostProxyJoin(uint32 Sequence, TFunction<void()> OnLost);
+  TFunction<void()> MakeLostProxyJoin(
+    uint32 Sequence, TFunction<void()> OnLost
+  );
   void HandleTicketingJoinReply(const FString &Error, uint32 Sequence);
   // A join whose reply was lost: the game went back to character select, so
   // its assignment must not move the player. A new join clears it.

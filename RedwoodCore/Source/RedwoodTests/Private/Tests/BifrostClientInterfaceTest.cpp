@@ -1673,6 +1673,9 @@ bool FRedwoodBifrostClientCharacterFriendAlertTest::RunTest(
 //  16. A held call that acts for a character is not sent when the player
 //      selected another character during the hold; one whose character did
 //      not change goes out for it.
+//  17. A push subscription of the game (OnPush) hears a push's payload, also
+//      on a new connection, and not after it is removed. A push the client
+//      handles itself reaches its handler and the subscribers.
 
 namespace RedwoodBifrostClientTest {
   const FString OtherPassword = TEXT("other-secret");
@@ -2327,5 +2330,128 @@ bool FRedwoodBifrostClientHeldCallForAnotherCharacterTest::RunTest(
     );
     TestEqual(TEXT("Its caller waits for the realm"), Invite.Count, 0);
   }
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientPushSubscriptionTest,
+  "Redwood.Bifrost.Client.PushReachesSubscribers",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientPushSubscriptionTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  FClientHarness H(*this);
+  H.EnterSessionWithCharacter();
+
+  // An event the client does not interpret: the game owns it.
+  const FString BroadcastEvent = TEXT("admin:server-broadcast");
+  int32 Broadcasts = 0;
+  FString LastMessage;
+  FRedwoodPushDelegate &OnBroadcast = H.Client()->OnPush(BroadcastEvent);
+  const FDelegateHandle Handle = OnBroadcast.AddLambda(
+    [&Broadcasts, &LastMessage](const TSharedPtr<FJsonObject> &Payload) {
+      ++Broadcasts;
+      LastMessage = Payload->GetStringField(TEXT("message"));
+    }
+  );
+  TSharedPtr<FJsonObject> Broadcast = MakeShared<FJsonObject>();
+  Broadcast->SetStringField(TEXT("message"), TEXT("Restart in five minutes."));
+  H.Socket()->Push(TEXT("bc-1"), BroadcastEvent, Broadcast, H.JoinRef);
+  TestEqual(TEXT("The subscriber hears the push once"), Broadcasts, 1);
+  TestEqual(
+    TEXT("With the push's payload"),
+    LastMessage,
+    TEXT("Restart in five minutes.")
+  );
+
+  // The game connects again: a new connection, and no re-bind.
+  H.Open();
+  H.LoginOk(TEXT("s2"), TEXT("rt-2"));
+  H.Socket()->Push(TEXT("bc-2"), BroadcastEvent, Broadcast, H.JoinRef);
+  TestEqual(
+    TEXT("A push on the new connection reaches the subscriber"), Broadcasts, 2
+  );
+
+  OnBroadcast.Remove(Handle);
+  H.Socket()->Push(TEXT("bc-3"), BroadcastEvent, Broadcast, H.JoinRef);
+  TestEqual(TEXT("A removed subscriber hears nothing"), Broadcasts, 2);
+
+  // An event the client handles itself: its handler keeps the party, and
+  // the subscriber hears the same push after it.
+  const FString PartyEvent = TEXT("realm:parties:changed");
+  int32 PartyChanges = 0;
+  FString LastPartyId;
+  FRedwoodPushDelegate &OnPartyChanged = H.Client()->OnPush(PartyEvent);
+  const FDelegateHandle PartyHandle = OnPartyChanged.AddLambda(
+    [&PartyChanges, &LastPartyId](const TSharedPtr<FJsonObject> &Payload) {
+      ++PartyChanges;
+      LastPartyId =
+        Payload->GetObjectField(TEXT("party"))->GetStringField(TEXT("id"));
+    }
+  );
+  TSharedPtr<FJsonObject> Character = MakeShared<FJsonObject>();
+  Character->SetStringField(TEXT("id"), CharacterId);
+  Character->SetStringField(TEXT("name"), TEXT("Alpha"));
+  TSharedPtr<FJsonObject> Member = MakeShared<FJsonObject>();
+  Member->SetStringField(TEXT("playerId"), PlayerId);
+  Member->SetStringField(TEXT("nickname"), TEXT("Nick"));
+  Member->SetObjectField(TEXT("character"), Character);
+  TSharedPtr<FJsonObject> Party = MakeShared<FJsonObject>();
+  Party->SetStringField(TEXT("id"), TEXT("party-1"));
+  Party->SetStringField(TEXT("lootType"), TEXT("free-for-all"));
+  Party->SetStringField(TEXT("leaderId"), PlayerId);
+  TArray<TSharedPtr<FJsonValue>> Members;
+  Members.Add(MakeShared<FJsonValueObject>(Member));
+  Party->SetArrayField(TEXT("members"), Members);
+  TSharedPtr<FJsonObject> Changed = MakeShared<FJsonObject>();
+  Changed->SetObjectField(TEXT("party"), Party);
+  H.Socket()->Push(TEXT("party-1"), PartyEvent, Changed, H.JoinRef);
+  TestEqual(
+    TEXT("The client's own handler keeps the party"),
+    H.Client()->GetCachedParty().Id,
+    TEXT("party-1")
+  );
+  TestEqual(TEXT("The subscriber hears the same push"), PartyChanges, 1);
+  TestEqual(TEXT("With its payload"), LastPartyId, TEXT("party-1"));
+  OnPartyChanged.Remove(PartyHandle);
+
+  // A subscriber that subscribes to new events from inside its callback: the
+  // map grows under the broadcast, and the delegate it runs on must not move.
+  constexpr int32 LateEvents = 64;
+  int32 LateSubscriptions = 0;
+  int32 Rounds = 0;
+  TArray<TPair<FString, FDelegateHandle>> LateHandles;
+  const FString FirstEvent = TEXT("admin:first");
+  FRedwoodPushDelegate &OnFirst = H.Client()->OnPush(FirstEvent);
+  const FDelegateHandle FirstHandle =
+    OnFirst.AddLambda([&H, &LateSubscriptions, &Rounds, &LateHandles](
+                        const TSharedPtr<FJsonObject> &
+                      ) {
+      ++Rounds;
+      for (int32 Index = 0; Index < LateEvents; ++Index) {
+        const FString Event = FString::Printf(TEXT("admin:late-%d"), Index);
+        LateHandles.Emplace(
+          Event,
+          H.Client()->OnPush(Event).AddLambda([&LateSubscriptions](
+                                                const TSharedPtr<FJsonObject> &
+                                              ) { ++LateSubscriptions; })
+        );
+      }
+    });
+  H.Socket()->Push(TEXT("first-1"), FirstEvent, Broadcast, H.JoinRef);
+  TestEqual(TEXT("The callback ran once"), Rounds, 1);
+  H.Socket()->Push(TEXT("late-1"), TEXT("admin:late-7"), Broadcast, H.JoinRef);
+  TestEqual(TEXT("A late subscription hears its push"), LateSubscriptions, 1);
+  TestTrue(
+    TEXT("The reference handed out before the growth is still the delegate"),
+    &H.Client()->OnPush(FirstEvent) == &OnFirst
+  );
+  for (const TPair<FString, FDelegateHandle> &Late : LateHandles) {
+    H.Client()->OnPush(Late.Key).Remove(Late.Value);
+  }
+  OnFirst.Remove(FirstHandle);
   return true;
 }
