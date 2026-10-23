@@ -1563,12 +1563,25 @@ bool FRedwoodBifrostChatTest::RunTest(const FString &Parameters) {
     TestTrue(TEXT("The party's"), Truncated.Contains(Party));
   }
 
+  // Lines Bifrost does not store (`/all`, seq 0) have no cursor: nothing
+  // can replay them, so only their id tells a replay.
+  const FString All = TEXT("r:realm-1/all");
+  H.Socket()->ChatMessage(FFakeBifrost::ChatLine(All, 0, TEXT("a1")), Join.Ref);
+  H.Socket()->ChatMessage(FFakeBifrost::ChatLine(All, 0, TEXT("a2")), Join.Ref);
+  TestEqual(TEXT("Two unstored lines are both delivered"), Lines.Num(), 8);
+  H.Socket()->ChatMessage(FFakeBifrost::ChatLine(All, 0, TEXT("a1")), Join.Ref);
+  TestEqual(TEXT("The same unstored line is dropped"), Lines.Num(), 8);
+  TestFalse(
+    TEXT("No cursor is kept for an unstored topic"),
+    H.Conn->GetChatCursors().Contains(All)
+  );
+
   // A new session starts live.
   H.Conn->ResetChat();
   TestEqual(TEXT("No cursor is left"), H.Conn->GetChatCursors().Num(), 0);
   H.Socket()->ChatMessage(
     FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), Join.Ref
   );
-  TestEqual(TEXT("A line of the new session is delivered"), Lines.Num(), 7);
+  TestEqual(TEXT("A line of the new session is delivered"), Lines.Num(), 9);
   return true;
 }
