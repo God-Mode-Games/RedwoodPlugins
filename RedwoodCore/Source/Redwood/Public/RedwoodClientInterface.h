@@ -37,8 +37,13 @@ DECLARE_MULTICAST_DELEGATE_OneParam(
 // too_long, forbidden, rate_limited, invalid_request, unavailable), so the
 // game can act on one. MsgId is the line's id, on every answer, so a send
 // that failed can be sent again as the same line. Topic and Seq name the
-// posted line.
+// posted line. A reply lost with the socket has the client's own code,
+// LostReplyCode: the line may or may not have posted, and the game resends
+// it once under the same id. A send the gate refused ("Not connected to
+// Realm.") has an empty Code: nothing is resent into a closed gate.
 struct REDWOOD_API FRedwoodChatSendOutput {
+  static constexpr const TCHAR *LostReplyCode = TEXT("lost_reply");
+
   FString Error;
   FString Code;
   FString MsgId;

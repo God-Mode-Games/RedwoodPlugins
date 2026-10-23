@@ -95,6 +95,21 @@ namespace {
       OnOutput.ExecuteIfBound(Output);
     };
   }
+
+  // A chat send tells a lost reply from the server's `unavailable` by a code
+  // of its own, so the game resends the line once under the same id. Only
+  // the lost path sets it: the gate's refusal goes through
+  // SetRedwoodGateError and keeps an empty code.
+  TFunction<void()> MakeLostReply(
+    const TDelegate<void(const FRedwoodChatSendOutput &)> &OnOutput
+  ) {
+    return [OnOutput]() {
+      FRedwoodChatSendOutput Output;
+      Output.Error = FRedwoodPendingReplies::LostReplyError;
+      Output.Code = FRedwoodChatSendOutput::LostReplyCode;
+      OnOutput.ExecuteIfBound(Output);
+    };
+  }
 }
 
 // FORK(hollowed-oath): HollowedOath#2854. A backend move drops the socket for
