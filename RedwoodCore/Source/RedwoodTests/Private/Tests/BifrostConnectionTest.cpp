@@ -14,13 +14,14 @@
 //      is refused with the lost-reply error.
 //   4. `resume_refused` and `invalid_request` end the session; any other
 //      refusal of a resume is the pod's trouble, and the client tries
-//      another socket.
+//      another socket. A resume join that went with its socket, or that a
+//      newer join replaced, leaves the socket alone.
 //   5. A push is delivered once for each push id.
 //   6. `closed` is followed by the end of the channel (phx_close), not a
 //      drop. After `replaced` the socket stays for the next login; after
 //      `reconnect` a new socket is opened at once, with no backoff, and the
 //      session is resumed on it. A socket Bifrost closes after `closed` is
-//      not a drop either.
+//      not a drop either; the owner only hears that the socket went.
 //   7. A heartbeat goes every 30 s; one with no answer by the next closes the
 //      socket with the client's own code and reconnects.
 //   8. Close() stops every reconnect. A message of a replaced join is
@@ -31,7 +32,9 @@
 //      the queued ones with the lost-reply error.
 //  10. A join sent while one waits replaces it: the old join hears that, and
 //      only the new join's reply makes the session. A reply with no join
-//      pending changes nothing.
+//      pending changes nothing. A join also ends the channel it replaces: a
+//      step that waited on it is answered as lost, the next step of the new
+//      channel goes out, and a `closed` of the old channel is forgotten.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -62,6 +65,8 @@ namespace RedwoodBifrostConnectionTest {
 
     int32 Connected = 0;
     int32 Dropped = 0;
+    // Sockets Bifrost closed after `closed`: no loss, only the socket going.
+    int32 QuietDrops = 0;
     int32 Resumed = 0;
     int32 ResumeRefused = 0;
     TSharedPtr<FJsonObject> LastResumeReply;
@@ -74,7 +79,13 @@ namespace RedwoodBifrostConnectionTest {
       Advance(0.0f);
       Conn = MakeShared<FRedwoodBifrostConnection>(Timers);
       Conn->OnConnected = [this]() { ++Connected; };
-      Conn->OnDropped = [this]() { ++Dropped; };
+      Conn->OnDropped = [this](bool bAnnounced) {
+        if (bAnnounced) {
+          ++Dropped;
+        } else {
+          ++QuietDrops;
+        }
+      };
       Conn->OnResumed = [this](const TSharedPtr<FJsonObject> &Reply) {
         ++Resumed;
         LastResumeReply = Reply;
@@ -771,6 +782,7 @@ bool FRedwoodBifrostClosedByServerTest::RunTest(const FString &Parameters) {
   H.Socket()->CloseSession(TEXT("logout"), Third.Ref);
   H.Socket()->Drop(FRedwoodBifrostConnection::NormalCloseCode);
   TestEqual(TEXT("A socket closed after `closed` is not a drop"), H.Dropped, 1);
+  TestEqual(TEXT("But the owner hears the socket go"), H.QuietDrops, 1);
   TestTrue(
     TEXT("The socket comes back for the next login"),
     H.Conn->GetBackoff().IsReconnectPending(H.Timers)
@@ -1178,5 +1190,133 @@ bool FRedwoodBifrostChannelErrorTest::RunTest(const FString &Parameters) {
   TestTrue(
     TEXT("The new socket resumes"), H.Socket()->Last(TEXT("phx_join")).IsValid()
   );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostLostResumeKeepsSocketTest,
+  "Redwood.Bifrost.Connection.LostResumeLeavesTheSocket",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostLostResumeKeepsSocketTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostConnectionTest;
+  AddExpectedMessage(TEXT("reconnecting"), ELogVerbosity::Warning, Contains, 0);
+
+  // A newer join replaces the resume in flight: the resume's refusal is
+  // "not_connected", and the socket that carries the new join must stay.
+  {
+    FHarness H(*this);
+    H.Open();
+    H.LoginOk();
+    H.Socket()->Drop();
+    H.Advance(PastFirstDelaySeconds);
+    H.Accept();
+    TestTrue(
+      TEXT("A resume is in flight"),
+      H.Socket()->Last(TEXT("phx_join")).IsValid()
+    );
+    const int32 DroppedBefore = H.Dropped;
+    const FPhoenixMessage Login = H.SendLogin();
+    TestTrue(TEXT("The login goes out"), Login.IsValid());
+    TestFalse(TEXT("The socket is not closed"), H.Socket()->bCloseCalled);
+    TestTrue(TEXT("Still connected"), H.Conn->IsConnected());
+    TestFalse(
+      TEXT("No reconnect"), H.Conn->GetBackoff().IsReconnectPending(H.Timers)
+    );
+    TestEqual(TEXT("No drop"), H.Dropped, DroppedBefore);
+    TestEqual(TEXT("One socket"), H.Bifrost.Sockets.Num(), 2);
+  }
+
+  // The socket drops with the resume in flight: the lost join is one drop,
+  // not a drop and then a second one from the refusal it got.
+  {
+    FHarness H(*this);
+    H.Open();
+    H.LoginOk();
+    H.Socket()->Drop();
+    H.Advance(PastFirstDelaySeconds);
+    H.Accept();
+    H.Socket()->Drop();
+    TestEqual(TEXT("Two drops for two sockets"), H.Dropped, 2);
+    TestTrue(TEXT("The session is kept"), H.Conn->HasSession());
+    TestTrue(
+      TEXT("One reconnect is scheduled"),
+      H.Conn->GetBackoff().IsReconnectPending(H.Timers)
+    );
+    TestEqual(TEXT("No extra socket yet"), H.Bifrost.Sockets.Num(), 2);
+  }
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostJoinEndsOldChannelTest,
+  "Redwood.Bifrost.Connection.JoinEndsTheOldChannel",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostJoinEndsOldChannelTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodBifrostConnectionTest;
+
+  // A step waits on the old channel when a new login goes out: the step's
+  // reply would carry the old join_ref and be dropped, so the step hears it
+  // is lost now, and the new channel's first step is not stuck behind it.
+  {
+    FHarness H(*this);
+    H.Open();
+    H.LoginOk();
+    TSharedPtr<FJsonObject> StepAnswer;
+    H.Conn->Step(
+      TEXT("session.enter-realm"),
+      nullptr,
+      [&StepAnswer](const TArray<TSharedPtr<FJsonValue>> &Response) {
+        StepAnswer = ResponseObject(Response);
+      }
+    );
+    const FPhoenixMessage Join = H.SendLogin();
+    TestTrue(TEXT("The new join goes out"), Join.IsValid());
+    if (TestNotNull(TEXT("The waiting step is answered"), StepAnswer.Get())) {
+      TestEqual(
+        TEXT("As lost"),
+        StepAnswer->GetStringField(TEXT("code")),
+        TEXT("not_connected")
+      );
+    }
+    H.Socket()->Reply(
+      Join,
+      TEXT("ok"),
+      FFakeBifrost::JoinReply(
+        TEXT("s2"),
+        TEXT("t2"),
+        FFakeBifrost::LoginPlayer(TEXT("p1"), TEXT("tok"))
+      )
+    );
+    H.Conn->Step(TEXT("session.select-character"), nullptr);
+    TestTrue(
+      TEXT("The new channel's first step goes out"),
+      H.Socket()->Last(TEXT("session.select-character")).IsValid()
+    );
+  }
+
+  // `closed` came, and a new login went out before the channel ended: the
+  // old channel's end is filtered by join_ref, so the connection must not
+  // wait for it. The next real drop is a drop, not a quiet close.
+  {
+    FHarness H(*this);
+    H.Open();
+    const FPhoenixMessage First = H.LoginOk();
+    H.Socket()->CloseSession(TEXT("replaced"), First.Ref);
+    H.LoginOk(TEXT("s2"), TEXT("t2"));
+    H.Socket()->EndChannel(First.Ref);
+    TestTrue(
+      TEXT("The old channel's end changes nothing"), H.Conn->HasSession()
+    );
+    ExpectReconnectWarnings(*this);
+    H.Socket()->Drop();
+    TestEqual(TEXT("The drop is announced"), H.Dropped, 1);
+    TestEqual(TEXT("And not quiet"), H.QuietDrops, 0);
+  }
   return true;
 }
