@@ -1676,6 +1676,18 @@ bool FRedwoodBifrostClientCharacterFriendAlertTest::RunTest(
 //  17. A push subscription of the game (OnPush) hears a push's payload, also
 //      on a new connection, and not after it is removed. A push the client
 //      handles itself reaches its handler and the subscribers.
+//  18. A chat send before the realm fails at once. In the realm it goes out
+//      with an id the client made and is answered with its seq; a refusal
+//      gives the player a text of ours and the game the code; a whisper names
+//      the player. A send made during a drop is held and goes out after the
+//      resume, behind `chat.resume` with the cursors; the replay reaches the
+//      game, and so does the topic whose replay was cut short.
+//  19. `chat.topics` updates GetChatTopics and the delegate; a logout clears
+//      them and the next session starts live, with no cursor of the last.
+//  20. A chat resume Bifrost refuses, or one lost with the socket, reports
+//      every topic with a cursor as possibly missing lines, and the line held
+//      for a lost resume is delivered. A resume the session outlived (a
+//      logout before the reply) reports nothing and moves nothing.
 
 namespace RedwoodBifrostClientTest {
   const FString OtherPassword = TEXT("other-secret");
@@ -2453,5 +2465,372 @@ bool FRedwoodBifrostClientPushSubscriptionTest::RunTest(
     H.Client()->OnPush(Late.Key).Remove(Late.Value);
   }
   OnFirst.Remove(FirstHandle);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientChatSendTest,
+  "Redwood.Bifrost.Client.ChatSendAnsweredAndHeldThroughDrop",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientChatSendTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodBifrostClientTest;
+  ExpectDrop(*this);
+  FClientHarness H(*this);
+  const FString Party = TEXT("r:realm-1/party:party-1");
+
+  // Chat needs the session in its realm, like a realm request.
+  H.Open();
+  H.LoginOk();
+  TCapture<FRedwoodChatSendOutput> Early;
+  H.Client()->SendChat(Party, TEXT("too soon"), Early.Delegate());
+  TestEqual(
+    TEXT("A send before the realm is answered at once"), Early.Count, 1
+  );
+  TestEqual(
+    TEXT("As not connected to the realm"), Early.Last.Error, NotConnectedToRealm
+  );
+  TestFalse(
+    TEXT("The gate's answer carries the line's id"), Early.Last.MsgId.IsEmpty()
+  );
+  TestTrue(
+    TEXT("With no code: nothing is resent into a closed gate"),
+    Early.Last.Code.IsEmpty()
+  );
+  TestEqual(
+    TEXT("And nothing went out"), H.Socket()->CountSent(TEXT("chat.send")), 0
+  );
+
+  H.EnterRealmOk();
+  H.SelectCharacterOk();
+  TArray<FRedwoodChatMessage> Lines;
+  H.Client()->OnChatMessage.AddLambda(
+    [&Lines](const FRedwoodChatMessage &Line) { Lines.Add(Line); }
+  );
+
+  // A send in the realm, answered with its seq.
+  TCapture<FRedwoodChatSendOutput> Sent;
+  H.Client()->SendChat(Party, TEXT("hi all"), Sent.Delegate());
+  const FPhoenixMessage Send = H.Socket()->Last(TEXT("chat.send"));
+  if (!TestTrue(TEXT("The send goes out"), Send.IsValid())) {
+    return false;
+  }
+  const FString MsgId = Send.Payload->GetStringField(TEXT("msgId"));
+  TestFalse(TEXT("With an id the client made"), MsgId.IsEmpty());
+  TestEqual(
+    TEXT("To the topic"), Send.Payload->GetStringField(TEXT("topic")), Party
+  );
+  TestEqual(
+    TEXT("With the body"),
+    Send.Payload->GetStringField(TEXT("body")),
+    TEXT("hi all")
+  );
+  TSharedPtr<FJsonObject> Posted = MakeShared<FJsonObject>();
+  Posted->SetStringField(TEXT("msgId"), MsgId);
+  Posted->SetStringField(TEXT("topic"), Party);
+  Posted->SetNumberField(TEXT("seq"), 4);
+  H.Socket()->Reply(Send, TEXT("ok"), Posted);
+  TestEqual(TEXT("The send is answered once"), Sent.Count, 1);
+  TestEqual(TEXT("As a success"), Sent.Last.Error, FString());
+  TestEqual(TEXT("With the line's seq"), Sent.Last.Seq, static_cast<int64>(4));
+  TestEqual(TEXT("And its topic"), Sent.Last.Topic, Party);
+  TestEqual(TEXT("And the id it was sent under"), Sent.Last.MsgId, MsgId);
+
+  // A line arrives: the session has a cursor to resume from.
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 5, TEXT("m5")), H.JoinRef
+  );
+  TestEqual(TEXT("A live line reaches the game"), Lines.Num(), 1);
+
+  // A refusal: the player reads a text of ours, the game gets the code.
+  TCapture<FRedwoodChatSendOutput> Muted;
+  H.Client()->SendChat(Party, TEXT("again"), Muted.Delegate());
+  H.Socket()->Refuse(
+    H.Socket()->Last(TEXT("chat.send")), TEXT("muted"), TEXT("muted by staff")
+  );
+  TestEqual(TEXT("The refusal is answered"), Muted.Count, 1);
+  TestEqual(TEXT("With the code"), Muted.Last.Code, TEXT("muted"));
+  TestEqual(
+    TEXT("And the player's text for it"),
+    Muted.Last.Error,
+    URedwoodClientInterface::ChatErrorText(TEXT("muted"), FString())
+  );
+
+  // The game sends the same line again under the id it was given: Bifrost
+  // posts one line per id, so a retry cannot post twice.
+  TCapture<FRedwoodChatSendOutput> Retry;
+  H.Client()->SendChat(
+    Party, TEXT("again"), Muted.Last.MsgId, Retry.Delegate()
+  );
+  TestEqual(
+    TEXT("A retry goes out under the game's id"),
+    H.Socket()->Last(TEXT("chat.send")).Payload->GetStringField(TEXT("msgId")),
+    Muted.Last.MsgId
+  );
+
+  // A whisper names the player, not a topic.
+  TCapture<FRedwoodChatSendOutput> Whisper;
+  H.Client()->SendWhisper(TEXT("p2"), TEXT("psst"), Whisper.Delegate());
+  const FPhoenixMessage Whispered = H.Socket()->Last(TEXT("chat.send"));
+  TestEqual(
+    TEXT("A whisper carries the target player"),
+    Whispered.Payload->GetStringField(TEXT("to")),
+    TEXT("p2")
+  );
+  TestFalse(TEXT("And no topic"), Whispered.Payload->HasField(TEXT("topic")));
+
+  // A whisper by name names the character the player typed.
+  TCapture<FRedwoodChatSendOutput> ByName;
+  H.Client()->SendWhisperByName(TEXT("Alpha"), TEXT("psst"), ByName.Delegate());
+  const FPhoenixMessage Named = H.Socket()->Last(TEXT("chat.send"));
+  TestEqual(
+    TEXT("A whisper by name carries the name"),
+    Named.Payload->GetStringField(TEXT("toName")),
+    TEXT("Alpha")
+  );
+  TestFalse(TEXT("And no player"), Named.Payload->HasField(TEXT("to")));
+  TestFalse(TEXT("Nor a topic"), Named.Payload->HasField(TEXT("topic")));
+
+  // The drop. The whisper that waited fails; a send made in the gap is held.
+  H.Socket()->Drop();
+  TestEqual(TEXT("The waiting whisper fails"), Whisper.Count, 1);
+  TestEqual(
+    TEXT("With the lost-reply error"),
+    Whisper.Last.Error,
+    FRedwoodPendingReplies::LostReplyError
+  );
+  TestFalse(
+    TEXT("And carries its id for a retry"), Whisper.Last.MsgId.IsEmpty()
+  );
+  TestEqual(
+    TEXT("Under the client's lost-reply code"),
+    Whisper.Last.Code,
+    FRedwoodChatSendOutput::LostReplyCode
+  );
+  TestEqual(TEXT("The unanswered retry fails too"), Retry.Count, 1);
+  TestEqual(TEXT("And the unanswered whisper by name"), ByName.Count, 1);
+  TCapture<FRedwoodChatSendOutput> Held;
+  H.Client()->SendChat(Party, TEXT("while down"), Held.Delegate());
+  TestEqual(TEXT("A send in the gap is held"), H.HeldCount(), 1);
+  TestEqual(TEXT("And not answered"), Held.Count, 0);
+
+  // The session comes back: the chat is resumed first, from the cursor, and
+  // the held send follows it.
+  TArray<FString> Truncated;
+  H.Client()->OnChatTruncated.AddLambda(
+    [&Truncated](const TArray<FString> &In) { Truncated = In; }
+  );
+  H.Advance(PastFirstDelaySeconds);
+  H.Accept();
+  H.ResumeOk();
+  const FPhoenixMessage Resume = H.Socket()->Last(TEXT("chat.resume"));
+  if (!TestTrue(TEXT("The resume goes out"), Resume.IsValid())) {
+    return false;
+  }
+  TestEqual(
+    TEXT("With the topic's cursor"),
+    static_cast<int32>(
+      Resume.Payload->GetObjectField(TEXT("cursors"))->GetNumberField(Party)
+    ),
+    5
+  );
+  const FPhoenixMessage HeldSend = H.Socket()->Last(TEXT("chat.send"));
+  if (!TestTrue(TEXT("The held send goes out"), HeldSend.IsValid())) {
+    return false;
+  }
+  TestTrue(
+    TEXT("After the resume"),
+    IndexOfLast(*H.Socket(), TEXT("chat.resume")) <
+      IndexOfLast(*H.Socket(), TEXT("chat.send"))
+  );
+  TestEqual(
+    TEXT("With its body"),
+    HeldSend.Payload->GetStringField(TEXT("body")),
+    TEXT("while down")
+  );
+  TestEqual(TEXT("Nothing is held"), H.HeldCount(), 0);
+
+  // The replay repairs the gap, and the game hears what was cut short.
+  TSharedPtr<FJsonObject> Topics = MakeShared<FJsonObject>();
+  Topics->SetObjectField(
+    Party,
+    FFakeBifrost::ResumedTopic(
+      {FFakeBifrost::ChatLine(Party, 6, TEXT("m6"))}, true
+    )
+  );
+  TSharedPtr<FJsonObject> ResumeReply = MakeShared<FJsonObject>();
+  ResumeReply->SetObjectField(TEXT("topics"), Topics);
+  H.Socket()->Reply(Resume, TEXT("ok"), ResumeReply);
+  if (TestEqual(TEXT("The replayed line reaches the game"), Lines.Num(), 2)) {
+    TestEqual(TEXT("After the gap"), Lines[1].Seq, static_cast<int64>(6));
+  }
+  TestEqual(TEXT("The cut topic is reported"), Truncated.Num(), 1);
+  TestTrue(TEXT("By name"), Truncated.Contains(Party));
+
+  // The held send is answered when Bifrost answers it.
+  Posted->SetStringField(
+    TEXT("msgId"), HeldSend.Payload->GetStringField(TEXT("msgId"))
+  );
+  Posted->SetNumberField(TEXT("seq"), 7);
+  H.Socket()->Reply(HeldSend, TEXT("ok"), Posted);
+  TestEqual(TEXT("The held send is answered once"), Held.Count, 1);
+  TestEqual(TEXT("With its seq"), Held.Last.Seq, static_cast<int64>(7));
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientChatTopicsTest,
+  "Redwood.Bifrost.Client.ChatTopicsFollowTheSession",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientChatTopicsTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodBifrostClientTest;
+  FClientHarness H(*this);
+  H.EnterSessionWithCharacter();
+  const FString Party = TEXT("r:realm-1/party:party-1");
+  const FString Guild = TEXT("guild:guild-1");
+
+  int32 Updates = 0;
+  H.Client()->OnChatTopics.AddLambda([&Updates](const TArray<FString> &) {
+    ++Updates;
+  });
+  TArray<FRedwoodChatMessage> Lines;
+  H.Client()->OnChatMessage.AddLambda(
+    [&Lines](const FRedwoodChatMessage &Line) { Lines.Add(Line); }
+  );
+  TestEqual(
+    TEXT("No topics before Bifrost names them"),
+    H.Client()->GetChatTopics().Num(),
+    0
+  );
+
+  H.Socket()->ChatTopics({Party, Guild}, H.JoinRef);
+  TestEqual(TEXT("The game hears the topics"), Updates, 1);
+  TestEqual(TEXT("All of them"), H.Client()->GetChatTopics().Num(), 2);
+  TestTrue(
+    TEXT("Including the guild's"), H.Client()->GetChatTopics().Contains(Guild)
+  );
+
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), H.JoinRef
+  );
+  TestEqual(TEXT("A line reaches the game"), Lines.Num(), 1);
+
+  // The session ends: its topics go, and the game hears that too.
+  H.Client()->Logout();
+  TestEqual(
+    TEXT("The logout clears the topics"), H.Client()->GetChatTopics().Num(), 0
+  );
+  TestEqual(TEXT("And the game hears it"), Updates, 2);
+
+  // The next session starts live: a line with the last session's topic and
+  // seq is new to it.
+  H.LoginOk(TEXT("s2"), TEXT("rt2"));
+  H.EnterRealmOk();
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), H.JoinRef
+  );
+  TestEqual(TEXT("The new session's line is delivered"), Lines.Num(), 2);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientChatResumeFailureTest,
+  "Redwood.Bifrost.Client.ChatResumeFailureReportsTheGap",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientChatResumeFailureTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  ExpectDrop(*this, 3);
+  AddExpectedMessage(
+    TEXT("The chat resume was refused"), ELogVerbosity::Warning, Contains, 1
+  );
+  FClientHarness H(*this);
+  H.EnterSessionWithCharacter();
+  const FString Party = TEXT("r:realm-1/party:party-1");
+  TArray<FRedwoodChatMessage> Lines;
+  H.Client()->OnChatMessage.AddLambda(
+    [&Lines](const FRedwoodChatMessage &Line) { Lines.Add(Line); }
+  );
+  int32 GapReports = 0;
+  TArray<FString> GapTopics;
+  H.Client()->OnChatTruncated.AddLambda(
+    [&GapReports, &GapTopics](const TArray<FString> &Topics) {
+      ++GapReports;
+      GapTopics = Topics;
+    }
+  );
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), H.JoinRef
+  );
+  TestEqual(TEXT("A line gives the session a cursor"), Lines.Num(), 1);
+
+  // 1. Bifrost refuses the resume: the gap stays, and the game hears that
+  //    the topic may be missing lines.
+  H.DropAndReopen();
+  H.ResumeOk();
+  H.Socket()->Refuse(
+    H.Socket()->Last(TEXT("chat.resume")),
+    TEXT("unavailable"),
+    TEXT("The store did not answer.")
+  );
+  TestEqual(TEXT("A refused resume reports the gap once"), GapReports, 1);
+  TestEqual(TEXT("For the topic with a cursor"), GapTopics.Num(), 1);
+  TestTrue(TEXT("By name"), GapTopics.Contains(Party));
+  // The connection counts as healthy again, so the next drop waits only the
+  // first delay.
+  H.Advance(FRedwoodCloseBackoff::StableConnectionSeconds + 0.1f);
+
+  // 2. The socket goes with the resume in flight: the line held for it is
+  //    delivered, and the game hears the gap again.
+  H.DropAndReopen();
+  H.ResumeOk();
+  TestTrue(
+    TEXT("The resume went out"), H.Socket()->Last(TEXT("chat.resume")).IsValid()
+  );
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 2, TEXT("m2")), H.JoinRef
+  );
+  TestEqual(TEXT("A live line waits for the resume"), Lines.Num(), 1);
+  H.Socket()->Drop();
+  TestEqual(TEXT("The drop delivers the held line"), Lines.Num(), 2);
+  TestEqual(TEXT("A lost resume reports the gap"), GapReports, 2);
+
+  // 3. A logout before the reply: the resume was the ended session's, so
+  //    nothing is said and nothing moves.
+  H.Advance(PastSecondDelaySeconds);
+  H.Accept();
+  H.ResumeOk();
+  const FPhoenixMessage Resume = H.Socket()->Last(TEXT("chat.resume"));
+  TestEqual(
+    TEXT("The resume asks from the moved cursor"),
+    static_cast<int32>(
+      Resume.Payload->GetObjectField(TEXT("cursors"))->GetNumberField(Party)
+    ),
+    2
+  );
+  H.Client()->Logout();
+  TSharedPtr<FJsonObject> Topics = MakeShared<FJsonObject>();
+  Topics->SetObjectField(
+    Party,
+    FFakeBifrost::ResumedTopic(
+      {FFakeBifrost::ChatLine(Party, 3, TEXT("m3"))}, true
+    )
+  );
+  TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+  Reply->SetObjectField(TEXT("topics"), Topics);
+  H.Socket()->Reply(Resume, TEXT("ok"), Reply);
+  TestEqual(TEXT("The old session's replay reaches nobody"), Lines.Num(), 2);
+  TestEqual(TEXT("No gap is reported for it"), GapReports, 2);
+  TestEqual(
+    TEXT("No cursor is kept"),
+    FRedwoodClientTestAccess::Connection(*H.Client())->GetChatCursors().Num(),
+    0
+  );
   return true;
 }

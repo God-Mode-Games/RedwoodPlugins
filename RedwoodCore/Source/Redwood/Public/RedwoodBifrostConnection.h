@@ -14,10 +14,71 @@
 
 class IWebSocket;
 
+// A chat line as Bifrost delivers it (`chat.msg`) and as a `chat.resume`
+// reply replays it. Seq orders the lines of one topic; MsgId is the sender's
+// id of the line, the same on every delivery of it.
+struct REDWOOD_API FRedwoodChatMessage {
+  FString Topic;
+  int64 Seq = 0;
+  FString MsgId;
+  FString Category;
+  // The sender's player id is optional: empty when Bifrost sent none.
+  FString SenderPlayerId;
+  FString SenderCharacterId;
+  FString SenderName;
+  // The whisper's target, `to: {playerId, characterId, name}`: set on the
+  // copies of a whisper only, so the sender's own copy can name who it was
+  // for; empty on every other line.
+  FString ToPlayerId;
+  FString ToCharacterId;
+  FString ToName;
+  FString Template;
+  TArray<FString> Args;
+  // The contract sends an ISO 8601 date-time string.
+  FDateTime SentAt;
+
+  // From the payload of `chat.msg`, or one element of a resume's `messages`.
+  // False when the topic, the seq or the msgId is missing: a line cannot be
+  // ordered or deduplicated without them.
+  static bool Parse(
+    const TSharedPtr<FJsonObject> &Object, FRedwoodChatMessage &OutMessage
+  );
+};
+
+// The last ids seen, so a delivery sent again is dropped: a push a resume
+// sends again, a chat line a resume replays. Fixed size, because what a
+// session can see again is recent; an id that fell out is treated as new.
+class REDWOOD_API FRedwoodRecentIds {
+public:
+  explicit FRedwoodRecentIds(int32 Capacity) {
+    Ids.SetNum(Capacity);
+  }
+
+  bool Contains(const FString &Id) const {
+    return Ids.Contains(Id);
+  }
+
+  void Add(const FString &Id) {
+    Ids[NextSlot] = Id;
+    NextSlot = (NextSlot + 1) % Ids.Num();
+  }
+
+  void Reset() {
+    for (FString &Id : Ids) {
+      Id.Reset();
+    }
+    NextSlot = 0;
+  }
+
+private:
+  TArray<FString> Ids;
+  int32 NextSlot = 0;
+};
+
 // The one player connection: a WebSocket to Bifrost, which carries the
-// session, every request to the Redwood director and realm, and every push
-// from them. It speaks the Phoenix Channels protocol (v2 JSON) on one
-// channel, "session". The contract is HollowedOath-Services
+// session, every request to the Redwood director and realm, every push
+// from them, and the chat. It speaks the Phoenix Channels protocol (v2 JSON)
+// on one channel, "session". The contract is HollowedOath-Services
 // services/bifrost/contract/protocol.md.
 //
 // It owns the socket's life: a drop it did not ask for is followed by a
@@ -52,6 +113,10 @@ public:
   // How many push ids are remembered: a push sent again after a resume is
   // dropped if its id was seen.
   static constexpr int32 RememberedPushIds = 256;
+  // How many chat msgIds are remembered. The per-topic cursor drops most
+  // replays; the ids catch a line delivered again under a seq the cursor
+  // has not reached (a resume's replay that overlaps a live delivery).
+  static constexpr int32 RememberedChatMsgIds = 256;
 
   explicit FRedwoodBifrostConnection(FTimerManager &InTimerManager);
   ~FRedwoodBifrostConnection();
@@ -109,6 +174,83 @@ public:
     const TSharedPtr<FJsonObject> &Payload,
     FRedwoodReplyCallback Callback = nullptr
   );
+
+  // ── Chat ────────────────────────────────────────────────────────────────
+  // protocol.md, "Chat". The replies are shaped as for Rpc: one element, an
+  // object with an `error` string that is empty on success, and the reply's
+  // own fields beside it (`chat.send`: msgId, topic, seq). A reply lost with
+  // the socket is the owner's to answer, as for Rpc.
+
+  // `chat.send {msgId, topic, body}`. MsgId is the caller's: Bifrost posts
+  // a line once per id, so a send that is sent again cannot post twice.
+  void ChatSend(
+    const FString &MsgId,
+    const FString &Topic,
+    const FString &Body,
+    FRedwoodReplyCallback Callback = nullptr
+  );
+
+  // A whisper is addressed to a player, not a topic: `chat.send {msgId, to,
+  // body}`. Bifrost finds the player's session and writes the line to both
+  // sides' character topics.
+  void ChatWhisper(
+    const FString &MsgId,
+    const FString &ToPlayerId,
+    const FString &Body,
+    FRedwoodReplyCallback Callback = nullptr
+  );
+
+  // A whisper to a character by name: `chat.send {msgId, toName, body}`.
+  // The player types a name; Bifrost finds the character's player.
+  void ChatWhisperByName(
+    const FString &MsgId,
+    const FString &ToName,
+    const FString &Body,
+    FRedwoodReplyCallback Callback = nullptr
+  );
+
+  // `chat.resume {cursors}` with the cursor of every topic this connection
+  // has a line of. The reply's lines reach OnChatMessage in seq order,
+  // through the same cursor and id check as a live line, before the
+  // callback runs; read the topics Bifrost could not replay in full with
+  // TruncatedTopics. A live line that arrives while the resume waits is
+  // delivered after the reply, so the replay cannot be dropped as old. The
+  // hold ends only with the reply, a drop of the channel or ResetChat; there
+  // is no timer, because a request on a live channel is always answered or
+  // lost with the channel, and a timer that gave up first would deliver the
+  // live lines past the gap while the replay could still arrive. A refused
+  // resume and a drop deliver the held lines (the owner hears that the
+  // resume failed); a reset drops them with the session. A reply of a resume
+  // that a reset or a drop ended changes nothing.
+  void ChatResume(FRedwoodReplyCallback Callback = nullptr);
+
+  // `chat.report {topic, seq, reason}`.
+  void ChatReport(
+    const FString &Topic,
+    int64 Seq,
+    const FString &Reason,
+    FRedwoodReplyCallback Callback = nullptr
+  );
+
+  // The topics of a resume reply whose replay was cut short: lines before
+  // the oldest one sent are lost to this client.
+  static TArray<FString> TruncatedTopics(
+    const TSharedPtr<FJsonObject> &ResumeReply
+  );
+
+  // A new session starts live: no cursor to resume from, no id to drop.
+  void ResetChat();
+
+  const TMap<FString, int64> &GetChatCursors() const {
+    return ChatCursors;
+  }
+
+  // A chat line this client had not seen: delivered live, or replayed by a
+  // resume. Each line of a topic comes once, and after the lines before it.
+  TFunction<void(const FRedwoodChatMessage &Message)> OnChatMessage;
+  // `chat.topics`: the topics this session can read and send to, each time
+  // the set changes. The cursors of topics not named are dropped first.
+  TFunction<void(const TArray<FString> &Topics)> OnChatTopics;
 
   // A Redwood push by its Redwood event name. One handler per event.
   void OnEvent(const FString &Event, FEventHandler Handler);
@@ -182,6 +324,13 @@ private:
   void HandleMessage(const FString &Text);
   void HandleReply(const FString &Ref, const TSharedPtr<FJsonObject> &Payload);
   void HandlePush(const TSharedPtr<FJsonObject> &Payload);
+  void HandleChatMessage(const TSharedPtr<FJsonObject> &Payload);
+  void HandleChatTopics(const TSharedPtr<FJsonObject> &Payload);
+  // The one path a line takes to OnChatMessage. False when it was seen.
+  bool DeliverChatLine(const FRedwoodChatMessage &Message);
+  void ApplyChatResume(
+    const TArray<TSharedPtr<FJsonValue>> &Response, uint32 Generation
+  );
   void HandleClosedByServer(const TSharedPtr<FJsonObject> &Payload);
   void EndChannel();
   void HandleSocketClosed(bool bRequested);
@@ -228,8 +377,19 @@ private:
   TArray<FQueuedStep> QueuedSteps;
   FString StepRef;
   TMap<FString, FEventHandler> Handlers;
-  TArray<FString> SeenPushIds;
-  int32 NextSeenPushIdSlot = 0;
+  FRedwoodRecentIds SeenPushIds{RememberedPushIds};
+
+  // The seq of the last line delivered, per topic. A line at or before it
+  // was seen (a replay), and a resume asks for what came after.
+  TMap<FString, int64> ChatCursors;
+  FRedwoodRecentIds SeenChatMsgIds{RememberedChatMsgIds};
+  // A live line that arrives while a resume waits would move the cursor past
+  // the replay and have it dropped, so it waits until the reply is applied.
+  bool bChatResumePending = false;
+  TArray<FRedwoodChatMessage> ChatLinesHeldForResume;
+  // Counts the resets and drops, so the reply of a resume sent before one
+  // is known as stale: a new session must not take the old one's replay.
+  uint32 ChatResumeGeneration = 0;
 
   FRedwoodCloseBackoff Backoff;
   FTimerHandle HeartbeatTimer;

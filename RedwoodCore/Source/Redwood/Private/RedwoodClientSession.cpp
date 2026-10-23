@@ -1072,6 +1072,8 @@ void FRedwoodClientSession::Suspend(const FString &RealmToRestore) {
 void FRedwoodClientSession::Restore(ERedwoodSessionPhase To) {
   bGraceExpired = false;
   Go(To);
+  // Only here: a fresh session has no cursors to repair.
+  Emit(ERedwoodSessionEffectKind::ResumeChat);
   Emit(ERedwoodSessionEffectKind::ReleaseHeld);
   Emit(ERedwoodSessionEffectKind::StopGrace);
   Emit(ERedwoodSessionEffectKind::BroadcastReestablished);
@@ -1213,6 +1215,8 @@ const TCHAR *FRedwoodClientSession::EffectName(ERedwoodSessionEffectKind Kind) {
       return TEXT("SendLogoutStep");
     case ERedwoodSessionEffectKind::ForgetSession:
       return TEXT("ForgetSession");
+    case ERedwoodSessionEffectKind::ResumeChat:
+      return TEXT("ResumeChat");
     case ERedwoodSessionEffectKind::StartGrace:
       return TEXT("StartGrace");
     case ERedwoodSessionEffectKind::StopGrace:

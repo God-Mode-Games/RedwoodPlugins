@@ -35,6 +35,19 @@
 //      pending changes nothing. A join also ends the channel it replaces: a
 //      step that waited on it is answered as lost, the next step of the new
 //      channel goes out, and a `closed` of the old channel is forgotten.
+//  11. A chat line (`chat.msg`) is delivered once and moves its topic's
+//      cursor; a line at or before the cursor, or with a seen msgId, is
+//      dropped; a line of a new topic starts its cursor. `chat.resume` sends
+//      the cursors, and the reply's lines are delivered oldest first through
+//      the same check, with the truncated topics readable from the reply; a
+//      live line that arrives while the resume waits comes after the replay.
+//      `chat.send` is answered with its seq, a whisper carries `to` and no
+//      topic, and `chat.topics` reaches its callback.
+//  12. A resume ended by a reset (the session ended) or a drop is stale: its
+//      reply moves no cursor and delivers nothing. A line or a topic list
+//      that arrives with no session is dropped.
+//  13. A drop with a resume in flight delivers the lines held for it; the
+//      next resume asks from the moved cursor.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -1318,5 +1331,440 @@ bool FRedwoodBifrostJoinEndsOldChannelTest::RunTest(const FString &Parameters) {
     TestEqual(TEXT("The drop is announced"), H.Dropped, 1);
     TestEqual(TEXT("And not quiet"), H.QuietDrops, 0);
   }
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostChatTest,
+  "Redwood.Bifrost.Connection.ChatLinesAndResume",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostChatTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodBifrostConnectionTest;
+  FHarness H(*this);
+  H.Open();
+  const FPhoenixMessage Join = H.LoginOk();
+
+  const FString Party = TEXT("r:realm-1/party:party-1");
+  const FString Guild = TEXT("guild:guild-1");
+  TArray<FRedwoodChatMessage> Lines;
+  H.Conn->OnChatMessage = [&Lines](const FRedwoodChatMessage &Message) {
+    Lines.Add(Message);
+  };
+  TArray<FString> Topics;
+  int32 TopicUpdates = 0;
+  H.Conn->OnChatTopics = [&Topics, &TopicUpdates](const TArray<FString> &In) {
+    Topics = In;
+    ++TopicUpdates;
+  };
+
+  // A live line, with its fields.
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1"), TEXT("first")), Join.Ref
+  );
+  if (!TestEqual(TEXT("A chat line reaches the callback"), Lines.Num(), 1)) {
+    return false;
+  }
+  TestEqual(TEXT("With its topic"), Lines[0].Topic, Party);
+  TestEqual(TEXT("With its seq"), Lines[0].Seq, static_cast<int64>(1));
+  TestEqual(TEXT("With its id"), Lines[0].MsgId, TEXT("m1"));
+  TestEqual(
+    TEXT("With its category"), Lines[0].Category, TEXT("Message.Chat.Party")
+  );
+  TestEqual(
+    TEXT("With the sender's character"),
+    Lines[0].SenderCharacterId,
+    TEXT("char-9")
+  );
+  TestEqual(TEXT("With the sender's name"), Lines[0].SenderName, TEXT("Bravo"));
+  TestTrue(
+    TEXT("No sender player id when Bifrost sent none"),
+    Lines[0].SenderPlayerId.IsEmpty()
+  );
+  TestTrue(
+    TEXT("No whisper target on a topic line"), Lines[0].ToPlayerId.IsEmpty()
+  );
+  TestEqual(TEXT("With the template"), Lines[0].Template, TEXT("first"));
+  TestTrue(
+    TEXT("With the time it was sent, from ISO 8601"),
+    Lines[0].SentAt == FDateTime(2026, 10, 23, 12, 0, 0)
+  );
+  TestEqual(
+    TEXT("The topic's cursor is the line's seq"),
+    H.Conn->GetChatCursors()[Party],
+    static_cast<int64>(1)
+  );
+
+  // Replays are dropped: the same seq under a new id, a seen id under a new
+  // seq, and a seq before the cursor.
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1b")), Join.Ref
+  );
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 2, TEXT("m1")), Join.Ref
+  );
+  TestEqual(
+    TEXT("A line at the cursor, or with a seen id, is dropped"), Lines.Num(), 1
+  );
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 3, TEXT("m3")), Join.Ref
+  );
+  TestEqual(TEXT("A line after the cursor is delivered"), Lines.Num(), 2);
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 2, TEXT("m2")), Join.Ref
+  );
+  TestEqual(TEXT("A line before the cursor is dropped"), Lines.Num(), 2);
+
+  // A whisper copy names the sender's player and the target.
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(
+      TEXT("r:realm-1/char:char-1"),
+      1,
+      TEXT("w1"),
+      TEXT("psst"),
+      TEXT("2026-10-23T12:00:01Z"),
+      TEXT("p9"),
+      TEXT("p1")
+    ),
+    Join.Ref
+  );
+  if (TestEqual(TEXT("The whisper copy is delivered"), Lines.Num(), 3)) {
+    TestEqual(
+      TEXT("With the sender's player"), Lines[2].SenderPlayerId, TEXT("p9")
+    );
+    TestEqual(TEXT("With the target player"), Lines[2].ToPlayerId, TEXT("p1"));
+    TestEqual(
+      TEXT("The target character"), Lines[2].ToCharacterId, TEXT("char-1")
+    );
+    TestEqual(TEXT("And the target name"), Lines[2].ToName, TEXT("Alpha"));
+  }
+
+  // A topic the connection has no cursor for starts live.
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Guild, 40, TEXT("g40")), Join.Ref
+  );
+  TestEqual(TEXT("A line of a new topic is delivered"), Lines.Num(), 4);
+  TestEqual(
+    TEXT("And starts that topic's cursor"),
+    H.Conn->GetChatCursors()[Guild],
+    static_cast<int64>(40)
+  );
+
+  // A line with nothing to order or deduplicate it is dropped, loudly.
+  AddExpectedMessage(
+    TEXT("Dropped a chat.msg"), ELogVerbosity::Warning, Contains, 1
+  );
+  TSharedPtr<FJsonObject> NoSeq = FFakeBifrost::ChatLine(Party, 4, TEXT("m4"));
+  NoSeq->RemoveField(TEXT("seq"));
+  H.Socket()->ChatMessage(NoSeq, Join.Ref);
+  TestEqual(TEXT("A line with no seq is dropped"), Lines.Num(), 4);
+
+  // The session's topics.
+  H.Socket()->ChatTopics({Party, Guild}, Join.Ref);
+  TestEqual(TEXT("The topics reach their callback"), TopicUpdates, 1);
+  TestEqual(TEXT("All of them"), Topics.Num(), 2);
+  TestTrue(TEXT("Including the guild's"), Topics.Contains(Guild));
+
+  // A send, answered with its seq.
+  TSharedPtr<FJsonObject> Answer;
+  H.Conn->ChatSend(TEXT("c1"), Party, TEXT("hi all"), Keep(Answer));
+  const FPhoenixMessage Send = H.Socket()->Last(TEXT("chat.send"));
+  if (!TestTrue(TEXT("A send goes out as chat.send"), Send.IsValid())) {
+    return false;
+  }
+  TestEqual(TEXT("The send is on the join"), Send.JoinRef, Join.Ref);
+  TestEqual(
+    TEXT("With the caller's id"),
+    Send.Payload->GetStringField(TEXT("msgId")),
+    TEXT("c1")
+  );
+  TestEqual(
+    TEXT("The topic"), Send.Payload->GetStringField(TEXT("topic")), Party
+  );
+  TestEqual(
+    TEXT("And the body"),
+    Send.Payload->GetStringField(TEXT("body")),
+    TEXT("hi all")
+  );
+  TSharedPtr<FJsonObject> Posted = MakeShared<FJsonObject>();
+  Posted->SetStringField(TEXT("msgId"), TEXT("c1"));
+  Posted->SetStringField(TEXT("topic"), Party);
+  Posted->SetNumberField(TEXT("seq"), 4);
+  H.Socket()->Reply(Send, TEXT("ok"), Posted);
+  if (TestNotNull(TEXT("The send is answered"), Answer.Get())) {
+    TestEqual(
+      TEXT("As a success"), Answer->GetStringField(TEXT("error")), TEXT("")
+    );
+    TestEqual(
+      TEXT("With the seq Bifrost gave the line"),
+      static_cast<int32>(Answer->GetNumberField(TEXT("seq"))),
+      4
+    );
+  }
+
+  // A send Bifrost refuses.
+  Answer.Reset();
+  H.Conn->ChatSend(TEXT("c2"), Party, TEXT("again"), Keep(Answer));
+  H.Socket()->Refuse(
+    H.Socket()->Last(TEXT("chat.send")), TEXT("muted"), TEXT("You are muted.")
+  );
+  if (TestNotNull(TEXT("The refusal is answered"), Answer.Get())) {
+    TestEqual(
+      TEXT("With its code"), Answer->GetStringField(TEXT("code")), TEXT("muted")
+    );
+  }
+
+  // A whisper names a player, not a topic.
+  H.Conn->ChatWhisper(TEXT("c3"), TEXT("p2"), TEXT("psst"), nullptr);
+  const FPhoenixMessage Whisper = H.Socket()->Last(TEXT("chat.send"));
+  TestEqual(
+    TEXT("A whisper carries the target player"),
+    Whisper.Payload->GetStringField(TEXT("to")),
+    TEXT("p2")
+  );
+  TestFalse(TEXT("And no topic"), Whisper.Payload->HasField(TEXT("topic")));
+
+  // A whisper by name names the character, and nothing else.
+  H.Conn->ChatWhisperByName(TEXT("c4"), TEXT("Alpha"), TEXT("psst"), nullptr);
+  const FPhoenixMessage ByName = H.Socket()->Last(TEXT("chat.send"));
+  TestEqual(
+    TEXT("A whisper by name carries the name"),
+    ByName.Payload->GetStringField(TEXT("toName")),
+    TEXT("Alpha")
+  );
+  TestFalse(TEXT("No player"), ByName.Payload->HasField(TEXT("to")));
+  TestFalse(TEXT("No topic either"), ByName.Payload->HasField(TEXT("topic")));
+
+  // A report.
+  H.Conn->ChatReport(Party, 3, TEXT("spam"), nullptr);
+  const FPhoenixMessage Report = H.Socket()->Last(TEXT("chat.report"));
+  TestTrue(
+    TEXT("A report names the line and the reason"),
+    Report.IsValid() &&
+      Report.Payload->GetStringField(TEXT("topic")) == Party &&
+      static_cast<int32>(Report.Payload->GetNumberField(TEXT("seq"))) == 3 &&
+      Report.Payload->GetStringField(TEXT("reason")) == TEXT("spam")
+  );
+
+  // The resume sends the cursors. The reply lists the party's lines newest
+  // first and one the client has (seq 3): they are delivered oldest first,
+  // and the seen one is dropped. A live line that arrives while the resume
+  // waits comes after the replay, so the replay is not dropped as old.
+  Answer.Reset();
+  H.Conn->ChatResume(Keep(Answer));
+  const FPhoenixMessage Resume = H.Socket()->Last(TEXT("chat.resume"));
+  if (!TestTrue(TEXT("The resume goes out"), Resume.IsValid())) {
+    return false;
+  }
+  const TSharedPtr<FJsonObject> Cursors =
+    Resume.Payload->GetObjectField(TEXT("cursors"));
+  // The whisper topic's cursor went with the topics push that did not name
+  // it: only the party's and the guild's remain.
+  TestEqual(TEXT("With a cursor per topic"), Cursors->Values.Num(), 2);
+  TestEqual(
+    TEXT("The party's cursor"),
+    static_cast<int32>(Cursors->GetNumberField(Party)),
+    3
+  );
+  TestEqual(
+    TEXT("The guild's cursor"),
+    static_cast<int32>(Cursors->GetNumberField(Guild)),
+    40
+  );
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 7, TEXT("m7")), Join.Ref
+  );
+  TestEqual(TEXT("A live line waits for the resume"), Lines.Num(), 4);
+
+  TSharedPtr<FJsonObject> ResumedTopics = MakeShared<FJsonObject>();
+  ResumedTopics->SetObjectField(
+    Party,
+    FFakeBifrost::ResumedTopic(
+      {FFakeBifrost::ChatLine(Party, 6, TEXT("m6")),
+       FFakeBifrost::ChatLine(Party, 5, TEXT("m5")),
+       FFakeBifrost::ChatLine(Party, 3, TEXT("m3"))},
+      true
+    )
+  );
+  ResumedTopics->SetObjectField(Guild, FFakeBifrost::ResumedTopic({}, false));
+  TSharedPtr<FJsonObject> ResumeReply = MakeShared<FJsonObject>();
+  ResumeReply->SetObjectField(TEXT("topics"), ResumedTopics);
+  H.Socket()->Reply(Resume, TEXT("ok"), ResumeReply);
+
+  if (!TestEqual(
+        TEXT("The replay and the live line are delivered"), Lines.Num(), 7
+      )) {
+    return false;
+  }
+  TestEqual(TEXT("Oldest first"), Lines[4].Seq, static_cast<int64>(5));
+  TestEqual(TEXT("Then the next"), Lines[5].Seq, static_cast<int64>(6));
+  TestEqual(TEXT("Then the live line"), Lines[6].Seq, static_cast<int64>(7));
+  TestEqual(
+    TEXT("The cursor is at the live line"),
+    H.Conn->GetChatCursors()[Party],
+    static_cast<int64>(7)
+  );
+  if (TestNotNull(TEXT("The resume is answered"), Answer.Get())) {
+    const TArray<FString> Truncated =
+      FRedwoodBifrostConnection::TruncatedTopics(Answer);
+    TestEqual(TEXT("One topic was cut short"), Truncated.Num(), 1);
+    TestTrue(TEXT("The party's"), Truncated.Contains(Party));
+  }
+
+  // The session leaves the guild: its cursor goes with it, the party's stays.
+  H.Socket()->ChatTopics({Party}, Join.Ref);
+  TestFalse(
+    TEXT("A topic the session left keeps no cursor"),
+    H.Conn->GetChatCursors().Contains(Guild)
+  );
+  TestTrue(
+    TEXT("A topic it still has keeps its cursor"),
+    H.Conn->GetChatCursors().Contains(Party)
+  );
+
+  // Lines Bifrost does not store (`/all`, seq 0) have no cursor: nothing
+  // can replay them, so only their id tells a replay.
+  const FString All = TEXT("r:realm-1/all");
+  H.Socket()->ChatMessage(FFakeBifrost::ChatLine(All, 0, TEXT("a1")), Join.Ref);
+  H.Socket()->ChatMessage(FFakeBifrost::ChatLine(All, 0, TEXT("a2")), Join.Ref);
+  TestEqual(TEXT("Two unstored lines are both delivered"), Lines.Num(), 9);
+  H.Socket()->ChatMessage(FFakeBifrost::ChatLine(All, 0, TEXT("a1")), Join.Ref);
+  TestEqual(TEXT("The same unstored line is dropped"), Lines.Num(), 9);
+  TestFalse(
+    TEXT("No cursor is kept for an unstored topic"),
+    H.Conn->GetChatCursors().Contains(All)
+  );
+
+  // A new session starts live.
+  H.Conn->ResetChat();
+  TestEqual(TEXT("No cursor is left"), H.Conn->GetChatCursors().Num(), 0);
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), Join.Ref
+  );
+  TestEqual(TEXT("A line of the new session is delivered"), Lines.Num(), 10);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostChatResumeAfterResetTest,
+  "Redwood.Bifrost.Connection.ChatResumeEndedByResetIsStale",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostChatResumeAfterResetTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostConnectionTest;
+  FHarness H(*this);
+  H.Open();
+  const FPhoenixMessage Join = H.LoginOk();
+  const FString Party = TEXT("r:realm-1/party:party-1");
+  int32 Delivered = 0;
+  int32 TopicUpdates = 0;
+  H.Conn->OnChatMessage = [&Delivered](const FRedwoodChatMessage &) {
+    ++Delivered;
+  };
+  H.Conn->OnChatTopics = [&TopicUpdates](const TArray<FString> &) {
+    ++TopicUpdates;
+  };
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), Join.Ref
+  );
+  TestEqual(TEXT("A line is delivered"), Delivered, 1);
+
+  // The resume waits; a live line is held for it. The player logs out: the
+  // session is forgotten and the chat reset before the reply comes.
+  TSharedPtr<FJsonObject> Answer;
+  H.Conn->ChatResume(Keep(Answer));
+  const FPhoenixMessage Resume = H.Socket()->Last(TEXT("chat.resume"));
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 2, TEXT("m2")), Join.Ref
+  );
+  TestEqual(TEXT("The live line waits for the resume"), Delivered, 1);
+  H.Conn->ForgetSession();
+  H.Conn->ResetChat();
+
+  // The old session's replay arrives: it is stale.
+  TSharedPtr<FJsonObject> Topics = MakeShared<FJsonObject>();
+  Topics->SetObjectField(
+    Party,
+    FFakeBifrost::ResumedTopic(
+      {FFakeBifrost::ChatLine(Party, 3, TEXT("m3"))}, false
+    )
+  );
+  TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+  Reply->SetObjectField(TEXT("topics"), Topics);
+  H.Socket()->Reply(Resume, TEXT("ok"), Reply);
+  TestEqual(
+    TEXT("Neither the replay nor the held line is delivered"), Delivered, 1
+  );
+  TestEqual(TEXT("No cursor is kept"), H.Conn->GetChatCursors().Num(), 0);
+  TestNotNull(TEXT("The caller still hears the reply"), Answer.Get());
+
+  // Lines and topics between the logout and Bifrost's `closed` are the
+  // ended session's.
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 4, TEXT("m4")), Join.Ref
+  );
+  H.Socket()->ChatTopics({Party}, Join.Ref);
+  TestEqual(TEXT("A line with no session is dropped"), Delivered, 1);
+  TestEqual(TEXT("Topics with no session are dropped"), TopicUpdates, 0);
+  TestEqual(TEXT("And start no cursor"), H.Conn->GetChatCursors().Num(), 0);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostChatResumeLostTest,
+  "Redwood.Bifrost.Connection.ChatResumeLostToDropDeliversHeldLines",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostChatResumeLostTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodBifrostConnectionTest;
+  ExpectReconnectWarnings(*this);
+  FHarness H(*this);
+  H.Open();
+  const FPhoenixMessage Join = H.LoginOk();
+  const FString Party = TEXT("r:realm-1/party:party-1");
+  TArray<FRedwoodChatMessage> Lines;
+  H.Conn->OnChatMessage = [&Lines](const FRedwoodChatMessage &Line) {
+    Lines.Add(Line);
+  };
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), Join.Ref
+  );
+
+  // The socket goes with the resume in flight: the line held for it is
+  // delivered, and the owner (who tracks the reply) hears the loss.
+  H.Conn->ChatResume(nullptr);
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 3, TEXT("m3")), Join.Ref
+  );
+  TestEqual(TEXT("The live line waits for the resume"), Lines.Num(), 1);
+  H.Socket()->Drop();
+  TestEqual(TEXT("The drop delivers the held line"), Lines.Num(), 2);
+  TestEqual(
+    TEXT("The cursor moved on with it"),
+    H.Conn->GetChatCursors()[Party],
+    static_cast<int64>(3)
+  );
+
+  // The next socket's resume asks from the new cursor.
+  H.Advance(PastFirstDelaySeconds);
+  H.Accept();
+  const FPhoenixMessage Resume = H.Socket()->Last(TEXT("phx_join"));
+  H.Socket()->Reply(
+    Resume, TEXT("ok"), FFakeBifrost::JoinReply(TEXT("s1"), TEXT("t2"), nullptr)
+  );
+  H.Conn->ChatResume(nullptr);
+  TestEqual(
+    TEXT("The next resume carries the moved cursor"),
+    static_cast<int32>(H.Socket()
+                         ->Last(TEXT("chat.resume"))
+                         .Payload->GetObjectField(TEXT("cursors"))
+                         ->GetNumberField(Party)),
+    3
+  );
   return true;
 }
