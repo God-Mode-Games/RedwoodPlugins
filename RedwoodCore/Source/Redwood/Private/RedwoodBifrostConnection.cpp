@@ -680,8 +680,7 @@ TArray<FString> FRedwoodBifrostConnection::TruncatedTopics(
   ) {
     return Truncated;
   }
-  for (const TPair<FString, TSharedPtr<FJsonValue>> &Topic :
-       (*Topics)->Values) {
+  for (const TPair<FString, TSharedPtr<FJsonValue>> Topic : (*Topics)->Values) {
     const TSharedPtr<FJsonObject> *Entry = nullptr;
     bool bTruncated = false;
     if (
@@ -721,7 +720,7 @@ void FRedwoodBifrostConnection::ApplyChatResume(
                                                 : nullptr;
   const TSharedPtr<FJsonObject> *Topics = nullptr;
   if (Reply.IsValid() && Reply->TryGetObjectField(TEXT("topics"), Topics)) {
-    for (const TPair<FString, TSharedPtr<FJsonValue>> &Topic :
+    for (const TPair<FString, TSharedPtr<FJsonValue>> Topic :
          (*Topics)->Values) {
       const TSharedPtr<FJsonObject> *Entry = nullptr;
       const TArray<TSharedPtr<FJsonValue>> *Messages = nullptr;
