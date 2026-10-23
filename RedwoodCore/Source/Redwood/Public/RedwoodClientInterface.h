@@ -141,6 +141,16 @@ public:
     const FString &MsgId,
     FRedwoodChatSendDelegate OnOutput
   );
+  // A whisper to a character by its name, as the player typed it.
+  void SendWhisperByName(
+    const FString &ToName, const FString &Body, FRedwoodChatSendDelegate OnOutput
+  );
+  void SendWhisperByName(
+    const FString &ToName,
+    const FString &Body,
+    const FString &MsgId,
+    FRedwoodChatSendDelegate OnOutput
+  );
   void ReportChat(
     const FString &Topic,
     int64 Seq,
@@ -557,13 +567,15 @@ private:
   // place, and a subscriber that subscribes to a new event from its callback
   // grows the map under that broadcast.
   TMap<FString, TUniquePtr<FRedwoodPushDelegate>> PushSubscribers;
-  // The chat: the topics Bifrost named last, the one path of a send (a topic
-  // or a player, never both), and the resume the machine asks for.
+  // The chat: the topics Bifrost named last, the one path of a send (a
+  // topic, a player or a character name, never two), and the resume the
+  // machine asks for.
   TArray<FString> ChatTopics;
   void SendChatLine(
     const FString &MsgId,
     const FString &Topic,
     const FString &ToPlayerId,
+    const FString &ToName,
     const FString &Body,
     FRedwoodChatSendDelegate OnOutput
   );

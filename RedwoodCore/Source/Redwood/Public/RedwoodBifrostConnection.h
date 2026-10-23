@@ -200,6 +200,15 @@ public:
     FRedwoodReplyCallback Callback = nullptr
   );
 
+  // A whisper to a character by name: `chat.send {msgId, toName, body}`.
+  // The player types a name; Bifrost finds the character's player.
+  void ChatWhisperByName(
+    const FString &MsgId,
+    const FString &ToName,
+    const FString &Body,
+    FRedwoodReplyCallback Callback = nullptr
+  );
+
   // `chat.resume {cursors}` with the cursor of every topic this connection
   // has a line of. The reply's lines reach OnChatMessage in seq order,
   // through the same cursor and id check as a live line, before the
