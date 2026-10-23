@@ -380,6 +380,7 @@ void FRedwoodBifrostConnection::DropPending() {
   // the cursors did not move, so the next resume replays them.
   bChatResumePending = false;
   ChatLinesHeldForResume.Reset();
+  ++ChatResumeGeneration;
 
   if (Join) {
     Join(false, LostJoinRefusal(FRedwoodPendingReplies::LostReplyError));
@@ -610,12 +611,15 @@ void FRedwoodBifrostConnection::ChatResume(FRedwoodReplyCallback Callback) {
   Payload->SetObjectField(TEXT("cursors"), Cursors);
 
   TWeakPtr<FRedwoodBifrostConnection> Weak = AsShared();
+  const uint32 Generation = ChatResumeGeneration;
   const FString Ref = Push(
     TEXT("chat.resume"),
     Payload,
-    [Weak, Callback](const TArray<TSharedPtr<FJsonValue>> &Response) {
+    [Weak,
+     Callback,
+     Generation](const TArray<TSharedPtr<FJsonValue>> &Response) {
       if (const TSharedPtr<FRedwoodBifrostConnection> Self = Weak.Pin()) {
-        Self->ApplyChatResume(Response);
+        Self->ApplyChatResume(Response, Generation);
       }
       if (Callback) {
         Callback(Response);
@@ -668,8 +672,10 @@ TArray<FString> FRedwoodBifrostConnection::TruncatedTopics(
 void FRedwoodBifrostConnection::ResetChat() {
   ChatCursors.Reset();
   SeenChatMsgIds.Reset();
+  // The lines held for a resume in flight were the old session's.
   bChatResumePending = false;
   ChatLinesHeldForResume.Reset();
+  ++ChatResumeGeneration;
 }
 
 // The replay of each topic is applied oldest first, whatever order Bifrost
@@ -677,8 +683,13 @@ void FRedwoodBifrostConnection::ResetChat() {
 // old by a later one. The lines held while the resume waited follow: a line
 // the replay also carried is dropped by its id.
 void FRedwoodBifrostConnection::ApplyChatResume(
-  const TArray<TSharedPtr<FJsonValue>> &Response
+  const TArray<TSharedPtr<FJsonValue>> &Response, uint32 Generation
 ) {
+  // A reset or a drop ended this resume: its replay is of a session or a
+  // channel that is gone, and the cursors it would move are not its own.
+  if (!bChatResumePending || Generation != ChatResumeGeneration) {
+    return;
+  }
   bChatResumePending = false;
   const TSharedPtr<FJsonObject> Reply =
     Response.Num() > 0 && Response[0].IsValid() ? Response[0]->AsObject()
@@ -753,9 +764,13 @@ bool FRedwoodBifrostConnection::DeliverChatLine(
   return true;
 }
 
+// A line between a logout and Bifrost's `closed` is the ended session's.
 void FRedwoodBifrostConnection::HandleChatMessage(
   const TSharedPtr<FJsonObject> &Payload
 ) {
+  if (!HasSession()) {
+    return;
+  }
   FRedwoodChatMessage Message;
   if (!FRedwoodChatMessage::Parse(Payload, Message)) {
     UE_LOG(
@@ -775,6 +790,9 @@ void FRedwoodBifrostConnection::HandleChatMessage(
 void FRedwoodBifrostConnection::HandleChatTopics(
   const TSharedPtr<FJsonObject> &Payload
 ) {
+  if (!HasSession()) {
+    return;
+  }
   TArray<FString> Topics;
   Payload->TryGetStringArrayField(TEXT("topics"), Topics);
   if (OnChatTopics) {
