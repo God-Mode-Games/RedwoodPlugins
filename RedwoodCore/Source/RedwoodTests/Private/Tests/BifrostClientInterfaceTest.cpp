@@ -2576,6 +2576,18 @@ bool FRedwoodBifrostClientChatSendTest::RunTest(const FString &Parameters) {
   );
   TestFalse(TEXT("And no topic"), Whispered.Payload->HasField(TEXT("topic")));
 
+  // A whisper by name names the character the player typed.
+  TCapture<FRedwoodChatSendOutput> ByName;
+  H.Client()->SendWhisperByName(TEXT("Alpha"), TEXT("psst"), ByName.Delegate());
+  const FPhoenixMessage Named = H.Socket()->Last(TEXT("chat.send"));
+  TestEqual(
+    TEXT("A whisper by name carries the name"),
+    Named.Payload->GetStringField(TEXT("toName")),
+    TEXT("Alpha")
+  );
+  TestFalse(TEXT("And no player"), Named.Payload->HasField(TEXT("to")));
+  TestFalse(TEXT("Nor a topic"), Named.Payload->HasField(TEXT("topic")));
+
   // The drop. The whisper that waited fails; a send made in the gap is held.
   H.Socket()->Drop();
   TestEqual(TEXT("The waiting whisper fails"), Whisper.Count, 1);
@@ -2588,6 +2600,7 @@ bool FRedwoodBifrostClientChatSendTest::RunTest(const FString &Parameters) {
     TEXT("And carries its id for a retry"), Whisper.Last.MsgId.IsEmpty()
   );
   TestEqual(TEXT("The unanswered retry fails too"), Retry.Count, 1);
+  TestEqual(TEXT("And the unanswered whisper by name"), ByName.Count, 1);
   TCapture<FRedwoodChatSendOutput> Held;
   H.Client()->SendChat(Party, TEXT("while down"), Held.Delegate());
   TestEqual(TEXT("A send in the gap is held"), H.HeldCount(), 1);

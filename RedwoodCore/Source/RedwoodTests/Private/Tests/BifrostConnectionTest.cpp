@@ -1525,6 +1525,17 @@ bool FRedwoodBifrostChatTest::RunTest(const FString &Parameters) {
   );
   TestFalse(TEXT("And no topic"), Whisper.Payload->HasField(TEXT("topic")));
 
+  // A whisper by name names the character, and nothing else.
+  H.Conn->ChatWhisperByName(TEXT("c4"), TEXT("Alpha"), TEXT("psst"), nullptr);
+  const FPhoenixMessage ByName = H.Socket()->Last(TEXT("chat.send"));
+  TestEqual(
+    TEXT("A whisper by name carries the name"),
+    ByName.Payload->GetStringField(TEXT("toName")),
+    TEXT("Alpha")
+  );
+  TestFalse(TEXT("No player"), ByName.Payload->HasField(TEXT("to")));
+  TestFalse(TEXT("No topic either"), ByName.Payload->HasField(TEXT("topic")));
+
   // A report.
   H.Conn->ChatReport(Party, 3, TEXT("spam"), nullptr);
   const FPhoenixMessage Report = H.Socket()->Last(TEXT("chat.report"));

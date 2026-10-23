@@ -614,6 +614,19 @@ void FRedwoodBifrostConnection::ChatWhisper(
   Push(TEXT("chat.send"), Payload, MoveTemp(Callback));
 }
 
+void FRedwoodBifrostConnection::ChatWhisperByName(
+  const FString &MsgId,
+  const FString &ToName,
+  const FString &Body,
+  FRedwoodReplyCallback Callback
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetStringField(TEXT("msgId"), MsgId);
+  Payload->SetStringField(TEXT("toName"), ToName);
+  Payload->SetStringField(TEXT("body"), Body);
+  Push(TEXT("chat.send"), Payload, MoveTemp(Callback));
+}
+
 void FRedwoodBifrostConnection::ChatResume(FRedwoodReplyCallback Callback) {
   TSharedPtr<FJsonObject> Cursors = MakeShared<FJsonObject>();
   for (const TPair<FString, int64> &Cursor : ChatCursors) {

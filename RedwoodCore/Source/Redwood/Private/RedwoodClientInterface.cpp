@@ -810,7 +810,7 @@ void URedwoodClientInterface::SendChat(
   const FString &MsgId,
   FRedwoodChatSendDelegate OnOutput
 ) {
-  SendChatLine(MsgId, Topic, FString(), Body, OnOutput);
+  SendChatLine(MsgId, Topic, FString(), FString(), Body, OnOutput);
 }
 
 void URedwoodClientInterface::SendWhisper(
@@ -832,7 +832,27 @@ void URedwoodClientInterface::SendWhisper(
   const FString &MsgId,
   FRedwoodChatSendDelegate OnOutput
 ) {
-  SendChatLine(MsgId, FString(), ToPlayerId, Body, OnOutput);
+  SendChatLine(MsgId, FString(), ToPlayerId, FString(), Body, OnOutput);
+}
+
+void URedwoodClientInterface::SendWhisperByName(
+  const FString &ToName, const FString &Body, FRedwoodChatSendDelegate OnOutput
+) {
+  SendWhisperByName(
+    ToName,
+    Body,
+    FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower),
+    OnOutput
+  );
+}
+
+void URedwoodClientInterface::SendWhisperByName(
+  const FString &ToName,
+  const FString &Body,
+  const FString &MsgId,
+  FRedwoodChatSendDelegate OnOutput
+) {
+  SendChatLine(MsgId, FString(), FString(), ToName, Body, OnOutput);
 }
 
 // The gate holds the whole call, id included: a send held through a drop
@@ -841,6 +861,7 @@ void URedwoodClientInterface::SendChatLine(
   const FString &MsgId,
   const FString &Topic,
   const FString &ToPlayerId,
+  const FString &ToName,
   const FString &Body,
   FRedwoodChatSendDelegate OnOutput
 ) {
@@ -857,7 +878,7 @@ void URedwoodClientInterface::SendChatLine(
 
   // HollowedOath#2854. See GateRealm.
   if (GateRealm([=, this]() {
-        SendChatLine(MsgId, Topic, ToPlayerId, Body, OnOutput);
+        SendChatLine(MsgId, Topic, ToPlayerId, ToName, Body, OnOutput);
       }, Answer)) {
     return;
   }
@@ -877,10 +898,12 @@ void URedwoodClientInterface::SendChatLine(
     Answer.ExecuteIfBound(Output);
   }, Answer);
 
-  if (ToPlayerId.IsEmpty()) {
-    Connection->ChatSend(MsgId, Topic, Body, OnReply);
-  } else {
+  if (!ToName.IsEmpty()) {
+    Connection->ChatWhisperByName(MsgId, ToName, Body, OnReply);
+  } else if (!ToPlayerId.IsEmpty()) {
     Connection->ChatWhisper(MsgId, ToPlayerId, Body, OnReply);
+  } else {
+    Connection->ChatSend(MsgId, Topic, Body, OnReply);
   }
 }
 
