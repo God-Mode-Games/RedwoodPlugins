@@ -232,7 +232,7 @@ public:
   // resume. Each line of a topic comes once, and after the lines before it.
   TFunction<void(const FRedwoodChatMessage &Message)> OnChatMessage;
   // `chat.topics`: the topics this session can read and send to, each time
-  // the set changes.
+  // the set changes. The cursors of topics not named are dropped first.
   TFunction<void(const TArray<FString> &Topics)> OnChatTopics;
 
   // A Redwood push by its Redwood event name. One handler per event.

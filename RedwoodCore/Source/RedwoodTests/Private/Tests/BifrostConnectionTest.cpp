@@ -1568,6 +1568,17 @@ bool FRedwoodBifrostChatTest::RunTest(const FString &Parameters) {
     TestTrue(TEXT("The party's"), Truncated.Contains(Party));
   }
 
+  // The session leaves the guild: its cursor goes with it, the party's stays.
+  H.Socket()->ChatTopics({Party}, Join.Ref);
+  TestFalse(
+    TEXT("A topic the session left keeps no cursor"),
+    H.Conn->GetChatCursors().Contains(Guild)
+  );
+  TestTrue(
+    TEXT("A topic it still has keeps its cursor"),
+    H.Conn->GetChatCursors().Contains(Party)
+  );
+
   // Lines Bifrost does not store (`/all`, seq 0) have no cursor: nothing
   // can replay them, so only their id tells a replay.
   const FString All = TEXT("r:realm-1/all");
