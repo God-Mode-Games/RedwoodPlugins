@@ -760,17 +760,19 @@ void FRedwoodBifrostConnection::HandlePush(
     SeenPushIds[NextSeenPushIdSlot] = PushId;
     NextSeenPushIdSlot = (NextSeenPushIdSlot + 1) % RememberedPushIds;
   }
-  const FEventHandler *Handler = Handlers.Find(Event);
-  if (!Handler) {
-    UE_LOG(LogRedwood, Verbose, TEXT("No handler for the push %s."), *Event);
-    return;
-  }
   const TSharedPtr<FJsonObject> *Inner = nullptr;
   const TSharedPtr<FJsonObject> Message =
     Payload->TryGetObjectField(TEXT("payload"), Inner)
     ? *Inner
     : MakeShared<FJsonObject>();
-  (*Handler)(Event, MakeShared<FJsonValueObject>(Message));
+  const FEventHandler *Handler = Handlers.Find(Event);
+  if (Handler) {
+    (*Handler)(Event, MakeShared<FJsonValueObject>(Message));
+  }
+  const bool bSubscribed = OnAnyPush && OnAnyPush(Event, Message);
+  if (!Handler && !bSubscribed) {
+    UE_LOG(LogRedwood, Verbose, TEXT("No handler for the push %s."), *Event);
+  }
 }
 
 void FRedwoodBifrostConnection::HandleClosedByServer(

@@ -113,6 +113,13 @@ public:
   // A Redwood push by its Redwood event name. One handler per event.
   void OnEvent(const FString &Event, FEventHandler Handler);
 
+  // Every push, after the event's handler ran, if it has one. The owner fans
+  // the push out to subscribers this connection does not know (see
+  // URedwoodClientInterface::OnPush), and says whether anyone took it, so a
+  // push nobody wants can be logged.
+  TFunction<bool(const FString &Event, const TSharedPtr<FJsonObject> &Payload)>
+    OnAnyPush;
+
   // The socket opened, first or again. With a session, a resume follows and
   // OnResumed or OnResumeRefused tells its outcome; without one, this is all.
   TFunction<void()> OnConnected;

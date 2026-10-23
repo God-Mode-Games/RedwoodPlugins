@@ -466,6 +466,17 @@ void URedwoodClientInterface::InitializeDirectorConnection(
       Self->Dispatch(FRedwoodSessionEvent::ClosedByServer(Reason));
     }
   };
+  Connection->OnAnyPush =
+    [WeakThis](const FString &Event, const TSharedPtr<FJsonObject> &Payload) {
+      URedwoodClientInterface *Self = WeakThis.Get();
+      const FRedwoodPushDelegate *Subscribers =
+        Self ? Self->PushSubscribers.Find(Event) : nullptr;
+      if (!Subscribers || !Subscribers->IsBound()) {
+        return false;
+      }
+      Subscribers->Broadcast(Payload);
+      return true;
+    };
 
   UE_LOG(LogRedwood, Log, TEXT("Connecting to Bifrost at %s"), *ConnectionUri);
   Connection->Connect(ConnectionUri);
@@ -754,6 +765,10 @@ void URedwoodClientInterface::SaveCredentials(
 
 bool URedwoodClientInterface::IsDirectorConnected() {
   return Connection.IsValid() && Connection->IsConnected();
+}
+
+FRedwoodPushDelegate &URedwoodClientInterface::OnPush(const FString &Event) {
+  return PushSubscribers.FindOrAdd(Event);
 }
 
 void URedwoodClientInterface::BindPushHandlers() {
