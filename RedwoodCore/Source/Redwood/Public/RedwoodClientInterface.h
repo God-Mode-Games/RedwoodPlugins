@@ -500,6 +500,8 @@ private:
     const TDelegate<void(const TOutput &)> &OnOutput
   );
   void FailTicketingJoin(uint32 Sequence);
+  // FORK(hollowed-oath): HollowedOath#2929. See the .cpp.
+  bool GateTicketingAttempt(TFunction<void()> Attempt);
   friend class FRedwoodClientTestAccess; // FORK(hollowed-oath): the tests.
   FRedwoodHeldRequests HeldRequests;
   // FORK(hollowed-oath) BEGIN: HollowedOath#2886. The requests still waiting
