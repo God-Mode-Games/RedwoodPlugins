@@ -2,19 +2,17 @@
 
 #pragma once
 
-#include "RedwoodCloseBackoff.h" // FORK(hollowed-oath)
+#include "RedwoodBifrostConnection.h" // FORK(hollowed-oath)
 #include "RedwoodHeldRequests.h" // FORK(hollowed-oath): HollowedOath#2854.
 #include "RedwoodPendingReplies.h" // FORK(hollowed-oath): HollowedOath#2886.
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
 
 #include "CoreMinimal.h"
+#include "SIOJsonObject.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Tickable.h"
 #include "TimerManager.h"
-
-#include "SocketIOFunctionLibrary.h"
-#include "SocketIONative.h"
 
 #include "RedwoodClientInterface.generated.h"
 
@@ -38,45 +36,35 @@ public:
   }
   // FTickableGameObject end
 
+  // FORK(hollowed-oath): the client holds ONE connection, to Bifrost, which
+  // carries the Director and the Realm. The names below keep the steps a
+  // caller takes: connect, log in, enter a realm. "Director connected" is
+  // the socket; "Realm connected" is the session being in a realm.
   void InitializeDirectorConnection(
     FRedwoodSocketConnectedDelegate OnDirectorConnected
   );
 
   bool IsDirectorConnected();
 
-  TSharedPtr<FSocketIONative> GetDirectorConnection() const {
-    return Director;
-  }
-
   // FORK(hollowed-oath): HollowedOath#2886. The client world of a game
   // server, or a standalone world (the entry level), began play. See the .cpp.
   void NoteArrivedInWorld();
   void NoteLeftWorld();
-
-  // FORK(hollowed-oath): HollowedOath#2886. For a request that another module
-  // sends on GetDirectorConnection(): a Director drop fails it with OnLost.
-  FRedwoodReplyCallback TrackDirectorReply(
-    FRedwoodReplyCallback OnReply, TFunction<void()> OnLost
-  );
-
-  TSharedPtr<FSocketIONative> GetRealmConnection() const {
-    return Realm;
-  }
 
   FRedwoodDynamicDelegate OnPingsReceived;
 
   FRedwoodConnectToServerDynamicDelegate OnRequestToJoinServer;
   FRedwoodStitchToServerDynamicDelegate OnRequestToStitchServer;
 
-  FRedwoodDynamicDelegate OnDirectorConnectionLost;
-  FRedwoodDynamicDelegate OnDirectorConnectionReestablished;
-  // FORK(hollowed-oath): the two On*AuthFailed delegates are fork-added; upstream has no
-  // auth-failure surface (it only logs reauth failures). Broadcast from RedwoodClientInterface.cpp,
-  // relayed to the game by RedwoodClientGameSubsystem.
-  FRedwoodConnectionAuthFailedDynamicDelegate OnDirectorAuthFailed;
-  FRedwoodDynamicDelegate OnRealmConnectionLost;
-  FRedwoodDynamicDelegate OnRealmConnectionReestablished;
-  FRedwoodConnectionAuthFailedDynamicDelegate OnRealmAuthFailed;
+  // FORK(hollowed-oath): one connection, so one set. Lost: the socket
+  // dropped, and its requests are held for the reconnect. Reestablished: the
+  // session is back (resumed, or logged in again with the realm and the
+  // character restored). AuthFailed: the session is over and cannot come
+  // back by itself; the message says why. Upstream had no auth-failure
+  // surface (it only logged); the game's disconnect modal needs it.
+  FRedwoodDynamicDelegate OnConnectionLost;
+  FRedwoodDynamicDelegate OnConnectionReestablished;
+  FRedwoodConnectionAuthFailedDynamicDelegate OnAuthFailed;
 
   void Register(
     const FString &Username,
@@ -86,17 +74,16 @@ public:
 
   void AttemptAutoLogin(FRedwoodAuthUpdateDelegate OnUpdate);
 
+  // FORK(hollowed-oath): the login is the join of the Bifrost session.
+  // Provider is "hams_access" (the launcher's code) or "local" (a token
+  // from an earlier login, as the auto-login and the re-login send).
   void Login(
     const FString &Username,
     const FString &PasswordOrToken,
     const FString &Provider,
     bool bRememberMe,
-    FRedwoodAuthUpdateDelegate OnUpdate,
-    bool bBypassProviderCheck = false
+    FRedwoodAuthUpdateDelegate OnUpdate
   );
-
-  void LoginWithDiscord(bool bRememberMe, FRedwoodAuthUpdateDelegate OnUpdate);
-  void LoginWithTwitch(bool bRememberMe, FRedwoodAuthUpdateDelegate OnUpdate);
 
   FString GetNickname();
 
@@ -348,20 +335,12 @@ public:
     FRedwoodGetCharacterOutputDelegate OnOutput
   );
 
+  // FORK(hollowed-oath): one step of the session: the realm checks that the
+  // player owns the character and selects it for the party, then the
+  // director records the online state. It replaces the two sends of
+  // upstream (realm:parties:select-character and the director's online
+  // state), which could disagree.
   void SetSelectedCharacter(FString CharacterId);
-
-  // FORK(hollowed-oath): HollowedOath#2854. The director route that sets the
-  // character that friends see. Kept here so the unit test pins the name.
-  static constexpr const TCHAR *SetOnlineCharacterEventName =
-    TEXT("director:players:online-state:set-character");
-
-  // FORK(hollowed-oath): HollowedOath#2854. Null when any id is empty: the
-  // director rejects such a request, and there is nothing to restore.
-  static TSharedPtr<FJsonObject> MakeOnlineCharacterPayload(
-    const FString &InPlayerId,
-    const FString &InCharacterId,
-    const FString &InRealmId
-  );
 
   void JoinMatchmaking(
     FString ProfileId,
@@ -448,56 +427,60 @@ public:
   void GetRealmGlobalData(FRedwoodGetGlobalDataOutputDelegate OnOutput);
 
 private:
-  bool bSentDirectorConnected;
-  bool bDirectorDisconnected = true;
-  bool bSentInitialDirectorConnectionFailureLog = false;
-  bool bSentRealmConnected;
-  bool bRealmDisconnected = true;
-  bool bSentInitialRealmConnectionFailureLog = false;
-  TSharedPtr<FSocketIONative> Director;
-  TSharedPtr<FSocketIONative> Realm;
+  // Before the connection and the request holders: members are destroyed in
+  // reverse order, and theirs clear timers on this manager.
+  FTimerManager TimerManager;
 
-  // FORK(hollowed-oath) BEGIN: a retry replaces the realm socket. The old
-  // socket's callbacks go with it, and a Director or Realm answer of an older
-  // handshake is dropped, so neither can act on the new socket.
-  void ReleaseRealmSocket();
-  uint32 RealmHandshakeGeneration = 0;
-  // FORK(hollowed-oath) END
-  // FORK(hollowed-oath) BEGIN: a stopping backend can close a socket with a
-  // normal (1000) close. The socket library takes that as a close we asked
-  // for, so it neither reconnects nor reports the drop. Bound to
-  // OnDisconnectedCallback, this reports it through the socket's reconnection
-  // callback, which is the drop path, and connects again after the backoff.
-  // IsCloseRequested names the closes we asked for; without it, no close was
-  // asked for.
-  TFunction<void(const ESIOConnectionCloseReason)> MakeUnrequestedCloseHandler(
-    TWeakPtr<FSocketIONative> WeakSocket,
-    FRedwoodCloseBackoff &Backoff,
-    TFunction<bool()> IsCloseRequested = nullptr
+  // FORK(hollowed-oath) BEGIN: the one connection. See RedwoodBifrostConnection.
+  TSharedPtr<FRedwoodBifrostConnection> Connection;
+  FString ConnectionUri;
+  // The first connect was reported to the caller of
+  // InitializeDirectorConnection; every later connect is a reconnect.
+  bool bSentConnected = false;
+  bool bSentInitialConnectionFailureLog = false;
+  // A lost connection was broadcast and no reestablished one since. One
+  // outage is one lost connection, however many reconnect attempts fail
+  // inside it; the first connect's failures use bLostBeforeFirstConnect.
+  bool bDisconnected = false;
+  // A first connect failed, so a lost connection was broadcast before the
+  // socket ever connected.
+  bool bLostBeforeFirstConnect = false;
+  // The session is in CurrentRealmId: `session.enter-realm` was accepted.
+  bool bRealmEntered = false;
+  // The socket dropped and the session is not back yet (the resume or the
+  // re-login is in flight, or the socket is still down). Requests are held.
+  bool bReauthPending = false;
+  void BindPushHandlers();
+  void BindRealmPushHandlers();
+  void HandleConnected();
+  void HandleDropped();
+  void HandleResumed(const TSharedPtr<FJsonObject> &Reply);
+  void HandleResumeRefused();
+  // The session is gone; its token logs the player in again.
+  void Relogin();
+  // The join of the session, for the game's login and for the re-login.
+  void SendLogin(
+    const FString &Username,
+    const FString &PasswordOrToken,
+    const FString &Provider,
+    bool bRememberMe,
+    FRedwoodAuthUpdateDelegate OnUpdate
   );
-  void BindRealmCloseHandler();
-  // The one Realm close we ask for. Every such close must go through it.
-  void RequestRealmClose();
-  // What the close handler runs when its backoff ends. Tests count it
-  // instead of connecting.
-  TFunction<void(FSocketIONative &)> ReconnectSocket =
-    [](FSocketIONative &Socket) { Socket.Connect(); };
-  FRedwoodCloseBackoff DirectorCloseBackoff;
-  FRedwoodCloseBackoff RealmCloseBackoff;
-  // Set just before a Realm close we ask for; a new Realm socket clears it.
-  // The handler reads it late on purpose: the library also reports the close
-  // from a lambda queued to the game thread, which runs after Disconnect()
-  // returns, and the flag must still be set then.
-  bool bRealmCloseRequested = false;
-  // HollowedOath#2999. That close started the library's close timer, and the
-  // timer has not run yet. See RedwoodClosingSockets.
-  bool bRealmCloseTimerPending = false;
-  // FORK(hollowed-oath) END
-
-  void InitiateRealmHandshake(
-    FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected
+  void HandleClosedByServer(const FString &Reason);
+  // After a re-login, the new session enters the realm and selects the
+  // character the old one had, then the held requests go out.
+  void RestoreRealmAfterRelogin();
+  void EnterRealm(
+    const FString &RealmId, FRedwoodSocketConnectedDelegate OnEntered
   );
-  void BindRealmEvents();
+  void ApplyRegions(const TSharedPtr<FJsonObject> &Response);
+  // The session is over and cannot come back by itself.
+  void EndSession(const FString &Message);
+  // The re-login, or the realm entry after it, was refused.
+  void FailReauthentication(const FString &Message);
+  void ClearSessionState();
+  void ClearRealmState();
+  // FORK(hollowed-oath) END
 
   // FORK(hollowed-oath): the one path of the character friend calls: gated
   // like every Realm request, and needs a selected character. CharacterId is
@@ -511,27 +494,19 @@ private:
     TOutput (*ParseAnswer)(const TArray<TSharedPtr<FJsonValue>> &),
     const TDelegate<void(const TOutput &)> &OnOutput
   );
-  void FinalizeRealmHandshake(
-    FString Token, FRedwoodSocketConnectedDelegate OnRealmConnected
-  );
 
-  UFUNCTION()
-  void BeginRealmReauthentication();
-  FTimerHandle ReauthenticationAttemptTimer;
-
-  // FORK(hollowed-oath): HollowedOath#2854. See the .cpp.
-  void ResendOnlineCharacter();
   // FORK(hollowed-oath): HollowedOath#2448. See the .cpp.
   void SendSelectCharacter();
   template <typename TOutput>
   bool Gate(
-    FRedwoodHeldRequests &Held,
     bool bSessionEstablished,
     bool bCanSend,
     const TCHAR *NotConnectedError,
     TFunction<void()> Request,
     const TDelegate<void(const TOutput &)> &OnOutput
   );
+  // The two gates differ in one thing: a Realm request also needs the
+  // session to be in a realm.
   template <typename TOutput>
   bool GateDirector(
     TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
@@ -543,49 +518,19 @@ private:
   // FORK(hollowed-oath): HollowedOath#2886. See the .cpp.
   template <typename TOutput>
   FRedwoodReplyCallback TrackReply(
-    FRedwoodPendingReplies &Replies,
     FRedwoodReplyCallback OnReply,
     const TDelegate<void(const TOutput &)> &OnOutput
   );
   void FailTicketingJoin(uint32 Sequence);
-  void NoteDirectorDrop();
-  void NoteFirstDirectorConnect();
-  void NoteFirstRealmConnect();
-  void NoteRealmDrop();
-  // A first connect failed twice, so a lost connection was broadcast before
-  // the socket ever connected.
-  bool bLostBeforeFirstDirectorConnect = false;
-  bool bLostBeforeFirstRealmConnect = false;
   bool HasPlayerSession() const;
-  // Drives the private reconnect state without a backend.
-  friend class FRedwoodReloginFailureTest;
-  friend class FRedwoodLogoutDuringGraceTest;
-  friend class FRedwoodRealmReauthRetryTest;
-  friend class FRedwoodFirstConnectAfterLossTest;
-  friend class FRedwoodDropAfterLogoutTest;
-  friend class FRedwoodLogoutClosesReconnectingRealmTest;
-  friend class FRedwoodFailedReloginStopsRealmRetryTest;
-  // FORK(hollowed-oath): character friends.
-  friend class FRedwoodCharacterFriendsHeldTest;
-  // FORK(hollowed-oath) BEGIN: the close handler tests.
-  friend class FRedwoodUnrequestedCloseBacksOffTest;
-  friend class FRedwoodLogoutRealmCloseStaysCleanTest;
-  friend class FRedwoodFailedReloginRealmCloseStaysCleanTest;
-  friend class FRedwoodQueuedRequestedCloseStaysCleanTest;
-  // FORK(hollowed-oath) END
-  friend class FRedwoodInFlightTestAccess; // FORK(hollowed-oath): HollowedOath#2886.
+  friend class FRedwoodClientTestAccess; // FORK(hollowed-oath): the tests.
   bool CanSendToDirector();
   bool CanSendToRealm();
-  void EndDirectorReauthentication(bool bSucceeded);
-  void EndRealmReauthentication(bool bSucceeded);
-  FRedwoodHeldRequests DirectorHeldRequests;
-  FRedwoodHeldRequests RealmHeldRequests;
+  void EndReauthentication(bool bSucceeded);
+  FRedwoodHeldRequests HeldRequests;
   // FORK(hollowed-oath) BEGIN: HollowedOath#2886. The requests still waiting
-  // for a reply on each socket; a drop fails them.
-  FRedwoodPendingReplies DirectorReplies;
-  FRedwoodPendingReplies RealmReplies;
-  void NoteDirectorReconnected();
-  void NoteRealmReconnected();
+  // for a reply; a drop fails them.
+  FRedwoodPendingReplies Replies;
   bool IsRealmReady();
   void SendOwedLeave();
   void NoteJoinSent();
@@ -634,18 +579,13 @@ private:
   void HandlePartyLeft(const TSharedPtr<FJsonObject> &Message);
   void ForgetPartyTickets();
   // FORK(hollowed-oath) END
-  // The Realm socket dropped and the player is not authenticated on it again
-  // yet; the Director has bAuthenticated for this.
-  bool bRealmReauthPending = false;
-  // The player was logged in when the Director dropped. Kept through a failed
+  // The player was logged in when the socket dropped. Kept through a failed
   // re-login, so the dead session's requests fail; cleared by a successful
-  // re-login and by Logout.
+  // resume or re-login and by Logout.
   bool bLoggedInAtDrop = false;
-  // A Director re-login could not restore the online character because the
-  // Realm re-handshake was still pending.
-  bool bOnlineCharacterOwedAfterRealm = false;
   // FORK(hollowed-oath): HollowedOath#2448. A character was selected while
-  // the Realm did not know the player, so the Realm did not learn it.
+  // the session was not in a realm it could tell, so the realm did not learn
+  // it. The reconnect sends it.
   bool bSelectCharacterOwedToRealm = false;
   // Set by Logout, cleared when a re-login starts: a re-login reply after it
   // must not log the player back in.
@@ -684,8 +624,6 @@ private:
   FRedwoodRealm CurrentRealm;
 
   TMap<FString, FString> CharacterNamesById;
-
-  FTimerManager TimerManager;
 
   UPROPERTY()
   FRedwoodParty CurrentParty;

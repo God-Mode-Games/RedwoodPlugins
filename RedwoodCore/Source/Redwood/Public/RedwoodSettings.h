@@ -62,6 +62,22 @@ public:
 
   static FString GetDirectorUri();
 
+  // FORK(hollowed-oath): the one player connection. Bifrost owns the
+  // session, and carries every request to the Director and the Realm.
+  /** The base URI of the Bifrost of this deployment channel (ws[s]://host[:port]). */
+  UPROPERTY(config, EditAnywhere, BlueprintReadWrite, Category = "General")
+  FString BifrostUri = "ws://localhost:4000";
+
+  // The `bifrostUri` of a signed redwood.json wins over the setting, as
+  // `directorUri` does for the Director.
+  static FString GetBifrostUri();
+
+  // The deployment channel the client belongs to, from the `channel` field
+  // of a signed redwood.json. Empty when the file names none: a developer
+  // machine. The patcher writes it beside the URIs, so a client no longer
+  // reads its channel out of a host name.
+  static FString GetChannelName();
+
   /**
    * If set to true, Redwood will automatically connect clients to servers
    * when they receive a request from the Realm service. This will happen

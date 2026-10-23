@@ -36,26 +36,19 @@ public:
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodConnectToServerDynamicDelegate OnRequestToJoinServer;
 
+  // FORK(hollowed-oath): the one connection's events, relayed from
+  // URedwoodClientInterface. Lost: the socket dropped and its requests are
+  // held. Reestablished: the session is back. AuthFailed: the session is
+  // over and cannot come back by itself (the HollowedOath disconnect modal
+  // shows the message). Upstream only logged an auth failure.
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
-  FRedwoodDynamicDelegate OnDirectorConnectionLost;
+  FRedwoodDynamicDelegate OnConnectionLost;
 
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
-  FRedwoodDynamicDelegate OnDirectorConnectionReestablished;
+  FRedwoodDynamicDelegate OnConnectionReestablished;
 
-  // FORK(hollowed-oath): BlueprintAssignable event surfacing director reauth failure to the game
-  // (the HollowedOath disconnect/reconnect modal subscribes). Fork-added; upstream only logs.
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
-  FRedwoodConnectionAuthFailedDynamicDelegate OnDirectorAuthFailed;
-
-  // There is no realm established delegate; you'll have to reinitialize
-  // the realm connection from the director to restart the handshake.
-  UPROPERTY(BlueprintAssignable, Category = "Redwood")
-  FRedwoodDynamicDelegate OnRealmConnectionLost;
-
-  // FORK(hollowed-oath): BlueprintAssignable event surfacing realm reauth failure. Fork-added;
-  // upstream only logs. Pairs with the handler + bind in RedwoodClientGameSubsystem.cpp.
-  UPROPERTY(BlueprintAssignable, Category = "Redwood")
-  FRedwoodConnectionAuthFailedDynamicDelegate OnRealmAuthFailed;
+  FRedwoodConnectionAuthFailedDynamicDelegate OnAuthFailed;
 
   UPROPERTY(BlueprintAssignable, Category = "Redwood")
   FRedwoodPartyInvitedDynamicDelegate OnPartyInvited;
@@ -84,9 +77,6 @@ public:
     bool bRememberMe,
     FRedwoodAuthUpdateDelegate OnUpdate
   );
-
-  void LoginWithDiscord(bool bRememberMe, FRedwoodAuthUpdateDelegate OnUpdate);
-  void LoginWithTwitch(bool bRememberMe, FRedwoodAuthUpdateDelegate OnUpdate);
 
   UFUNCTION(BlueprintPure, Category = "Redwood")
   FString GetNickname();
@@ -434,21 +424,13 @@ private:
   void HandlePingsReceived();
 
   UFUNCTION()
-  void HandleOnDirectorConnectionLost();
+  void HandleOnConnectionLost();
 
   UFUNCTION()
-  void HandleOnDirectorConnectionReestablished();
-
-  // FORK(hollowed-oath): handlers for the two fork-added auth-failed delegates; bound in
-  // Initialize, re-broadcast to the BlueprintAssignable events above.
-  UFUNCTION()
-  void HandleOnDirectorAuthFailed(FString Message);
+  void HandleOnConnectionReestablished();
 
   UFUNCTION()
-  void HandleOnRealmConnectionLost();
-
-  UFUNCTION()
-  void HandleOnRealmAuthFailed(FString Message);
+  void HandleOnAuthFailed(FString Message);
 
   UFUNCTION()
   void HandleRequestToJoinServer(FString ConsoleCommand);
