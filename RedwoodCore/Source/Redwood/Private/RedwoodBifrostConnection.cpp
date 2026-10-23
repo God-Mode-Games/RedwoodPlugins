@@ -725,7 +725,10 @@ void FRedwoodBifrostConnection::ApplyChatResume(
 bool FRedwoodBifrostConnection::DeliverChatLine(
   const FRedwoodChatMessage &Message
 ) {
-  const int64 *Cursor = ChatCursors.Find(Message.Topic);
+  // Seq 0 is a line Bifrost does not store (`/all`): no resume can replay
+  // it, so no cursor is kept or sent for it, and only its id tells a replay.
+  const bool bStored = Message.Seq > 0;
+  const int64 *Cursor = bStored ? ChatCursors.Find(Message.Topic) : nullptr;
   if (
     (Cursor && Message.Seq <= *Cursor) || SeenChatMsgIds.Contains(Message.MsgId)
   ) {
@@ -741,7 +744,9 @@ bool FRedwoodBifrostConnection::DeliverChatLine(
   SeenChatMsgIds.Add(Message.MsgId);
   // A topic with no cursor starts here: its first line is the first one
   // this session can see.
-  ChatCursors.Add(Message.Topic, Message.Seq);
+  if (bStored) {
+    ChatCursors.Add(Message.Topic, Message.Seq);
+  }
   if (OnChatMessage) {
     OnChatMessage(Message);
   }
