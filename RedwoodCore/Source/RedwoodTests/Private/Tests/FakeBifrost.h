@@ -438,18 +438,31 @@ namespace RedwoodFakeBifrost {
 
     // One chat line as Bifrost sends it (`chat.msg`, and a resume's
     // `messages`): {topic, seq, msgId, category, sender, template, args,
-    // sentAt}. The body is the template; the args are empty.
+    // sentAt}. The body is the template; the args are empty. SenderPlayerId
+    // adds `sender.playerId`; ToPlayerId adds a whisper's `to`.
     static TSharedPtr<FJsonObject> ChatLine(
       const FString &Topic,
       int64 Seq,
       const FString &MsgId,
       const FString &Body = TEXT("hello"),
-      const FString &SentAt = TEXT("2026-10-23T12:00:00Z")
+      const FString &SentAt = TEXT("2026-10-23T12:00:00Z"),
+      const FString &SenderPlayerId = FString(),
+      const FString &ToPlayerId = FString()
     ) {
       TSharedPtr<FJsonObject> Sender = MakeShared<FJsonObject>();
+      if (!SenderPlayerId.IsEmpty()) {
+        Sender->SetStringField(TEXT("playerId"), SenderPlayerId);
+      }
       Sender->SetStringField(TEXT("characterId"), TEXT("char-9"));
       Sender->SetStringField(TEXT("name"), TEXT("Bravo"));
       TSharedPtr<FJsonObject> Line = MakeShared<FJsonObject>();
+      if (!ToPlayerId.IsEmpty()) {
+        TSharedPtr<FJsonObject> To = MakeShared<FJsonObject>();
+        To->SetStringField(TEXT("playerId"), ToPlayerId);
+        To->SetStringField(TEXT("characterId"), TEXT("char-1"));
+        To->SetStringField(TEXT("name"), TEXT("Alpha"));
+        Line->SetObjectField(TEXT("to"), To);
+      }
       Line->SetStringField(TEXT("topic"), Topic);
       Line->SetNumberField(TEXT("seq"), static_cast<double>(Seq));
       Line->SetStringField(TEXT("msgId"), MsgId);
