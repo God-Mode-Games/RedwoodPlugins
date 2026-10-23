@@ -201,8 +201,10 @@ public:
   // hold ends only with the reply, a drop of the channel or ResetChat; there
   // is no timer, because a request on a live channel is always answered or
   // lost with the channel, and a timer that gave up first would deliver the
-  // live lines past the gap while the replay could still arrive. A reply of
-  // a resume that a reset or a drop ended changes nothing.
+  // live lines past the gap while the replay could still arrive. A refused
+  // resume and a drop deliver the held lines (the owner hears that the
+  // resume failed); a reset drops them with the session. A reply of a resume
+  // that a reset or a drop ended changes nothing.
   void ChatResume(FRedwoodReplyCallback Callback = nullptr);
 
   // `chat.report {topic, seq, reason}`.

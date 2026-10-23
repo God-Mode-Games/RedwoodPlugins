@@ -46,6 +46,8 @@
 //  12. A resume ended by a reset (the session ended) or a drop is stale: its
 //      reply moves no cursor and delivers nothing. A line or a topic list
 //      that arrives with no session is dropped.
+//  13. A drop with a resume in flight delivers the lines held for it; the
+//      next resume asks from the moved cursor.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -1654,5 +1656,60 @@ bool FRedwoodBifrostChatResumeAfterResetTest::RunTest(
   TestEqual(TEXT("A line with no session is dropped"), Delivered, 1);
   TestEqual(TEXT("Topics with no session are dropped"), TopicUpdates, 0);
   TestEqual(TEXT("And start no cursor"), H.Conn->GetChatCursors().Num(), 0);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostChatResumeLostTest,
+  "Redwood.Bifrost.Connection.ChatResumeLostToDropDeliversHeldLines",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostChatResumeLostTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodBifrostConnectionTest;
+  ExpectReconnectWarnings(*this);
+  FHarness H(*this);
+  H.Open();
+  const FPhoenixMessage Join = H.LoginOk();
+  const FString Party = TEXT("r:realm-1/party:party-1");
+  TArray<FRedwoodChatMessage> Lines;
+  H.Conn->OnChatMessage = [&Lines](const FRedwoodChatMessage &Line) {
+    Lines.Add(Line);
+  };
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), Join.Ref
+  );
+
+  // The socket goes with the resume in flight: the line held for it is
+  // delivered, and the owner (who tracks the reply) hears the loss.
+  H.Conn->ChatResume(nullptr);
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 3, TEXT("m3")), Join.Ref
+  );
+  TestEqual(TEXT("The live line waits for the resume"), Lines.Num(), 1);
+  H.Socket()->Drop();
+  TestEqual(TEXT("The drop delivers the held line"), Lines.Num(), 2);
+  TestEqual(
+    TEXT("The cursor moved on with it"),
+    H.Conn->GetChatCursors()[Party],
+    static_cast<int64>(3)
+  );
+
+  // The next socket's resume asks from the new cursor.
+  H.Advance(PastFirstDelaySeconds);
+  H.Accept();
+  const FPhoenixMessage Resume = H.Socket()->Last(TEXT("phx_join"));
+  H.Socket()->Reply(
+    Resume, TEXT("ok"), FFakeBifrost::JoinReply(TEXT("s1"), TEXT("t2"), nullptr)
+  );
+  H.Conn->ChatResume(nullptr);
+  TestEqual(
+    TEXT("The next resume carries the moved cursor"),
+    static_cast<int32>(H.Socket()
+                         ->Last(TEXT("chat.resume"))
+                         .Payload->GetObjectField(TEXT("cursors"))
+                         ->GetNumberField(Party)),
+    3
+  );
   return true;
 }

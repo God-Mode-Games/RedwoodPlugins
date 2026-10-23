@@ -1684,6 +1684,10 @@ bool FRedwoodBifrostClientCharacterFriendAlertTest::RunTest(
 //      game, and so does the topic whose replay was cut short.
 //  19. `chat.topics` updates GetChatTopics and the delegate; a logout clears
 //      them and the next session starts live, with no cursor of the last.
+//  20. A chat resume Bifrost refuses, or one lost with the socket, reports
+//      every topic with a cursor as possibly missing lines, and the line held
+//      for a lost resume is delivered. A resume the session outlived (a
+//      logout before the reply) reports nothing and moves nothing.
 
 namespace RedwoodBifrostClientTest {
   const FString OtherPassword = TEXT("other-secret");
@@ -2687,5 +2691,104 @@ bool FRedwoodBifrostClientChatTopicsTest::RunTest(const FString &Parameters) {
     FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), H.JoinRef
   );
   TestEqual(TEXT("The new session's line is delivered"), Lines.Num(), 2);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostClientChatResumeFailureTest,
+  "Redwood.Bifrost.Client.ChatResumeFailureReportsTheGap",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostClientChatResumeFailureTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostClientTest;
+  ExpectDrop(*this, 3);
+  AddExpectedMessage(
+    TEXT("The chat resume was refused"), ELogVerbosity::Warning, Contains, 1
+  );
+  FClientHarness H(*this);
+  H.EnterSessionWithCharacter();
+  const FString Party = TEXT("r:realm-1/party:party-1");
+  TArray<FRedwoodChatMessage> Lines;
+  H.Client()->OnChatMessage.AddLambda(
+    [&Lines](const FRedwoodChatMessage &Line) { Lines.Add(Line); }
+  );
+  int32 GapReports = 0;
+  TArray<FString> GapTopics;
+  H.Client()->OnChatTruncated.AddLambda(
+    [&GapReports, &GapTopics](const TArray<FString> &Topics) {
+      ++GapReports;
+      GapTopics = Topics;
+    }
+  );
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), H.JoinRef
+  );
+  TestEqual(TEXT("A line gives the session a cursor"), Lines.Num(), 1);
+
+  // 1. Bifrost refuses the resume: the gap stays, and the game hears that
+  //    the topic may be missing lines.
+  H.DropAndReopen();
+  H.ResumeOk();
+  H.Socket()->Refuse(
+    H.Socket()->Last(TEXT("chat.resume")),
+    TEXT("unavailable"),
+    TEXT("The store did not answer.")
+  );
+  TestEqual(TEXT("A refused resume reports the gap once"), GapReports, 1);
+  TestEqual(TEXT("For the topic with a cursor"), GapTopics.Num(), 1);
+  TestTrue(TEXT("By name"), GapTopics.Contains(Party));
+  // The connection counts as healthy again, so the next drop waits only the
+  // first delay.
+  H.Advance(FRedwoodCloseBackoff::StableConnectionSeconds + 0.1f);
+
+  // 2. The socket goes with the resume in flight: the line held for it is
+  //    delivered, and the game hears the gap again.
+  H.DropAndReopen();
+  H.ResumeOk();
+  TestTrue(
+    TEXT("The resume went out"), H.Socket()->Last(TEXT("chat.resume")).IsValid()
+  );
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 2, TEXT("m2")), H.JoinRef
+  );
+  TestEqual(TEXT("A live line waits for the resume"), Lines.Num(), 1);
+  H.Socket()->Drop();
+  TestEqual(TEXT("The drop delivers the held line"), Lines.Num(), 2);
+  TestEqual(TEXT("A lost resume reports the gap"), GapReports, 2);
+
+  // 3. A logout before the reply: the resume was the ended session's, so
+  //    nothing is said and nothing moves.
+  H.Advance(PastSecondDelaySeconds);
+  H.Accept();
+  H.ResumeOk();
+  const FPhoenixMessage Resume = H.Socket()->Last(TEXT("chat.resume"));
+  TestEqual(
+    TEXT("The resume asks from the moved cursor"),
+    static_cast<int32>(
+      Resume.Payload->GetObjectField(TEXT("cursors"))->GetNumberField(Party)
+    ),
+    2
+  );
+  H.Client()->Logout();
+  TSharedPtr<FJsonObject> Topics = MakeShared<FJsonObject>();
+  Topics->SetObjectField(
+    Party,
+    FFakeBifrost::ResumedTopic(
+      {FFakeBifrost::ChatLine(Party, 3, TEXT("m3"))}, true
+    )
+  );
+  TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+  Reply->SetObjectField(TEXT("topics"), Topics);
+  H.Socket()->Reply(Resume, TEXT("ok"), Reply);
+  TestEqual(TEXT("The old session's replay reaches nobody"), Lines.Num(), 2);
+  TestEqual(TEXT("No gap is reported for it"), GapReports, 2);
+  TestEqual(
+    TEXT("No cursor is kept"),
+    FRedwoodClientTestAccess::Connection(*H.Client())->GetChatCursors().Num(),
+    0
+  );
   return true;
 }

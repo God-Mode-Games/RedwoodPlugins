@@ -891,8 +891,11 @@ void URedwoodClientInterface::ReportChat(
 }
 
 // The session came back: the connection asks for the lines it missed, from
-// its cursors. The reply is tracked like any request. A reply lost with the
-// socket owes nothing: the next restore resumes again from the same cursors.
+// its cursors. The reply is tracked like any request. A refused or lost
+// resume is not retried (the next restore resumes again), but the gap stays
+// and the cursors move on with the live lines, so the player is told that
+// every topic may be missing lines. A resume lost because the session ended
+// (a logout, a new connection) owes nothing: there is no player to tell.
 void URedwoodClientInterface::ResumeChat() {
   TWeakObjectPtr<URedwoodClientInterface> WeakThis(this);
   Connection->ChatResume(Replies.Track(
@@ -911,6 +914,7 @@ void URedwoodClientInterface::ResumeChat() {
           TEXT("The chat resume was refused: %s"),
           *Error
         );
+        Self->ReportChatGap();
         return;
       }
       const TArray<FString> Truncated =
@@ -919,8 +923,23 @@ void URedwoodClientInterface::ResumeChat() {
         Self->OnChatTruncated.Broadcast(Truncated);
       }
     },
-    []() {}
+    [WeakThis]() {
+      URedwoodClientInterface *Self = WeakThis.Get();
+      if (Self && Self->Session.HasPlayerSession()) {
+        Self->ReportChatGap();
+      }
+    }
   ));
+}
+
+void URedwoodClientInterface::ReportChatGap() {
+  TArray<FString> Topics;
+  if (Connection.IsValid()) {
+    Connection->GetChatCursors().GetKeys(Topics);
+  }
+  if (Topics.Num() > 0) {
+    OnChatTruncated.Broadcast(Topics);
+  }
 }
 
 // The server's message is for its logs; the player reads a text of ours.

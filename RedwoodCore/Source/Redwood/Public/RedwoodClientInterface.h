@@ -136,8 +136,9 @@ public:
   // The topics the session can read and send to: each time Bifrost changes
   // the set, and when the session ends (empty).
   FRedwoodChatTopicsDelegate OnChatTopics;
-  // Topics whose replay after a drop was cut short: the player missed lines
-  // Bifrost could not send again.
+  // Topics whose lines may be missing after a drop: the replay was cut
+  // short, or the resume was refused or lost and the cursors moved on with
+  // the live lines. Nothing is retried; the UI can say lines were missed.
   FRedwoodChatTopicsDelegate OnChatTruncated;
   const TArray<FString> &GetChatTopics() const {
     return ChatTopics;
@@ -550,6 +551,8 @@ private:
     FRedwoodChatSendDelegate OnOutput
   );
   void ResumeChat();
+  // The resume failed: every topic with a cursor may be missing lines.
+  void ReportChatGap();
   // The effects that reach Bifrost.
   void SendLogin(const FRedwoodSessionEffect &Effect);
   void SendEnterRealm(uint32 Seq, const FString &RealmId);

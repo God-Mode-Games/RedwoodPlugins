@@ -376,11 +376,16 @@ void FRedwoodBifrostConnection::DropPending() {
   PendingReplies.Reset();
   TArray<FQueuedStep> Steps = MoveTemp(QueuedSteps);
   QueuedSteps.Reset();
-  // The resume went with the channel; the lines held for it are not lost:
-  // the cursors did not move, so the next resume replays them.
+  // The resume went with the channel. The lines held for it are delivered
+  // now: the owner hears that the resume was lost and tells the player that
+  // lines may be missing, and a line in hand beats a gap kept silent.
   bChatResumePending = false;
-  ChatLinesHeldForResume.Reset();
   ++ChatResumeGeneration;
+  TArray<FRedwoodChatMessage> HeldLines = MoveTemp(ChatLinesHeldForResume);
+  ChatLinesHeldForResume.Reset();
+  for (const FRedwoodChatMessage &Line : HeldLines) {
+    DeliverChatLine(Line);
+  }
 
   if (Join) {
     Join(false, LostJoinRefusal(FRedwoodPendingReplies::LostReplyError));
