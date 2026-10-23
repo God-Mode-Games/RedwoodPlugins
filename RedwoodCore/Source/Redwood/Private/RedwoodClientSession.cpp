@@ -949,6 +949,9 @@ void FRedwoodClientSession::OnEnterRealm(const FRedwoodSessionEvent &Event) {
   switch (Phase) {
     case ERedwoodSessionPhase::LoggedIn:
       RealmId = Event.RealmId;
+      // A character is selected in a realm; the last realm's selection
+      // cannot act in this one (a kept zone assignment is for it).
+      SelectedCharacterId.Reset();
       Go(ERedwoodSessionPhase::EnteringRealm);
       Emit(ERedwoodSessionEffectKind::RealmCleared);
       PendingEntryRequests.Add(Event.RequestId);

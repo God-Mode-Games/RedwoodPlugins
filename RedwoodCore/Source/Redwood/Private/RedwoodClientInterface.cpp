@@ -17,27 +17,34 @@
 #include "TimerManager.h"
 
 void URedwoodClientInterface::Deinitialize() {
-  // FORK(hollowed-oath): HollowedOath#2886. The callers go away too, so a
-  // request that waits for a reply is dropped, not failed.
+  // FORK(hollowed-oath): HollowedOath#2886, HollowedOath#2854. The callers go
+  // away too, so a request that waits for a reply, a held request and a
+  // pending login or entry are dropped, not failed: their callers are
+  // forgotten, and the session is back at its start, before the close
+  // answers what was in flight. Nothing is said to the game.
   Replies.Reset();
+  HeldRequests.Reset();
+  LoginCallers.Reset();
+  EntryCallers.Reset();
+  EntryRealms.Reset();
+  FirstConnectCaller.Unbind();
+  Session = FRedwoodClientSession();
 
   if (Connection.IsValid()) {
     Connection->Close();
     Connection.Reset();
   }
-
-  // FORK(hollowed-oath): HollowedOath#2854. The callers are going away too, so
-  // a held request is dropped, not failed.
-  HeldRequests.Reset(TimerManager);
+  TimerManager.ClearTimer(GraceTimer);
 }
 
 // FORK(hollowed-oath): HollowedOath#2854. A backend move drops a socket for a
 // few seconds. A request made then used to fail at once ("Not connected"), or,
 // once the socket was back but before the re-login, reach a server socket that
 // did not know the player and be refused. The gate holds it and sends it after
-// the re-login instead; FRedwoodHeldRequests bounds the wait. True means the
+// the session is back instead; the session machine says when a request is
+// held, sent or failed, and FRedwoodHeldRequests is the queue. True means the
 // request was held or failed, and the caller returns. When it lets a request
-// through, the socket is connected, so the upstream check after it passes.
+// through, the session is live, so the upstream check after it passes.
 // Not gated: login and the handshakes (they are the re-login), ticketing and
 // proxies (a late join can move a player who has given up waiting),
 // CreateCharacter (the creation screen shows its failure), and requests with
@@ -61,24 +68,6 @@ namespace {
     Output.Message = Error;
   }
 
-  // FORK(hollowed-oath): what the player reads for a join that Bifrost
-  // refused with a reason and no message of its own (protocol.md, "Join").
-  FString JoinRefusalText(const FString &Reason) {
-    if (Reason == TEXT("rate_limited")) {
-      return TEXT("Too many login attempts. Try again in a minute.");
-    }
-    if (Reason == TEXT("unavailable")) {
-      return TEXT("The login service did not answer. Try again.");
-    }
-    if (Reason == TEXT("replaced")) {
-      return TEXT("A newer login of this account finished first.");
-    }
-    if (Reason == TEXT("invalid_request")) {
-      return TEXT("The client and the server do not speak the same protocol.");
-    }
-    return Reason;
-  }
-
   // FORK(hollowed-oath): HollowedOath#2886. What a request whose reply was
   // lost tells its caller.
   template <typename TOutput>
@@ -93,58 +82,49 @@ namespace {
   }
 }
 
+// FORK(hollowed-oath): HollowedOath#2854. A backend move drops the socket for
+// a few seconds. The session machine says what a request does then: held
+// while the session comes back (it runs again, through this gate, when it
+// is), sent when the session is live, failed at once otherwise. True means
+// the request was held or failed, and the caller returns.
 template <typename TOutput>
 bool URedwoodClientInterface::Gate(
-  bool bSessionEstablished,
-  bool bCanSend,
-  const TCHAR *NotConnectedError,
+  ERedwoodRequestKind Kind,
   TFunction<void()> Request,
   const TDelegate<void(const TOutput &)> &OnOutput
 ) {
-  if (HeldRequests.HoldIfReconnecting(
-        bSessionEstablished, bCanSend, MoveTemp(Request), TimerManager
-      )) {
-    return true;
+  switch (Session.Gate(Kind)) {
+    case ERedwoodGateDecision::Send:
+      return false;
+    case ERedwoodGateDecision::Hold:
+      HeldRequests.Add(MoveTemp(Request));
+      return true;
+    default: {
+      TOutput Output;
+      SetRedwoodGateError(
+        Output,
+        Kind == ERedwoodRequestKind::Director
+          ? FRedwoodClientSession::NotConnectedToDirector
+          : FRedwoodClientSession::NotConnectedToRealm
+      );
+      OnOutput.ExecuteIfBound(Output);
+      return true;
+    }
   }
-
-  if (bCanSend) {
-    return false;
-  }
-
-  TOutput Output;
-  SetRedwoodGateError(Output, NotConnectedError);
-  OnOutput.ExecuteIfBound(Output);
-  return true;
 }
 
 template <typename TOutput>
 bool URedwoodClientInterface::GateDirector(
   TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
 ) {
-  return Gate(
-    Connection.IsValid() && bSentConnected && HasPlayerSession(),
-    CanSendToDirector(),
-    TEXT("Not connected to Director."),
-    MoveTemp(Request),
-    OnOutput
-  );
+  return Gate(ERedwoodRequestKind::Director, MoveTemp(Request), OnOutput);
 }
 
 template <typename TOutput>
 bool URedwoodClientInterface::GateRealm(
   TFunction<void()> Request, const TDelegate<void(const TOutput &)> &OnOutput
 ) {
-  // FORK(hollowed-oath): CurrentRealmId is set when the session entered a
-  // realm and cleared when it ends, so a realm request made before the
-  // entry, or after a logout, fails at once instead of waiting a grace.
-  return Gate(
-    Connection.IsValid() && bSentConnected && HasPlayerSession() &&
-      !CurrentRealmId.IsEmpty(),
-    CanSendToRealm(),
-    TEXT("Not connected to Realm."),
-    MoveTemp(Request),
-    OnOutput
-  );
+  return Gate(ERedwoodRequestKind::Realm, MoveTemp(Request), OnOutput);
 }
 
 // FORK(hollowed-oath) BEGIN: HollowedOath#2886. The reply callback of a
@@ -247,12 +227,12 @@ void URedwoodClientInterface::HandlePartyQueued(
       TicketId.IsEmpty() || CharacterId.IsEmpty()) {
     return;
   }
-  if (SelectedCharacterId.IsEmpty()) {
+  if (Session.GetSelectedCharacterId().IsEmpty()) {
     PendingPartyTicketId = TicketId;
     PendingPartyCharacterId = CharacterId;
     return;
   }
-  if (CharacterId == SelectedCharacterId) {
+  if (CharacterId == Session.GetSelectedCharacterId()) {
     AcceptPartyTicket(TicketId);
   }
 }
@@ -282,7 +262,7 @@ void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
   bAbandonedQueueJoin = false;
   AcceptedPartyTicketId = TicketId;
   if (IsRealmReady()) {
-    SendOwedLeave();
+    SendOwedLeave(Session.GetPlayerId());
   }
 }
 
@@ -399,67 +379,344 @@ TStatId URedwoodClientInterface::GetStatId() const {
 }
 
 // FORK(hollowed-oath) BEGIN: the one connection. The socket opens here; the
-// login joins the session on it. A drop is followed by a reconnect and a
-// resume inside the connection; this object hears the outcome and holds the
-// requests made in between (HollowedOath#2854).
+// login joins the session on it. What the connection reports becomes an event
+// of the session machine, and the machine's effects run in Execute.
 void URedwoodClientInterface::InitializeDirectorConnection(
   FRedwoodSocketConnectedDelegate OnDirectorConnected
 ) {
+  // Before the old connection closes: its callbacks answer their joins and
+  // steps as lost, and the machine ignores those of a connection it left.
+  Dispatch(FRedwoodSessionEvent::Initialize());
   if (Connection.IsValid()) {
     Connection->Close();
   }
+  FirstConnectCaller = OnDirectorConnected;
   Connection = MakeShared<FRedwoodBifrostConnection>(TimerManager);
-  bSentConnected = false;
-  bDisconnected = false;
-  bRealmEntered = false;
-  bReauthPending = false;
   BindPushHandlers();
 
   ConnectionUri = URedwoodSettings::GetBifrostUri();
   TWeakObjectPtr<URedwoodClientInterface> WeakThis(this);
 
-  Connection->OnConnected = [WeakThis, OnDirectorConnected]() {
+  Connection->OnConnected = [WeakThis]() {
+    if (URedwoodClientInterface *Self = WeakThis.Get()) {
+      Self->Dispatch(FRedwoodSessionEvent::SocketUp());
+    }
+  };
+  Connection->OnDropped = [WeakThis](bool bAnnounced) {
+    if (URedwoodClientInterface *Self = WeakThis.Get()) {
+      Self->Dispatch(FRedwoodSessionEvent::SocketDown(bAnnounced));
+    }
+  };
+  Connection->OnResumed = [WeakThis](const TSharedPtr<FJsonObject> &Reply) {
     URedwoodClientInterface *Self = WeakThis.Get();
     if (!Self) {
       return;
     }
-    const bool bFirst = !Self->bSentConnected;
-    Self->HandleConnected();
-    if (bFirst) {
-      FRedwoodSocketConnected Details;
-      Details.Error = TEXT("");
-      OnDirectorConnected.ExecuteIfBound(Details);
-    }
-  };
-  Connection->OnDropped = [WeakThis](bool bAnnounced) {
-    // A socket Bifrost closed after `closed` goes with a session this
-    // object ended already; nothing is lost that the game must hear of.
-    if (!bAnnounced) {
-      return;
-    }
-    if (URedwoodClientInterface *Self = WeakThis.Get()) {
-      Self->HandleDropped();
-    }
-  };
-  Connection->OnResumed = [WeakThis](const TSharedPtr<FJsonObject> &Reply) {
-    if (URedwoodClientInterface *Self = WeakThis.Get()) {
-      Self->HandleResumed(Reply);
-    }
+    FString RealmId;
+    FString LockedRealmId;
+    FString CharacterId;
+    Reply->TryGetStringField(TEXT("realmId"), RealmId);
+    Reply->TryGetStringField(TEXT("lockedRealmId"), LockedRealmId);
+    Reply->TryGetStringField(TEXT("characterId"), CharacterId);
+    Self->Dispatch(
+      FRedwoodSessionEvent::ResumeAccepted(RealmId, LockedRealmId, CharacterId)
+    );
   };
   Connection->OnResumeRefused = [WeakThis]() {
     if (URedwoodClientInterface *Self = WeakThis.Get()) {
-      Self->HandleResumeRefused();
+      Self->Dispatch(FRedwoodSessionEvent::ResumeRefused());
     }
   };
   Connection->OnClosedByServer = [WeakThis](const FString &Reason) {
     if (URedwoodClientInterface *Self = WeakThis.Get()) {
-      Self->HandleClosedByServer(Reason);
+      Self->Dispatch(FRedwoodSessionEvent::ClosedByServer(Reason));
     }
   };
 
   UE_LOG(LogRedwood, Log, TEXT("Connecting to Bifrost at %s"), *ConnectionUri);
   Connection->Connect(ConnectionUri);
 }
+
+
+// An event raised while effects run waits its turn: the phase is committed
+// before any effect runs, and a game delegate that calls back in sees it.
+void URedwoodClientInterface::Dispatch(const FRedwoodSessionEvent &Event) {
+  EventQueue.Add(Event);
+  if (bDispatching) {
+    return;
+  }
+  bDispatching = true;
+  while (EventQueue.Num() > 0) {
+    const FRedwoodSessionEvent Next = EventQueue[0];
+    EventQueue.RemoveAt(0);
+    const TArray<FRedwoodSessionEffect> Effects = Session.Handle(Next);
+    for (const FRedwoodSessionEffect &Effect : Effects) {
+      Execute(Effect);
+    }
+  }
+  bDispatching = false;
+}
+
+void URedwoodClientInterface::Execute(const FRedwoodSessionEffect &Effect) {
+  using EKind = ERedwoodSessionEffectKind;
+  switch (Effect.Kind) {
+    case EKind::SendLogin:
+      SendLogin(Effect);
+      return;
+    case EKind::SendEnterRealm:
+      SendEnterRealm(Effect.Seq, Effect.Text);
+      return;
+    case EKind::SendSelectCharacter:
+      SendSelectCharacter();
+      return;
+    case EKind::SendLogoutStep:
+      if (Connection.IsValid()) {
+        Connection->Step(TEXT("session.logout"), MakeShared<FJsonObject>());
+      }
+      return;
+    case EKind::ForgetSession:
+      if (Connection.IsValid()) {
+        Connection->ForgetSession();
+      }
+      return;
+    case EKind::StartGrace: {
+      // Counted from the drop, like the game's own disconnect grace.
+      TWeakObjectPtr<URedwoodClientInterface> WeakThis(this);
+      TimerManager.SetTimer(
+        GraceTimer,
+        FTimerDelegate::CreateLambda([WeakThis]() {
+          if (URedwoodClientInterface *Self = WeakThis.Get()) {
+            Self->Dispatch(FRedwoodSessionEvent::GraceExpired());
+          }
+        }),
+        FRedwoodHeldRequests::GraceSeconds,
+        false
+      );
+      return;
+    }
+    case EKind::StopGrace:
+      TimerManager.ClearTimer(GraceTimer);
+      return;
+    case EKind::ReleaseHeld:
+      HeldRequests.Release();
+      return;
+    case EKind::ExpireHeld:
+      HeldRequests.Expire();
+      return;
+    case EKind::FailPendingReplies:
+      Replies.FailAll();
+      return;
+    case EKind::BroadcastLost:
+      // A first connect that fails has its own line (LogFirstConnectFailure).
+      if (Session.GetPhase() != ERedwoodSessionPhase::ConnectFailed) {
+        UE_LOG(
+          LogRedwood,
+          Error,
+          TEXT("Lost the connection to Bifrost at %s; will continue to try to reestablish it."),
+          *ConnectionUri
+        );
+      }
+      OnConnectionLost.Broadcast();
+      return;
+    case EKind::BroadcastReestablished:
+      UE_LOG(
+        LogRedwood,
+        Log,
+        TEXT("Reestablished the connection to Bifrost at %s."),
+        *ConnectionUri
+      );
+      OnConnectionReestablished.Broadcast();
+      return;
+    case EKind::BroadcastAuthFailed:
+      UE_LOG(
+        LogRedwood,
+        Warning,
+        TEXT("The session cannot come back: %s"),
+        *Effect.Text
+      );
+      OnAuthFailed.Broadcast(Effect.Text);
+      return;
+    case EKind::ReportFirstConnect: {
+      FRedwoodSocketConnected Details;
+      Details.Error = TEXT("");
+      FRedwoodSocketConnectedDelegate Caller = FirstConnectCaller;
+      FirstConnectCaller.Unbind();
+      Caller.ExecuteIfBound(Details);
+      return;
+    }
+    case EKind::LogFirstConnectFailure:
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("Unable to establish the initial connection to Bifrost at %s; will continue to try."),
+        *ConnectionUri
+      );
+      return;
+    case EKind::AnswerLogin: {
+      FRedwoodAuthUpdateDelegate Caller;
+      if (!LoginCallers.RemoveAndCopyValue(Effect.RequestId, Caller)) {
+        return;
+      }
+      FRedwoodAuthUpdate Update;
+      switch (Effect.LoginAnswer) {
+        case ERedwoodLoginAnswer::Success:
+          Update.Type = ERedwoodAuthUpdateType::Success;
+          break;
+        case ERedwoodLoginAnswer::MustVerify:
+          // The push `player:account-verified` answers the caller later.
+          OnAccountVerified = Caller;
+          MustVerifyPlayerId = Effect.Text;
+          Update.Type = ERedwoodAuthUpdateType::MustVerifyAccount;
+          break;
+        default:
+          Update.Type = ERedwoodAuthUpdateType::Error;
+          Update.Message = Effect.Text;
+          break;
+      }
+      Caller.ExecuteIfBound(Update);
+      return;
+    }
+    case EKind::AnswerRealmEntry: {
+      FRedwoodRealm Realm;
+      const bool bHasRealm = EntryRealms.RemoveAndCopyValue(Effect.RequestId, Realm);
+      FRedwoodSocketConnectedDelegate Caller;
+      if (!EntryCallers.RemoveAndCopyValue(Effect.RequestId, Caller)) {
+        return;
+      }
+      if (Effect.Text.IsEmpty() && bHasRealm) {
+        CurrentRealm = Realm;
+      }
+      FRedwoodSocketConnected Output;
+      Output.Error = Effect.Text;
+      Caller.ExecuteIfBound(Output);
+      return;
+    }
+    case EKind::ApplyRegions:
+      if (Effect.Response.IsValid()) {
+        ApplyRegions(Effect.Response);
+      }
+      return;
+    case EKind::RealmEntered: {
+      // A resume can reach a realm the game never named to this client (the
+      // locked realm after an entry lost with its socket).
+      if (CurrentRealm.Id.IsEmpty()) {
+        CurrentRealm.Id = Session.GetRealmId();
+      }
+      // HollowedOath#2886. Before the caller can join.
+      SendOwedLeave(Session.GetPlayerId());
+      return;
+    }
+    case EKind::PayOwedLeave:
+      SendOwedLeave(Effect.Text, true);
+      return;
+    case EKind::RealmCleared:
+      ClearRealmDetails();
+      return;
+    case EKind::SessionCleared:
+      // The next login can be another account, whose tickets are not ours.
+      bLeaveTicketingOwed = false;
+      return;
+    case EKind::SaveCredentials:
+      SaveCredentials(Effect.Username, Effect.Secret);
+      return;
+    case EKind::ClearCredentials:
+      SaveCredentials(FString(), FString());
+      return;
+    default:
+      return;
+  }
+}
+
+
+void URedwoodClientInterface::SendLogin(const FRedwoodSessionEffect &Effect) {
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("username"), Effect.Username);
+  Payload->SetStringField(TEXT("secret"), Effect.Secret);
+  Payload->SetStringField(TEXT("provider"), Effect.Provider);
+
+  // The join of the session. Its reply is an event of the machine, under the
+  // sequence of this join, so a reply of an older join cannot act.
+  const uint32 Seq = Effect.Seq;
+  TWeakObjectPtr<URedwoodClientInterface> WeakThis(this);
+  Connection->Login(
+    Payload,
+    [WeakThis, Seq](bool bOk, const TSharedPtr<FJsonObject> &Response) {
+      URedwoodClientInterface *Self = WeakThis.Get();
+      if (!Self) {
+        return;
+      }
+      if (bOk) {
+        FString PlayerId;
+        FString Token;
+        FString Nickname;
+        const TSharedPtr<FJsonObject> *Player = nullptr;
+        if (Response->TryGetObjectField(TEXT("player"), Player)) {
+          (*Player)->TryGetStringField(TEXT("playerId"), PlayerId);
+          (*Player)->TryGetStringField(TEXT("token"), Token);
+          (*Player)->TryGetStringField(TEXT("nickname"), Nickname);
+        }
+        Self->Dispatch(
+          FRedwoodSessionEvent::LoginOk(Seq, PlayerId, Token, Nickname)
+        );
+        return;
+      }
+      FString Reason;
+      FString Message;
+      FString MustVerifyPlayer;
+      Response->TryGetStringField(TEXT("reason"), Reason);
+      Response->TryGetStringField(TEXT("message"), Message);
+      Response->TryGetStringField(TEXT("playerId"), MustVerifyPlayer);
+      if (Reason == TEXT("not_connected")) {
+        Self->Dispatch(FRedwoodSessionEvent::LoginLost(Seq));
+        return;
+      }
+      Self->Dispatch(FRedwoodSessionEvent::LoginRefused(
+        Seq, Reason, Message, MustVerifyPlayer
+      ));
+    }
+  );
+}
+
+void URedwoodClientInterface::SendEnterRealm(uint32 Seq, const FString &RealmId) {
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("realmId"), RealmId);
+  UE_LOG(LogRedwood, Log, TEXT("Entering realm %s"), *RealmId);
+
+  TWeakObjectPtr<URedwoodClientInterface> WeakThis(this);
+  Connection->Step(
+    TEXT("session.enter-realm"),
+    Payload,
+    [WeakThis, Seq](const TArray<TSharedPtr<FJsonValue>> &Response) {
+      URedwoodClientInterface *Self = WeakThis.Get();
+      if (!Self) {
+        return;
+      }
+      const TSharedPtr<FJsonObject> Object = Response[0]->AsObject();
+      const FString Error = Object->GetStringField(TEXT("error"));
+      FString Code;
+      Object->TryGetStringField(TEXT("code"), Code);
+      if (Code == TEXT("not_connected")) {
+        Self->Dispatch(FRedwoodSessionEvent::EnterRealmLost(Seq));
+      } else if (Error.IsEmpty()) {
+        Self->Dispatch(FRedwoodSessionEvent::EnterRealmOk(Seq, Object));
+      } else {
+        Self->Dispatch(FRedwoodSessionEvent::EnterRealmRefused(Seq, Error));
+      }
+    }
+  );
+}
+
+void URedwoodClientInterface::SaveCredentials(
+  const FString &Username, const FString &Token
+) {
+  URedwoodSaveGame *SaveGame = Cast<URedwoodSaveGame>(
+    UGameplayStatics::CreateSaveGameObject(URedwoodSaveGame::StaticClass())
+  );
+  SaveGame->Username = Username;
+  SaveGame->AuthToken = Token;
+  UGameplayStatics::SaveGameToSlot(SaveGame, TEXT("RedwoodSaveGame"), 0);
+}
+// FORK(hollowed-oath) END
 
 bool URedwoodClientInterface::IsDirectorConnected() {
   return Connection.IsValid() && Connection->IsConnected();
@@ -472,7 +729,8 @@ void URedwoodClientInterface::BindPushHandlers() {
       TSharedPtr<FJsonObject> MessageObject = Message->AsObject();
       FString InPlayerId = MessageObject->GetStringField(TEXT("playerId"));
 
-      if (InPlayerId == PlayerId) {
+      if (!InPlayerId.IsEmpty() && InPlayerId == MustVerifyPlayerId) {
+        MustVerifyPlayerId.Reset();
         FRedwoodAuthUpdate Update;
         Update.Type = ERedwoodAuthUpdateType::Success;
         Update.Message = TEXT("");
@@ -508,262 +766,6 @@ void URedwoodClientInterface::BindPushHandlers() {
 
   BindRealmPushHandlers();
 }
-
-void URedwoodClientInterface::HandleConnected() {
-  if (!bSentConnected) {
-    bSentConnected = true;
-    UE_LOG(LogRedwood, Log, TEXT("Connected to Bifrost at %s"), *ConnectionUri);
-    // A first connect that failed broadcast a lost connection, and the game
-    // shows a message for it; this is the only event that takes it down.
-    if (bLostBeforeFirstConnect) {
-      bLostBeforeFirstConnect = false;
-      OnConnectionReestablished.Broadcast();
-    }
-    return;
-  }
-
-  UE_LOG(
-    LogRedwood,
-    Log,
-    TEXT("Reestablished the connection to Bifrost at %s."),
-    *ConnectionUri
-  );
-
-  // With a session, the connection resumes it now, and HandleResumed or
-  // HandleResumeRefused tells the outcome. The connection counts as lost
-  // until then: a resume that this pod refuses drops the socket again, and
-  // that is the same outage.
-  if (Connection->HasSession()) {
-    return;
-  }
-
-  // No session to resume: the player was never logged in, logged out during
-  // the drop, or a re-login's own socket dropped. The last one logs in again.
-  bLoggedOutDuringRelogin = false;
-  if (HasPlayerSession()) {
-    Relogin();
-    return;
-  }
-  bReauthPending = false;
-  // Only a lost connection the game heard of is reestablished: a socket
-  // that Bifrost closed after `closed` was not one.
-  if (bDisconnected) {
-    bDisconnected = false;
-    OnConnectionReestablished.Broadcast();
-  }
-}
-
-void URedwoodClientInterface::HandleDropped() {
-  if (!bSentConnected) {
-    if (!bSentInitialConnectionFailureLog) {
-      bSentInitialConnectionFailureLog = true;
-      UE_LOG(
-        LogRedwood,
-        Error,
-        TEXT(
-          "Unable to establish the initial connection to Bifrost at %s; will continue to try."
-        ),
-        *ConnectionUri
-      );
-    }
-    if (!bLostBeforeFirstConnect) {
-      bLostBeforeFirstConnect = true;
-      OnConnectionLost.Broadcast();
-    }
-    return;
-  }
-
-  // One outage is one drop: the reconnect attempts that fail inside it
-  // close their sockets too.
-  if (bDisconnected) {
-    return;
-  }
-  bDisconnected = true;
-
-  UE_LOG(
-    LogRedwood,
-    Error,
-    TEXT("Lost the connection to Bifrost at %s; will continue to try to reestablish it."),
-    *ConnectionUri
-  );
-
-  // HollowedOath#2854. Before bAuthenticated is cleared: it reads whether
-  // the player was logged in at the drop.
-  bLoggedInAtDrop = bLoggedInAtDrop || bAuthenticated;
-  bAuthenticated = false;
-  if (HasPlayerSession()) {
-    bReauthPending = true;
-    // Count the request grace from the drop, like the game's own
-    // disconnect grace.
-    HeldRequests.StartGrace(TimerManager);
-  }
-  // HollowedOath#2886. Last, so a request that a failure handler sends again
-  // is held for the reconnect.
-  Replies.FailAll();
-  OnConnectionLost.Broadcast();
-}
-
-// The session is back as it was: Redwood saw no drop. The reply says what
-// the session has; what this client had and the reply lacks (a realm whose
-// start answer was lost, a character whose claim was lost) is sent again.
-void URedwoodClientInterface::HandleResumed(
-  const TSharedPtr<FJsonObject> &Reply
-) {
-  // The player logged out while the resume was in flight; its reply brought
-  // back a session that must end now. The client's own state is cleared
-  // already, so this is the step and the forgetting that Logout would do.
-  if (bLoggedOutDuringRelogin) {
-    bLoggedOutDuringRelogin = false;
-    bReauthPending = false;
-    Connection->Step(TEXT("session.logout"), MakeShared<FJsonObject>());
-    Connection->ForgetSession();
-    return;
-  }
-
-  FString RealmId;
-  FString LockedRealmId;
-  FString CharacterId;
-  Reply->TryGetStringField(TEXT("realmId"), RealmId);
-  Reply->TryGetStringField(TEXT("lockedRealmId"), LockedRealmId);
-  Reply->TryGetStringField(TEXT("characterId"), CharacterId);
-
-  // The realm did not answer the start before the drop. The session is
-  // locked to that realm, and no other is accepted, so enter it again: the
-  // one this client asked for, or the one Bifrost names when this client's
-  // own entry was lost with the socket before it learned the realm.
-  if (RealmId.IsEmpty() &&
-      (!CurrentRealmId.IsEmpty() || !LockedRealmId.IsEmpty())) {
-    if (CurrentRealmId.IsEmpty()) {
-      CurrentRealmId = LockedRealmId;
-      CurrentRealm.Id = LockedRealmId;
-    }
-    bRealmEntered = false;
-    RestoreRealmAfterRelogin();
-    return;
-  }
-
-  bRealmEntered = !RealmId.IsEmpty();
-  if (bRealmEntered && !SelectedCharacterId.IsEmpty() &&
-      (CharacterId != SelectedCharacterId || bSelectCharacterOwedToRealm)) {
-    SendSelectCharacter();
-  }
-  EndReauthentication(true);
-}
-
-// The session is gone: its grace ended, or another login replaced it and
-// the notice was lost. The token logs the player in again, as before the
-// one connection; the new session then enters the realm the old one was in.
-void URedwoodClientInterface::HandleResumeRefused() {
-  bLoggedOutDuringRelogin = false;
-  // The player logged out while the resume was in flight: there is no
-  // session to log in again with, and nothing more to do.
-  if (!HasPlayerSession()) {
-    bReauthPending = false;
-    return;
-  }
-  Relogin();
-}
-
-void URedwoodClientInterface::Relogin() {
-  UE_LOG(LogRedwood, Log, TEXT("Logging in again after the reconnect."));
-  SendLogin(
-    PlayerId,
-    AuthToken,
-    TEXT("local"),
-    true,
-    FRedwoodAuthUpdateDelegate::CreateLambda(
-      [this](const FRedwoodAuthUpdate &Update) {
-        if (Update.Type == ERedwoodAuthUpdateType::Success) {
-          RestoreRealmAfterRelogin();
-          return;
-        }
-        UE_LOG(
-          LogRedwood,
-          Error,
-          TEXT("Could not log in again after the reconnect: %s"),
-          *Update.Message
-        );
-        FailReauthentication(Update.Message);
-      }
-    )
-  );
-}
-
-void URedwoodClientInterface::RestoreRealmAfterRelogin() {
-  if (CurrentRealmId.IsEmpty()) {
-    EndReauthentication(true);
-    return;
-  }
-
-  EnterRealm(
-    CurrentRealmId,
-    FRedwoodSocketConnectedDelegate::CreateLambda(
-      [this](const FRedwoodSocketConnected &Output) {
-        if (!Output.Error.IsEmpty()) {
-          UE_LOG(
-            LogRedwood,
-            Error,
-            TEXT("Could not enter the realm again after the reconnect: %s"),
-            *Output.Error
-          );
-          FailReauthentication(Output.Error);
-          return;
-        }
-        // HollowedOath#2448. Before the held requests, which can act for
-        // the character.
-        if (!SelectedCharacterId.IsEmpty()) {
-          SendSelectCharacter();
-        }
-        EndReauthentication(true);
-      }
-    )
-  );
-}
-
-void URedwoodClientInterface::HandleClosedByServer(const FString &Reason) {
-  if (Reason == TEXT("replaced")) {
-    EndSession(TEXT("This account logged in from another client."));
-  }
-  // "logout" is this client's own; "reconnect" is followed by the socket
-  // close, which HandleDropped sees, and by a resume on a new socket.
-}
-
-// Bifrost ended the session, or a re-login could not bring it back. The
-// player's requests fail now, and the game hears why.
-void URedwoodClientInterface::EndSession(const FString &Message) {
-  HeldRequests.Expire(TimerManager);
-  Replies.FailAll();
-  bReauthPending = false;
-  bLoggedOutDuringRelogin = false;
-  // The outage, if one was on, ends in this failure, not in a reestablished
-  // connection; the next drop is a new one.
-  bDisconnected = false;
-  ClearSessionState();
-  OnAuthFailed.Broadcast(Message);
-}
-
-// The session cannot come back: the re-login, or the realm entry after it,
-// was refused. It ends as a session Bifrost ended does, so that no later
-// socket tries the dead token again and no request waits for it. A new
-// session the re-login did make is logged out of Bifrost.
-void URedwoodClientInterface::FailReauthentication(const FString &Message) {
-  EndReauthentication(false);
-  const bool bLoggedOut = bLoggedOutDuringRelogin;
-  bLoggedOutDuringRelogin = false;
-  bDisconnected = false;
-  if (IsDirectorConnected() && Connection->HasSession()) {
-    Connection->Step(TEXT("session.logout"), MakeShared<FJsonObject>());
-  }
-  if (Connection.IsValid()) {
-    Connection->ForgetSession();
-  }
-  ClearSessionState();
-  // A player who logged out meanwhile is at the title screen.
-  if (!bLoggedOut) {
-    OnAuthFailed.Broadcast(Message);
-  }
-}
-// FORK(hollowed-oath) END
 
 void URedwoodClientInterface::HandleRegionsChanged(
   const FString &Event, const TSharedPtr<FJsonValue> &Message
@@ -910,82 +912,29 @@ void URedwoodClientInterface::Register(
 }
 
 void URedwoodClientInterface::Logout() {
-  // FORK(hollowed-oath): HollowedOath#2854. Not IsLoggedIn: in the silent grace
-  // after a drop the player is not authenticated, and a no-op here let the
-  // reconnect bring the player back after they chose to leave.
-  if (HasPlayerSession()) {
-    // Before the ids are cleared, so the held requests fail and are not sent.
-    HeldRequests.Expire(TimerManager);
-    // Only a resume or re-login still in flight can bring the player back
-    // after this; its reply must log out again. A later login is a new
-    // session, and must not be logged out for this one.
-    bLoggedOutDuringRelogin = bReauthPending;
-    bReauthPending = false;
-
-    // Not while a resume is still unanswered: the step would reach no
-    // channel. HandleResumed sends the logout when that resume is accepted.
-    if (IsDirectorConnected() && Connection->HasSession() &&
-        Connection->IsJoined()) {
-      // FORK(hollowed-oath): HollowedOath#2886. Only a realm that knows the
-      // player can run the leave. In the re-login window the flag is
-      // dropped below all the same; the server ticket then expires.
-      if (IsRealmReady()) {
-        SendOwedLeave();
-      }
-      // Bifrost ends the session at the realm and the director, and closes
-      // the socket; the socket comes back for the next login. A request
-      // still waiting is not answered over that close, and the close is one
-      // we asked for, so nothing else fails it.
-      Connection->Step(TEXT("session.logout"), MakeShared<FJsonObject>());
-      Replies.FailAll();
-    }
-    // A session the socket could not tell is ended after its grace. Either
-    // way, no resume must bring it back.
-    if (Connection.IsValid()) {
-      Connection->ForgetSession();
-    }
-
-    ClearSessionState();
-
-    URedwoodSaveGame *SaveGame = Cast<URedwoodSaveGame>(
-      UGameplayStatics::CreateSaveGameObject(URedwoodSaveGame::StaticClass())
-    );
-
-    UGameplayStatics::SaveGameToSlot(SaveGame, TEXT("RedwoodSaveGame"), 0);
-  }
+  // FORK(hollowed-oath): the session machine ends the session: it pays an
+  // owed leave, sends `session.logout` while a channel can carry it, fails
+  // the held requests, and keeps a resume or re-login still in flight from
+  // bringing the session back.
+  Dispatch(FRedwoodSessionEvent::Logout());
 }
 
-// FORK(hollowed-oath): what a logout and an end by Bifrost have in common.
-void URedwoodClientInterface::ClearSessionState() {
-  PlayerId = TEXT("");
-  AuthToken = TEXT("");
-  // The next session is in no realm until it enters one; a resume of it
-  // must not enter the old realm by itself.
-  ClearRealmState();
-  // The next login can be another account, whose tickets are not ours.
-  bLeaveTicketingOwed = false;
-  // HollowedOath#2854. See HasPlayerSession: both flags, or a later drop at
-  // the title screen logs in again with empty ids and reports an
-  // authentication failure there.
-  bAuthenticated = false;
-  bLoggedInAtDrop = false;
-}
 
 bool URedwoodClientInterface::IsLoggedIn() {
-  return !PlayerId.IsEmpty() && !AuthToken.IsEmpty() && bAuthenticated;
+  return Session.IsLoggedIn();
 }
 
 FString URedwoodClientInterface::GetPlayerId() {
-  return PlayerId;
+  return Session.GetPlayerId();
 }
 
 FString URedwoodClientInterface::GetCharacterId() {
-  return SelectedCharacterId;
+  return Session.GetSelectedCharacterId();
 }
 
 FString URedwoodClientInterface::GetCharacterName() {
-  if (!SelectedCharacterId.IsEmpty()) {
-    FString *CharacterName = CharacterNamesById.Find(SelectedCharacterId);
+  if (!Session.GetSelectedCharacterId().IsEmpty()) {
+    FString *CharacterName = CharacterNamesById.Find(Session.GetSelectedCharacterId());
 
     if (CharacterName != nullptr) {
       return *CharacterName;
@@ -996,7 +945,7 @@ FString URedwoodClientInterface::GetCharacterName() {
 }
 
 FString URedwoodClientInterface::GetRealmId() {
-  return CurrentRealmId;
+  return Session.GetRealmId();
 }
 
 void URedwoodClientInterface::AttemptAutoLogin(
@@ -1024,6 +973,9 @@ void URedwoodClientInterface::AttemptAutoLogin(
   }
 }
 
+// FORK(hollowed-oath): the login is the join of the Bifrost session. The
+// machine starts a clean session for it and answers the caller through
+// AnswerLogin, by this request id.
 void URedwoodClientInterface::Login(
   const FString &Username,
   const FString &PasswordOrToken,
@@ -1031,110 +983,20 @@ void URedwoodClientInterface::Login(
   bool bRememberMe,
   FRedwoodAuthUpdateDelegate OnUpdate
 ) {
-  // FORK(hollowed-oath): a new session is in no realm, whatever the last one
-  // was in; a resume of it must not enter the old realm by itself.
-  ClearRealmState();
-  SendLogin(Username, PasswordOrToken, Provider, bRememberMe, OnUpdate);
-  // A re-login that was still in flight was answered (and silenced) inside
-  // SendLogin, so the logout of the old session is over here and must not
-  // end the new one.
-  bLoggedOutDuringRelogin = false;
+  const uint32 RequestId = ++NextRequestId;
+  LoginCallers.Add(RequestId, OnUpdate);
+  Dispatch(FRedwoodSessionEvent::Login(
+    RequestId, Username, PasswordOrToken, Provider, bRememberMe
+  ));
 }
 
-void URedwoodClientInterface::SendLogin(
-  const FString &Username,
-  const FString &PasswordOrToken,
-  const FString &Provider,
-  bool bRememberMe,
-  FRedwoodAuthUpdateDelegate OnUpdate
-) {
-  if (!IsDirectorConnected()) {
-    FRedwoodAuthUpdate Update;
-    Update.Type = ERedwoodAuthUpdateType::Error;
-    Update.Message = TEXT("Not connected to Director.");
-    OnUpdate.ExecuteIfBound(Update);
-    return;
-  }
-
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("username"), Username);
-  Payload->SetStringField(TEXT("secret"), PasswordOrToken);
-  Payload->SetStringField(TEXT("provider"), Provider);
-
-  // FORK(hollowed-oath): the join of the session. Not tracked: the
-  // re-login also runs this, and a failure would end the session.
-  TWeakObjectPtr<URedwoodClientInterface> WeakThis(this);
-  Connection->Login(
-    Payload,
-    [WeakThis, Username, bRememberMe, OnUpdate](
-      bool bOk, const TSharedPtr<FJsonObject> &Response
-    ) {
-      URedwoodClientInterface *Self = WeakThis.Get();
-      if (!Self) {
-        return;
-      }
-
-      FRedwoodAuthUpdate Update;
-
-      if (bOk) {
-        const TSharedPtr<FJsonObject> *Player = nullptr;
-        if (Response->TryGetObjectField(TEXT("player"), Player)) {
-          (*Player)->TryGetStringField(TEXT("playerId"), Self->PlayerId);
-          (*Player)->TryGetStringField(TEXT("token"), Self->AuthToken);
-          (*Player)->TryGetStringField(TEXT("nickname"), Self->Nickname);
-        }
-
-        Update.Type = ERedwoodAuthUpdateType::Success;
-        Update.Message = TEXT("");
-
-        Self->bAuthenticated = true;
-        // A new session is in no realm, whatever the last one was in.
-        Self->bRealmEntered = false;
-
-        URedwoodSaveGame *SaveGame =
-          Cast<URedwoodSaveGame>(UGameplayStatics::CreateSaveGameObject(
-            URedwoodSaveGame::StaticClass()
-          ));
-
-        if (bRememberMe) {
-          SaveGame->Username = Username;
-          SaveGame->AuthToken = Self->AuthToken;
-        }
-
-        UGameplayStatics::SaveGameToSlot(SaveGame, TEXT("RedwoodSaveGame"), 0);
-      } else {
-        FString Reason;
-        FString Message;
-        Response->TryGetStringField(TEXT("reason"), Reason);
-        Response->TryGetStringField(TEXT("message"), Message);
-
-        if (Message == TEXT("Must verify account")) {
-          Self->OnAccountVerified = OnUpdate;
-          Update.Type = ERedwoodAuthUpdateType::MustVerifyAccount;
-          Update.Message = TEXT("");
-        } else {
-          Update.Type = ERedwoodAuthUpdateType::Error;
-          Update.Message =
-            Message.IsEmpty() ? JoinRefusalText(Reason) : Message;
-
-          URedwoodSaveGame *SaveGame =
-            Cast<URedwoodSaveGame>(UGameplayStatics::CreateSaveGameObject(
-              URedwoodSaveGame::StaticClass()
-            ));
-          UGameplayStatics::SaveGameToSlot(SaveGame, TEXT("RedwoodSaveGame"), 0);
-        }
-      }
-
-      OnUpdate.ExecuteIfBound(Update);
-    }
-  );
-}
 
 FString URedwoodClientInterface::GetNickname() {
-  return Nickname;
+  return Session.GetNickname();
 }
 
 void URedwoodClientInterface::CancelWaitingForAccountVerification() {
+  MustVerifyPlayerId.Reset();
   if (OnAccountVerified.IsBound()) {
     OnAccountVerified.Unbind();
   }
@@ -1160,7 +1022,7 @@ void URedwoodClientInterface::SearchForPlayers(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("searchText"), UsernameOrNickname);
   Payload->SetBoolField(TEXT("includePartial"), bIncludePartialMatches);
 
@@ -1238,7 +1100,7 @@ void URedwoodClientInterface::SearchForPlayerById(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("id"), PlayerId);
+  Payload->SetStringField(TEXT("id"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -1313,7 +1175,7 @@ void URedwoodClientInterface::ListFriends(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   if (Filter == ERedwoodFriendListType::All || Filter == ERedwoodFriendListType::Unknown) {
     TSharedPtr<FJsonValue> NullValue = MakeShareable(new FJsonValueNull());
@@ -1395,7 +1257,7 @@ void URedwoodClientInterface::RequestFriend(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -1429,7 +1291,7 @@ void URedwoodClientInterface::RemoveFriend(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -1463,7 +1325,7 @@ void URedwoodClientInterface::RespondToFriendRequest(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
   Payload->SetBoolField(TEXT("accept"), bAccept);
 
@@ -1498,7 +1360,7 @@ void URedwoodClientInterface::SetPlayerBlocked(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("friendId"), OtherPlayerId);
   Payload->SetBoolField(TEXT("block"), bBlocked);
 
@@ -1534,8 +1396,8 @@ void URedwoodClientInterface::ListRealmContacts(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
+  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
@@ -1609,8 +1471,8 @@ void URedwoodClientInterface::AddRealmContact(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
+  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
   Payload->SetStringField(TEXT("targetCharacterId"), OtherCharacterId);
   Payload->SetBoolField(TEXT("blocked"), bBlocked);
 
@@ -1645,8 +1507,8 @@ void URedwoodClientInterface::RemoveRealmContact(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
+  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
   Payload->SetStringField(TEXT("targetCharacterId"), OtherCharacterId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -1692,21 +1554,25 @@ void URedwoodClientInterface::EmitCharacterFriendCall(
   TOutput (*ParseAnswer)(const TArray<TSharedPtr<FJsonValue>> &),
   const TDelegate<void(const TOutput &)> &OnOutput
 ) {
+  // A held call passes the gate again first: a session that ended fails it
+  // as not connected, and only a call that would go out is checked for its
+  // character.
   if (GateRealm([=, this]() {
-        // The backend accepts any character of the player, and a list answer
-        // names no character, so a stale call would act for the wrong one.
-        if (CharacterId != SelectedCharacterId) {
-          TOutput Output;
-          SetRedwoodGateError(
-            Output, URedwoodCommonGameSubsystem::CharacterChangedError
-          );
-          OnOutput.ExecuteIfBound(Output);
-          return;
-        }
         EmitCharacterFriendCall(
           EventName, CharacterId, Payload, ParseAnswer, OnOutput
         );
       }, OnOutput)) {
+    return;
+  }
+
+  // The backend accepts any character of the player, and a list answer
+  // names no character, so a stale call would act for the wrong one.
+  if (CharacterId != Session.GetSelectedCharacterId()) {
+    TOutput Output;
+    SetRedwoodGateError(
+      Output, URedwoodCommonGameSubsystem::CharacterChangedError
+    );
+    OnOutput.ExecuteIfBound(Output);
     return;
   }
 
@@ -1717,7 +1583,7 @@ void URedwoodClientInterface::EmitCharacterFriendCall(
     return;
   }
 
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("characterId"), CharacterId);
   // HollowedOath#2886. See TrackReply.
   Connection->Rpc(
@@ -1727,7 +1593,7 @@ void URedwoodClientInterface::EmitCharacterFriendCall(
       [this, CharacterId, ParseAnswer, OnOutput](auto Response) {
         // A list answer names no character, so after a switch it would fill
         // the new character's friends with the old one's.
-        if (CharacterId != SelectedCharacterId) {
+        if (CharacterId != Session.GetSelectedCharacterId()) {
           TOutput Output;
           SetRedwoodGateError(
             Output, URedwoodCommonGameSubsystem::CharacterChangedError
@@ -1747,7 +1613,7 @@ void URedwoodClientInterface::ListCharacterFriends(
 ) {
   EmitCharacterFriendCall(
     TEXT("realm:contacts:list"),
-    SelectedCharacterId,
+    Session.GetSelectedCharacterId(),
     MakeShared<FJsonObject>(),
     &URedwoodCommonGameSubsystem::ParseListCharacterFriends,
     OnOutput
@@ -1761,7 +1627,7 @@ void URedwoodClientInterface::RequestCharacterFriend(
   Payload->SetStringField(TEXT("targetCharacterId"), TargetCharacterId);
   EmitCharacterFriendCall(
     TEXT("realm:contacts:friends:request"),
-    SelectedCharacterId,
+    Session.GetSelectedCharacterId(),
     Payload,
     &ParseCharacterFriendCommandAnswer,
     OnOutput
@@ -1776,7 +1642,7 @@ void URedwoodClientInterface::RespondToCharacterFriendRequest(
   Payload->SetBoolField(TEXT("accept"), bAccept);
   EmitCharacterFriendCall(
     TEXT("realm:contacts:friends:respond"),
-    SelectedCharacterId,
+    Session.GetSelectedCharacterId(),
     Payload,
     &ParseCharacterFriendCommandAnswer,
     OnOutput
@@ -1790,7 +1656,7 @@ void URedwoodClientInterface::RemoveCharacterFriend(
   Payload->SetStringField(TEXT("otherCharacterId"), OtherCharacterId);
   EmitCharacterFriendCall(
     TEXT("realm:contacts:friends:remove"),
-    SelectedCharacterId,
+    Session.GetSelectedCharacterId(),
     Payload,
     &ParseCharacterFriendCommandAnswer,
     OnOutput
@@ -1805,7 +1671,7 @@ void URedwoodClientInterface::CancelCharacterFriendRequest(
   Payload->SetBoolField(TEXT("requestOnly"), true);
   EmitCharacterFriendCall(
     TEXT("realm:contacts:friends:remove"),
-    SelectedCharacterId,
+    Session.GetSelectedCharacterId(),
     Payload,
     &ParseCharacterFriendCommandAnswer,
     OnOutput
@@ -1831,7 +1697,7 @@ void URedwoodClientInterface::ListGuilds(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetBoolField(TEXT("onlyPlayersGuilds"), bOnlyPlayersGuilds);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -1883,7 +1749,7 @@ void URedwoodClientInterface::SearchForGuilds(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("searchText"), SearchText);
   Payload->SetBoolField(TEXT("includePartial"), bIncludePartialMatches);
 
@@ -1934,7 +1800,7 @@ void URedwoodClientInterface::GetGuild(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -1980,7 +1846,7 @@ void URedwoodClientInterface::GetSelectedGuild(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
@@ -2024,7 +1890,7 @@ void URedwoodClientInterface::SetSelectedGuild(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -2058,7 +1924,7 @@ void URedwoodClientInterface::JoinGuild(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -2092,7 +1958,7 @@ void URedwoodClientInterface::InviteToGuild(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(TEXT("targetId"), TargetId);
 
@@ -2127,7 +1993,7 @@ void URedwoodClientInterface::LeaveGuild(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -2164,7 +2030,7 @@ void URedwoodClientInterface::ListGuildMembers(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(
     TEXT("state"),
@@ -2236,7 +2102,7 @@ void URedwoodClientInterface::CreateGuild(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("name"), GuildName);
   Payload->SetStringField(TEXT("tag"), GuildTag);
   Payload->SetStringField(
@@ -2294,7 +2160,7 @@ void URedwoodClientInterface::UpdateGuild(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(TEXT("name"), GuildName);
   Payload->SetStringField(TEXT("tag"), GuildTag);
@@ -2336,7 +2202,7 @@ void URedwoodClientInterface::KickPlayerFromGuild(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(TEXT("targetId"), TargetId);
   Payload->SetBoolField(TEXT("ban"), false);
@@ -2372,7 +2238,7 @@ void URedwoodClientInterface::BanPlayerFromGuild(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(TEXT("targetId"), TargetId);
   Payload->SetBoolField(TEXT("ban"), true);
@@ -2414,7 +2280,7 @@ void URedwoodClientInterface::PromotePlayerToGuildAdmin(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(TEXT("targetId"), TargetId);
 
@@ -2449,7 +2315,7 @@ void URedwoodClientInterface::DemotePlayerFromGuildAdmin(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(TEXT("targetId"), TargetId);
 
@@ -2485,7 +2351,7 @@ void URedwoodClientInterface::ListAlliances(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildIdFilter"), GuildIdFilter);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -2547,7 +2413,7 @@ void URedwoodClientInterface::SearchForAlliances(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("searchText"), SearchText);
   Payload->SetBoolField(TEXT("includePartial"), bIncludePartialMatches);
 
@@ -2594,7 +2460,7 @@ void URedwoodClientInterface::CanAdminAlliance(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -2632,7 +2498,7 @@ void URedwoodClientInterface::CreateAlliance(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetStringField(TEXT("name"), AllianceName);
   Payload->SetBoolField(TEXT("inviteOnly"), bInviteOnly);
@@ -2674,7 +2540,7 @@ void URedwoodClientInterface::UpdateAlliance(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
   Payload->SetStringField(TEXT("name"), AllianceName);
   Payload->SetBoolField(TEXT("inviteOnly"), bInviteOnly);
@@ -2710,7 +2576,7 @@ void URedwoodClientInterface::KickGuildFromAlliance(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
   Payload->SetStringField(TEXT("targetGuildId"), GuildId);
   Payload->SetBoolField(TEXT("ban"), false);
@@ -2746,7 +2612,7 @@ void URedwoodClientInterface::BanGuildFromAlliance(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
   Payload->SetStringField(TEXT("guildId"), GuildId);
   Payload->SetBoolField(TEXT("ban"), true);
@@ -2791,7 +2657,7 @@ void URedwoodClientInterface::ListAllianceGuilds(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
   Payload->SetStringField(
     TEXT("state"),
@@ -2855,7 +2721,7 @@ void URedwoodClientInterface::JoinAlliance(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
@@ -2890,7 +2756,7 @@ void URedwoodClientInterface::LeaveAlliance(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
   Payload->SetStringField(TEXT("guildId"), GuildId);
 
@@ -2925,7 +2791,7 @@ void URedwoodClientInterface::InviteGuildToAlliance(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("allianceId"), AllianceId);
   Payload->SetStringField(TEXT("targetGuildId"), GuildId);
 
@@ -2954,7 +2820,7 @@ void URedwoodClientInterface::ListRealms(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
@@ -3036,49 +2902,25 @@ void URedwoodClientInterface::InitializeConnectionForFirstRealm(
 // Director, a second socket to the Realm) is one step of the session:
 // Bifrost asks the realm to start the session, and the realm asks the
 // Director to admit it. A session is in one realm; to change realm, the
-// client logs in again.
+// client logs in again. The machine answers the caller through
+// AnswerRealmEntry, by this request id; the realm's details are kept for it.
 void URedwoodClientInterface::InitializeRealmConnection(
   FRedwoodRealm InRealm, FRedwoodSocketConnectedDelegate OnRealmConnected
 ) {
-  if (!IsDirectorConnected() || !IsLoggedIn()) {
-    FRedwoodSocketConnected Output;
-    Output.Error = TEXT("Not connected or authenticated to Director.");
-    OnRealmConnected.ExecuteIfBound(Output);
-    return;
-  }
-
-  // FORK(hollowed-oath): the session is in this realm already (the game asks
-  // again after an entry whose answer was lost with the socket, and the
-  // resume entered it). A second start at the realm would replace the
-  // session with itself, so the answer is given here.
-  if (bRealmEntered && CurrentRealmId == InRealm.Id) {
-    CurrentRealm = InRealm;
-    FRedwoodSocketConnected Output;
-    Output.Error = TEXT("");
-    OnRealmConnected.ExecuteIfBound(Output);
-    return;
-  }
-
-  ClearRealmState();
-  // FORK(hollowed-oath): HollowedOath#2854. Requests held for the old realm
-  // cannot go to this one, so they fail now.
-  HeldRequests.Expire(TimerManager);
-
-  CurrentRealm = InRealm;
-  EnterRealm(InRealm.Id, OnRealmConnected);
+  const uint32 RequestId = ++NextRequestId;
+  EntryCallers.Add(RequestId, OnRealmConnected);
+  EntryRealms.Add(RequestId, InRealm);
+  Dispatch(FRedwoodSessionEvent::EnterRealm(RequestId, InRealm.Id));
 }
 
-// FORK(hollowed-oath): what a session has in a realm. Cleared by a new
-// entry, a new login and the end of the session, so that nothing of the old
-// realm (its character, its party, a kept zone assignment) acts in the new.
-void URedwoodClientInterface::ClearRealmState() {
+// FORK(hollowed-oath): what a session had in a realm that is not the
+// machine's: the realm's details, the party and the ticketing cluster's
+// flags. Cleared by a new entry and by the end of the session, so nothing of
+// the old realm (a kept zone assignment, a party) acts in the new.
+void URedwoodClientInterface::ClearRealmDetails() {
   CurrentRealm = FRedwoodRealm();
-  CurrentRealmId = TEXT("");
-  bRealmEntered = false;
   // HollowedOath#2886. The server can replay an assignment kept for the
   // last character; nothing here may accept it.
-  SelectedCharacterId = TEXT("");
-  bSelectCharacterOwedToRealm = false;
   bAssignmentExpected = false;
   bInWorld = false;
   bAbandonedQueueJoin = false;
@@ -3088,42 +2930,6 @@ void URedwoodClientInterface::ClearRealmState() {
   ForgetPartyTickets();
 }
 
-void URedwoodClientInterface::EnterRealm(
-  const FString &RealmId, FRedwoodSocketConnectedDelegate OnEntered
-) {
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("realmId"), RealmId);
-
-  UE_LOG(LogRedwood, Log, TEXT("Entering realm %s"), *RealmId);
-
-  // Not tracked (HA plan ruling C1): the reconnect also runs this, and a
-  // failure would end the session.
-  TWeakObjectPtr<URedwoodClientInterface> WeakThis(this);
-  Connection->Step(
-    TEXT("session.enter-realm"),
-    Payload,
-    [WeakThis, RealmId, OnEntered](auto Response) {
-      URedwoodClientInterface *Self = WeakThis.Get();
-      if (!Self) {
-        return;
-      }
-      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-      FString Error = MessageObject->GetStringField(TEXT("error"));
-
-      if (Error.IsEmpty()) {
-        Self->CurrentRealmId = RealmId;
-        Self->bRealmEntered = true;
-        Self->ApplyRegions(MessageObject);
-        // HollowedOath#2886. Before the caller can join.
-        Self->SendOwedLeave();
-      }
-
-      FRedwoodSocketConnected Output;
-      Output.Error = Error;
-      OnEntered.ExecuteIfBound(Output);
-    }
-  );
-}
 
 // The realm's start answer carries its regions, where upstream's realm
 // socket pushed them at the connect.
@@ -3201,7 +3007,7 @@ void URedwoodClientInterface::BindRealmPushHandlers() {
       FString AssignedCharacterId;
       MessageObject->TryGetStringField(TEXT("characterId"), AssignedCharacterId);
       const bool bForAnotherCharacter = !AssignedCharacterId.IsEmpty() &&
-        AssignedCharacterId != SelectedCharacterId;
+        AssignedCharacterId != Session.GetSelectedCharacterId();
       // HollowedOath#3002. A party ticket's assignment names it. A member
       // that the server told of a party ticket takes only that ticket's
       // assignment; in the world, it still takes a zone transfer with no
@@ -3302,23 +3108,23 @@ void URedwoodClientInterface::BindRealmPushHandlers() {
   );
 }
 
+bool URedwoodClientInterface::IsRealmConnected() {
+  return Session.IsRealmEntered();
+}
+
 bool URedwoodClientInterface::IsRealmConnected(FRedwoodRealm &OutRealm) {
-  bool bIsConnected = IsRealmConnected();
+  const bool bIsConnected = IsRealmConnected();
   if (bIsConnected) {
     OutRealm = CurrentRealm;
   }
   return bIsConnected;
 }
 
-bool URedwoodClientInterface::IsRealmConnected() {
-  return IsDirectorConnected() && bRealmEntered;
-}
-
-// FORK(hollowed-oath): HollowedOath#2886. For the requests the gates do not
-// hold. In the re-login window the socket is back but does not know the
-// player, and nothing answers a request sent to it.
+// FORK(hollowed-oath): one and the same as IsRealmConnected since the
+// session machine: a realm the session is in is one it can be asked about.
+// Kept for the ticketing cluster, which reads it by this name.
 bool URedwoodClientInterface::IsRealmReady() {
-  return IsRealmConnected() && !bReauthPending;
+  return Session.IsRealmEntered();
 }
 
 TMap<FString, float> URedwoodClientInterface::GetRegions() {
@@ -3343,7 +3149,7 @@ void URedwoodClientInterface::ListCharacters(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
@@ -3394,7 +3200,7 @@ void URedwoodClientInterface::ListArchivedCharacters(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetBoolField(TEXT("includeArchived"), true);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -3447,7 +3253,7 @@ void URedwoodClientInterface::CreateCharacter(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   Payload->SetStringField(TEXT("name"), Name);
 
@@ -3494,7 +3300,7 @@ void URedwoodClientInterface::SetCharacterArchived(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("id"), PlayerId);
+  Payload->SetStringField(TEXT("id"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("characterId"), CharacterId);
   Payload->SetBoolField(TEXT("archived"), bArchived);
 
@@ -3529,7 +3335,7 @@ void URedwoodClientInterface::GetCharacterData(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("id"), PlayerId);
+  Payload->SetStringField(TEXT("id"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("characterIdOrName"), CharacterIdOrName);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -3577,7 +3383,7 @@ void URedwoodClientInterface::SetCharacterData(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("characterId"), CharacterId);
 
   if (!Name.IsEmpty()) {
@@ -3616,7 +3422,7 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
   // FORK(hollowed-oath): HollowedOath#2886. A new character is at character
   // select until it joins. A dropped join was the old character's; its owed
   // leave stays, because the old ticket still needs it.
-  if (CharacterId != SelectedCharacterId) {
+  if (CharacterId != Session.GetSelectedCharacterId()) {
     bAssignmentExpected = false;
     bInWorld = false;
     bAbandonedQueueJoin = false;
@@ -3625,17 +3431,12 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
     // tickets stay ended, and a held notice waits for its own character.
     AcceptedPartyTicketId.Reset();
   }
-  SelectedCharacterId = CharacterId;
+  // The machine sends the selection when the session is in its realm, now or
+  // when it arrives there (HollowedOath#2448).
+  Dispatch(FRedwoodSessionEvent::SelectCharacter(CharacterId));
   if (!PendingPartyTicketId.IsEmpty() && PendingPartyCharacterId == CharacterId) {
     AcceptPartyTicket(PendingPartyTicketId);
     PendingPartyTicketId.Reset();
-  }
-
-  // FORK(hollowed-oath): HollowedOath#2448. The reconnect sends what a
-  // session that is not in its realm yet cannot send now.
-  bSelectCharacterOwedToRealm = !IsRealmReady();
-  if (!bSelectCharacterOwedToRealm) {
-    SendSelectCharacter();
   }
 }
 
@@ -3664,10 +3465,8 @@ bool URedwoodClientInterface::ApplyPartyChange(
 // realm checks the owner and selects the character for the party, then
 // Bifrost records the online state at the director.
 void URedwoodClientInterface::SendSelectCharacter() {
-  bSelectCharacterOwedToRealm = false;
-
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
 
   Connection->Step(
     TEXT("session.select-character"),
@@ -3696,16 +3495,18 @@ void URedwoodClientInterface::SendSelectCharacter() {
 // the loss, whatever came between; the reply to the auth is the first moment
 // the Realm knows the player. The flag stays until a leave succeeds or a join
 // replaces the ticket; with a join out, the leave would cancel it.
-void URedwoodClientInterface::SendOwedLeave() {
+void URedwoodClientInterface::SendOwedLeave(
+  const FString &AsPlayerId, bool bForce
+) {
   // Only this client's own join would lose its ticket to the leave; a
   // party join is the leader's ticket (HollowedOath#3002).
   if (!bLeaveTicketingOwed ||
       (bAssignmentExpected && AcceptedPartyTicketId.IsEmpty()) ||
-      !IsRealmConnected()) {
+      (!bForce && !IsRealmConnected())) {
     return;
   }
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), AsPlayerId);
   Connection->Rpc(
     TEXT("realm:ticketing:leave"),
     Payload,
@@ -3717,63 +3518,13 @@ void URedwoodClientInterface::SendOwedLeave() {
   );
 }
 
-// Not AuthToken: a failed re-login writes the EMPTY ids of its reply before it
-// checks the error, and the requests of a player who was logged in must still
-// fail then, not go out to a socket that does not know the player.
-bool URedwoodClientInterface::HasPlayerSession() const {
-  return bAuthenticated || bLoggedInAtDrop;
-}
-
-// FORK(hollowed-oath): a request rides the session channel, so with no
-// session on the connection (before the login, after a logout, after Bifrost
-// ended the session) it cannot be sent, even while the socket is still open.
-bool URedwoodClientInterface::CanSendToDirector() {
-  return FRedwoodHeldRequests::CanSend(
-    IsDirectorConnected() && Connection->HasSession(),
-    bAuthenticated && !bReauthPending,
-    HasPlayerSession()
-  );
-}
-
-bool URedwoodClientInterface::CanSendToRealm() {
-  return FRedwoodHeldRequests::CanSend(
-    IsRealmConnected(), bAuthenticated && !bReauthPending, HasPlayerSession()
-  );
-}
-
-// The session is back (or not): send what the player asked for while the
-// socket was away, or fail it now instead of at the end of the grace.
-void URedwoodClientInterface::EndReauthentication(bool bSucceeded) {
-  bReauthPending = false;
-
-  // The player logged out while the re-login was in flight; its reply has
-  // just logged them in again, so log out again.
-  if (bLoggedOutDuringRelogin) {
-    if (bSucceeded) {
-      Logout();
-    }
-    return;
-  }
-
-  if (bSucceeded) {
-    // bAuthenticated carries the session again.
-    bAuthenticated = true;
-    bLoggedInAtDrop = false;
-    bDisconnected = false;
-    HeldRequests.Release(TimerManager);
-    OnConnectionReestablished.Broadcast();
-  } else {
-    HeldRequests.Expire(TimerManager);
-    bRealmEntered = false;
-  }
-}
 
 void URedwoodClientInterface::JoinMatchmaking(
   FString ProfileId,
   TArray<FString> InRegions,
   FRedwoodTicketingUpdateDelegate OnUpdate
 ) {
-  if (SelectedCharacterId.IsEmpty()) {
+  if (Session.GetSelectedCharacterId().IsEmpty()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message =
@@ -3795,7 +3546,7 @@ void URedwoodClientInterface::JoinQueue(
   bool bFavorLastZone,
   FRedwoodTicketingUpdateDelegate OnUpdate
 ) {
-  if (SelectedCharacterId.IsEmpty()) {
+  if (Session.GetSelectedCharacterId().IsEmpty()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message =
@@ -3814,8 +3565,8 @@ void URedwoodClientInterface::JoinQueue(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
+  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
 
   TSharedPtr<FJsonObject> QueueData = MakeShareable(new FJsonObject);
 
@@ -3850,7 +3601,7 @@ void URedwoodClientInterface::JoinCustom(
   TArray<FString> InRegions,
   FRedwoodTicketingUpdateDelegate OnUpdate
 ) {
-  if (SelectedCharacterId.IsEmpty()) {
+  if (Session.GetSelectedCharacterId().IsEmpty()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message = TEXT("Please select a character before joining.");
@@ -3875,7 +3626,7 @@ void URedwoodClientInterface::AttemptJoinCustom() {
     return;
   }
 
-  if (SelectedCharacterId.IsEmpty()) {
+  if (Session.GetSelectedCharacterId().IsEmpty()) {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message = TEXT("Please select a character before joining.");
@@ -3903,8 +3654,8 @@ void URedwoodClientInterface::AttemptJoinCustom() {
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
+  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
   Payload->SetBoolField(
     TEXT("transferWholeParty"), bTicketingTransferWholeParty
   );
@@ -3966,7 +3717,7 @@ void URedwoodClientInterface::LeaveTicketing(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
@@ -4001,7 +3752,7 @@ void URedwoodClientInterface::ListProxies(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   TArray<TSharedPtr<FJsonValue>> PrivateProxyReferencesArray;
   for (FString Reference : PrivateProxyReferences) {
@@ -4053,10 +3804,10 @@ void URedwoodClientInterface::CreateProxy(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   if (bJoinSession) {
-    if (SelectedCharacterId.IsEmpty()) {
+    if (Session.GetSelectedCharacterId().IsEmpty()) {
       FRedwoodCreateProxyOutput Output;
       Output.Error =
         TEXT("Please select a character before joining a session.");
@@ -4064,7 +3815,7 @@ void URedwoodClientInterface::CreateProxy(
       return;
     }
 
-    Payload->SetStringField(TEXT("joinCharacterId"), SelectedCharacterId);
+    Payload->SetStringField(TEXT("joinCharacterId"), Session.GetSelectedCharacterId());
   } else {
     TSharedPtr<FJsonValue> NullValue = MakeShareable(new FJsonValueNull());
     Payload->SetField(TEXT("joinCharacterId"), NullValue);
@@ -4155,17 +3906,17 @@ void URedwoodClientInterface::JoinProxyWithSingleInstance(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("id"), PlayerId);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("id"), Session.GetPlayerId());
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
-  if (SelectedCharacterId.IsEmpty()) {
+  if (Session.GetSelectedCharacterId().IsEmpty()) {
     FRedwoodJoinServerOutput Output;
     Output.Error = TEXT("Please select a character before joining a session.");
     OnOutput.ExecuteIfBound(Output);
     return;
   }
 
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
 
   Payload->SetStringField(TEXT("proxyReference"), ProxyReference);
 
@@ -4209,7 +3960,7 @@ void URedwoodClientInterface::StopProxy(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("id"), PlayerId);
+  Payload->SetStringField(TEXT("id"), Session.GetPlayerId());
 
   Payload->SetStringField(TEXT("proxyId"), ServerProxyId);
 
@@ -4260,8 +4011,8 @@ void URedwoodClientInterface::AttemptJoinMatchmaking() {
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
+  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
 
   TSharedPtr<FJsonObject> MatchmakingData = MakeShareable(new FJsonObject);
 
@@ -4324,7 +4075,7 @@ void URedwoodClientInterface::GetOrCreateParty(
     return;
   }
 
-  if (SelectedCharacterId == TEXT("")) {
+  if (Session.GetSelectedCharacterId() == TEXT("")) {
     FRedwoodGetPartyOutput Output;
     Output.Error = TEXT("Please select a character before joining a party.");
     OnOutput.ExecuteIfBound(Output);
@@ -4332,8 +4083,8 @@ void URedwoodClientInterface::GetOrCreateParty(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
+  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
   Payload->SetBoolField(TEXT("createIfNotInParty"), bCreateIfNotInParty);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -4374,7 +4125,7 @@ void URedwoodClientInterface::LeaveParty(FRedwoodErrorOutputDelegate OnOutput) {
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
@@ -4398,17 +4149,26 @@ void URedwoodClientInterface::InviteToParty(
 ) {
   // FORK(hollowed-oath): HollowedOath#2448. The invite names the inviter's
   // character, so a held invite must not go out for one selected after it.
-  const FString InviterCharacterId = SelectedCharacterId;
-  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm.
+  InviteToPartyAs(Session.GetSelectedCharacterId(), TargetPlayerId, OnOutput);
+}
+
+void URedwoodClientInterface::InviteToPartyAs(
+  const FString &InviterCharacterId,
+  const FString &TargetPlayerId,
+  FRedwoodErrorOutputDelegate OnOutput
+) {
+  // FORK(hollowed-oath): HollowedOath#2854. See GateRealm. A held invite
+  // passes the gate again first: a session that ended fails it as not
+  // connected, and only an invite that would go out is checked for its
+  // character.
   if (GateRealm([=, this]() {
-        if (InviterCharacterId != SelectedCharacterId) {
-          OnOutput.ExecuteIfBound(
-            URedwoodCommonGameSubsystem::CharacterChangedError
-          );
-          return;
-        }
-        InviteToParty(TargetPlayerId, OnOutput);
+        InviteToPartyAs(InviterCharacterId, TargetPlayerId, OnOutput);
       }, OnOutput)) {
+    return;
+  }
+
+  if (InviterCharacterId != Session.GetSelectedCharacterId()) {
+    OnOutput.ExecuteIfBound(URedwoodCommonGameSubsystem::CharacterChangedError);
     return;
   }
 
@@ -4418,11 +4178,11 @@ void URedwoodClientInterface::InviteToParty(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
   // FORK(hollowed-oath): HollowedOath#2448. The realm makes a party only when
   // an invite is accepted, so it needs the inviter's character from the invite.
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("characterId"), InviterCharacterId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
@@ -4454,7 +4214,7 @@ void URedwoodClientInterface::ListPartyInvites(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
@@ -4496,7 +4256,7 @@ void URedwoodClientInterface::RespondToPartyInvite(
     return;
   }
 
-  if (SelectedCharacterId == TEXT("")) {
+  if (Session.GetSelectedCharacterId() == TEXT("")) {
     FRedwoodGetPartyOutput Output;
     Output.Error =
       TEXT("Please select a character before responding to a party invite.");
@@ -4505,8 +4265,8 @@ void URedwoodClientInterface::RespondToPartyInvite(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
-  Payload->SetStringField(TEXT("characterId"), SelectedCharacterId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
+  Payload->SetStringField(TEXT("characterId"), Session.GetSelectedCharacterId());
   Payload->SetStringField(TEXT("partyId"), PartyId);
   Payload->SetBoolField(TEXT("accept"), bAccept);
 
@@ -4549,7 +4309,7 @@ void URedwoodClientInterface::PromoteToPartyLeader(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -4580,7 +4340,7 @@ void URedwoodClientInterface::KickFromParty(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("targetPlayerId"), TargetPlayerId);
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
@@ -4617,7 +4377,7 @@ void URedwoodClientInterface::SetPartyData(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   if (!LootType.IsEmpty()) {
     Payload->SetStringField(TEXT("lootType"), LootType);
@@ -4663,7 +4423,7 @@ void URedwoodClientInterface::SendEmoteToParty(FString Emote) {
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
   Payload->SetStringField(TEXT("emote"), Emote);
 
   Connection->Rpc(TEXT("realm:parties:emote"), Payload);
@@ -4675,15 +4435,15 @@ FString URedwoodClientInterface::GetConnectionConsoleCommand() {
     return "";
   }
 
-  if (SelectedCharacterId.IsEmpty()) {
+  if (Session.GetSelectedCharacterId().IsEmpty()) {
     UE_LOG(LogRedwood, Error, TEXT("Selected character ID is empty."));
     return "";
   }
 
   TMap<FString, FString> Options;
   Options.Add("RedwoodAuth", "1");
-  Options.Add("CharacterId", SelectedCharacterId);
-  Options.Add("PlayerId", PlayerId);
+  Options.Add("CharacterId", Session.GetSelectedCharacterId());
+  Options.Add("PlayerId", Session.GetPlayerId());
   Options.Add("Token", ServerToken);
 
   TArray<FString> JoinedOptions;
@@ -4707,7 +4467,7 @@ FURL URedwoodClientInterface::GetConnectionURL() {
     return URL;
   }
 
-  if (SelectedCharacterId.IsEmpty()) {
+  if (Session.GetSelectedCharacterId().IsEmpty()) {
     UE_LOG(LogRedwood, Error, TEXT("Selected character ID is empty."));
     return URL;
   }
@@ -4723,8 +4483,8 @@ FURL URedwoodClientInterface::GetConnectionURL() {
 
   TMap<FString, FString> Options;
   Options.Add("RedwoodAuth", "1");
-  Options.Add("CharacterId", SelectedCharacterId);
-  Options.Add("PlayerId", PlayerId);
+  Options.Add("CharacterId", Session.GetSelectedCharacterId());
+  Options.Add("PlayerId", Session.GetPlayerId());
   Options.Add("Token", ServerToken);
   for (const TPair<FString, FString> &Option : Options) {
     URL.AddOption(*(Option.Key + "=" + Option.Value));
@@ -4751,7 +4511,7 @@ void URedwoodClientInterface::GetDirectorGlobalData(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
@@ -4800,7 +4560,7 @@ void URedwoodClientInterface::GetRealmGlobalData(
   }
 
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
 
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
