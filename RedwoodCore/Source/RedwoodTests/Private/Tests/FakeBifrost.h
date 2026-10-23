@@ -296,6 +296,26 @@ namespace RedwoodFakeBifrost {
       Receive(JoinRef, FString(), TEXT("session"), TEXT("push"), Message);
     }
 
+    // A chat line: `chat.msg`, with the payload of FFakeBifrost::ChatLine.
+    void ChatMessage(
+      const TSharedPtr<FJsonObject> &Line, const FString &JoinRef
+    ) {
+      Receive(JoinRef, FString(), TEXT("session"), TEXT("chat.msg"), Line);
+    }
+
+    // The session's topics changed: `chat.topics {topics}`.
+    void ChatTopics(const TArray<FString> &Topics, const FString &JoinRef) {
+      TArray<TSharedPtr<FJsonValue>> Values;
+      for (const FString &Topic : Topics) {
+        Values.Add(MakeShared<FJsonValueString>(Topic));
+      }
+      TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+      Payload->SetArrayField(TEXT("topics"), Values);
+      Receive(
+        JoinRef, FString(), TEXT("session"), TEXT("chat.topics"), Payload
+      );
+    }
+
     // Bifrost ends the session: `closed {reason}`. The end of the channel
     // that follows it is a separate step (EndChannel), as on the wire.
     void CloseSession(const FString &Reason, const FString &JoinRef) {
@@ -414,6 +434,45 @@ namespace RedwoodFakeBifrost {
         Reply->SetStringField(TEXT("characterId"), CharacterId);
       }
       return Reply;
+    }
+
+    // One chat line as Bifrost sends it (`chat.msg`, and a resume's
+    // `messages`): {topic, seq, msgId, category, sender, template, args,
+    // sentAt}. The body is the template; the args are empty.
+    static TSharedPtr<FJsonObject> ChatLine(
+      const FString &Topic,
+      int64 Seq,
+      const FString &MsgId,
+      const FString &Body = TEXT("hello"),
+      const FString &SentAt = TEXT("2026-10-23T12:00:00Z")
+    ) {
+      TSharedPtr<FJsonObject> Sender = MakeShared<FJsonObject>();
+      Sender->SetStringField(TEXT("characterId"), TEXT("char-9"));
+      Sender->SetStringField(TEXT("name"), TEXT("Bravo"));
+      TSharedPtr<FJsonObject> Line = MakeShared<FJsonObject>();
+      Line->SetStringField(TEXT("topic"), Topic);
+      Line->SetNumberField(TEXT("seq"), static_cast<double>(Seq));
+      Line->SetStringField(TEXT("msgId"), MsgId);
+      Line->SetStringField(TEXT("category"), TEXT("Message.Chat.Party"));
+      Line->SetObjectField(TEXT("sender"), Sender);
+      Line->SetStringField(TEXT("template"), Body);
+      Line->SetArrayField(TEXT("args"), TArray<TSharedPtr<FJsonValue>>());
+      Line->SetStringField(TEXT("sentAt"), SentAt);
+      return Line;
+    }
+
+    // One topic of a `chat.resume` reply: {messages, truncated}.
+    static TSharedPtr<FJsonObject> ResumedTopic(
+      const TArray<TSharedPtr<FJsonObject>> &Lines, bool bTruncated
+    ) {
+      TArray<TSharedPtr<FJsonValue>> Messages;
+      for (const TSharedPtr<FJsonObject> &Line : Lines) {
+        Messages.Add(MakeShared<FJsonValueObject>(Line));
+      }
+      TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+      Entry->SetArrayField(TEXT("messages"), Messages);
+      Entry->SetBoolField(TEXT("truncated"), bTruncated);
+      return Entry;
     }
 
     // The director's login answer inside a join reply.
