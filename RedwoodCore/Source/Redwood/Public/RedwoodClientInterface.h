@@ -23,6 +23,29 @@ DECLARE_MULTICAST_DELEGATE_OneParam(
   FRedwoodPushDelegate, const TSharedPtr<FJsonObject> & /*Payload*/
 );
 
+// FORK(hollowed-oath) BEGIN: chat over the session (protocol.md, "Chat").
+// A chat line the connection parsed, and a list of chat topics.
+DECLARE_MULTICAST_DELEGATE_OneParam(
+  FRedwoodChatMessageDelegate, const FRedwoodChatMessage & /*Message*/
+);
+DECLARE_MULTICAST_DELEGATE_OneParam(
+  FRedwoodChatTopicsDelegate, const TArray<FString> & /*Topics*/
+);
+
+// The answer to a chat send. Error is the text the player reads, empty on
+// success; Code is the contract's error code beside it (muted, not_available,
+// too_long, forbidden, rate_limited, invalid_request, unavailable), so the
+// game can act on one. Topic and Seq name the posted line.
+struct REDWOOD_API FRedwoodChatSendOutput {
+  FString Error;
+  FString Code;
+  FString Topic;
+  int64 Seq = 0;
+};
+typedef TDelegate<void(const FRedwoodChatSendOutput &)>
+  FRedwoodChatSendDelegate;
+// FORK(hollowed-oath) END
+
 // This class is separated from URedwoodClientGameSubsystem
 // so that we can use it in automated tests without instantiating
 // a whole world.
@@ -86,6 +109,43 @@ public:
   // subscriber may subscribe to another event from inside its own callback.
   // The shape is the ability system's attribute change delegates.
   FRedwoodPushDelegate &OnPush(const FString &Event);
+
+  // FORK(hollowed-oath) BEGIN: chat over the session. A send is gated like a
+  // realm request: during a drop it is held, and goes out after the chat is
+  // resumed, so the player's line lands behind the lines they missed. The
+  // line's id is made before the gate, so a held send goes out with the id
+  // it was given and Bifrost posts it once. A whisper names a player; Bifrost
+  // writes it to both sides' character topics.
+  void SendChat(
+    const FString &Topic, const FString &Body, FRedwoodChatSendDelegate OnOutput
+  );
+  void SendWhisper(
+    const FString &ToPlayerId,
+    const FString &Body,
+    FRedwoodChatSendDelegate OnOutput
+  );
+  void ReportChat(
+    const FString &Topic,
+    int64 Seq,
+    const FString &Reason,
+    FRedwoodErrorOutputDelegate OnOutput
+  );
+  // Every chat line this client had not seen: live, or replayed after a
+  // drop. Each line of a topic comes once, after the lines before it.
+  FRedwoodChatMessageDelegate OnChatMessage;
+  // The topics the session can read and send to: each time Bifrost changes
+  // the set, and when the session ends (empty).
+  FRedwoodChatTopicsDelegate OnChatTopics;
+  // Topics whose replay after a drop was cut short: the player missed lines
+  // Bifrost could not send again.
+  FRedwoodChatTopicsDelegate OnChatTruncated;
+  const TArray<FString> &GetChatTopics() const {
+    return ChatTopics;
+  }
+  // What the player reads for a chat refusal, by the contract's code. A
+  // code with no text of its own shows the server's message.
+  static FString ChatErrorText(const FString &Code, const FString &Message);
+  // FORK(hollowed-oath) END
 
   void Register(
     const FString &Username,
@@ -479,6 +539,17 @@ private:
   // place, and a subscriber that subscribes to a new event from its callback
   // grows the map under that broadcast.
   TMap<FString, TUniquePtr<FRedwoodPushDelegate>> PushSubscribers;
+  // The chat: the topics Bifrost named last, the one path of a send (a topic
+  // or a player, never both), and the resume the machine asks for.
+  TArray<FString> ChatTopics;
+  void SendChatLine(
+    const FString &MsgId,
+    const FString &Topic,
+    const FString &ToPlayerId,
+    const FString &Body,
+    FRedwoodChatSendDelegate OnOutput
+  );
+  void ResumeChat();
   // The effects that reach Bifrost.
   void SendLogin(const FRedwoodSessionEffect &Effect);
   void SendEnterRealm(uint32 Seq, const FString &RealmId);
