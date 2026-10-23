@@ -2385,7 +2385,7 @@ bool FRedwoodBifrostClientPushSubscriptionTest::RunTest(
   int32 PartyChanges = 0;
   FString LastPartyId;
   FRedwoodPushDelegate &OnPartyChanged = H.Client()->OnPush(PartyEvent);
-  OnPartyChanged.AddLambda(
+  const FDelegateHandle PartyHandle = OnPartyChanged.AddLambda(
     [&PartyChanges, &LastPartyId](const TSharedPtr<FJsonObject> &Payload) {
       ++PartyChanges;
       LastPartyId =
@@ -2416,5 +2416,42 @@ bool FRedwoodBifrostClientPushSubscriptionTest::RunTest(
   );
   TestEqual(TEXT("The subscriber hears the same push"), PartyChanges, 1);
   TestEqual(TEXT("With its payload"), LastPartyId, TEXT("party-1"));
+  OnPartyChanged.Remove(PartyHandle);
+
+  // A subscriber that subscribes to new events from inside its callback: the
+  // map grows under the broadcast, and the delegate it runs on must not move.
+  constexpr int32 LateEvents = 64;
+  int32 LateSubscriptions = 0;
+  int32 Rounds = 0;
+  TArray<TPair<FString, FDelegateHandle>> LateHandles;
+  const FString FirstEvent = TEXT("admin:first");
+  FRedwoodPushDelegate &OnFirst = H.Client()->OnPush(FirstEvent);
+  const FDelegateHandle FirstHandle =
+    OnFirst.AddLambda([&H, &LateSubscriptions, &Rounds, &LateHandles](
+                        const TSharedPtr<FJsonObject> &
+                      ) {
+      ++Rounds;
+      for (int32 Index = 0; Index < LateEvents; ++Index) {
+        const FString Event = FString::Printf(TEXT("admin:late-%d"), Index);
+        LateHandles.Emplace(
+          Event,
+          H.Client()->OnPush(Event).AddLambda([&LateSubscriptions](
+                                                const TSharedPtr<FJsonObject> &
+                                              ) { ++LateSubscriptions; })
+        );
+      }
+    });
+  H.Socket()->Push(TEXT("first-1"), FirstEvent, Broadcast, H.JoinRef);
+  TestEqual(TEXT("The callback ran once"), Rounds, 1);
+  H.Socket()->Push(TEXT("late-1"), TEXT("admin:late-7"), Broadcast, H.JoinRef);
+  TestEqual(TEXT("A late subscription hears its push"), LateSubscriptions, 1);
+  TestTrue(
+    TEXT("The reference handed out before the growth is still the delegate"),
+    &H.Client()->OnPush(FirstEvent) == &OnFirst
+  );
+  for (const TPair<FString, FDelegateHandle> &Late : LateHandles) {
+    H.Client()->OnPush(Late.Key).Remove(Late.Value);
+  }
+  OnFirst.Remove(FirstHandle);
   return true;
 }

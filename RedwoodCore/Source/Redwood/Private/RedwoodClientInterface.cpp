@@ -469,12 +469,12 @@ void URedwoodClientInterface::InitializeDirectorConnection(
   Connection->OnAnyPush =
     [WeakThis](const FString &Event, const TSharedPtr<FJsonObject> &Payload) {
       URedwoodClientInterface *Self = WeakThis.Get();
-      const FRedwoodPushDelegate *Subscribers =
+      const TUniquePtr<FRedwoodPushDelegate> *Subscribers =
         Self ? Self->PushSubscribers.Find(Event) : nullptr;
-      if (!Subscribers || !Subscribers->IsBound()) {
+      if (!Subscribers || !(*Subscribers)->IsBound()) {
         return false;
       }
-      Subscribers->Broadcast(Payload);
+      (*Subscribers)->Broadcast(Payload);
       return true;
     };
 
@@ -768,7 +768,11 @@ bool URedwoodClientInterface::IsDirectorConnected() {
 }
 
 FRedwoodPushDelegate &URedwoodClientInterface::OnPush(const FString &Event) {
-  return PushSubscribers.FindOrAdd(Event);
+  TUniquePtr<FRedwoodPushDelegate> &Subscribers = PushSubscribers.FindOrAdd(Event);
+  if (!Subscribers) {
+    Subscribers = MakeUnique<FRedwoodPushDelegate>();
+  }
+  return *Subscribers;
 }
 
 void URedwoodClientInterface::BindPushHandlers() {
