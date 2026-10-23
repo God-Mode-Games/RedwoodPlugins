@@ -197,7 +197,12 @@ public:
   // through the same cursor and id check as a live line, before the
   // callback runs; read the topics Bifrost could not replay in full with
   // TruncatedTopics. A live line that arrives while the resume waits is
-  // delivered after the reply, so the replay cannot be dropped as old.
+  // delivered after the reply, so the replay cannot be dropped as old. The
+  // hold ends only with the reply, a drop of the channel or ResetChat; there
+  // is no timer, because a request on a live channel is always answered or
+  // lost with the channel, and a timer that gave up first would deliver the
+  // live lines past the gap while the replay could still arrive. A reply of
+  // a resume that a reset or a drop ended changes nothing.
   void ChatResume(FRedwoodReplyCallback Callback = nullptr);
 
   // `chat.report {topic, seq, reason}`.
@@ -304,7 +309,9 @@ private:
   void HandleChatTopics(const TSharedPtr<FJsonObject> &Payload);
   // The one path a line takes to OnChatMessage. False when it was seen.
   bool DeliverChatLine(const FRedwoodChatMessage &Message);
-  void ApplyChatResume(const TArray<TSharedPtr<FJsonValue>> &Response);
+  void ApplyChatResume(
+    const TArray<TSharedPtr<FJsonValue>> &Response, uint32 Generation
+  );
   void HandleClosedByServer(const TSharedPtr<FJsonObject> &Payload);
   void EndChannel();
   void HandleSocketClosed(bool bRequested);
@@ -361,6 +368,9 @@ private:
   // the replay and have it dropped, so it waits until the reply is applied.
   bool bChatResumePending = false;
   TArray<FRedwoodChatMessage> ChatLinesHeldForResume;
+  // Counts the resets and drops, so the reply of a resume sent before one
+  // is known as stale: a new session must not take the old one's replay.
+  uint32 ChatResumeGeneration = 0;
 
   FRedwoodCloseBackoff Backoff;
   FTimerHandle HeartbeatTimer;

@@ -43,6 +43,9 @@
 //      live line that arrives while the resume waits comes after the replay.
 //      `chat.send` is answered with its seq, a whisper carries `to` and no
 //      topic, and `chat.topics` reaches its callback.
+//  12. A resume ended by a reset (the session ended) or a drop is stale: its
+//      reply moves no cursor and delivers nothing. A line or a topic list
+//      that arrives with no session is dropped.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -1583,5 +1586,73 @@ bool FRedwoodBifrostChatTest::RunTest(const FString &Parameters) {
     FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), Join.Ref
   );
   TestEqual(TEXT("A line of the new session is delivered"), Lines.Num(), 9);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodBifrostChatResumeAfterResetTest,
+  "Redwood.Bifrost.Connection.ChatResumeEndedByResetIsStale",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodBifrostChatResumeAfterResetTest::RunTest(
+  const FString &Parameters
+) {
+  using namespace RedwoodBifrostConnectionTest;
+  FHarness H(*this);
+  H.Open();
+  const FPhoenixMessage Join = H.LoginOk();
+  const FString Party = TEXT("r:realm-1/party:party-1");
+  int32 Delivered = 0;
+  int32 TopicUpdates = 0;
+  H.Conn->OnChatMessage = [&Delivered](const FRedwoodChatMessage &) {
+    ++Delivered;
+  };
+  H.Conn->OnChatTopics = [&TopicUpdates](const TArray<FString> &) {
+    ++TopicUpdates;
+  };
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 1, TEXT("m1")), Join.Ref
+  );
+  TestEqual(TEXT("A line is delivered"), Delivered, 1);
+
+  // The resume waits; a live line is held for it. The player logs out: the
+  // session is forgotten and the chat reset before the reply comes.
+  TSharedPtr<FJsonObject> Answer;
+  H.Conn->ChatResume(Keep(Answer));
+  const FPhoenixMessage Resume = H.Socket()->Last(TEXT("chat.resume"));
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 2, TEXT("m2")), Join.Ref
+  );
+  TestEqual(TEXT("The live line waits for the resume"), Delivered, 1);
+  H.Conn->ForgetSession();
+  H.Conn->ResetChat();
+
+  // The old session's replay arrives: it is stale.
+  TSharedPtr<FJsonObject> Topics = MakeShared<FJsonObject>();
+  Topics->SetObjectField(
+    Party,
+    FFakeBifrost::ResumedTopic(
+      {FFakeBifrost::ChatLine(Party, 3, TEXT("m3"))}, false
+    )
+  );
+  TSharedPtr<FJsonObject> Reply = MakeShared<FJsonObject>();
+  Reply->SetObjectField(TEXT("topics"), Topics);
+  H.Socket()->Reply(Resume, TEXT("ok"), Reply);
+  TestEqual(
+    TEXT("Neither the replay nor the held line is delivered"), Delivered, 1
+  );
+  TestEqual(TEXT("No cursor is kept"), H.Conn->GetChatCursors().Num(), 0);
+  TestNotNull(TEXT("The caller still hears the reply"), Answer.Get());
+
+  // Lines and topics between the logout and Bifrost's `closed` are the
+  // ended session's.
+  H.Socket()->ChatMessage(
+    FFakeBifrost::ChatLine(Party, 4, TEXT("m4")), Join.Ref
+  );
+  H.Socket()->ChatTopics({Party}, Join.Ref);
+  TestEqual(TEXT("A line with no session is dropped"), Delivered, 1);
+  TestEqual(TEXT("Topics with no session are dropped"), TopicUpdates, 0);
+  TestEqual(TEXT("And start no cursor"), H.Conn->GetChatCursors().Num(), 0);
   return true;
 }
