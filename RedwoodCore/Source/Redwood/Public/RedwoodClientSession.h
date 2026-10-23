@@ -171,6 +171,11 @@ enum class ERedwoodSessionEffectKind : uint8 {
   SendSelectCharacter, // Text = character id
   SendLogoutStep,
   ForgetSession,
+  // The session came back: `chat.resume` with the cursors, so the lines
+  // missed during the gap are replayed. Before ReleaseHeld, so a held chat
+  // send goes out behind the repair, and the player's own line lands after
+  // the lines they missed.
+  ResumeChat,
   // The held requests and the pending replies.
   StartGrace,
   StopGrace,

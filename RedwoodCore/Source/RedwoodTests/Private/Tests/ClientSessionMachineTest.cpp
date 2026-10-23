@@ -376,9 +376,14 @@ namespace RedwoodSessionMachineTest {
     return Effects;
   }
 
+  // The chat repair goes out before the held requests, so a held chat send
+  // lands behind the lines the player missed.
   TArray<FExpect> Restored() {
     return {
-      EKind::ReleaseHeld, EKind::StopGrace, EKind::BroadcastReestablished
+      EKind::ResumeChat,
+      EKind::ReleaseHeld,
+      EKind::StopGrace,
+      EKind::BroadcastReestablished
     };
   }
 
