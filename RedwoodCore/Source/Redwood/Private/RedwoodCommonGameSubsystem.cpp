@@ -1361,6 +1361,22 @@ URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(
 ) {
   return Response.IsValidIndex(0) ? TryGetRedwoodObject(Response[0]) : nullptr;
 }
+
+bool URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+  const TSharedPtr<FJsonObject> &Object,
+  const TCHAR *FieldName,
+  FString &OutValue
+) {
+  if (!Object.IsValid()) {
+    return false;
+  }
+  const TSharedPtr<FJsonValue> Field = Object->TryGetField(FieldName);
+  if (!Field.IsValid() || Field->Type != EJson::String) {
+    return false;
+  }
+  OutValue = Field->AsString();
+  return true;
+}
 // FORK(hollowed-oath) END
 
 // FORK(hollowed-oath) BEGIN: the character friend list. The game takes a good
@@ -1381,10 +1397,16 @@ void ParseCharacterFriendRows(
     }
 
     FRedwoodCharacterFriend Row;
-    (*RowObject)->TryGetStringField(TEXT("characterId"), Row.CharacterId);
-    (*RowObject)->TryGetStringField(TEXT("characterName"), Row.CharacterName);
+    URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+      *RowObject, TEXT("characterId"), Row.CharacterId
+    );
+    URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+      *RowObject, TEXT("characterName"), Row.CharacterName
+    );
     (*RowObject)->TryGetBoolField(TEXT("online"), Row.bOnline);
-    (*RowObject)->TryGetStringField(TEXT("zoneName"), Row.ZoneName);
+    URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+      *RowObject, TEXT("zoneName"), Row.ZoneName
+    );
 
     if (!Row.CharacterId.IsEmpty() && !Row.CharacterName.IsEmpty()) {
       OutRows.Add(Row);
@@ -1405,7 +1427,7 @@ URedwoodCommonGameSubsystem::ParseListCharacterFriends(
     TryGetRedwoodAnswerObject(Response);
   FString Error;
   if (MessageObject == nullptr ||
-      !(*MessageObject)->TryGetStringField(TEXT("error"), Error)) {
+      !TryGetRedwoodStringField(*MessageObject, TEXT("error"), Error)) {
     return Output;
   }
 
@@ -1448,30 +1470,34 @@ bool URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
   }
   const TSharedPtr<FJsonObject> &AlertObject = *AlertObjectPtr;
 
+  // Strcmp, not ==: FString's == ignores case, and the type words are a
+  // wire contract with the director.
   FString Type;
-  AlertObject->TryGetStringField(TEXT("type"), Type);
-  if (Type == TEXT("requested")) {
+  TryGetRedwoodStringField(AlertObject, TEXT("type"), Type);
+  if (FCString::Strcmp(*Type, TEXT("requested")) == 0) {
     OutAlert.Type = ERedwoodCharacterFriendAlertType::Requested;
-  } else if (Type == TEXT("accepted")) {
+  } else if (FCString::Strcmp(*Type, TEXT("accepted")) == 0) {
     OutAlert.Type = ERedwoodCharacterFriendAlertType::Accepted;
-  } else if (Type == TEXT("removed")) {
+  } else if (FCString::Strcmp(*Type, TEXT("removed")) == 0) {
     OutAlert.Type = ERedwoodCharacterFriendAlertType::Removed;
-  } else if (Type == TEXT("online")) {
+  } else if (FCString::Strcmp(*Type, TEXT("online")) == 0) {
     OutAlert.Type = ERedwoodCharacterFriendAlertType::Online;
-  } else if (Type == TEXT("offline")) {
+  } else if (FCString::Strcmp(*Type, TEXT("offline")) == 0) {
     OutAlert.Type = ERedwoodCharacterFriendAlertType::Offline;
   } else {
     return false;
   }
 
-  AlertObject->TryGetStringField(TEXT("characterId"), OutAlert.CharacterId);
-  AlertObject->TryGetStringField(
-    TEXT("otherCharacterId"), OutAlert.OtherCharacterId
+  TryGetRedwoodStringField(
+    AlertObject, TEXT("characterId"), OutAlert.CharacterId
   );
-  AlertObject->TryGetStringField(
-    TEXT("otherCharacterName"), OutAlert.OtherCharacterName
+  TryGetRedwoodStringField(
+    AlertObject, TEXT("otherCharacterId"), OutAlert.OtherCharacterId
   );
-  AlertObject->TryGetStringField(TEXT("zoneName"), OutAlert.ZoneName);
+  TryGetRedwoodStringField(
+    AlertObject, TEXT("otherCharacterName"), OutAlert.OtherCharacterName
+  );
+  TryGetRedwoodStringField(AlertObject, TEXT("zoneName"), OutAlert.ZoneName);
 
   return !OutAlert.CharacterId.IsEmpty() &&
          !OutAlert.OtherCharacterId.IsEmpty();

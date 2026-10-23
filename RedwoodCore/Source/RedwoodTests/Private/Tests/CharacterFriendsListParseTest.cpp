@@ -88,6 +88,11 @@ bool FRedwoodCharacterFriendsListParseTest::RunTest(const FString &Parameters) {
   Friends.Add(nullptr);
   // In UE 5.8, TryGetObject says yes to an object value that holds no object.
   Friends.Add(MakeShared<FJsonValueObject>(TSharedPtr<FJsonObject>()));
+  // The engine's TryGetStringField would make the id "7".
+  TSharedPtr<FJsonObject> NumberId =
+    MakeFriendListRow(nullptr, TEXT("Numbered"), true, TEXT("L_Freewind"));
+  NumberId->SetNumberField(TEXT("characterId"), 7);
+  Friends.Add(MakeShared<FJsonValueObject>(NumberId));
   Answer->SetArrayField(TEXT("friends"), Friends);
   Answer->SetArrayField(
     TEXT("incomingRequests"),
@@ -102,7 +107,7 @@ bool FRedwoodCharacterFriendsListParseTest::RunTest(const FString &Parameters) {
 
   TestEqual(TEXT("A good answer carries no error"), Output.Error, FString());
   TestEqual(
-    TEXT("Rows with no id, no name, or no object are left out"),
+    TEXT("Rows with no id, a number id, no name, or no object are left out"),
     Output.Friends.Num(),
     2
   );
@@ -190,6 +195,23 @@ bool FRedwoodCharacterFriendsListBadAnswerTest::RunTest(
   TestFalse(
     TEXT("An object with no error field is an error"),
     ParseFriendListAnswer(MakeShared<FJsonObject>()).Error.IsEmpty()
+  );
+
+  // The engine's TryGetStringField makes text out of a number or a boolean,
+  // and a refusal is a string. Neither may read as a success or a refusal.
+  TSharedPtr<FJsonObject> NumberError = MakeFriendListAnswer(FString());
+  NumberError->SetNumberField(TEXT("error"), 0);
+  TestEqualSensitive(
+    TEXT("A number in the error field is a bad answer"),
+    *ParseFriendListAnswer(NumberError).Error,
+    URedwoodCommonGameSubsystem::BadRealmAnswerError
+  );
+  TSharedPtr<FJsonObject> BoolError = MakeFriendListAnswer(FString());
+  BoolError->SetBoolField(TEXT("error"), false);
+  TestEqualSensitive(
+    TEXT("A boolean in the error field is a bad answer"),
+    *ParseFriendListAnswer(BoolError).Error,
+    URedwoodCommonGameSubsystem::BadRealmAnswerError
   );
 
   // UE 5.8: TryGetObject says yes to an object value with no object.

@@ -3,7 +3,7 @@
 // FORK(hollowed-oath): entire file is fork-added -- no upstream counterpart.
 // Pins the field names and type words read from the character friend push.
 // They must equal the CharacterAlert schema of the RedwoodBackend fork
-// (packages/common/src/interfaces.ts).
+// (packages/common/src/interfaces.ts): lower-case words, string ids.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -51,9 +51,15 @@ bool FRedwoodCharacterFriendAlertParseTest::RunTest(const FString &Parameters) {
     Alert.Type == ERedwoodCharacterFriendAlertType::Online
   );
   // TestEqualSensitive: the string forms of TestEqual ignore case.
-  TestEqualSensitive(TEXT("The recipient id"), *Alert.CharacterId, TEXT("me-1"));
-  TestEqualSensitive(TEXT("The other id"), *Alert.OtherCharacterId, TEXT("other-1"));
-  TestEqualSensitive(TEXT("The other name"), *Alert.OtherCharacterName, TEXT("Other"));
+  TestEqualSensitive(
+    TEXT("The recipient id"), *Alert.CharacterId, TEXT("me-1")
+  );
+  TestEqualSensitive(
+    TEXT("The other id"), *Alert.OtherCharacterId, TEXT("other-1")
+  );
+  TestEqualSensitive(
+    TEXT("The other name"), *Alert.OtherCharacterName, TEXT("Other")
+  );
   TestEqualSensitive(TEXT("The zone"), *Alert.ZoneName, TEXT("L_Freewind"));
 
   const TCHAR *Words[] = {
@@ -130,6 +136,32 @@ bool FRedwoodCharacterFriendAlertBadPayloadTest::RunTest(
     TEXT("A missing type is refused"),
     URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
       AsCharacterAlertValue(NoType), Alert
+    )
+  );
+
+  // FString's == ignores case; the type words are a wire contract.
+  TestFalse(
+    TEXT("A type word in another case is refused"),
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      AsCharacterAlertValue(MakeCharacterAlertObj(TEXT("Online"))), Alert
+    )
+  );
+
+  // The engine's TryGetStringField makes text out of a number.
+  TSharedPtr<FJsonObject> NumberType = MakeCharacterAlertObj(TEXT("online"));
+  NumberType->SetNumberField(TEXT("type"), 1);
+  TestFalse(
+    TEXT("A number as the type is refused"),
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      AsCharacterAlertValue(NumberType), Alert
+    )
+  );
+  TSharedPtr<FJsonObject> NumberId = MakeCharacterAlertObj(TEXT("online"));
+  NumberId->SetNumberField(TEXT("otherCharacterId"), 7);
+  TestFalse(
+    TEXT("A number as the other id is refused"),
+    URedwoodCommonGameSubsystem::ParseCharacterFriendAlert(
+      AsCharacterAlertValue(NumberId), Alert
     )
   );
 

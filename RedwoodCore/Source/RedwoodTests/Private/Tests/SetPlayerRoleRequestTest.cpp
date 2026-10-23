@@ -11,10 +11,11 @@
 //      object. AsObject would turn such an answer into a valid EMPTY object,
 //      which reads as "no error" -- that is, as a role change that never
 //      happened.
-//   3. AnswerSetPlayerRole refuses an answer with no `error` field. The
-//      backend puts an error on every answer, so an object without one is not
-//      one of its answers, and reading the absent field as an empty error
-//      would report a role change that never happened.
+//   3. AnswerSetPlayerRole refuses an answer with no `error` field, or one
+//      that is not a string. The backend puts an error string on every
+//      answer, so an object without one is not one of its answers, and
+//      reading the absent field as an empty error would report a role change
+//      that never happened.
 //   4. AnswerSetPlayerRole reads the committed tier, and keeps 0 for a number
 //      that cannot become an int32.
 //   5. SetPlayerRoleEventName still holds the wire name the backend declares.
@@ -227,6 +228,23 @@ bool FRedwoodSetPlayerRoleBadAnswerTest::RunTest(const FString &Parameters) {
   TestFalse(
     TEXT("A tier without an error field fails"),
     AnswerForObject(RoleOnlyObj).bOk
+  );
+
+  // An error that is not a string. The engine's TryGetStringField would make
+  // "0" out of it, and report a refusal with those words.
+  TSharedPtr<FJsonObject> NumberErrorObj = MakeSuccessObj(75.0);
+  NumberErrorObj->SetNumberField(TEXT("error"), 0);
+  const FRoleAnswer FromNumberError = AnswerForObject(NumberErrorObj);
+  TestFalse(TEXT("A number in the error field fails"), FromNumberError.bOk);
+  TestEqual(
+    TEXT("A number in the error field is not an answer"),
+    FromNumberError.Error,
+    TEXT("The backend did not answer the role change")
+  );
+  TestEqual(
+    TEXT("A number in the error field carries no tier"),
+    FromNumberError.NewRole,
+    0
   );
 
   // A tier that cannot become an int32. Narrowing these with a bare
