@@ -238,6 +238,16 @@ void URedwoodClientInterface::NoteLeftWorld() {
   bAssignmentExpected = false;
   bInWorld = false;
   bTravelPending = false;
+  // FORK(hollowed-oath): HollowedOath#3806. The character left behind is not
+  // selected any more, as after a fresh login. Otherwise a party notice for
+  // it at character select is accepted and travels the player into the
+  // world without Enter World. The notice is held until SetSelectedCharacter
+  // names its character. The party stays: the player is still in it, and the
+  // ended and repeated notice ids stay, so a late replay is still refused.
+  SelectedCharacterId = TEXT("");
+  AcceptedPartyTicketId.Reset();
+  PendingPartyTicketId.Reset();
+  PendingPartyCharacterId.Reset();
 }
 
 // A join replaces any ticket the server kept, so a leave owed for it would

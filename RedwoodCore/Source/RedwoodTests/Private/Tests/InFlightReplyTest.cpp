@@ -1989,6 +1989,37 @@ namespace RedwoodInFlightTest {
     return true;
   }
 
+  // Back at character select with the old character still selected: a party
+  // notice for it must wait for Enter World instead of moving the player.
+  // Pins: the character reset in NoteLeftWorld.
+  bool RunPartyNoticeAfterLeftWorldWaits(FAutomationTestBase &Test) {
+    FRealmHarness Harness;
+    if (!OpenAsPartyMember(Test, Harness)) {
+      return false;
+    }
+    URedwoodClientInterface &C = Harness.Client();
+    C.NoteLeftWorld();
+    Test.TestTrue(
+      TEXT("Leaving the world deselects the character"),
+      FAccess::SelectedCharacterId(C).IsEmpty()
+    );
+    SendEvent(Test, Harness, PartyQueued(TEXT("character-1"), TEXT("ticket-1"), TEXT("m-1")));
+    Test.TestFalse(
+      TEXT("At character select, the notice does not accept the ticket"),
+      FAccess::bAssignmentExpected(C)
+    );
+    Test.TestFalse(
+      TEXT("At character select, the party assignment does not move the player"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    C.SetSelectedCharacter(TEXT("character-1"));
+    Test.TestTrue(
+      TEXT("Enter World takes the held notice"),
+      PartyAssignmentMoves(Test, Harness, TEXT("ticket-1"))
+    );
+    return true;
+  }
+
   // A client world that is not the travel of an accepted assignment (a PIE
   // client, a future lobby) must not open the guard. Pins: the
   // bTravelPending check in NoteArrivedInWorld.
@@ -2560,6 +2591,11 @@ REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightLeftWorldTest,
   "LeftWorldExpectsNoAssignment",
   RedwoodInFlightTest::RunLeftWorld(*this)
+)
+REDWOOD_IN_FLIGHT_TEST(
+  FRedwoodInFlightPartyNoticeAfterLeftWorldTest,
+  "PartyNoticeAfterLeftWorldWaitsForEnterWorld",
+  RedwoodInFlightTest::RunPartyNoticeAfterLeftWorldWaits(*this)
 )
 REDWOOD_IN_FLIGHT_TEST(
   FRedwoodInFlightFreeDuringCloseTest,
