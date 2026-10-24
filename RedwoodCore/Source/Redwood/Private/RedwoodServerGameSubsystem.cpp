@@ -2179,6 +2179,13 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
       // Offline only: the union of every character component's item rows, written to the
       // single "items" field after the loop below (the backend leg sends each component's
       // rows on its own sidecar channel instead, so it needs no accumulator).
+      // FORK(hollowed-oath): backend saves merge per-field so they send only dirty groups, but
+      // offline saves replace the whole JSON file, so every enabled group must be serialized even
+      // on a forced flush. A forced save that sent only dirty groups wiped clean groups from the
+      // offline character. Same split as FlushDetachedCharacterData.
+      auto ShouldSerializeGroup = [bUseBackend](bool bGroupDirty, bool bGroupEnabled) {
+        return bUseBackend ? bGroupDirty : bGroupEnabled;
+      };
       TArray<TSharedPtr<FJsonValue>> OfflineItemRows;
       bool bHasOfflineItemRows = false;
 
@@ -2231,8 +2238,7 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
 
         AActor *ComponentOwner = CharacterComponent->GetOwner();
 
-        if (bForce || bUseBackend ? CharacterComponent->IsCharacterCreatorDataDirty()
-                          : CharacterComponent->bUseCharacterCreatorData) {
+        if (ShouldSerializeGroup(CharacterComponent->IsCharacterCreatorDataDirty(), CharacterComponent->bUseCharacterCreatorData)) {
           USIOJsonObject *CharacterCreatorData =
             URedwoodCommonGameSubsystem::SerializeBackendData(
               CharacterComponent->bStoreDataInActor
@@ -2250,8 +2256,7 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           }
         }
 
-        if (bForce || bUseBackend ? CharacterComponent->IsMetadataDirty()
-                          : CharacterComponent->bUseMetadata) {
+        if (ShouldSerializeGroup(CharacterComponent->IsMetadataDirty(), CharacterComponent->bUseMetadata)) {
           USIOJsonObject *Metadata =
             URedwoodCommonGameSubsystem::SerializeBackendData(
               CharacterComponent->bStoreDataInActor
@@ -2267,8 +2272,7 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           }
         }
 
-        if (bForce || bUseBackend ? CharacterComponent->IsEquippedInventoryDirty()
-                          : CharacterComponent->bUseEquippedInventory) {
+        if (ShouldSerializeGroup(CharacterComponent->IsEquippedInventoryDirty(), CharacterComponent->bUseEquippedInventory)) {
           USIOJsonObject *EquippedInventory =
             URedwoodCommonGameSubsystem::SerializeBackendData(
               CharacterComponent->bStoreDataInActor
@@ -2285,8 +2289,7 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           }
         }
 
-        if (bForce || bUseBackend ? CharacterComponent->IsNonequippedInventoryDirty()
-                          : CharacterComponent->bUseNonequippedInventory) {
+        if (ShouldSerializeGroup(CharacterComponent->IsNonequippedInventoryDirty(), CharacterComponent->bUseNonequippedInventory)) {
           USIOJsonObject *NonequippedInventory =
             URedwoodCommonGameSubsystem::SerializeBackendData(
               CharacterComponent->bStoreDataInActor
@@ -2304,8 +2307,7 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           }
         }
 
-        if (bForce || bUseBackend ? CharacterComponent->IsProgressDirty()
-                          : CharacterComponent->bUseProgress) {
+        if (ShouldSerializeGroup(CharacterComponent->IsProgressDirty(), CharacterComponent->bUseProgress)) {
           USIOJsonObject *Progress =
             URedwoodCommonGameSubsystem::SerializeBackendData(
               CharacterComponent->bStoreDataInActor
@@ -2321,7 +2323,7 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           }
         }
 
-        if (bForce || bUseBackend ? CharacterComponent->IsDataDirty() : CharacterComponent->bUseData) {
+        if (ShouldSerializeGroup(CharacterComponent->IsDataDirty(), CharacterComponent->bUseData)) {
           USIOJsonObject *CharData =
             URedwoodCommonGameSubsystem::SerializeBackendData(
               CharacterComponent->bStoreDataInActor
@@ -2337,8 +2339,7 @@ URedwoodServerGameSubsystem::CreatePlayerCharacterDataObject(
           }
         }
 
-        if (bForce || bUseBackend ? CharacterComponent->IsAbilitySystemDirty()
-                          : CharacterComponent->bUseAbilitySystem) {
+        if (ShouldSerializeGroup(CharacterComponent->IsAbilitySystemDirty(), CharacterComponent->bUseAbilitySystem)) {
           USIOJsonObject *AbilitySystem =
             URedwoodCommonGameSubsystem::SerializeBackendData(
               CharacterComponent->bStoreDataInActor
