@@ -407,6 +407,37 @@ void URedwoodClientGameSubsystem::RequestCharacterFriend(
   }
 }
 
+// FORK(hollowed-oath) BEGIN: account-wide chat mutes.
+void URedwoodClientGameSubsystem::SetMute(
+  FString TargetCharacterName,
+  int64 DurationMs,
+  FString Reason,
+  FRedwoodSetMuteOutputDelegate OnOutput
+) {
+  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return;
+    ClientInterface->SetMute(TargetCharacterName, DurationMs, Reason, OnOutput);
+  } else {
+    FRedwoodSetMuteOutput Output;
+    Output.Error = TEXT("Cannot mute a player without using a backend");
+    OnOutput.ExecuteIfBound(Output);
+  }
+}
+
+void URedwoodClientGameSubsystem::ClearMute(
+  FString TargetCharacterName, FRedwoodErrorOutputDelegate OnOutput
+) {
+  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
+    if (AnswerNoClientInterface(ClientInterface, OnOutput)) return;
+    ClientInterface->ClearMute(TargetCharacterName, OnOutput);
+  } else {
+    OnOutput.ExecuteIfBound(
+      TEXT("Cannot unmute a player without using a backend")
+    );
+  }
+}
+// FORK(hollowed-oath) END
+
 void URedwoodClientGameSubsystem::RespondToCharacterFriendRequest(
   FString OtherCharacterId, bool bAccept, FRedwoodErrorOutputDelegate OnOutput
 ) {

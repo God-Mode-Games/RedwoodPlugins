@@ -87,3 +87,47 @@ UDELEGATE()
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
   FRedwoodPlayerOutputDynamicDelegate, FRedwoodPlayerOutput, Data
 );
+
+// FORK(hollowed-oath) BEGIN: account-wide chat mutes. Upstream has no mute;
+// the record lives on the director in the RedwoodBackend fork. One mute covers
+// every character and every channel of the account, so it is keyed by player.
+// Plain structs and plain delegates, like the role change: no Blueprint
+// reaches them, and the game owns every word a player reads.
+//
+// Until is Unix milliseconds the mute ends at, and 0 means no end. The answer
+// to a set carries the end the director committed, which it computed from the
+// duration, so the game shows the same moment Bifrost refuses with.
+struct FRedwoodSetMuteOutput {
+  FString Error;
+  int64 Until = 0;
+};
+
+typedef TDelegate<void(const FRedwoodSetMuteOutput &)>
+  FRedwoodSetMuteOutputDelegate;
+
+// What the realm holds for one player: the game server's copy. bMuted tells a
+// player with no mute from one muted with no end, which Until alone cannot
+// (both are 0). On a refusal bMuted is false and Error says why.
+struct FRedwoodPlayerMuteOutput {
+  FString Error;
+  bool bMuted = false;
+  int64 Until = 0;
+  FString Reason;
+};
+
+typedef TDelegate<void(const FRedwoodPlayerMuteOutput &)>
+  FRedwoodPlayerMuteOutputDelegate;
+
+// The realm's push after a set or a clear, to the game server that hosts a
+// character of the player. After a clear: bMuted false, Until 0, Reason "".
+struct FRedwoodPlayerMuteChanged {
+  FString PlayerId;
+  bool bMuted = false;
+  int64 Until = 0;
+  FString Reason;
+};
+
+DECLARE_MULTICAST_DELEGATE_OneParam(
+  FRedwoodPlayerMuteChangedDelegate, const FRedwoodPlayerMuteChanged &
+);
+// FORK(hollowed-oath) END
