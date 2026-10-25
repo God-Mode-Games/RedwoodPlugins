@@ -62,6 +62,10 @@ public:
     return Client.bAbandonedQueueJoin;
   }
 
+  static bool IsJoinAwaitingReply(const URedwoodClientInterface &Client) {
+    return Client.bJoinAwaitingReply;
+  }
+
   static bool IsInWorld(const URedwoodClientInterface &Client) {
     return Client.bInWorld;
   }

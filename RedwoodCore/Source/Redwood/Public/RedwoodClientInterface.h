@@ -689,11 +689,18 @@ private:
   );
   void HandleTicketingJoinReply(const FString &Error, uint32 Sequence);
   // A join whose reply was lost: the game went back to character select, so
-  // its assignment must not move the player. A new join clears it.
+  // its assignment must not move the player. A new join that the realm
+  // accepts clears it.
   bool bAbandonedQueueJoin = false;
-  // A join is out, or the player is in the world. Otherwise an assignment is
-  // a replay for a player at character select.
+  // The realm accepted a join or named a party ticket, or the player is in
+  // the world. Otherwise an assignment is a replay for a player at character
+  // select.
   bool bAssignmentExpected = false;
+  // A join is out and the realm has not answered it. HollowedOath#3609: the
+  // server replays a dropped ticket's assignment before it answers the join
+  // that replaces the ticket, so the guard opens at the answer, not the
+  // send. The owed leave still waits for this join. See NoteJoinSent.
+  bool bJoinAwaitingReply = false;
   // The travel of an accepted assignment arrived, and the player has not
   // left the world since. A refused or ended join does not clear it: the
   // server's zone transfers must still move the player.
