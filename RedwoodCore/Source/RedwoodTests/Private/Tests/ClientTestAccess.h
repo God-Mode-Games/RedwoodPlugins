@@ -66,8 +66,8 @@ public:
     return Client.bJoinAwaitingReply;
   }
 
-  static bool HasHeldAssignment(const URedwoodClientInterface &Client) {
-    return Client.HeldAssignment.IsValid();
+  static int32 HeldAssignmentCount(const URedwoodClientInterface &Client) {
+    return Client.HeldAssignments.Num();
   }
 
   static const FString &OwnTicketId(const URedwoodClientInterface &Client) {
