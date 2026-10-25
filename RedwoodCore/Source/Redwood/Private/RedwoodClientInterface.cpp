@@ -1012,7 +1012,10 @@ FString URedwoodClientInterface::ChatErrorText(
   const FString &Code, const FString &Message
 ) {
   if (Code == TEXT("muted")) {
-    return TEXT("You are muted and cannot send messages.");
+    // Bifrost's message carries the end and the reason ("You are muted until
+    // <ISO 8601> (<reason>)."); the fixed text is for a message that is empty.
+    return Message.IsEmpty() ? TEXT("You are muted and cannot send messages.")
+                             : Message;
   }
   if (Code == TEXT("not_available")) {
     return TEXT("That player is not available.");

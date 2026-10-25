@@ -176,7 +176,9 @@ public:
     return ChatTopics;
   }
   // What the player reads for a chat refusal, by the contract's code. A
-  // code with no text of its own shows the server's message.
+  // code with no text of its own shows the server's message, and so does
+  // `muted`: the server's message names the end of the mute and its reason,
+  // which no fixed text can.
   static FString ChatErrorText(const FString &Code, const FString &Message);
   // FORK(hollowed-oath) END
 
