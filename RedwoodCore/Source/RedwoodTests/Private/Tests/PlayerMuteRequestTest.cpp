@@ -27,10 +27,12 @@
 #include "RedwoodServerGameSubsystem.h"
 
 namespace RedwoodPlayerMuteTest {
+  // Names unique in the test module: the unity build merges this file with
+  // tests whose anonymous namespaces define ParseOne and UntilMs.
   // 2026-10-24 13:00:00 UTC in Unix ms: past 2^31, so a 32-bit read shows.
-  constexpr int64 UntilMs = 1792846800000LL;
+  constexpr int64 MuteUntilMs = 1792846800000LL;
 
-  FRedwoodPlayerMuteOutput ParseOne(
+  FRedwoodPlayerMuteOutput ParseMuteAnswer(
     const TSharedPtr<FJsonValue> &ResponseValue
   ) {
     TArray<TSharedPtr<FJsonValue>> Response;
@@ -39,7 +41,7 @@ namespace RedwoodPlayerMuteTest {
   }
 
   FRedwoodPlayerMuteOutput ParseObject(const TSharedPtr<FJsonObject> &Object) {
-    return ParseOne(MakeShared<FJsonValueObject>(Object));
+    return ParseMuteAnswer(MakeShared<FJsonValueObject>(Object));
   }
 
   // The realm's answer for a mute, or for none.
@@ -91,11 +93,12 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FRedwoodPlayerMuteAnswerTest::RunTest(const FString &Parameters) {
   using namespace RedwoodPlayerMuteTest;
-  const FRedwoodPlayerMuteOutput WithEnd =
-    ParseObject(MakeMuteObj(true, static_cast<double>(UntilMs), TEXT("Spam.")));
+  const FRedwoodPlayerMuteOutput WithEnd = ParseObject(
+    MakeMuteObj(true, static_cast<double>(MuteUntilMs), TEXT("Spam."))
+  );
   TestEqual(TEXT("A good answer has no error"), WithEnd.Error, FString());
   TestTrue(TEXT("The player is muted"), WithEnd.bMuted);
-  TestEqual(TEXT("Until the end the realm holds"), WithEnd.Until, UntilMs);
+  TestEqual(TEXT("Until the end the realm holds"), WithEnd.Until, MuteUntilMs);
   TestEqual(TEXT("For the reason"), WithEnd.Reason, TEXT("Spam."));
 
   // Muted with no end and not muted both carry until 0: `muted` decides.
@@ -145,12 +148,14 @@ bool FRedwoodPlayerMuteBadAnswerTest::RunTest(const FString &Parameters) {
       TestFalse(*FString::Printf(TEXT("%s mutes nobody"), What), Out.bMuted);
     };
 
-  IsRefusedAsBad(TEXT("A null answer"), ParseOne(MakeShared<FJsonValueNull>()));
+  IsRefusedAsBad(
+    TEXT("A null answer"), ParseMuteAnswer(MakeShared<FJsonValueNull>())
+  );
   IsRefusedAsBad(
     TEXT("A string answer"),
-    ParseOne(MakeShared<FJsonValueString>(TEXT("nope")))
+    ParseMuteAnswer(MakeShared<FJsonValueString>(TEXT("nope")))
   );
-  IsRefusedAsBad(TEXT("An answer with no value"), ParseOne(nullptr));
+  IsRefusedAsBad(TEXT("An answer with no value"), ParseMuteAnswer(nullptr));
   TArray<TSharedPtr<FJsonValue>> Empty;
   IsRefusedAsBad(
     TEXT("An empty answer"), URedwoodServerGameSubsystem::ParsePlayerMute(Empty)
@@ -205,7 +210,7 @@ bool FRedwoodPlayerMuteChangedTest::RunTest(const FString &Parameters) {
   TSharedPtr<FJsonObject> SetObj = MakeShared<FJsonObject>();
   SetObj->SetStringField(TEXT("playerId"), TEXT("p1"));
   SetObj->SetBoolField(TEXT("muted"), true);
-  SetObj->SetNumberField(TEXT("until"), static_cast<double>(UntilMs));
+  SetObj->SetNumberField(TEXT("until"), static_cast<double>(MuteUntilMs));
   SetObj->SetStringField(TEXT("reason"), TEXT("Spam."));
   FRedwoodPlayerMuteChanged Set;
   TestTrue(
@@ -214,7 +219,7 @@ bool FRedwoodPlayerMuteChangedTest::RunTest(const FString &Parameters) {
   );
   TestEqual(TEXT("It names the player"), Set.PlayerId, TEXT("p1"));
   TestTrue(TEXT("It mutes"), Set.bMuted);
-  TestEqual(TEXT("Until the end"), Set.Until, UntilMs);
+  TestEqual(TEXT("Until the end"), Set.Until, MuteUntilMs);
   TestEqual(TEXT("For the reason"), Set.Reason, TEXT("Spam."));
 
   // A clear: muted false, until 0, reason "".
