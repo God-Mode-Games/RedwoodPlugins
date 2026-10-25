@@ -1518,13 +1518,14 @@ bool FRedwoodZoneTravelReplayBeforeReplyTest::RunTest(
 ) {
   using namespace RedwoodBifrostZoneTravelTest;
   ExpectDrop(*this);
-  ExpectIgnoredAssignments(*this, 2);
+  ExpectIgnoredAssignments(*this, 3);
   FZoneHarness H(*this);
   H.EnterSessionWithCharacter();
 
   // The realm pushes a ticket's assignment before it answers the join, so
-  // the push waits for the answer, which names the join's ticket. The latest
-  // push waits; a replay that came before it is let go.
+  // the push waits for the answer, which names the join's ticket. Each
+  // ticket's push waits; the answer picks the join's own, and a replay that
+  // came before it is let go.
   TCapture<FRedwoodTicketingUpdate> First;
   const FPhoenixMessage FirstJoin = H.SendJoinQueue(First);
   TestTrue(
@@ -1543,8 +1544,10 @@ bool FRedwoodZoneTravelReplayBeforeReplyTest::RunTest(
     TEXT("Nor does the join's own assignment yet"),
     H.AssignmentMoves(CharacterId, TEXT("t1"))
   );
-  TestTrue(
-    TEXT("It waits for the answer"), FAccess::HasHeldAssignment(*H.Client())
+  TestEqual(
+    TEXT("Both wait for the answer"),
+    FAccess::HeldAssignmentCount(*H.Client()),
+    2
   );
   TestEqual(TEXT("The game saw no response"), First.Count, 0);
   const int32 Before = H.Joins->Count;
@@ -1552,21 +1555,29 @@ bool FRedwoodZoneTravelReplayBeforeReplyTest::RunTest(
   TestEqual(TEXT("The answer reaches the game"), First.Count, 1);
   TestTrue(TEXT("Accepted"), First.Last.Message.IsEmpty());
   TestEqual(
-    TEXT("And the assignment that waited moves the player"),
+    TEXT("And the join's own assignment moves the player, once"),
     H.Joins->Count,
     Before + 1
   );
-  TestFalse(TEXT("Nothing waits"), FAccess::HasHeldAssignment(*H.Client()));
-  TestTrue(
-    TEXT("The ticket is used"), FAccess::OwnTicketId(*H.Client()).IsEmpty()
+  TestEqual(
+    TEXT("Nothing waits"), FAccess::HeldAssignmentCount(*H.Client()), 0
+  );
+  TestEqual(
+    TEXT("The ticket stays current through the travel"),
+    FAccess::OwnTicketId(*H.Client()),
+    TEXT("t1")
   );
   H.Client()->NoteArrivedInWorld();
+  TestTrue(
+    TEXT("The arrival uses it up"), FAccess::OwnTicketId(*H.Client()).IsEmpty()
+  );
   H.Client()->NoteLeftWorld();
 
   // HollowedOath#3609. The join is lost with the socket, and the player
   // presses Enter World during the drop. At the resume the owed leave goes
-  // out, then the held join, and the server replays the lost ticket's
-  // assignment before it answers the new join.
+  // out, then the held join; the server pushes the new ticket's assignment
+  // and replays the lost ticket's, in either order, before it answers the
+  // new join.
   TCapture<FRedwoodTicketingUpdate> Lost;
   H.SendJoinQueue(Lost);
   H.Drop();
@@ -1600,21 +1611,29 @@ bool FRedwoodZoneTravelReplayBeforeReplyTest::RunTest(
     TEXT("And its leave stays owed"), FAccess::IsLeaveTicketingOwed(*H.Client())
   );
   TestFalse(
-    TEXT("The replay of the lost ticket's assignment does not move the player"),
+    TEXT("The new ticket's assignment does not move the player yet"),
+    H.AssignmentMoves(CharacterId, TEXT("t2"))
+  );
+  TestFalse(
+    TEXT("Nor does the replay of the lost ticket's, which came after it"),
     H.AssignmentMoves(CharacterId, TEXT("t-lost"))
   );
-  TestTrue(
-    TEXT("It waits for the answer"), FAccess::HasHeldAssignment(*H.Client())
+  TestEqual(
+    TEXT("Both wait for the answer"),
+    FAccess::HeldAssignmentCount(*H.Client()),
+    2
   );
   H.Socket()->ReplyOk(Join, AcceptedJoin(TEXT("t2")));
   TestEqual(TEXT("The realm's answer reaches the game"), Held.Count, 1);
   TestTrue(TEXT("Accepted"), Held.Last.Message.IsEmpty());
   TestEqual(
-    TEXT("The replay is not the join's ticket: it is let go"),
+    TEXT("The new ticket's assignment moves the player; the replay is let go"),
     H.Joins->Count,
-    Before + 1
+    Before + 2
   );
-  TestFalse(TEXT("Nothing waits"), FAccess::HasHeldAssignment(*H.Client()));
+  TestEqual(
+    TEXT("Nothing waits"), FAccess::HeldAssignmentCount(*H.Client()), 0
+  );
   TestFalse(
     TEXT("The accepted join replaces the dropped join"),
     FAccess::IsQueueJoinAbandoned(*H.Client())
@@ -1630,10 +1649,6 @@ bool FRedwoodZoneTravelReplayBeforeReplyTest::RunTest(
   TestFalse(
     TEXT("A replay after the answer does not move the player either"),
     H.AssignmentMoves(CharacterId, TEXT("t-lost"))
-  );
-  TestTrue(
-    TEXT("The new join's assignment moves the player"),
-    H.AssignmentMoves(CharacterId, TEXT("t2"))
   );
   return true;
 }

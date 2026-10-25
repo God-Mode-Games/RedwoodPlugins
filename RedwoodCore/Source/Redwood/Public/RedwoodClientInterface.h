@@ -690,6 +690,9 @@ private:
   TSharedPtr<FJsonObject> NoteTicketingJoinAccepted(const FString &TicketId);
   void EndOwnJoin();
   void HandleZoneAssignment(const TSharedPtr<FJsonObject> &MessageObject);
+  void HoldAssignment(
+    const FString &TicketId, const TSharedPtr<FJsonObject> &Assignment
+  );
   TFunction<void()> MakeLostProxyJoin(
     uint32 Sequence, TFunction<void()> OnLost
   );
@@ -710,12 +713,13 @@ private:
   // at the answer, not the send. The owed leave still waits for this join.
   // See NoteTicketingJoinSent.
   bool bJoinAwaitingReply = false;
-  // An assignment that names a ticket, pushed while the join is awaited:
-  // the realm pushes before it answers. One slot, the latest; the answer's
-  // ticket judges it. See HandleZoneAssignment.
-  TSharedPtr<FJsonObject> HeldAssignment;
+  // The assignments that name a ticket, pushed while the join is awaited:
+  // the realm pushes before it answers. One per ticket, the newest, oldest
+  // tickets first; the answer's ticket picks the join's own. See
+  // HoldAssignment.
+  TArray<TPair<FString, TSharedPtr<FJsonObject>>> HeldAssignments;
   // The ticket of this client's own accepted ticketing join, from the
-  // realm's answer, until its assignment is used. While it is set, another
+  // realm's answer, until its travel arrives. While it is set, another
   // ticket's assignment is a replay. Empty for an older realm that names
   // no ticket.
   FString OwnTicketId;

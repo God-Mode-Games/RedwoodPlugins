@@ -196,6 +196,9 @@ void URedwoodClientInterface::NoteArrivedInWorld() {
   bAbandonedQueueJoin = false;
   bAssignmentExpected = true;
   bLeaveTicketingOwed = false;
+  // The ticket is used up: the server's zone transfers name other tickets,
+  // and the own ticket's check must not refuse them.
+  OwnTicketId.Reset();
 }
 
 // Back at the entry level without a Logout or a new character: the player is
@@ -244,7 +247,7 @@ void URedwoodClientInterface::NoteTicketingJoinSent() {
 // current. The guard's flags are the caller's to set.
 void URedwoodClientInterface::EndOwnJoin() {
   bJoinAwaitingReply = false;
-  HeldAssignment.Reset();
+  HeldAssignments.Reset();
   OwnTicketId.Reset();
 }
 
@@ -268,6 +271,22 @@ namespace {
     FString MessageId;
     Message.TryGetStringField(TEXT("messageId"), MessageId);
     return !MessageId.IsEmpty() && !RememberRecentId(RecentIds, MessageId);
+  }
+
+  // HollowedOath#3609. Tickets whose assignment waits for the join's answer:
+  // the join's own and the replays of a drop or two. Beyond that the oldest
+  // goes.
+  constexpr int32 MaxHeldAssignments = 8;
+
+  // The handler's refusal of a zone assignment; the tests count it.
+  void LogIgnoredAssignment() {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT(
+        "Ignoring a zone assignment for a dropped queue request or another character."
+      )
+    );
   }
 }
 
@@ -398,8 +417,9 @@ void URedwoodClientInterface::NoteJoinAnswered(
 // more, and the owed leave for it is paid by the replacement. Only while
 // the join is still awaited: the game may have left it, or gone back to
 // character select, since it went out, and the late acceptance must not
-// undo that. Answers the assignment kept during the wait, for the caller to
-// judge by the ticket once the game has seen the answer.
+// undo that. Answers the assignment kept for the join's ticket during the
+// wait, for the caller to apply once the game has seen the answer; the
+// assignments kept for other tickets were replays, and go.
 TSharedPtr<FJsonObject> URedwoodClientInterface::NoteTicketingJoinAccepted(
   const FString &TicketId
 ) {
@@ -411,8 +431,15 @@ TSharedPtr<FJsonObject> URedwoodClientInterface::NoteTicketingJoinAccepted(
   bAbandonedQueueJoin = false;
   bLeaveTicketingOwed = false;
   OwnTicketId = TicketId;
-  TSharedPtr<FJsonObject> Held = HeldAssignment;
-  HeldAssignment.Reset();
+  TSharedPtr<FJsonObject> Held;
+  for (const TPair<FString, TSharedPtr<FJsonObject>> &Kept : HeldAssignments) {
+    if (Kept.Key == TicketId) {
+      Held = Kept.Value;
+    } else {
+      LogIgnoredAssignment();
+    }
+  }
+  HeldAssignments.Reset();
   return Held;
 }
 
@@ -3231,6 +3258,23 @@ void URedwoodClientInterface::ApplyRegions(
   }
 }
 
+// HollowedOath#3609. The newest push of a ticket replaces the one kept for
+// it: a resend of the same assignment is one assignment.
+void URedwoodClientInterface::HoldAssignment(
+  const FString &TicketId, const TSharedPtr<FJsonObject> &Assignment
+) {
+  for (TPair<FString, TSharedPtr<FJsonObject>> &Kept : HeldAssignments) {
+    if (Kept.Key == TicketId) {
+      Kept.Value = Assignment;
+      return;
+    }
+  }
+  if (HeldAssignments.Num() >= MaxHeldAssignments) {
+    HeldAssignments.RemoveAt(0);
+  }
+  HeldAssignments.Emplace(TicketId, Assignment);
+}
+
 // FORK(hollowed-oath): HollowedOath#2886. A zone assignment
 // (realm:servers:connect-to-instance) sent again after a reconnect can be
 // for a request the game dropped, for a character the player no longer
@@ -3259,12 +3303,12 @@ void URedwoodClientInterface::HandleZoneAssignment(
   // answers the join that made the ticket, and the push and the answer
   // travel on their own paths. While this client's own ticketing join waits
   // for its answer, an assignment that names a ticket is the new join's or
-  // the replay of a dropped one; the answer's ticket tells which, so it is
-  // kept until then, the latest one. One with no ticket is an old
-  // server's, and is judged as before.
+  // the replay of a dropped one; the answer's ticket tells which, so each
+  // ticket's is kept until then, in whatever order they came. One with no
+  // ticket is an old server's, and is judged as before.
   if (bJoinAwaitingReply && !AssignedTicketId.IsEmpty() &&
       !bForAnotherCharacter && !bEndedTicket) {
-    HeldAssignment = MessageObject;
+    HoldAssignment(AssignedTicketId, MessageObject);
     return;
   }
   // The answer named the join's ticket: another ticket's assignment is a
@@ -3274,13 +3318,7 @@ void URedwoodClientInterface::HandleZoneAssignment(
   if ((!bAssignmentExpected && !bInWorld) || bAbandonedQueueJoin ||
       bForAnotherCharacter || bNotThePartyTicket || bEndedTicket ||
       bNotTheOwnTicket) {
-    UE_LOG(
-      LogRedwood,
-      Warning,
-      TEXT(
-        "Ignoring a zone assignment for a dropped queue request or another character."
-      )
-    );
+    LogIgnoredAssignment();
     return;
   }
 
@@ -3288,13 +3326,11 @@ void URedwoodClientInterface::HandleZoneAssignment(
   bTravelPending = true;
   TravelJoinSequence = JoinSequence;
   // The ticket is used: a "queued" for it sent again must not arm the
-  // guard for a replay of this assignment, and the own ticket's check must
-  // not refuse the server's later zone transfers.
+  // guard for a replay of this assignment. The own ticket stays current
+  // through the travel, so a replay of another ticket during it is refused;
+  // the arrival ends it (NoteArrivedInWorld).
   if (!AssignedTicketId.IsEmpty()) {
     EndPartyTicket(AssignedTicketId);
-    if (AssignedTicketId == OwnTicketId) {
-      OwnTicketId.Reset();
-    }
   }
 
   bool bShouldStitch = MessageObject->GetBoolField(TEXT("shouldStitch"));
