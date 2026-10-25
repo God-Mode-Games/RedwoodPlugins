@@ -280,6 +280,32 @@ public:
   );
   // FORK(hollowed-oath) END
 
+  // FORK(hollowed-oath) BEGIN: account-wide chat mutes, the GM's /mute and
+  // /unmute. Director routes, because a mute is the account's, not a realm's.
+  // The director takes the commander from the session, never from a field, and
+  // checks their role itself: a GM may set a mute with an end, an Admin one
+  // with no end (DurationMs 0). The target is a character name, so a GM can
+  // mute a player in another zone; the director resolves it to a player and
+  // refuses a name of no character in play. Both answer the director's error
+  // word for word, because the game owns what a GM reads.
+  void SetMute(
+    FString TargetCharacterName,
+    int64 DurationMs,
+    FString Reason,
+    FRedwoodSetMuteOutputDelegate OnOutput
+  );
+
+  void ClearMute(
+    FString TargetCharacterName, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  // The parse half of SetMute, public so a test can feed it an answer. An
+  // answer with no error string is a bad answer, not a success.
+  static FRedwoodSetMuteOutput ParseSetMuteAnswer(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  );
+  // FORK(hollowed-oath) END
+
   void ListGuilds(
     bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
   );

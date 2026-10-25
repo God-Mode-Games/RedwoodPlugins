@@ -155,6 +155,20 @@ public:
   );
   // FORK(hollowed-oath) END
 
+  // FORK(hollowed-oath) BEGIN: account-wide chat mutes, the GM's /mute and
+  // /unmute. See URedwoodClientInterface::SetMute.
+  void SetMute(
+    FString TargetCharacterName,
+    int64 DurationMs,
+    FString Reason,
+    FRedwoodSetMuteOutputDelegate OnOutput
+  );
+
+  void ClearMute(
+    FString TargetCharacterName, FRedwoodErrorOutputDelegate OnOutput
+  );
+  // FORK(hollowed-oath) END
+
   void ListGuilds(
     bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
   );

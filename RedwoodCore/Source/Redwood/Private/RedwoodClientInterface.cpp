@@ -1940,6 +1940,101 @@ void URedwoodClientInterface::CancelCharacterFriendRequest(
 }
 // FORK(hollowed-oath) END
 
+// FORK(hollowed-oath) BEGIN: account-wide chat mutes. See the header.
+namespace {
+  // The wire names, as the RedwoodBackend fork declares them. The backend
+  // keeps its own copy, so the test pins these against it.
+  const TCHAR *const SetMuteEventName = TEXT("director:moderation:mute:set");
+  const TCHAR *const ClearMuteEventName =
+    TEXT("director:moderation:mute:clear");
+}
+
+void URedwoodClientInterface::SetMute(
+  FString TargetCharacterName,
+  int64 DurationMs,
+  FString Reason,
+  FRedwoodSetMuteOutputDelegate OnOutput
+) {
+  // HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
+        SetMute(TargetCharacterName, DurationMs, Reason, OnOutput);
+      }, OnOutput)) {
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetStringField(TEXT("targetCharacterName"), TargetCharacterName);
+  // A JSON number: the backend declares durationMs a number and refuses a
+  // string. A double holds every millisecond count up to 2^53, far past the
+  // longest mute with an end.
+  Payload->SetNumberField(TEXT("durationMs"), static_cast<double>(DurationMs));
+  Payload->SetStringField(TEXT("reason"), Reason);
+
+  // HollowedOath#2886. See TrackReply.
+  Connection->Rpc(
+    SetMuteEventName,
+    Payload,
+    TrackReply([OnOutput](auto Response) {
+      OnOutput.ExecuteIfBound(ParseSetMuteAnswer(Response));
+    }, OnOutput)
+  );
+}
+
+void URedwoodClientInterface::ClearMute(
+  FString TargetCharacterName, FRedwoodErrorOutputDelegate OnOutput
+) {
+  // HollowedOath#2854. See GateDirector.
+  if (GateDirector([=, this]() {
+        ClearMute(TargetCharacterName, OnOutput);
+      }, OnOutput)) {
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+  Payload->SetStringField(TEXT("targetCharacterName"), TargetCharacterName);
+
+  // HollowedOath#2886. See TrackReply.
+  Connection->Rpc(
+    ClearMuteEventName,
+    Payload,
+    TrackReply([OnOutput](auto Response) {
+      // The clear's answer carries nothing but the error, so the friend
+      // calls' reading of one serves it.
+      OnOutput.ExecuteIfBound(ParseCharacterFriendCommandAnswer(Response));
+    }, OnOutput)
+  );
+}
+
+FRedwoodSetMuteOutput URedwoodClientInterface::ParseSetMuteAnswer(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  FRedwoodSetMuteOutput Output;
+  const TSharedPtr<FJsonObject> *MessageObject =
+    URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+  // The director puts an error on every answer, empty when the mute is
+  // recorded. An object without one is not its answer, and must not read as
+  // a mute that was made.
+  if (MessageObject == nullptr ||
+      !URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+        *MessageObject, TEXT("error"), Output.Error
+      )) {
+    Output.Error = URedwoodCommonGameSubsystem::BadRealmAnswerError;
+    return Output;
+  }
+  // The end, as the director committed it. A JSON number arrives as a
+  // double; one that is not a whole non-negative count is not an end and
+  // stays 0, which reads as no end, so the error string alone decides
+  // whether the mute was made.
+  double Until = 0.0;
+  if ((*MessageObject)->TryGetNumberField(TEXT("until"), Until) &&
+      FMath::IsFinite(Until) && Until >= 0.0 &&
+      Until <= static_cast<double>(MAX_int64)) {
+    Output.Until = static_cast<int64>(Until);
+  }
+  return Output;
+}
+// FORK(hollowed-oath) END
+
 void URedwoodClientInterface::ListGuilds(
   bool bOnlyPlayersGuilds, FRedwoodListGuildsOutputDelegate OnOutput
 ) {

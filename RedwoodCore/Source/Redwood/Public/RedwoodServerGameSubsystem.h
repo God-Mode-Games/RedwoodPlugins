@@ -455,6 +455,39 @@ public:
   static FRedwoodListOnlineCharactersOutput ParseListOnlineCharacters(
     const TArray<TSharedPtr<FJsonValue>> &Response
   );
+
+  // Account-wide chat mutes, the game server's copy. Fork-added. The realm
+  // holds the mute of every player it hosts (read from the director); the
+  // game server asks for one player's at join, and hears a change as a push.
+  // The same answer contract as RequestPlayerRoleChange: OnOutput is not
+  // guaranteed to fire, and fires INLINE, with an error, when the sidecar is
+  // down. The realm answers "not hosted" for a player with no live character
+  // on this server, so ask only once the player's auth has completed.
+  void RequestPlayerMute(
+    const FString &PlayerId, FRedwoodPlayerMuteOutputDelegate OnOutput
+  );
+
+  // Wire names, pinned by a test against the backend's own copies.
+  static constexpr const TCHAR *GetPlayerMuteEventName =
+    TEXT("realm:moderation:mute:get");
+  static constexpr const TCHAR *MuteChangedEventName =
+    TEXT("realm:moderation:mute-changed");
+
+  // The parse halves, kept apart from the socket so the automation test can
+  // reach them without a backend. An answer that is not one of the backend's
+  // comes back with an error, never as "not muted".
+  static FRedwoodPlayerMuteOutput ParsePlayerMute(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  );
+  // False for a push that is not one of the backend's: it is then dropped,
+  // because a half-read push could clear a mute that still stands.
+  static bool ParseMuteChanged(
+    const TSharedPtr<FJsonValue> &Message, FRedwoodPlayerMuteChanged &OutChanged
+  );
+
+  // The realm's push after a GM set or cleared a mute of a player this server
+  // hosts. The game's PlayerStates bind it and keep the one that names them.
+  FRedwoodPlayerMuteChangedDelegate OnPlayerMuteChanged;
   // FORK(hollowed-oath) END
 
   // The latest party data for all parties that have at least one

@@ -552,6 +552,25 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
     }
   );
 
+  // FORK(hollowed-oath): a GM set or cleared the chat mute of a player this
+  // server hosts. Upstream has no such event. The game's PlayerStates listen.
+  Sidecar->OnEvent(
+    MuteChangedEventName,
+    [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
+      FRedwoodPlayerMuteChanged Changed;
+      if (ParseMuteChanged(Message, Changed)) {
+        OnPlayerMuteChanged.Broadcast(Changed);
+      } else {
+        UE_LOG(
+          LogRedwood,
+          Warning,
+          TEXT("Dropped a %s push that could not be read"),
+          MuteChangedEventName
+        );
+      }
+    }
+  );
+
   // FORK(hollowed-oath): the realm tells the game server when a transfer it
   // had accepted then failed. Upstream has no such event. The rules live in
   // HandleTransferFailedEvent.
@@ -3973,6 +3992,112 @@ URedwoodServerGameSubsystem::ParseListOnlineCharacters(
 
   return Output;
 }
+
+// FORK(hollowed-oath) BEGIN: account-wide chat mutes. See the header.
+namespace {
+  // The three fields a mute carries on the wire, read the same way from the
+  // realm's answer and from its push. False when they are not the backend's:
+  // `muted` must be a boolean and `until` a whole non-negative number, so a
+  // field of the wrong type cannot read as "not muted" or as "no end".
+  bool ReadMuteFields(
+    const FJsonObject &Object,
+    bool &bOutMuted,
+    int64 &OutUntil,
+    FString &OutReason
+  ) {
+    double Until = 0.0;
+    if (
+      !Object.TryGetBoolField(TEXT("muted"), bOutMuted) ||
+      !Object.TryGetNumberField(TEXT("until"), Until) ||
+      !FMath::IsFinite(Until) || Until < 0.0 ||
+      Until > static_cast<double>(MAX_int64)
+    ) {
+      return false;
+    }
+    OutUntil = static_cast<int64>(Until);
+    // The reason is text or absent; a number here is not a reason.
+    OutReason.Empty();
+    const TSharedPtr<FJsonValue> ReasonValue =
+      Object.TryGetField(TEXT("reason"));
+    if (
+      ReasonValue.IsValid() && ReasonValue->Type != EJson::Null &&
+      !ReasonValue->TryGetString(OutReason)
+    ) {
+      return false;
+    }
+    return true;
+  }
+}
+
+void URedwoodServerGameSubsystem::RequestPlayerMute(
+  const FString &PlayerId, FRedwoodPlayerMuteOutputDelegate OnOutput
+) {
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    FRedwoodPlayerMuteOutput Output;
+    Output.Error = TEXT("Sidecar is not connected");
+    OnOutput.ExecuteIfBound(Output);
+    return;
+  }
+
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("playerId"), PlayerId);
+  Sidecar->Emit(GetPlayerMuteEventName, Payload, [OnOutput](auto Response) {
+    OnOutput.ExecuteIfBound(ParsePlayerMute(Response));
+  });
+}
+
+FRedwoodPlayerMuteOutput URedwoodServerGameSubsystem::ParsePlayerMute(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  FRedwoodPlayerMuteOutput Output;
+  Output.Error = TEXT("The backend did not answer the mute");
+
+  const TSharedPtr<FJsonObject> *MessageObject =
+    URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+  FString Error;
+  if (
+    MessageObject == nullptr ||
+    !URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+      *MessageObject, TEXT("error"), Error
+    )
+  ) {
+    return Output;
+  }
+  if (!Error.IsEmpty()) {
+    // A refusal: the backend words go back unchanged, and nothing is muted.
+    Output.Error = Error;
+    return Output;
+  }
+  // A success without the mute fields is not the backend's answer either, and
+  // must keep the default error: read as empty it would say "not muted".
+  if (!ReadMuteFields(
+        **MessageObject, Output.bMuted, Output.Until, Output.Reason
+      )) {
+    return Output;
+  }
+  Output.Error.Empty();
+  return Output;
+}
+
+bool URedwoodServerGameSubsystem::ParseMuteChanged(
+  const TSharedPtr<FJsonValue> &Message, FRedwoodPlayerMuteChanged &OutChanged
+) {
+  const TSharedPtr<FJsonObject> *Object =
+    URedwoodCommonGameSubsystem::TryGetRedwoodObject(Message);
+  if (
+    Object == nullptr ||
+    !URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+      *Object, TEXT("playerId"), OutChanged.PlayerId
+    ) ||
+    OutChanged.PlayerId.IsEmpty()
+  ) {
+    return false;
+  }
+  return ReadMuteFields(
+    **Object, OutChanged.bMuted, OutChanged.Until, OutChanged.Reason
+  );
+}
+// FORK(hollowed-oath) END
 
 void URedwoodServerGameSubsystem::RequestOnlineCharacters(
   FRedwoodListOnlineCharactersOutputDelegate OnOutput
