@@ -10,8 +10,10 @@
 //      director committed; ClearMute sends `director:moderation:mute:clear`
 //      with the target name alone.
 //   3. A director refusal goes back word for word. An answer with no error
-//      string is a bad answer, not a mute that was made.
-// The wire names are pinned against the RedwoodBackend fork's copies.
+//      string, or a success whose `until` is not a whole non-negative number,
+//      is a bad answer, not a mute that was made.
+// The wire names below are a second literal, not the plugin's constants, so
+// a drift on either side shows here; the RedwoodBackend fork pins its own.
 // An upstream merge must keep these APIs or update this file in lockstep.
 
 #include "CoreMinimal.h"
@@ -20,7 +22,9 @@
 #include "BifrostClientHarness.h"
 #include "RedwoodCommonGameSubsystem.h"
 
-namespace {
+// Named, not anonymous: the test module is a unity build, and these names
+// would be one translation unit's double definition beside another suite's.
+namespace RedwoodBifrostMuteTest {
   const TCHAR *const TargetName = TEXT("Old Junk");
   const TCHAR *const SetMuteEvent = TEXT("director:moderation:mute:set");
   const TCHAR *const ClearMuteEvent = TEXT("director:moderation:mute:clear");
@@ -29,7 +33,7 @@ namespace {
   // 2026-10-24 13:00:00 UTC in Unix ms: an end past 2^31, so a 32-bit read
   // would show.
   constexpr int64 UntilMs = 1792846800000LL;
-} // namespace
+} // namespace RedwoodBifrostMuteTest
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   FRedwoodBifrostMuteGateTest,
@@ -39,6 +43,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FRedwoodBifrostMuteGateTest::RunTest(const FString &Parameters) {
   using namespace RedwoodBifrostClientTest;
+  using namespace RedwoodBifrostMuteTest;
   FClientHarness H(*this);
   H.Open();
 
@@ -70,6 +75,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FRedwoodBifrostMuteSetTest::RunTest(const FString &Parameters) {
   using namespace RedwoodBifrostClientTest;
+  using namespace RedwoodBifrostMuteTest;
   FClientHarness H(*this);
   H.Open();
   H.LoginOk();
@@ -151,6 +157,35 @@ bool FRedwoodBifrostMuteSetTest::RunTest(const FString &Parameters) {
     Bad.Last.Error,
     URedwoodCommonGameSubsystem::BadRealmAnswerError
   );
+
+  // A success whose end cannot be read: a string, a fraction, a negative
+  // count, or no field at all. Each is a bad answer and never "no end", or a
+  // GM would read "forever" for a broken hop. The realm's copy refuses the
+  // same shapes (Redwood.PlayerMute.BadAnswer).
+  const TSharedPtr<FJsonValue> BadEnds[] = {
+    MakeShared<FJsonValueString>(TEXT("soon")),
+    MakeShared<FJsonValueNumber>(1.5),
+    MakeShared<FJsonValueNumber>(-1.0),
+    nullptr,
+  };
+  for (const TSharedPtr<FJsonValue> &BadEnd : BadEnds) {
+    TCapture<FRedwoodSetMuteOutput> Unread;
+    H.Client()->SetMute(
+      TargetName, TwoHoursMs, TEXT("Spam."), Unread.Delegate()
+    );
+    TSharedPtr<FJsonObject> Answer = NoError();
+    if (BadEnd.IsValid()) {
+      Answer->SetField(TEXT("until"), BadEnd);
+    }
+    H.Socket()->ReplyOk(H.Socket()->Last(SetMuteEvent), Answer);
+    TestEqual(TEXT("An unreadable end is answered"), Unread.Count, 1);
+    TestEqual(
+      TEXT("As a bad answer"),
+      Unread.Last.Error,
+      URedwoodCommonGameSubsystem::BadRealmAnswerError
+    );
+    TestEqual(TEXT("With no end"), Unread.Last.Until, static_cast<int64>(0));
+  }
   return true;
 }
 
@@ -162,6 +197,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FRedwoodBifrostMuteClearTest::RunTest(const FString &Parameters) {
   using namespace RedwoodBifrostClientTest;
+  using namespace RedwoodBifrostMuteTest;
   FClientHarness H(*this);
   H.Open();
   H.LoginOk();

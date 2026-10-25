@@ -1377,6 +1377,22 @@ bool URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
   OutValue = Field->AsString();
   return true;
 }
+
+// FORK(hollowed-oath): see the header.
+bool URedwoodCommonGameSubsystem::TryGetRedwoodUnixMsField(
+  const FJsonObject &Object, const TCHAR *FieldName, int64 &OutValue
+) {
+  double Value = 0.0;
+  if (
+    !Object.TryGetNumberField(FieldName, Value) || !FMath::IsFinite(Value) ||
+    Value < 0.0 || Value > static_cast<double>(MAX_int64) ||
+    Value != FMath::FloorToDouble(Value)
+  ) {
+    return false;
+  }
+  OutValue = static_cast<int64>(Value);
+  return true;
+}
 // FORK(hollowed-oath) END
 
 // FORK(hollowed-oath) BEGIN: the character friend list. The game takes a good

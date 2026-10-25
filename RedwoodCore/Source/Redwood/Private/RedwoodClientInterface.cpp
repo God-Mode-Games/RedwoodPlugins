@@ -2021,15 +2021,17 @@ FRedwoodSetMuteOutput URedwoodClientInterface::ParseSetMuteAnswer(
     Output.Error = URedwoodCommonGameSubsystem::BadRealmAnswerError;
     return Output;
   }
-  // The end, as the director committed it. A JSON number arrives as a
-  // double; one that is not a whole non-negative count is not an end and
-  // stays 0, which reads as no end, so the error string alone decides
-  // whether the mute was made.
-  double Until = 0.0;
-  if ((*MessageObject)->TryGetNumberField(TEXT("until"), Until) &&
-      FMath::IsFinite(Until) && Until >= 0.0 &&
-      Until <= static_cast<double>(MAX_int64)) {
-    Output.Until = static_cast<int64>(Until);
+  // A refusal carries its words and no end. A success must carry the end
+  // the director committed, read the way the realm's copy is (the server's
+  // ReadMuteFields): a success whose `until` cannot be read is a bad answer,
+  // not a mute with no end, or a GM would read "forever" for a broken hop.
+  if (
+    Output.Error.IsEmpty() &&
+    !URedwoodCommonGameSubsystem::TryGetRedwoodUnixMsField(
+      **MessageObject, TEXT("until"), Output.Until
+    )
+  ) {
+    Output.Error = URedwoodCommonGameSubsystem::BadRealmAnswerError;
   }
   return Output;
 }
