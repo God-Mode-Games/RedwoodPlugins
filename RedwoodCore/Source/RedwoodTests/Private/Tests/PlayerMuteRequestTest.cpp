@@ -26,7 +26,7 @@
 #include "Dom/JsonValue.h"
 #include "RedwoodServerGameSubsystem.h"
 
-namespace {
+namespace RedwoodPlayerMuteTest {
   // 2026-10-24 13:00:00 UTC in Unix ms: past 2^31, so a 32-bit read shows.
   constexpr int64 UntilMs = 1792846800000LL;
 
@@ -59,7 +59,7 @@ namespace {
   ) {
     return URedwoodServerGameSubsystem::ParseMuteChanged(Message, Out);
   }
-} // namespace
+} // namespace RedwoodPlayerMuteTest
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   FRedwoodPlayerMuteWireNamesTest,
@@ -68,6 +68,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodPlayerMuteWireNamesTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodPlayerMuteTest;
   // Pinned exactly as the RedwoodBackend fork writes them.
   TestEqual(
     TEXT("The get route has not drifted"),
@@ -89,6 +90,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodPlayerMuteAnswerTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodPlayerMuteTest;
   const FRedwoodPlayerMuteOutput WithEnd =
     ParseObject(MakeMuteObj(true, static_cast<double>(UntilMs), TEXT("Spam.")));
   TestEqual(TEXT("A good answer has no error"), WithEnd.Error, FString());
@@ -132,6 +134,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodPlayerMuteBadAnswerTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodPlayerMuteTest;
   // Every answer that is not the backend's keeps an error and mutes nobody,
   // so a muted player is never read as free to speak by a bad read.
   auto IsRefusedAsBad =
@@ -197,6 +200,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodPlayerMuteChangedTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodPlayerMuteTest;
   // A set: the player, the mute and its end.
   TSharedPtr<FJsonObject> SetObj = MakeShared<FJsonObject>();
   SetObj->SetStringField(TEXT("playerId"), TEXT("p1"));
