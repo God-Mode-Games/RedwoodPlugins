@@ -3996,24 +3996,23 @@ URedwoodServerGameSubsystem::ParseListOnlineCharacters(
 namespace {
   // The three fields a mute carries on the wire, read the same way from the
   // realm's answer and from its push. False when they are not the backend's:
-  // `muted` must be a boolean and `until` a whole non-negative number, so a
-  // field of the wrong type cannot read as "not muted" or as "no end".
+  // `muted` must be a boolean and `until` a whole non-negative number (the
+  // same reader the director's answer gets on the client), so a field of
+  // the wrong type cannot read as "not muted" or as "no end".
   bool ReadMuteFields(
     const FJsonObject &Object,
     bool &bOutMuted,
     int64 &OutUntil,
     FString &OutReason
   ) {
-    double Until = 0.0;
     if (
       !Object.TryGetBoolField(TEXT("muted"), bOutMuted) ||
-      !Object.TryGetNumberField(TEXT("until"), Until) ||
-      !FMath::IsFinite(Until) || Until < 0.0 ||
-      Until > static_cast<double>(MAX_int64)
+      !URedwoodCommonGameSubsystem::TryGetRedwoodUnixMsField(
+        Object, TEXT("until"), OutUntil
+      )
     ) {
       return false;
     }
-    OutUntil = static_cast<int64>(Until);
     // The reason is text or absent; a number here is not a reason.
     OutReason.Empty();
     const TSharedPtr<FJsonValue> ReasonValue =

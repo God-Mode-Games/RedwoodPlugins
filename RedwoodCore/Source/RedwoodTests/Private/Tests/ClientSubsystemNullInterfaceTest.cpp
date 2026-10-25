@@ -128,6 +128,13 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
         ++Answers;
       }
     );
+  FRedwoodSetMuteOutputDelegate OnSetMute =
+    FRedwoodSetMuteOutputDelegate::CreateLambda(
+      [&Error, &Answers](const FRedwoodSetMuteOutput &Output) {
+        Error = Output.Error;
+        ++Answers;
+      }
+    );
 
   // TestEqualSensitive: the string forms of TestEqual ignore case. The reset
   // makes a guard that never answers fail.
@@ -185,6 +192,13 @@ bool FRedwoodClientSubsystemNullInterfaceGuardsTest::RunTest(
 
   Subsystem->CancelCharacterFriendRequest(TEXT("character-1"), OnError);
   CheckGuard(TEXT("CancelCharacterFriendRequest reports the error"));
+
+  // The mute calls have the same guard.
+  Subsystem->SetMute(TEXT("Old Junk"), 0, TEXT("Spam."), OnSetMute);
+  CheckGuard(TEXT("SetMute reports the error"));
+
+  Subsystem->ClearMute(TEXT("Old Junk"), OnError);
+  CheckGuard(TEXT("ClearMute reports the error"));
 
   return true;
 }

@@ -120,6 +120,15 @@ public:
     FString &OutValue
   );
 
+  // FORK(hollowed-oath): a Unix millisecond count (a mute's end), and only
+  // one: a finite whole number from 0 up. A JSON number arrives as a double,
+  // and narrowing one out of range is undefined behaviour; a string or a
+  // fraction here is not the backend's. One reader for the director's answer
+  // and the realm's, so a GM and a game server never disagree about an end.
+  static bool TryGetRedwoodUnixMsField(
+    const FJsonObject &Object, const TCHAR *FieldName, int64 &OutValue
+  );
+
   // FORK(hollowed-oath): one text for every character friend call whose
   // realm answer cannot be read.
   static constexpr const TCHAR *BadRealmAnswerError =
