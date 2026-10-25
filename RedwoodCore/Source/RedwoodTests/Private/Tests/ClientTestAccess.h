@@ -66,6 +66,14 @@ public:
     return Client.bJoinAwaitingReply;
   }
 
+  static bool HasHeldAssignment(const URedwoodClientInterface &Client) {
+    return Client.HeldAssignment.IsValid();
+  }
+
+  static const FString &OwnTicketId(const URedwoodClientInterface &Client) {
+    return Client.OwnTicketId;
+  }
+
   static bool IsInWorld(const URedwoodClientInterface &Client) {
     return Client.bInWorld;
   }
