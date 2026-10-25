@@ -2543,18 +2543,26 @@ bool FRedwoodBifrostClientChatSendTest::RunTest(const FString &Parameters) {
   );
   TestEqual(TEXT("A live line reaches the game"), Lines.Num(), 1);
 
-  // A refusal: the player reads a text of ours, the game gets the code.
+  // A refusal: the game gets the code, and the player reads the server's
+  // message, because for a mute it names the end and the reason.
   TCapture<FRedwoodChatSendOutput> Muted;
   H.Client()->SendChat(Party, TEXT("again"), Muted.Delegate());
   H.Socket()->Refuse(
-    H.Socket()->Last(TEXT("chat.send")), TEXT("muted"), TEXT("muted by staff")
+    H.Socket()->Last(TEXT("chat.send")),
+    TEXT("muted"),
+    TEXT("You are muted until 2026-10-24T13:00:00.000Z (Spam.).")
   );
   TestEqual(TEXT("The refusal is answered"), Muted.Count, 1);
   TestEqual(TEXT("With the code"), Muted.Last.Code, TEXT("muted"));
   TestEqual(
-    TEXT("And the player's text for it"),
+    TEXT("And the server's words for it"),
     Muted.Last.Error,
-    URedwoodClientInterface::ChatErrorText(TEXT("muted"), FString())
+    TEXT("You are muted until 2026-10-24T13:00:00.000Z (Spam.).")
+  );
+  TestEqual(
+    TEXT("A mute refusal with no message reads as a text of ours"),
+    URedwoodClientInterface::ChatErrorText(TEXT("muted"), FString()),
+    TEXT("You are muted and cannot send messages.")
   );
 
   // The game sends the same line again under the id it was given: Bifrost
