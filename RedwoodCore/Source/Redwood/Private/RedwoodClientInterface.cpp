@@ -182,11 +182,12 @@ void URedwoodClientInterface::NoteArrivedInWorld() {
   bTravelPending = false;
   bInWorld = true;
   // A join sent after this travel's one owns the flags now; its lost reply
-  // must keep its dropped assignment and its owed leave. When no leave is
-  // owed, that join is still out or was left, and the player, who is in the
-  // world now, must get zone transfers.
+  // must keep its dropped assignment and its owed leave, and its reply, not
+  // the arrival, opens the guard for it. When no leave is owed and no reply
+  // is awaited, that join was left, and the player, who is in the world
+  // now, must get zone transfers.
   if (TravelJoinSequence != JoinSequence) {
-    if (!bLeaveTicketingOwed) {
+    if (!bLeaveTicketingOwed && !bJoinAwaitingReply) {
       bAbandonedQueueJoin = false;
       bAssignmentExpected = true;
     }
@@ -201,17 +202,22 @@ void URedwoodClientInterface::NoteArrivedInWorld() {
 // at character select, where no assignment may move them.
 void URedwoodClientInterface::NoteLeftWorld() {
   bAssignmentExpected = false;
+  bJoinAwaitingReply = false;
   bInWorld = false;
   bTravelPending = false;
 }
 
 // A join replaces any ticket the server kept, so a leave owed for it would
-// cancel the new one. It also replaces a dropped join, from any entry point
-// (a ticketing join, a create that joins, a proxy join).
+// cancel the new one. From any entry point (a ticketing join, a create that
+// joins, a proxy join). HollowedOath#3609: the join opens the guard, and
+// replaces a dropped join, only when the realm accepts it (NoteJoinAnswered).
+// The server replays a dropped ticket's assignment at the resume, before it
+// answers the join that was held through the drop; until the answer, an
+// assignment is that replay.
 void URedwoodClientInterface::NoteJoinSent() {
   ++JoinSequence;
-  bAssignmentExpected = true;
-  bAbandonedQueueJoin = false;
+  bJoinAwaitingReply = true;
+  bAssignmentExpected = false;
   bLeaveTicketingOwed = false;
   // This client's own join: its assignment names a ticket it was not told
   // of, so the party ticket's check must not refuse it.
@@ -274,10 +280,11 @@ void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
       EndedPartyTicketIds.Contains(TicketId)) {
     return;
   }
-  // This member's own join, still out, keeps its own ticket: leave it, or
-  // its solo assignment could move the player after the party's travel.
-  if (bAssignmentExpected && AcceptedPartyTicketId.IsEmpty() && !bInWorld &&
-      !bTravelPending) {
+  // This member's own join, still out or accepted, keeps its own ticket:
+  // leave it, or its solo assignment could move the player after the
+  // party's travel.
+  if ((bAssignmentExpected || bJoinAwaitingReply) &&
+      AcceptedPartyTicketId.IsEmpty() && !bInWorld && !bTravelPending) {
     bLeaveTicketingOwed = true;
   }
   // A leader has one ticket, so a stale "queued" of the replaced one
@@ -285,9 +292,12 @@ void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
   if (!AcceptedPartyTicketId.IsEmpty()) {
     EndPartyTicket(AcceptedPartyTicketId);
   }
-  // As NoteJoinSent, but an owed leave stays and goes now: it cannot end
-  // the leader's ticket, and the party's travel would erase it.
+  // The notice is the server's word that the ticket exists, so it opens the
+  // guard at once, where an own join waits for its reply. An owed leave
+  // stays and goes now: it cannot end the leader's ticket, and the party's
+  // travel would erase it.
   ++JoinSequence;
+  bJoinAwaitingReply = false;
   bAssignmentExpected = true;
   bAbandonedQueueJoin = false;
   AcceptedPartyTicketId = TicketId;
@@ -336,16 +346,31 @@ void URedwoodClientInterface::ForgetPartyTickets() {
   RecentPartyTicketMessageIds.Reset();
 }
 
-// A join that the server refused gets no assignment, so a replay of an
-// earlier ticket must not move the player. The refusal left no ticket, so no
-// leave is owed. Call it before the game sees the reply: the game can join
-// again then. Only for the latest join: an older join's refusal must not
+// The realm's answer to a join. Accepted, the join's ticket is the only one
+// the server holds: its assignment may move the player, and a dropped
+// join's cannot come any more (HollowedOath#3609). Only while the join is
+// still awaited: the game may have left it, or gone back to character
+// select, since it went out, and the late acceptance must not undo that.
+// Refused, the join gets no assignment, so a replay of an earlier ticket
+// must not move the player; the refusal left no ticket, so no leave is
+// owed. Call it before the game sees the reply: the game can join again
+// then. Only for the latest join: an older join's answer must not open or
 // close the guard for a newer one.
 void URedwoodClientInterface::NoteJoinAnswered(
   const FString &Error, uint32 Sequence
 ) {
-  if (!Error.IsEmpty() && Sequence == JoinSequence) {
+  if (Sequence != JoinSequence) {
+    return;
+  }
+  if (!Error.IsEmpty()) {
+    bJoinAwaitingReply = false;
     bAssignmentExpected = false;
+    return;
+  }
+  if (bJoinAwaitingReply) {
+    bJoinAwaitingReply = false;
+    bAssignmentExpected = true;
+    bAbandonedQueueJoin = false;
   }
 }
 
@@ -367,6 +392,7 @@ void URedwoodClientInterface::HandleTicketingJoinReply(
 // must not move the player, and the ticket or assignment the server may
 // have kept is left at the next auth.
 void URedwoodClientInterface::NoteJoinLost() {
+  bJoinAwaitingReply = false;
   bAbandonedQueueJoin = true;
   bAssignmentExpected = false;
   bLeaveTicketingOwed = true;
@@ -3115,6 +3141,7 @@ void URedwoodClientInterface::ClearRealmDetails() {
   // HollowedOath#2886. The server can replay an assignment kept for the
   // last character; nothing here may accept it.
   bAssignmentExpected = false;
+  bJoinAwaitingReply = false;
   bInWorld = false;
   bAbandonedQueueJoin = false;
   bTravelPending = false;
@@ -3163,8 +3190,10 @@ void URedwoodClientInterface::BindRealmPushHandlers() {
       Update.Message = Message->AsObject()->GetStringField(TEXT("error"));
       // FORK(hollowed-oath): HollowedOath#2886. The ticket ended, so no
       // assignment comes for it; a replay of an earlier one must not move
-      // the player. No ticket is left, so no leave is owed.
+      // the player. No ticket is left, so no leave is owed, and the join's
+      // own answer, if it is still to come, opens nothing.
       bAssignmentExpected = false;
+      bJoinAwaitingReply = false;
       OnTicketingUpdate.ExecuteIfBound(Update);
 
       OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
@@ -3583,6 +3612,7 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
   // leave stays, because the old ticket still needs it.
   if (CharacterId != Session.GetSelectedCharacterId()) {
     bAssignmentExpected = false;
+    bJoinAwaitingReply = false;
     bInWorld = false;
     bAbandonedQueueJoin = false;
     bTravelPending = false;
@@ -3657,10 +3687,11 @@ void URedwoodClientInterface::SendSelectCharacter() {
 void URedwoodClientInterface::SendOwedLeave(
   const FString &AsPlayerId, bool bForce
 ) {
-  // Only this client's own join would lose its ticket to the leave; a
-  // party join is the leader's ticket (HollowedOath#3002).
+  // Only this client's own join, out or accepted, would lose its ticket to
+  // the leave; a party join is the leader's ticket (HollowedOath#3002).
   if (!bLeaveTicketingOwed ||
-      (bAssignmentExpected && AcceptedPartyTicketId.IsEmpty()) ||
+      ((bAssignmentExpected || bJoinAwaitingReply) &&
+       AcceptedPartyTicketId.IsEmpty()) ||
       (!bForce && !IsRealmConnected())) {
     return;
   }
@@ -3864,9 +3895,11 @@ void URedwoodClientInterface::LeaveTicketing(
   // FORK(hollowed-oath): HollowedOath#2886. The game leaves when it gives up
   // on a join, often because the Realm dropped. Whatever the server does with
   // the leave, the join's assignment must not move the player, and a leave
-  // that cannot go out now is owed.
+  // that cannot go out now is owed. A join still out is left with it: its
+  // acceptance, when it comes, must not open the guard.
   bAbandonedQueueJoin = true;
   bAssignmentExpected = false;
+  bJoinAwaitingReply = false;
 
   // FORK(hollowed-oath): HollowedOath#2929. Held while the session comes
   // back, like every realm request, and the held leave pays what was owed:
