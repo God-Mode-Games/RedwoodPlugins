@@ -202,26 +202,50 @@ void URedwoodClientInterface::NoteArrivedInWorld() {
 // at character select, where no assignment may move them.
 void URedwoodClientInterface::NoteLeftWorld() {
   bAssignmentExpected = false;
-  bJoinAwaitingReply = false;
+  EndOwnJoin();
   bInWorld = false;
   bTravelPending = false;
 }
 
-// A join replaces any ticket the server kept, so a leave owed for it would
-// cancel the new one. From any entry point (a ticketing join, a create that
-// joins, a proxy join). HollowedOath#3609: the join opens the guard, and
-// replaces a dropped join, only when the realm accepts it (NoteJoinAnswered).
-// The server replays a dropped ticket's assignment at the resume, before it
-// answers the join that was held through the drop; until the answer, an
-// assignment is that replay.
+// A proxy join or a create that joins. It replaces any ticket the server
+// kept, so a leave owed for it would cancel the new one, and it replaces a
+// dropped join. The realm can push its assignment before it answers the
+// join, so the guard opens at the send. A ticketing join waits instead
+// (NoteTicketingJoinSent).
 void URedwoodClientInterface::NoteJoinSent() {
   ++JoinSequence;
-  bJoinAwaitingReply = true;
-  bAssignmentExpected = false;
+  EndOwnJoin();
+  bAssignmentExpected = true;
+  bAbandonedQueueJoin = false;
   bLeaveTicketingOwed = false;
   // This client's own join: its assignment names a ticket it was not told
   // of, so the party ticket's check must not refuse it.
   AcceptedPartyTicketId.Reset();
+}
+
+// HollowedOath#3609. A ticketing join (queue, custom, matchmaking). The
+// server replays a dropped ticket's assignment at the resume, before it
+// answers the join that was held through the drop, so the guard opens only
+// when the realm accepts the join (NoteTicketingJoinAccepted); the dropped
+// join and its owed leave stay until then, so a refusal leaves the old
+// ticket to the leave. The realm pushes the new ticket's assignment before
+// its answer too, so an assignment that names a ticket is kept until the
+// answer tells which ticket is the join's (HandleZoneAssignment).
+void URedwoodClientInterface::NoteTicketingJoinSent() {
+  ++JoinSequence;
+  EndOwnJoin();
+  bJoinAwaitingReply = true;
+  bAssignmentExpected = false;
+  AcceptedPartyTicketId.Reset();
+}
+
+// Nothing of this client's own ticketing join is live: no answer is
+// awaited, no assignment is kept for it, and no ticket of its own is
+// current. The guard's flags are the caller's to set.
+void URedwoodClientInterface::EndOwnJoin() {
+  bJoinAwaitingReply = false;
+  HeldAssignment.Reset();
+  OwnTicketId.Reset();
 }
 
 namespace {
@@ -297,7 +321,7 @@ void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
   // stays and goes now: it cannot end the leader's ticket, and the party's
   // travel would erase it.
   ++JoinSequence;
-  bJoinAwaitingReply = false;
+  EndOwnJoin();
   bAssignmentExpected = true;
   bAbandonedQueueJoin = false;
   AcceptedPartyTicketId = TicketId;
@@ -346,38 +370,76 @@ void URedwoodClientInterface::ForgetPartyTickets() {
   RecentPartyTicketMessageIds.Reset();
 }
 
-// The realm's answer to a join. Accepted, the join's ticket is the only one
-// the server holds: its assignment may move the player, and a dropped
-// join's cannot come any more (HollowedOath#3609). Only while the join is
-// still awaited: the game may have left it, or gone back to character
-// select, since it went out, and the late acceptance must not undo that.
-// Refused, the join gets no assignment, so a replay of an earlier ticket
-// must not move the player; the refusal left no ticket, so no leave is
-// owed. Call it before the game sees the reply: the game can join again
-// then. Only for the latest join: an older join's answer must not open or
-// close the guard for a newer one.
-void URedwoodClientInterface::NoteJoinAnswered(
-  const FString &Error, uint32 Sequence
-) {
-  if (Sequence != JoinSequence) {
-    return;
-  }
-  if (!Error.IsEmpty()) {
-    bJoinAwaitingReply = false;
-    bAssignmentExpected = false;
-    return;
-  }
-  if (bJoinAwaitingReply) {
-    bJoinAwaitingReply = false;
-    bAssignmentExpected = true;
+// A join that the server refused gets no assignment, so a replay of an
+// earlier ticket must not move the player at character select. In the
+// world, the server's zone transfers must go on: the refused join replaced
+// the dropped one whose replay they were held against. Call it before the
+// game sees the reply: the game can join again then.
+void URedwoodClientInterface::NoteJoinRefused() {
+  EndOwnJoin();
+  bAssignmentExpected = false;
+  if (bInWorld) {
     bAbandonedQueueJoin = false;
   }
 }
 
-void URedwoodClientInterface::HandleTicketingJoinReply(
+// The answer to a proxy join or a create that joins. Only for the latest
+// join: an older join's refusal must not close the guard for a newer one.
+void URedwoodClientInterface::NoteJoinAnswered(
   const FString &Error, uint32 Sequence
 ) {
-  NoteJoinAnswered(Error, Sequence);
+  if (!Error.IsEmpty() && Sequence == JoinSequence) {
+    NoteJoinRefused();
+  }
+}
+
+// HollowedOath#3609. The realm accepted a ticketing join: its ticket is the
+// only one the server holds, so a dropped join's assignment cannot come any
+// more, and the owed leave for it is paid by the replacement. Only while
+// the join is still awaited: the game may have left it, or gone back to
+// character select, since it went out, and the late acceptance must not
+// undo that. Answers the assignment kept during the wait, for the caller to
+// judge by the ticket once the game has seen the answer.
+TSharedPtr<FJsonObject> URedwoodClientInterface::NoteTicketingJoinAccepted(
+  const FString &TicketId
+) {
+  if (!bJoinAwaitingReply) {
+    return nullptr;
+  }
+  bJoinAwaitingReply = false;
+  bAssignmentExpected = true;
+  bAbandonedQueueJoin = false;
+  bLeaveTicketingOwed = false;
+  OwnTicketId = TicketId;
+  TSharedPtr<FJsonObject> Held = HeldAssignment;
+  HeldAssignment.Reset();
+  return Held;
+}
+
+// Only for the latest join: an older join's answer must not open or close
+// the guard for a newer one. Bifrost answers `unavailable` when the realm
+// did not answer in time; the realm may have made the ticket all the same,
+// so that is a lost reply, not a refusal.
+void URedwoodClientInterface::HandleTicketingJoinReply(
+  const TSharedPtr<FJsonObject> &Reply, uint32 Sequence
+) {
+  FString Code;
+  Reply->TryGetStringField(TEXT("code"), Code);
+  if (Code == TEXT("unavailable")) {
+    FailTicketingJoin(Sequence);
+    return;
+  }
+  const FString Error = Reply->GetStringField(TEXT("error"));
+  TSharedPtr<FJsonObject> Held;
+  if (Sequence == JoinSequence) {
+    if (!Error.IsEmpty()) {
+      NoteJoinRefused();
+    } else {
+      FString TicketId;
+      Reply->TryGetStringField(TEXT("ticketId"), TicketId);
+      Held = NoteTicketingJoinAccepted(TicketId);
+    }
+  }
   FRedwoodTicketingUpdate Update;
   Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
   Update.Message = Error;
@@ -386,13 +448,19 @@ void URedwoodClientInterface::HandleTicketingJoinReply(
   if (!Error.IsEmpty()) {
     OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
   }
+  // The assignment the realm pushed before its answer, after the game has
+  // seen the answer, as the game expects them. Not when the game joined
+  // again from its handler: that join replaced the ticket.
+  if (Held.IsValid() && Sequence == JoinSequence) {
+    HandleZoneAssignment(Held);
+  }
 }
 
 // A join whose reply was lost: the game gives up on it, so its assignment
 // must not move the player, and the ticket or assignment the server may
 // have kept is left at the next auth.
 void URedwoodClientInterface::NoteJoinLost() {
-  bJoinAwaitingReply = false;
+  EndOwnJoin();
   bAbandonedQueueJoin = true;
   bAssignmentExpected = false;
   bLeaveTicketingOwed = true;
@@ -3141,7 +3209,7 @@ void URedwoodClientInterface::ClearRealmDetails() {
   // HollowedOath#2886. The server can replay an assignment kept for the
   // last character; nothing here may accept it.
   bAssignmentExpected = false;
-  bJoinAwaitingReply = false;
+  EndOwnJoin();
   bInWorld = false;
   bAbandonedQueueJoin = false;
   bTravelPending = false;
@@ -3161,6 +3229,87 @@ void URedwoodClientInterface::ApplyRegions(
       TEXT("realm:regions"), MakeShared<FJsonValueObject>(Response)
     );
   }
+}
+
+// FORK(hollowed-oath): HollowedOath#2886. A zone assignment
+// (realm:servers:connect-to-instance) sent again after a reconnect can be
+// for a request the game dropped, for a character the player no longer
+// plays, or reach a player who is at character select with no join. None may
+// move the player. An old server sends no characterId; its assignment moves
+// as before.
+void URedwoodClientInterface::HandleZoneAssignment(
+  const TSharedPtr<FJsonObject> &MessageObject
+) {
+  FString AssignedCharacterId;
+  MessageObject->TryGetStringField(TEXT("characterId"), AssignedCharacterId);
+  const bool bForAnotherCharacter = !AssignedCharacterId.IsEmpty() &&
+    AssignedCharacterId != Session.GetSelectedCharacterId();
+  // HollowedOath#3002. A party ticket's assignment names it. A member
+  // that the server told of a party ticket takes only that ticket's
+  // assignment; in the world, it still takes a zone transfer with no
+  // ticket. An ended ticket has no valid assignment left.
+  FString AssignedTicketId;
+  MessageObject->TryGetStringField(TEXT("ticketId"), AssignedTicketId);
+  const bool bNotThePartyTicket = !AcceptedPartyTicketId.IsEmpty() &&
+    (AssignedTicketId.IsEmpty() ? !bInWorld
+                                : AssignedTicketId != AcceptedPartyTicketId);
+  const bool bEndedTicket = !AssignedTicketId.IsEmpty() &&
+    EndedPartyTicketIds.Contains(AssignedTicketId);
+  // HollowedOath#3609. The realm pushes a ticket's assignment before it
+  // answers the join that made the ticket, and the push and the answer
+  // travel on their own paths. While this client's own ticketing join waits
+  // for its answer, an assignment that names a ticket is the new join's or
+  // the replay of a dropped one; the answer's ticket tells which, so it is
+  // kept until then, the latest one. One with no ticket is an old
+  // server's, and is judged as before.
+  if (bJoinAwaitingReply && !AssignedTicketId.IsEmpty() &&
+      !bForAnotherCharacter && !bEndedTicket) {
+    HeldAssignment = MessageObject;
+    return;
+  }
+  // The answer named the join's ticket: another ticket's assignment is a
+  // replay, in the world too.
+  const bool bNotTheOwnTicket = !OwnTicketId.IsEmpty() &&
+    !AssignedTicketId.IsEmpty() && AssignedTicketId != OwnTicketId;
+  if ((!bAssignmentExpected && !bInWorld) || bAbandonedQueueJoin ||
+      bForAnotherCharacter || bNotThePartyTicket || bEndedTicket ||
+      bNotTheOwnTicket) {
+    UE_LOG(
+      LogRedwood,
+      Warning,
+      TEXT(
+        "Ignoring a zone assignment for a dropped queue request or another character."
+      )
+    );
+    return;
+  }
+
+  // See NoteArrivedInWorld.
+  bTravelPending = true;
+  TravelJoinSequence = JoinSequence;
+  // The ticket is used: a "queued" for it sent again must not arm the
+  // guard for a replay of this assignment, and the own ticket's check must
+  // not refuse the server's later zone transfers.
+  if (!AssignedTicketId.IsEmpty()) {
+    EndPartyTicket(AssignedTicketId);
+    if (AssignedTicketId == OwnTicketId) {
+      OwnTicketId.Reset();
+    }
+  }
+
+  bool bShouldStitch = MessageObject->GetBoolField(TEXT("shouldStitch"));
+  ServerConnection = MessageObject->GetStringField(TEXT("connection"));
+  ServerToken = MessageObject->GetStringField(TEXT("token"));
+
+  if (bShouldStitch) {
+    FURL URL = GetConnectionURL();
+    OnRequestToStitchServer.Broadcast(URL);
+  } else {
+    FString ConsoleCommand = GetConnectionConsoleCommand();
+    OnRequestToJoinServer.Broadcast(ConsoleCommand);
+  }
+
+  OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
 }
 
 // FORK(hollowed-oath): the realm's pushes, bound once on the one connection.
@@ -3193,7 +3342,7 @@ void URedwoodClientInterface::BindRealmPushHandlers() {
       // the player. No ticket is left, so no leave is owed, and the join's
       // own answer, if it is still to come, opens nothing.
       bAssignmentExpected = false;
-      bJoinAwaitingReply = false;
+      EndOwnJoin();
       OnTicketingUpdate.ExecuteIfBound(Update);
 
       OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
@@ -3219,62 +3368,7 @@ void URedwoodClientInterface::BindRealmPushHandlers() {
   Connection->OnEvent(
     TEXT("realm:servers:connect-to-instance"),
     [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
-      TSharedPtr<FJsonObject> MessageObject = Message->AsObject();
-
-      // FORK(hollowed-oath): HollowedOath#2886. A zone assignment sent again
-      // after a reconnect can be for a request the game dropped, for a
-      // character the player no longer plays, or reach a player who is at
-      // character select with no join. None may move the player.
-      // An old server sends no characterId; its assignment moves as before.
-      FString AssignedCharacterId;
-      MessageObject->TryGetStringField(TEXT("characterId"), AssignedCharacterId);
-      const bool bForAnotherCharacter = !AssignedCharacterId.IsEmpty() &&
-        AssignedCharacterId != Session.GetSelectedCharacterId();
-      // HollowedOath#3002. A party ticket's assignment names it. A member
-      // that the server told of a party ticket takes only that ticket's
-      // assignment; in the world, it still takes a zone transfer with no
-      // ticket. An ended ticket has no valid assignment left.
-      FString AssignedTicketId;
-      MessageObject->TryGetStringField(TEXT("ticketId"), AssignedTicketId);
-      const bool bNotThePartyTicket = !AcceptedPartyTicketId.IsEmpty() &&
-        (AssignedTicketId.IsEmpty() ? !bInWorld
-                                    : AssignedTicketId != AcceptedPartyTicketId);
-      const bool bEndedTicket = !AssignedTicketId.IsEmpty() &&
-        EndedPartyTicketIds.Contains(AssignedTicketId);
-      if ((!bAssignmentExpected && !bInWorld) || bAbandonedQueueJoin ||
-          bForAnotherCharacter || bNotThePartyTicket || bEndedTicket) {
-        UE_LOG(
-          LogRedwood,
-          Warning,
-          TEXT(
-            "Ignoring a zone assignment for a dropped queue request or another character."
-          )
-        );
-        return;
-      }
-
-      // FORK(hollowed-oath): HollowedOath#2886. See NoteArrivedInWorld.
-      bTravelPending = true;
-      TravelJoinSequence = JoinSequence;
-      // The ticket is used: a "queued" for it sent again must not arm the
-      // guard for a replay of this assignment.
-      if (!AssignedTicketId.IsEmpty()) {
-        EndPartyTicket(AssignedTicketId);
-      }
-
-      bool bShouldStitch = MessageObject->GetBoolField(TEXT("shouldStitch"));
-      ServerConnection = MessageObject->GetStringField(TEXT("connection"));
-      ServerToken = MessageObject->GetStringField(TEXT("token"));
-
-      if (bShouldStitch) {
-        FURL URL = GetConnectionURL();
-        OnRequestToStitchServer.Broadcast(URL);
-      } else {
-        FString ConsoleCommand = GetConnectionConsoleCommand();
-        OnRequestToJoinServer.Broadcast(ConsoleCommand);
-      }
-
-      OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+      HandleZoneAssignment(Message->AsObject());
     }
   );
 
@@ -3612,7 +3706,7 @@ void URedwoodClientInterface::SetSelectedCharacter(FString CharacterId) {
   // leave stays, because the old ticket still needs it.
   if (CharacterId != Session.GetSelectedCharacterId()) {
     bAssignmentExpected = false;
-    bJoinAwaitingReply = false;
+    EndOwnJoin();
     bInWorld = false;
     bAbandonedQueueJoin = false;
     bTravelPending = false;
@@ -3777,15 +3871,13 @@ void URedwoodClientInterface::JoinQueue(
 
   OnTicketingUpdate = OnUpdate;
 
-  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
+  NoteTicketingJoinSent(); // FORK(hollowed-oath): HollowedOath#2886, #3609.
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
     TEXT("realm:ticketing:join:queue"),
     Payload,
     Replies.Track([this, Sequence = JoinSequence](auto Response) {
-      HandleTicketingJoinReply(
-        Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
-      );
+      HandleTicketingJoinReply(Response[0]->AsObject(), Sequence);
     }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
   );
 }
@@ -3876,15 +3968,13 @@ void URedwoodClientInterface::AttemptJoinCustom() {
   }
   Payload->SetArrayField(TEXT("regions"), DesiredRegions);
 
-  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
+  NoteTicketingJoinSent(); // FORK(hollowed-oath): HollowedOath#2886, #3609.
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
     TEXT("realm:ticketing:join:custom"),
     Payload,
     Replies.Track([this, Sequence = JoinSequence](auto Response) {
-      HandleTicketingJoinReply(
-        Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
-      );
+      HandleTicketingJoinReply(Response[0]->AsObject(), Sequence);
     }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
   );
 }
@@ -3899,7 +3989,7 @@ void URedwoodClientInterface::LeaveTicketing(
   // acceptance, when it comes, must not open the guard.
   bAbandonedQueueJoin = true;
   bAssignmentExpected = false;
-  bJoinAwaitingReply = false;
+  EndOwnJoin();
 
   // FORK(hollowed-oath): HollowedOath#2929. Held while the session comes
   // back, like every realm request, and the held leave pays what was owed:
@@ -4244,15 +4334,13 @@ void URedwoodClientInterface::AttemptJoinMatchmaking() {
 
   Payload->SetObjectField(TEXT("data"), MatchmakingData);
 
-  NoteJoinSent(); // FORK(hollowed-oath): HollowedOath#2886.
+  NoteTicketingJoinSent(); // FORK(hollowed-oath): HollowedOath#2886, #3609.
   // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
   Connection->Rpc(
     TEXT("realm:ticketing:join:matchmaking"),
     Payload,
     Replies.Track([this, Sequence = JoinSequence](auto Response) {
-      HandleTicketingJoinReply(
-        Response[0]->AsObject()->GetStringField(TEXT("error")), Sequence
-      );
+      HandleTicketingJoinReply(Response[0]->AsObject(), Sequence);
     }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
   );
 }

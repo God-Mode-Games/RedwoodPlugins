@@ -683,24 +683,42 @@ private:
   );
   void NoteJoinSent();
   void NoteJoinAnswered(const FString &Error, uint32 Sequence);
+  void NoteJoinRefused();
   void NoteJoinLost();
+  // HollowedOath#3609. See the .cpp.
+  void NoteTicketingJoinSent();
+  TSharedPtr<FJsonObject> NoteTicketingJoinAccepted(const FString &TicketId);
+  void EndOwnJoin();
+  void HandleZoneAssignment(const TSharedPtr<FJsonObject> &MessageObject);
   TFunction<void()> MakeLostProxyJoin(
     uint32 Sequence, TFunction<void()> OnLost
   );
-  void HandleTicketingJoinReply(const FString &Error, uint32 Sequence);
+  void HandleTicketingJoinReply(
+    const TSharedPtr<FJsonObject> &Reply, uint32 Sequence
+  );
   // A join whose reply was lost: the game went back to character select, so
-  // its assignment must not move the player. A new join that the realm
-  // accepts clears it.
+  // its assignment must not move the player. A proxy join, a ticketing join
+  // that the realm accepts, or a join refused in the world clears it.
   bool bAbandonedQueueJoin = false;
   // The realm accepted a join or named a party ticket, or the player is in
   // the world. Otherwise an assignment is a replay for a player at character
   // select.
   bool bAssignmentExpected = false;
-  // A join is out and the realm has not answered it. HollowedOath#3609: the
-  // server replays a dropped ticket's assignment before it answers the join
-  // that replaces the ticket, so the guard opens at the answer, not the
-  // send. The owed leave still waits for this join. See NoteJoinSent.
+  // A ticketing join is out and the realm has not answered it.
+  // HollowedOath#3609: the server replays a dropped ticket's assignment
+  // before it answers the join that replaces the ticket, so the guard opens
+  // at the answer, not the send. The owed leave still waits for this join.
+  // See NoteTicketingJoinSent.
   bool bJoinAwaitingReply = false;
+  // An assignment that names a ticket, pushed while the join is awaited:
+  // the realm pushes before it answers. One slot, the latest; the answer's
+  // ticket judges it. See HandleZoneAssignment.
+  TSharedPtr<FJsonObject> HeldAssignment;
+  // The ticket of this client's own accepted ticketing join, from the
+  // realm's answer, until its assignment is used. While it is set, another
+  // ticket's assignment is a replay. Empty for an older realm that names
+  // no ticket.
+  FString OwnTicketId;
   // The travel of an accepted assignment arrived, and the player has not
   // left the world since. A refused or ended join does not clear it: the
   // server's zone transfers must still move the player.
