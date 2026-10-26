@@ -266,6 +266,14 @@ public:
 
   bool bRanPostLogin = false;
 
+  // FORK(hollowed-oath): server-only, not replicated. The character id the
+  // backend reports as still held by an earlier session of this account (the
+  // optional "reentryHeldCharacterId" sibling field of the player-auth
+  // response). Empty when the backend reports none, and always empty offline.
+  // Written before SetRedwoodCharacter so any listener of
+  // OnRedwoodCharacterUpdated already sees it.
+  FString ReentryHeldCharacterId;
+
 private:
   UFUNCTION()
   void OnRep_PartyId();

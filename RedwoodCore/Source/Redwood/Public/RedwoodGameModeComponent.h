@@ -5,10 +5,14 @@
 #include "Components/ActorComponent.h"
 #include "CoreMinimal.h"
 
+#include "RedwoodPendingOperations.h"
 #include "SocketIONative.h"
 
 #include "RedwoodGameModeComponent.generated.h"
 
+class APlayerState;
+class FJsonObject;
+class URedwoodPlayerStateComponent;
 class URedwoodServerGameSubsystem;
 
 // FORK(hollowed-oath): fork-added delegate, not in upstream Redwood. Part of
@@ -27,6 +31,30 @@ DECLARE_DELEGATE_RetVal_OneParam(
   bool, FRedwoodShouldRetainCharacterBinding, APlayerController *
 );
 
+// FORK(hollowed-oath): fork-added delegate, not in upstream Redwood. Called
+// when a player-auth reply arrives AFTER its connection already left. The
+// backend has bound the reply's (PlayerId, CharacterId) to this instance for a
+// player that no longer exists here, so nothing else would ever release it.
+// Return true to let the component emit a releasing player-left for the pair.
+// Both ids come from the validated reply, never from the client's URL options.
+// Unbound = no release (stock behavior).
+DECLARE_DELEGATE_RetVal_TwoParams(
+  bool, FRedwoodShouldReleaseDepartedAuth, const FString &, const FString &
+);
+
+// FORK(hollowed-oath): fork-added delegate. Called exactly once for every
+// RunSidecarPlayerAuth request, when that request is over: the reply came
+// (success or error), the sidecar socket dropped, the deadline passed
+// (AuthRequestDeadlineSeconds in the cpp), or the component ended. The game
+// uses it to drop the reservation it keeps for the request while the reply is
+// in flight. The string is the UNTRUSTED character id from the URL options;
+// use it only to find that reservation, never to authorize anything. The
+// controller is null when it is already gone. A request that did not go out
+// (no sidecar, no game mode) is reported the same way.
+DECLARE_DELEGATE_TwoParams(
+  FRedwoodAuthRequestSettled, APlayerController *, const FString &
+);
+
 UCLASS()
 class REDWOOD_API URedwoodGameModeComponent : public UActorComponent {
   GENERATED_BODY()
@@ -36,6 +64,7 @@ public:
 
   //~UActorComponent interface
   virtual void BeginPlay() override;
+  virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
   virtual void TickComponent(
     float DeltaTime,
     enum ELevelTick TickType,
@@ -134,6 +163,32 @@ public:
   // Unbound = stock behavior.
   FRedwoodShouldRetainCharacterBinding ShouldRetainCharacterBinding;
 
+  // FORK(hollowed-oath): see FRedwoodShouldReleaseDepartedAuth above.
+  FRedwoodShouldReleaseDepartedAuth ShouldReleaseDepartedAuth;
+
+  // FORK(hollowed-oath): see FRedwoodAuthRequestSettled above.
+  FRedwoodAuthRequestSettled AuthRequestSettled;
+
+  // FORK(hollowed-oath): the two decisions of the player-auth reply, split out
+  // of the async callback so tests can reach them without a live sidecar.
+  //
+  // Stores the reply's account data on the player state. Order matters:
+  // "reentryHeldCharacterId" and the item rows are set BEFORE
+  // SetRedwoodCharacter, so OnRedwoodCharacterUpdated listeners see them.
+  static void ApplyAuthSuccessToPlayerState(
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    const TSharedPtr<FJsonObject> &MessageStruct
+  );
+
+  // True when a departed player's late auth reply must be released: the game
+  // gate allows it AND no player state in Players carries the character.
+  static bool ShouldReleaseLateAuth(
+    const FRedwoodShouldReleaseDepartedAuth &Gate,
+    const TArray<APlayerState *> &Players,
+    const FString &PlayerId,
+    const FString &CharacterId
+  );
+
   UFUNCTION()
   void FlushPersistence();
 
@@ -158,6 +213,12 @@ private:
     const FString &CharacterId,
     const FString &Token
   );
+
+  // FORK(hollowed-oath): auth requests still waiting for their reply. Abandoned (controller
+  // kicked, AuthRequestSettled fired) when this component's sidecar socket drops, when a request
+  // passes its deadline, and on EndPlay. A reply that comes after that is "late": it never admits
+  // the kicked controller, but a late success still releases the validated ids.
+  FRedwoodPendingOperations PendingAuthRequests;
 
   float DatabasePersistenceInterval;
   float PostBeginPlayDelay;

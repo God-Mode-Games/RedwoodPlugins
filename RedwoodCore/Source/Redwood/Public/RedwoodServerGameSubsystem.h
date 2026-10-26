@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "RedwoodPendingOperations.h"
 #include "RedwoodGameplayTags.h"
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
@@ -206,25 +207,23 @@ public:
   // PlayerState); the characterId then comes from CharacterComponent->RedwoodCharacterId, which the
   // dispatch site has already verified equal to the authoritative id.
   //
-  // OnAckSettled (optional) fires EXACTLY ONCE per call, when this flush attempt has SETTLED --
-  // meaning the in-flight attempt resolved (success OR error), NOT that it committed. It runs after
-  // CompleteItemFlush in the async ack callback (both success and error), and synchronously on
-  // every early-return path that sends nothing (not dirty, sidecar down, unresolved records array,
-  // single-flight slot busy, empty build), so a caller can always count on receiving it. The
-  // detached-flush release barrier relies on this to order the binding-releasing player-left behind
-  // the item write (see FlushDetachedCharacterData): the backend's player-left tears down the
-  // character->instance binding this flush's auth gate needs, so the release must not fire until the
-  // flush has settled. Null (the default) for the ordinary tick-flush caller, which needs no
-  // completion signal.
+  // OnAckSettled runs after CompleteItemFlush, or synchronously if this attempt sends nothing.
+  // A parked detached attempt keeps its callback until it runs, unless its operation has already
+  // ended: ShouldRun then drops the retry and callback, because abandonment settled the caller.
+  // This orders the binding-releasing player-left behind the item attempt, not proof of a commit.
+  // The existing single-retry limit still settles an additional attempt immediately (#1534).
+  // Ordinary tick flushes need neither a completion callback nor an operation guard.
   //
   // Item LOADING has no counterpart here: item rows arrive in the SAME round trip as the rest of
   // the character (see FRedwoodCharacterBackend::Items), populated directly in
   // RedwoodPlayerStateCharacterUpdated() before OnRedwoodCharacterUpdated broadcasts, instead of a
   // separate later-arriving realm:characters:items:load call.
+  // A detached operation's guard must survive parking and every recursive retry.
   void FlushItemsForCharacterComponent(
     URedwoodPlayerStateComponent *PlayerStateComponent,
     URedwoodCharacterComponent *CharacterComponent,
-    TFunction<void()> OnAckSettled = nullptr
+    TFunction<void()> OnAckSettled = nullptr,
+    TFunction<bool()> ShouldRun = nullptr
   );
 
   // Offline/PIE counterpart to FlushItemsForCharacterComponent: appends CharacterComponent's item
@@ -322,6 +321,25 @@ public:
     const FString &CharacterId,
     const FString &PlayerId,
     bool bReleaseBindingWhenSettled = false
+  );
+
+  // Native overload of the above (UFUNCTIONs cannot take a TFunction, so the
+  // Blueprint-visible form stays as it is and forwards here with no callback).
+  // OnSettled runs EXACTLY ONCE on every exit, after the release was sent when
+  // one was requested: bad world or id, sidecar down, no usable pawn,
+  // nothing dirty, offline save, and the last write ack (success OR error).
+  // It reports that this flush/release EMIT is finished, NOT that the realm
+  // processed the player-left, and NOT that the data was saved: the sidecar-down
+  // exit calls it too, with the data still dirty. With writes in flight, a dropped
+  // sidecar socket, the deadline (DetachedFlushDeadlineSeconds in the cpp) or
+  // Deinitialize settles it WITHOUT sending the release; an ack after that is
+  // ignored, so no release can land after a replacement session took the character.
+  void FlushDetachedCharacterData(
+    APawn *Pawn,
+    const FString &CharacterId,
+    const FString &PlayerId,
+    bool bReleaseBindingWhenSettled,
+    TFunction<void()> OnSettled
   );
 
   // FORK(hollowed-oath): fork-added API (see FlushDetachedCharacterData
@@ -533,6 +551,11 @@ private:
   );
 
   TSharedPtr<FSocketIONative> Sidecar;
+
+  // FORK(hollowed-oath): FlushDetachedCharacterData operations with writes in flight. Abandoned
+  // (OnSettled runs, no release) when the sidecar socket drops, when an operation passes its
+  // deadline, and on Deinitialize, because the socket library never calls an ack that cannot come.
+  FRedwoodPendingOperations DetachedFlushSettlements;
 
   float UpdateSidecarRate = 3.f; // in seconds
   float UpdateSidecarLoadingRate = 0.2f; // in seconds
