@@ -689,7 +689,6 @@ private:
   void NoteTicketingJoinSent();
   TSharedPtr<FJsonObject> NoteTicketingJoinAccepted(const FString &TicketId);
   TSharedPtr<FJsonObject> TakeHeldAssignment(const FString &TicketId);
-  TSharedPtr<FJsonObject> TakeHeldAssignment(const FString &TicketId);
   void EndOwnJoin();
   void HandleZoneAssignment(const TSharedPtr<FJsonObject> &MessageObject);
   void HoldAssignment(
