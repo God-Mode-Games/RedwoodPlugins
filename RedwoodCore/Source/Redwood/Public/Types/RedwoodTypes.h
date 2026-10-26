@@ -10,6 +10,7 @@
 #include "RedwoodTypesAuth.h"
 #include "RedwoodTypesBlobs.h"
 #include "RedwoodTypesCharacters.h"
+#include "RedwoodTypesEvents.h" // FORK(hollowed-oath)
 #include "RedwoodTypesGlobalData.h"
 #include "RedwoodTypesGuilds.h"
 #include "RedwoodTypesParties.h"
