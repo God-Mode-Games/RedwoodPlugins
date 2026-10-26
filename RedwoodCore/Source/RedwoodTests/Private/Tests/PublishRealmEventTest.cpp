@@ -14,7 +14,7 @@
 //      pair is one), more than 16 args or an arg over 256 code points, a
 //      topic event with no topic or with a part that has no id, and a session
 //      event with no session id. The helpers refuse an empty id or one with a
-//      `/` in it, with an ensure and an empty topic.
+//      `/` in it, with a warning and an empty topic.
 //   4. ParsePublishRealmEventAnswer carries the realm's error through word for
 //      word, empty on success, and reports an answer that is not the realm's
 //      as an error, never as a line that went out.
@@ -179,14 +179,14 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FRedwoodPublishRealmEventBadIdTest::RunTest(const FString &Parameters) {
   using namespace RedwoodPublishRealmEventTest;
-  // Each refusal below raises an ensure on purpose: a topic with no id, or
+  // Each refusal below logs a warning on purpose: a topic with no id, or
   // with a `/` in an id, names nobody or someone else, and Bifrost would
   // store the line under it for good.
-  AddExpectedError(
-    TEXT("Ensure condition failed"), EAutomationExpectedErrorFlags::Contains, 0
-  );
-  AddExpectedError(
-    TEXT("Refused the realm topic"), EAutomationExpectedErrorFlags::Contains, 0
+  AddExpectedMessage(
+    TEXT("Refused the realm topic"),
+    ELogVerbosity::Warning,
+    EAutomationExpectedMessageFlags::Contains,
+    0
   );
 
   const FRedwoodRealmEvent Refused[] = {
