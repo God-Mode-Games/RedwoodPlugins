@@ -176,7 +176,10 @@ enum class ERedwoodSessionEffectKind : uint8 {
   // send goes out behind the repair, and the player's own line lands after
   // the lines they missed.
   ResumeChat,
-  // The held requests and the pending replies.
+  // The held requests and the pending replies. ReleaseHeld comes after
+  // RealmEntered: a ticketing join released here holds itself again while
+  // the owed leave sent there is out, and goes out at the leave's answer
+  // (HollowedOath#3609; the ticketing cluster in RedwoodClientInterface.h).
   StartGrace,
   StopGrace,
   ReleaseHeld,
