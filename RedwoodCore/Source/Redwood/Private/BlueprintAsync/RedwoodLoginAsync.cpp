@@ -29,10 +29,7 @@ void URedwoodLoginAsync::Activate() {
     bRememberMe,
     FRedwoodAuthUpdateDelegate::CreateLambda([this](FRedwoodAuthUpdate Update) {
       OnUpdate.Broadcast(Update);
-
-      if (Update.Type != ERedwoodAuthUpdateType::MustVerifyAccount) {
-        SetReadyToDestroy();
-      }
+      SetReadyToDestroy();
     })
   );
 }

@@ -7,12 +7,7 @@
 #include "RedwoodTypesAuth.generated.h"
 
 UENUM(BlueprintType)
-enum class ERedwoodAuthUpdateType : uint8 {
-  Success,
-  MustVerifyAccount,
-  Error,
-  Unknown
-};
+enum class ERedwoodAuthUpdateType : uint8 { Success, Error, Unknown };
 
 USTRUCT(BlueprintType)
 struct FRedwoodAuthUpdate {

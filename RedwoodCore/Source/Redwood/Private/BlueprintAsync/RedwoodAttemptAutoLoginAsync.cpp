@@ -17,10 +17,7 @@ void URedwoodAttemptAutoLoginAsync::Activate() {
   Target->AttemptAutoLogin(
     FRedwoodAuthUpdateDelegate::CreateLambda([this](FRedwoodAuthUpdate Update) {
       OnUpdate.Broadcast(Update);
-
-      if (Update.Type != ERedwoodAuthUpdateType::MustVerifyAccount) {
-        SetReadyToDestroy();
-      }
+      SetReadyToDestroy();
     })
   );
 }
