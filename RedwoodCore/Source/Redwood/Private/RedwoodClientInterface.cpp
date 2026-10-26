@@ -3974,31 +3974,38 @@ void URedwoodClientInterface::SendOwedLeave(
 // HollowedOath#3609. The one place a leave goes out, the game's and the owed
 // one alike, counted until the realm answers. The realm's ok is the leave's
 // enqueue: it ends whatever ticket the player holds, so it pays the owed
-// leave; the realm has no "no ticket" refusal. A leave lost with the socket
-// may not have run, so it is owed, unless a join since replaced the ticket
-// it was for. The answer releases a ticketing join that waited for it
-// (GateTicketingAttempt); a loss does not: the socket is down, and the
-// resume releases the hold.
+// leave; the realm has no "no ticket" refusal. Not when the leave went out
+// beside a join of the game's own (the game gives up on a join that is
+// out): the realm may have run the leave first, so the ticket the join then
+// made is still owed its leave, and the answer sends it once the join is
+// answered. A leave lost with the socket may not have run, so it is owed,
+// unless a join since replaced the ticket it was for. The answer releases a
+// ticketing join that waited for it (GateTicketingAttempt); a loss does
+// not: the socket is down, and the resume releases the hold.
 void URedwoodClientInterface::SendLeave(
   const FString &AsPlayerId, FRedwoodErrorOutputDelegate OnOutput
 ) {
   ++LeavesInFlight;
+  const bool bBesideJoin = JoinsInFlight > 0;
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), AsPlayerId);
   // HollowedOath#2886. See TrackReply.
   Connection->Rpc(
     TEXT("realm:ticketing:leave"),
     Payload,
-    Replies.Track([this, OnOutput](auto Response) {
+    Replies.Track([this, OnOutput, bBesideJoin, AsPlayerId](auto Response) {
       --LeavesInFlight;
       const FString Error =
         Response[0]->AsObject()->GetStringField(TEXT("error"));
-      if (Error.IsEmpty()) {
+      if (Error.IsEmpty() && !bBesideJoin) {
         bLeaveTicketingOwed = false;
       }
       OnOutput.ExecuteIfBound(Error);
       if (LeavesInFlight == 0) {
         HeldRequests.Release();
+      }
+      if (bBesideJoin && IsRealmReady()) {
+        SendOwedLeave(AsPlayerId);
       }
     }, [this, Sequence = JoinSequence, OnLost = MakeLostReply(OnOutput)]() {
       --LeavesInFlight;
