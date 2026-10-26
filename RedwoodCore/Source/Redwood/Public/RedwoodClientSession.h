@@ -132,13 +132,8 @@ struct REDWOOD_API FRedwoodSessionEvent {
     const FString &Token,
     const FString &Nickname
   );
-  // PlayerId is present when the account must verify its email: the push
-  // that confirms it names the player.
   static FRedwoodSessionEvent LoginRefused(
-    uint32 Seq,
-    const FString &Reason,
-    const FString &Message,
-    const FString &PlayerId = FString()
+    uint32 Seq, const FString &Reason, const FString &Message
   );
   static FRedwoodSessionEvent LoginLost(uint32 Seq);
   static FRedwoodSessionEvent EnterRealmOk(
@@ -191,8 +186,7 @@ enum class ERedwoodSessionEffectKind : uint8 {
   BroadcastAuthFailed, // Text = message
   ReportFirstConnect,
   LogFirstConnectFailure,
-  AnswerLogin, // RequestId, LoginAnswer, Text = message, or the player id
-  // of an account that must verify its email
+  AnswerLogin, // RequestId, LoginAnswer, Text = message
   AnswerRealmEntry, // RequestId, Text = error ("" is success)
   // To the adapter's own state.
   ApplyRegions, // Response
@@ -206,7 +200,7 @@ enum class ERedwoodSessionEffectKind : uint8 {
   ClearCredentials
 };
 
-enum class ERedwoodLoginAnswer : uint8 { Success, Error, MustVerify };
+enum class ERedwoodLoginAnswer : uint8 { Success, Error };
 
 struct REDWOOD_API FRedwoodSessionEffect {
   ERedwoodSessionEffectKind Kind = ERedwoodSessionEffectKind::ForgetSession;
