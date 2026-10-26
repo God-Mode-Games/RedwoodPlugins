@@ -13,10 +13,20 @@
 
 #include "RedwoodCurrencyTypes.generated.h"
 
+// The balance of each currency, keyed by the game's currency name (a gameplay tag name such as
+// "Currency.Gold"; the plugin never reads it). A currency with no key holds 0.
+using FRedwoodCurrencyBalances = TMap<FString, int64>;
+
+inline int64 GetCurrencyBalance(const FRedwoodCurrencyBalances &Balances, const FString &Currency) {
+  const int64 *Balance = Balances.Find(Currency);
+  return Balance ? *Balance : 0;
+}
+
 // One currency ledger entry, as the game server stages it. Amounts are int64 currency units here
 // and decimal strings on the wire. The backend recomputes every balance itself and refuses the
 // whole batch as final when BalanceAfter is not what it computed, so BalanceAfter must be chained
-// from the balance the backend holds (see URedwoodCharacterComponent::RebaseCurrency).
+// from the balance of the entry's own currency that the backend holds (see
+// URedwoodCharacterComponent::RebaseCurrency).
 USTRUCT()
 struct REDWOOD_API FRedwoodCurrencyEntry {
   GENERATED_BODY()
@@ -25,6 +35,11 @@ struct REDWOOD_API FRedwoodCurrencyEntry {
   // tell a replayed batch from a new one, so a resend must keep it.
   UPROPERTY()
   FString Id;
+
+  // The currency this entry changes. Every currency is its own chain: BalanceAfter is the balance
+  // of this currency only. The backend refuses an entry without one for good.
+  UPROPERTY()
+  FString Currency;
 
   UPROPERTY()
   int64 Delta = 0;
@@ -77,9 +92,9 @@ struct FRedwoodItemFlushSent {
   int32 CurrencyCount = 0;
   // The keys themselves, not only their count: a commit adds them to the snapshot's GrantKeys.
   TArray<FString> GrantKeys;
-  // The last sent entry's BalanceAfter: the balance the backend holds once this batch commits.
-  bool bHasBalanceAfter = false;
-  int64 BalanceAfter = 0;
+  // Per currency sent, its last entry's BalanceAfter: the balance the backend holds once this batch
+  // commits. Empty when the batch carries no currency.
+  FRedwoodCurrencyBalances BalancesAfter;
 };
 
 // What a flush reply proves about the batch it answers.
@@ -215,27 +230,47 @@ inline bool TryParseCurrencyAmount(const FString &Text, int64 &OutAmount) {
   return true;
 }
 
-// The field that carries a character's loaded currency, `{ amount, grants }`: beside "items" on
-// the player-auth reply, and inline on an offline character file.
+// The field that carries a character's loaded currency, `{ balances, grantKeys }`: beside "items"
+// on the player-auth reply, and inline on an offline character file.
 inline const TCHAR *const CurrencyLoadField = TEXT("currency");
 
-// Reads a `{ amount, grants }` object (CurrencyLoadSchema in the backend's interfaces.ts). Returns
-// false, with the outputs untouched, unless the amount is a strict amount string of at least zero
-// and every grant is a non-empty string. A load that fails this is a failed load, never a zero
+// Reads a `{ balances: [{ currency, amount }], grantKeys }` object (CurrencyLoadSchema in the
+// backend's interfaces.ts). A currency with no row holds 0. Returns false, with the outputs
+// untouched, unless every row names a currency once with a strict amount string of at least zero,
+// and every grant key is a non-empty string. A load that fails this is a failed load, never a zero
 // balance: a game server that started from zero would chain BalanceAfter values the backend
 // refuses for good.
 inline bool TryParseCurrencyLoad(
-  const TSharedPtr<FJsonObject> &CurrencyObject, int64 &OutAmount, TArray<FString> &OutGrantKeys
+  const TSharedPtr<FJsonObject> &CurrencyObject,
+  FRedwoodCurrencyBalances &OutBalances,
+  TArray<FString> &OutGrantKeys
 ) {
-  FString AmountText;
-  int64 Amount = 0;
+  const TArray<TSharedPtr<FJsonValue>> *BalanceValues = nullptr;
   const TArray<TSharedPtr<FJsonValue>> *GrantValues = nullptr;
-  // A string only: TryGetStringField also reads a JSON number, which may have been rounded.
-  if (!CurrencyObject.IsValid() || !CurrencyObject->HasTypedField<EJson::String>(TEXT("amount")) ||
-      !CurrencyObject->TryGetStringField(TEXT("amount"), AmountText) ||
-      !TryParseCurrencyAmount(AmountText, Amount) || Amount < 0 ||
-      !CurrencyObject->TryGetArrayField(TEXT("grants"), GrantValues)) {
+  if (!CurrencyObject.IsValid() ||
+      !CurrencyObject->TryGetArrayField(TEXT("balances"), BalanceValues) ||
+      !CurrencyObject->TryGetArrayField(TEXT("grantKeys"), GrantValues)) {
     return false;
+  }
+  FRedwoodCurrencyBalances Balances;
+  for (const TSharedPtr<FJsonValue> &BalanceValue : *BalanceValues) {
+    const TSharedPtr<FJsonObject> *Row = nullptr;
+    if (!BalanceValue.IsValid() || BalanceValue->Type != EJson::Object ||
+        !BalanceValue->TryGetObject(Row) || !Row) {
+      return false;
+    }
+    FString Currency;
+    FString AmountText;
+    int64 Amount = 0;
+    // Strings only: TryGetStringField also reads a JSON number, which may have been rounded.
+    if (!(*Row)->HasTypedField<EJson::String>(TEXT("currency")) ||
+        !(*Row)->TryGetStringField(TEXT("currency"), Currency) || Currency.IsEmpty() ||
+        Balances.Contains(Currency) || !(*Row)->HasTypedField<EJson::String>(TEXT("amount")) ||
+        !(*Row)->TryGetStringField(TEXT("amount"), AmountText) ||
+        !TryParseCurrencyAmount(AmountText, Amount) || Amount < 0) {
+      return false;
+    }
+    Balances.Add(Currency, Amount);
   }
   TArray<FString> GrantKeys;
   GrantKeys.Reserve(GrantValues->Num());
@@ -251,7 +286,7 @@ inline bool TryParseCurrencyLoad(
     }
     GrantKeys.Add(MoveTemp(GrantKey));
   }
-  OutAmount = Amount;
+  OutBalances = MoveTemp(Balances);
   OutGrantKeys = MoveTemp(GrantKeys);
   return true;
 }
@@ -279,19 +314,27 @@ inline void MergeGrantKeys(TArray<FString> &GrantKeys, const TArray<FString> &Ne
   }
 }
 
-// The same `{ amount, grants }` shape, for the offline character file. The amount is a decimal
-// string, as on the wire, so an offline file and a backend reply are read by the same rule.
+// The same `{ balances, grantKeys }` shape, for the offline character file. Amounts are decimal
+// strings, as on the wire, so an offline file and a backend reply are read by the same rule.
 inline TSharedPtr<FJsonObject> MakeCurrencyLoadObject(
-  int64 Amount, const TArray<FString> &GrantKeys
+  const FRedwoodCurrencyBalances &Balances, const TArray<FString> &GrantKeys
 ) {
   TSharedPtr<FJsonObject> CurrencyObject = MakeShared<FJsonObject>();
-  CurrencyObject->SetStringField(TEXT("amount"), LexToString(Amount));
+  TArray<TSharedPtr<FJsonValue>> BalanceValues;
+  BalanceValues.Reserve(Balances.Num());
+  for (const TPair<FString, int64> &Balance : Balances) {
+    TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+    Row->SetStringField(TEXT("currency"), Balance.Key);
+    Row->SetStringField(TEXT("amount"), LexToString(Balance.Value));
+    BalanceValues.Add(MakeShared<FJsonValueObject>(Row));
+  }
+  CurrencyObject->SetArrayField(TEXT("balances"), BalanceValues);
   TArray<TSharedPtr<FJsonValue>> GrantValues;
   GrantValues.Reserve(GrantKeys.Num());
   for (const FString &GrantKey : GrantKeys) {
     GrantValues.Add(MakeShared<FJsonValueString>(GrantKey));
   }
-  CurrencyObject->SetArrayField(TEXT("grants"), GrantValues);
+  CurrencyObject->SetArrayField(TEXT("grantKeys"), GrantValues);
   return CurrencyObject;
 }
 
@@ -311,11 +354,15 @@ DECLARE_MULTICAST_DELEGATE_TwoParams(
 // the game has set URedwoodServerGameSubsystem::bGameHandlesCurrencyDesync.
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnWriterFenceLost, const FString & /*CharacterId*/);
 
-// A reload gave the backend's balance, and every pending entry is now re-chained on top of it.
-// The game's running balance must restart from here: it is the last pending entry's BalanceAfter,
-// or Balance itself when nothing is pending. A game that keeps chaining from its old running
-// balance writes BalanceAfter values the backend refuses for good, and loses those entries.
-DECLARE_MULTICAST_DELEGATE_OneParam(FOnCurrencyRebased, int64 /*Balance*/);
+// A reload or a settled trade gave the backend's committed balances (every currency; one not in
+// the map holds 0), and every pending entry is now re-chained on top of the balance of its own
+// currency. The game's running balance of each currency must restart from here: it is the
+// BalanceAfter of the last pending entry of that currency, or the committed balance when none is
+// pending. A game that keeps chaining from its old running balance writes BalanceAfter values the
+// backend refuses for good, and loses those entries.
+DECLARE_MULTICAST_DELEGATE_OneParam(
+  FOnCurrencyRebased, const FRedwoodCurrencyBalances & /*Balances*/
+);
 
 // The alerts a committed flush raised (`alerts` on the ack), for the game to forward to GMs.
 DECLARE_MULTICAST_DELEGATE_OneParam(

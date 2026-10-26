@@ -202,9 +202,9 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::LoadCharacterFromDisk(
   // object (SaveCharacterJsonToDisk keeps it across a rewrite), so only an old file lacks it. A
   // present but unreadable object stays unknown.
   if (!JsonObject->HasField(CurrencyLoadField)) {
-    Character.CurrencyAmount = 0;
+    Character.CurrencyBalances.Reset();
     Character.GrantKeys.Reset();
-    Character.bCurrencyAmountUnknown = false;
+    Character.bCurrencyBalancesUnknown = false;
   }
 
   return Character;
@@ -336,25 +336,25 @@ FRedwoodCharacterBackend URedwoodCommonGameSubsystem::ParseCharacter(
 
   // The currency balance and grant keys, inline on an offline file. The player-auth reply carries
   // them beside "character" instead, and its graft sets them after this call. A character with no
-  // readable balance is marked unknown, never zero: a component seeded from it holds its currency
-  // until a load gives the real balance (see bCurrencyAmountUnknown).
+  // readable balances is marked unknown, never zero: a component seeded from it holds its currency
+  // until a load gives the real balance (see bCurrencyBalancesUnknown).
   const TSharedPtr<FJsonObject> *CurrencyObject = nullptr;
   if (CharacterObj->TryGetObjectField(CurrencyLoadField, CurrencyObject)) {
     // Offline files only; the ids are already-checked entry ids, so a plain string read is enough.
     (*CurrencyObject)->TryGetStringArrayField(
       OfflineAppliedEntryIdsField, Character.OfflineAppliedEntryIds
     );
-    if (!TryParseCurrencyLoad(*CurrencyObject, Character.CurrencyAmount, Character.GrantKeys)) {
+    if (!TryParseCurrencyLoad(*CurrencyObject, Character.CurrencyBalances, Character.GrantKeys)) {
       UE_LOG(
         LogRedwood,
         Error,
         TEXT("Character %s has an unreadable currency object; its balance is unknown"),
         *Character.Id
       );
-      Character.bCurrencyAmountUnknown = true;
+      Character.bCurrencyBalancesUnknown = true;
     }
   } else {
-    Character.bCurrencyAmountUnknown = true;
+    Character.bCurrencyBalancesUnknown = true;
   }
   // FORK(hollowed-oath) END
 
@@ -507,11 +507,11 @@ TArray<FRedwoodItemRecord> *URedwoodCommonGameSubsystem::ResolveItemsRecordsArra
 void URedwoodCommonGameSubsystem::WriteOfflineCurrency(
   const FRedwoodCharacterBackend &Character, const TSharedPtr<FJsonObject> &CharacterObject
 ) {
-  // The same `{ amount, grants }` shape as the auth reply, so ParseCharacter reads both the same
+  // The same `{ balances, grantKeys }` shape as the auth reply, so ParseCharacter reads both the same
   // way. An unknown balance is left out rather than written as a guess.
-  if (!Character.bCurrencyAmountUnknown) {
+  if (!Character.bCurrencyBalancesUnknown) {
     TSharedPtr<FJsonObject> CurrencyObject =
-      MakeCurrencyLoadObject(Character.CurrencyAmount, Character.GrantKeys);
+      MakeCurrencyLoadObject(Character.CurrencyBalances, Character.GrantKeys);
     // Inside the currency object, so it is kept and carried with the balance it belongs to.
     TArray<TSharedPtr<FJsonValue>> EntryIdValues;
     EntryIdValues.Reserve(Character.OfflineAppliedEntryIds.Num());

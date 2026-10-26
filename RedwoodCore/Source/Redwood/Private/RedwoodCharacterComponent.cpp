@@ -628,7 +628,7 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         // has it too.
         SeedWriterToken(RedwoodCharacterBackend.WriterToken);
         // FORK(hollowed-oath): a snapshot whose balance is stale must not seed a currency chain.
-        if (RedwoodCharacterBackend.bCurrencyAmountUnknown) {
+        if (RedwoodCharacterBackend.bCurrencyBalancesUnknown) {
           RequireCurrencyReload();
         }
         // FORK(hollowed-oath): what the component this one replaces never sent, and the snapshot
@@ -639,7 +639,7 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         // the marked seq; probe it before anything else goes out (see bInventorySeqUnconfirmed).
         if (RedwoodCharacterBackend.bInventorySeqUnconfirmed) {
           RequireItemSeqProbe(
-            RedwoodCharacterBackend.UnconfirmedInventorySeq, RedwoodCharacterBackend.bCurrencyAmountUnknown
+            RedwoodCharacterBackend.UnconfirmedInventorySeq, RedwoodCharacterBackend.bCurrencyBalancesUnknown
           );
         }
         // FORK(hollowed-oath): a snapshot the freeze marked (a respawn in the same session) starts
@@ -966,19 +966,19 @@ bool URedwoodCharacterComponent::QueueCurrency(
   // entry staged now is re-chained when it settles, from the balance after it or before it. A debit
   // that would go below zero on the lower one would then be held back for good, so refuse it now,
   // while the game can still undo the purchase it pays for. Credits always fit.
-  int64 TradeFloorRunning = 0;
-  const bool bTradeFloor = ServerSubsystem &&
-    ServerSubsystem->GetUnsettledTradeFloorBalance(RedwoodCharacterId, TradeFloorRunning);
-  auto AddToTradeFloor = [&TradeFloorRunning](int64 Delta) {
-    // Saturated: an overflowing chain is refused by the re-chain itself.
-    TradeFloorRunning = Delta > 0 && TradeFloorRunning > MAX_int64 - Delta
-      ? MAX_int64
-      : TradeFloorRunning + Delta;
-  };
-  if (bTradeFloor) {
-    for (const FRedwoodCurrencyEntry &Pending : PendingCurrencyEntries) {
-      AddToTradeFloor(Pending.Delta);
+  // Per currency: a trade floors only the currencies it moves.
+  FRedwoodCurrencyBalances TradeFloors;
+  if (ServerSubsystem) {
+    ServerSubsystem->GetUnsettledTradeFloorBalances(RedwoodCharacterId, TradeFloors);
+  }
+  auto AddToTradeFloor = [&TradeFloors](const FRedwoodCurrencyEntry &Entry) {
+    if (int64 *Floor = TradeFloors.Find(Entry.Currency)) {
+      // Saturated: an overflowing chain is refused by the re-chain itself.
+      *Floor = Entry.Delta > 0 && *Floor > MAX_int64 - Entry.Delta ? MAX_int64 : *Floor + Entry.Delta;
     }
+  };
+  for (const FRedwoodCurrencyEntry &Pending : PendingCurrencyEntries) {
+    AddToTradeFloor(Pending);
   }
 
   // Appended, never merged or de-duplicated: the backend checks each BalanceAfter in order, and a
@@ -1000,22 +1000,34 @@ bool URedwoodCharacterComponent::QueueCurrency(
       bAllQueued = false;
       continue;
     }
-    if (bTradeFloor && Entry.Delta < 0 && TradeFloorRunning + Entry.Delta < 0) {
+    // The same: the backend refuses an entry without a currency for good.
+    if (Entry.Currency.IsEmpty()) {
       UE_LOG(
         LogRedwood,
         Error,
-        TEXT("QueueCurrency: character %s has a trade unsettled and could hold only %lld after it; refused entry %s delta %lld"),
-        *RedwoodCharacterId,
-        TradeFloorRunning,
+        TEXT("QueueCurrency: refused entry %s (delta %lld): it names no currency"),
         *Entry.Id,
         Entry.Delta
       );
       bAllQueued = false;
       continue;
     }
-    if (bTradeFloor) {
-      AddToTradeFloor(Entry.Delta);
+    const int64 *TradeFloor = TradeFloors.Find(Entry.Currency);
+    if (TradeFloor && Entry.Delta < 0 && *TradeFloor + Entry.Delta < 0) {
+      UE_LOG(
+        LogRedwood,
+        Error,
+        TEXT("QueueCurrency: character %s has a trade unsettled and could hold only %lld %s after it; refused entry %s delta %lld"),
+        *RedwoodCharacterId,
+        *TradeFloor,
+        *Entry.Currency,
+        *Entry.Id,
+        Entry.Delta
+      );
+      bAllQueued = false;
+      continue;
     }
+    AddToTradeFloor(Entry);
     PendingCurrencyEntries.Add(Entry);
   }
   PendingGrantKeys.Append(GrantKeys);
@@ -1038,34 +1050,28 @@ int32 URedwoodCharacterComponent::GetGrantKeysToSendCount() const {
   return bCurrencyRebaseRequired ? 0 : PendingGrantKeys.Num();
 }
 
-void URedwoodCharacterComponent::RebaseCurrency(int64 Balance) {
+void URedwoodCharacterComponent::RebaseCurrency(const FRedwoodCurrencyBalances &Balances) {
   if (!bCurrencyRebaseRequired) {
-    UE_LOG(
-      LogRedwood,
-      Warning,
-      TEXT("RebaseCurrency: no rebase is required; ignoring the reloaded balance %lld"),
-      Balance
-    );
+    UE_LOG(LogRedwood, Warning, TEXT("RebaseCurrency: no rebase is required; ignoring the reloaded balances"));
     return;
   }
   if (bItemFlushInFlight || bCurrencyBatchUnconfirmed) {
     UE_LOG(
       LogRedwood,
       Warning,
-      TEXT("RebaseCurrency: a batch is in flight or unconfirmed; ignoring the reloaded balance %lld until it settles"),
-      Balance
+      TEXT("RebaseCurrency: a batch is in flight or unconfirmed; ignoring the reloaded balances until it settles")
     );
     return;
   }
 
   // On an overflow the rebase stays pending: the queue is held, not dropped, until a reload yields
   // a balance that fits.
-  if (TryRechainPendingCurrency(Balance)) {
+  if (TryRechainPendingCurrency(Balances)) {
     bCurrencyRebaseRequired = false;
   }
 }
 
-void URedwoodCharacterComponent::RechainCurrencyAfterTrade(int64 Balance) {
+void URedwoodCharacterComponent::RechainCurrencyAfterTrade(const FRedwoodCurrencyBalances &Balances) {
   // A batch whose reply is still open may or may not be in Balance, so no balance is known: a
   // re-chain could count its entries twice, and a reload would chain the pending entries on top of
   // that batch while it is still re-sent. The trade's hold makes this unreachable (a trade never
@@ -1088,51 +1094,61 @@ void URedwoodCharacterComponent::RechainCurrencyAfterTrade(int64 Balance) {
     NotifyItemFlushRefusedFinal(Reason);
     return;
   }
-  if (!TryRechainPendingCurrency(Balance)) {
+  if (!TryRechainPendingCurrency(Balances)) {
     bCurrencyRebaseRequired = true;
     return;
   }
-  OnCurrencyRebased.Broadcast(Balance);
+  OnCurrencyRebased.Broadcast(Balances);
 }
 
-bool URedwoodCharacterComponent::TryRechainPendingCurrency(int64 Balance) {
+bool URedwoodCharacterComponent::TryRechainPendingCurrency(const FRedwoodCurrencyBalances &Balances) {
   // Checked before anything is written: a batch that mixes stale and re-chained values is refused
   // for good. So is a chain below zero, and a final refusal freezes the character: keep such a
   // chain out of every batch instead. The caller holds the queue for a reload, and the reload's
-  // give-up logs what stays unsaved.
-  int64 Running = Balance;
+  // give-up logs what stays unsaved. Each currency is its own chain.
+  FRedwoodCurrencyBalances Running;
+  auto RunningOf = [&Running, &Balances](const FString &Currency) -> int64 & {
+    if (int64 *Found = Running.Find(Currency)) {
+      return *Found;
+    }
+    return Running.Add(Currency, GetCurrencyBalance(Balances, Currency));
+  };
   for (const FRedwoodCurrencyEntry &Entry : PendingCurrencyEntries) {
-    const bool bOverflows = Entry.Delta > 0 ? Running > MAX_int64 - Entry.Delta
-                                            : Running < MIN_int64 - Entry.Delta;
+    int64 &Balance = RunningOf(Entry.Currency);
+    const bool bOverflows = Entry.Delta > 0 ? Balance > MAX_int64 - Entry.Delta
+                                            : Balance < MIN_int64 - Entry.Delta;
     if (bOverflows) {
       UE_LOG(
         LogRedwood,
         Error,
-        TEXT("RebaseCurrency: entry %s overflows int64 from balance %lld; currency stays held"),
+        TEXT("RebaseCurrency: entry %s overflows int64 from %s balance %lld; currency stays held"),
         *Entry.Id,
-        Running
+        *Entry.Currency,
+        Balance
       );
       return false;
     }
-    Running += Entry.Delta;
-    if (Running < 0) {
+    Balance += Entry.Delta;
+    if (Balance < 0) {
       UE_LOG(
         LogRedwood,
         Error,
-        TEXT("Re-chaining currency: entry %s (delta %lld) of character %s takes the balance from %lld to %lld, below zero; currency stays held"),
+        TEXT("Re-chaining currency: entry %s (delta %lld) of character %s takes the %s balance from %lld to %lld, below zero; currency stays held"),
         *Entry.Id,
         Entry.Delta,
         *RedwoodCharacterId,
-        Balance,
-        Running
+        *Entry.Currency,
+        GetCurrencyBalance(Balances, Entry.Currency),
+        Balance
       );
       return false;
     }
   }
-  Running = Balance;
+  Running.Reset();
   for (FRedwoodCurrencyEntry &Entry : PendingCurrencyEntries) {
-    Running += Entry.Delta;
-    Entry.BalanceAfter = Running;
+    int64 &Balance = RunningOf(Entry.Currency);
+    Balance += Entry.Delta;
+    Entry.BalanceAfter = Balance;
   }
   return true;
 }

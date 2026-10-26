@@ -26,9 +26,10 @@ void LogCurrencyForStaff(
     UE_LOG(
       LogRedwood,
       Error,
-      TEXT("Currency for staff rebuild: character %s entry %s delta %lld reason %s, %s: %s. A re-grant must reuse entry id %s, so the backend refuses a second copy."),
+      TEXT("Currency for staff rebuild: character %s entry %s currency %s delta %lld reason %s, %s: %s. A re-grant must reuse entry id %s, so the backend refuses a second copy."),
       *CharacterId,
       *Entry.Id,
+      *Entry.Currency,
       Entry.Delta,
       *Entry.Reason,
       CurrencySaveStateText(

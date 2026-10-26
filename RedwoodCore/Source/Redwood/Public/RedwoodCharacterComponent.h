@@ -376,10 +376,10 @@ public:
   // FreezeAfterFinalRefusal) until it is hydrated again from the database.
   //
   // Returns false when anything was refused: every entry and key while the character is frozen or
-  // its writer fence is lost, or an entry whose id the backend would refuse. The caller must not
+  // its writer fence is lost, or an entry whose id or missing currency the backend would refuse. The caller must not
   // count a refused amount.
   // FORK(hollowed-oath): also a debit that would go below zero when an unsettled trade of this
-  // character settles (URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalance).
+  // character settles (URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalances).
   bool QueueCurrency(
     const TArray<FRedwoodCurrencyEntry> &Entries, const TArray<FString> &GrantKeys
   );
@@ -499,21 +499,21 @@ public:
   // that batch, so the hold is in place before the parked attempt CompleteItemFlush runs.
   void RequireCurrencyReload(bool bBeforeSettlingReply = false);
 
-  // Re-chains every pending entry's BalanceAfter from Balance (the amount just loaded from the
-  // backend) and allows currency to be sent again. Ignored unless a rebase is required, and while a
+  // Re-chains every pending entry's BalanceAfter from the balance of its currency in Balances (the
+  // balances just loaded from the backend) and allows currency to be sent again. Ignored unless a rebase is required, and while a
   // batch is in flight or unconfirmed: at any such time a pending entry may already be committed,
   // and re-chaining it would count it twice.
-  void RebaseCurrency(int64 Balance);
+  void RebaseCurrency(const FRedwoodCurrencyBalances &Balances);
 
-  // A trade of this character settled, and Balance is the backend balance after it: its own
-  // entries' last BalanceAfter when it committed, the balance before it when it did not apply.
-  // Every entry staged during the trade comes after it on the backend, so it is re-chained from
-  // Balance, and the game is told (OnCurrencyRebased): the game cannot know which balance its
+  // A trade of this character settled, and Balances are the backend balances after it: per
+  // currency, its own entries' last BalanceAfter when it committed, the balance before it when it
+  // did not apply. Every entry staged during the trade comes after it on the backend, so it is
+  // re-chained from the balance of its currency, and the game is told (OnCurrencyRebased): the game cannot know which balance its
   // running total should have used while the outcome was open. Nothing can be in flight here,
   // because the trade held this character's flushes; if one is, that is a bug, and the character
   // freezes (ensure). If a re-chained entry would overflow or go below zero, nothing is re-chained
   // and the queue waits for a reload instead (see RebaseCurrency).
-  void RechainCurrencyAfterTrade(int64 Balance);
+  void RechainCurrencyAfterTrade(const FRedwoodCurrencyBalances &Balances);
 
   // R26: what EndPlay does with the currency queues before the component goes. A batch in flight
   // is left to its reply (the subsystem settles it as a gone component's). An unconfirmed batch is
@@ -736,9 +736,9 @@ private:
   // See IsWriterFenceLost.
   bool bWriterFenceLost = false;
 
-  // Re-chains every pending entry from Balance. Returns false, with nothing changed, when an entry
-  // would overflow int64 or take the balance below zero.
-  bool TryRechainPendingCurrency(int64 Balance);
+  // Re-chains every pending entry from the balance of its currency in Balances. Returns false, with
+  // nothing changed, when an entry would overflow int64 or take its balance below zero.
+  bool TryRechainPendingCurrency(const FRedwoodCurrencyBalances &Balances);
 
   // The server subsystem of this component's game instance, or null (no world, or a client).
   URedwoodServerGameSubsystem *GetServerSubsystem() const;

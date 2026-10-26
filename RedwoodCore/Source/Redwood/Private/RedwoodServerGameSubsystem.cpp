@@ -2599,6 +2599,7 @@ static const TCHAR *ItemsEnvelopePlaceholderId = TEXT("game-server");
 static TSharedPtr<FJsonObject> MakeCurrencyEntryJson(const FRedwoodCurrencyEntry &Entry) {
   TSharedPtr<FJsonObject> EntryObject = MakeShareable(new FJsonObject);
   EntryObject->SetStringField(TEXT("id"), Entry.Id);
+  EntryObject->SetStringField(TEXT("currency"), Entry.Currency);
   EntryObject->SetStringField(TEXT("delta"), LexToString(Entry.Delta));
   EntryObject->SetStringField(TEXT("balanceAfter"), LexToString(Entry.BalanceAfter));
   EntryObject->SetStringField(TEXT("reason"), Entry.Reason);
@@ -2748,7 +2749,7 @@ static void CatchUpItemSeqFromSnapshot(
     CharacterComponent->SeedItemSeqFromCharacter(Snapshot.InventorySeq);
     // FORK(hollowed-oath): a component that catches up from a snapshot whose balance is stale
     // must not send currency chained from it.
-    if (Snapshot.bCurrencyAmountUnknown) {
+    if (Snapshot.bCurrencyBalancesUnknown) {
       CharacterComponent->RequireCurrencyReload();
     }
   }
@@ -2756,7 +2757,7 @@ static void CatchUpItemSeqFromSnapshot(
   // seq. This component probes it before its own batch could take that seq.
   if (Snapshot.bInventorySeqUnconfirmed) {
     CharacterComponent->RequireItemSeqProbe(
-      Snapshot.UnconfirmedInventorySeq, Snapshot.bCurrencyAmountUnknown
+      Snapshot.UnconfirmedInventorySeq, Snapshot.bCurrencyBalancesUnknown
     );
   }
 }
@@ -2970,9 +2971,9 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   ClaimCurrencyToSend(CharacterComponent, SentCurrencyEntries, SentGrantKeys);
   Sent.CurrencyCount = SentCurrencyEntries.Num();
   Sent.GrantKeys = SentGrantKeys;
-  if (SentCurrencyEntries.Num() > 0) {
-    Sent.bHasBalanceAfter = true;
-    Sent.BalanceAfter = SentCurrencyEntries.Last().BalanceAfter;
+  // In queue order, so the last entry of each currency wins.
+  for (const FRedwoodCurrencyEntry &Entry : SentCurrencyEntries) {
+    Sent.BalancesAfter.Add(Entry.Currency, Entry.BalanceAfter);
   }
 
   // FORK(hollowed-oath): a re-send of an unconfirmed currency batch carries no item rows. If the
@@ -3472,7 +3473,7 @@ static bool IsItemsFlushReplyCommitted(const FRedwoodItemFlushReply &Reply) {
 static bool IsItemsFlushBalanceUnconfirmed(
   const FRedwoodItemFlushReply &Reply, const FRedwoodItemFlushSent &Sent
 ) {
-  return IsItemsFlushReplyCommitted(Reply) && Sent.bHasBalanceAfter &&
+  return IsItemsFlushReplyCommitted(Reply) && Sent.BalancesAfter.Num() > 0 &&
     Reply.CommittedSeq > Sent.BatchSeq;
 }
 
@@ -3494,15 +3495,16 @@ void URedwoodServerGameSubsystem::WriteCommittedFlushToSnapshot(
       Snapshot.InventorySeq < Reply.CommittedSeq) {
     Snapshot.InventorySeq = Reply.CommittedSeq;
   }
-  // The committed balance, for the same reason: a recreated component and the game chain new
-  // entries from it. Only when the fence is exactly this batch's seq: a later fence means
+  // The committed balances, for the same reason: a recreated component and the game chain new
+  // entries from them. Only when the fence is exactly this batch's seq: a later fence means
   // something else (a trade) committed after it, and the last BalanceAfter is then not the
-  // balance. The snapshot then says so, and a reload sets it again.
-  if (bCommitted && Sent.bHasBalanceAfter && Reply.CommittedSeq == Sent.BatchSeq) {
-    Snapshot.CurrencyAmount = Sent.BalanceAfter;
-    Snapshot.bCurrencyAmountUnknown = false;
+  // balance. The snapshot then says so, and a reload sets it again. A currency the batch did not
+  // carry keeps its balance.
+  if (bCommitted && Sent.BalancesAfter.Num() > 0 && Reply.CommittedSeq == Sent.BatchSeq) {
+    Snapshot.CurrencyBalances.Append(Sent.BalancesAfter);
+    Snapshot.bCurrencyBalancesUnknown = false;
   } else if (IsItemsFlushBalanceUnconfirmed(Reply, Sent)) {
-    Snapshot.bCurrencyAmountUnknown = true;
+    Snapshot.bCurrencyBalancesUnknown = true;
   }
 
   // FORK(hollowed-oath): the committed grant keys, for the same reason: game code on a recreated
@@ -3559,7 +3561,7 @@ void URedwoodServerGameSubsystem::MarkSnapshotSeqUnconfirmed(
   }
   // The batch may have moved the balance and used its keys.
   if (bCarriedCurrency) {
-    Snapshot.bCurrencyAmountUnknown = true;
+    Snapshot.bCurrencyBalancesUnknown = true;
   }
 }
 
@@ -3591,7 +3593,9 @@ void URedwoodServerGameSubsystem::ApplyItemsFlushReply(
 }
 
 ERedwoodCurrencyReloadResult URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
-  const TSharedPtr<FJsonObject> &Reply, int64 &OutBalance, TArray<FString> &OutGrantKeys
+  const TSharedPtr<FJsonObject> &Reply,
+  FRedwoodCurrencyBalances &OutBalances,
+  TArray<FString> &OutGrantKeys
 ) {
   // Every error reply also carries a filler balance of "0", so the error is checked first: a
   // rebase from that filler would chain every held entry from zero.
@@ -3620,7 +3624,7 @@ ERedwoodCurrencyReloadResult URedwoodServerGameSubsystem::ParseCurrencyReloadRep
   // loaded state, and a reload that dropped them would leave the snapshot's keys stale.
   const TSharedPtr<FJsonObject> *Currency = nullptr;
   if (!Reply->TryGetObjectField(TEXT("currency"), Currency) || !Currency ||
-      !TryParseCurrencyLoad(*Currency, OutBalance, OutGrantKeys)) {
+      !TryParseCurrencyLoad(*Currency, OutBalances, OutGrantKeys)) {
     UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: the reply has no readable currency"));
     return ERedwoodCurrencyReloadResult::Retry;
   }
@@ -3630,32 +3634,30 @@ ERedwoodCurrencyReloadResult URedwoodServerGameSubsystem::ParseCurrencyReloadRep
 bool URedwoodServerGameSubsystem::ApplyCurrencyReload(
   URedwoodCharacterComponent *CharacterComponent,
   URedwoodPlayerStateComponent *PlayerStateComponent,
-  int64 Balance,
+  const FRedwoodCurrencyBalances &Balances,
   const TArray<FString> &GrantKeys
 ) {
   if (CharacterComponent->IsCurrencyRebaseRequired()) {
-    CharacterComponent->RebaseCurrency(Balance);
+    CharacterComponent->RebaseCurrency(Balances);
     if (CharacterComponent->IsCurrencyRebaseRequired()) {
       // RebaseCurrency logged why (an overflow). The entries stay held and unchanged.
-      UE_LOG(
-        LogRedwood, Error, TEXT("Currency reload failed: the rebase from %lld did not apply"), Balance
-      );
+      UE_LOG(LogRedwood, Error, TEXT("Currency reload failed: the rebase did not apply"));
       return false;
     }
   }
 
-  // The loaded balance is committed, so the snapshot takes it, as it takes a flush's. The keys are
+  // The loaded balances are committed and complete, so the snapshot takes them whole. The keys are
   // merged in (MergeGrantKeys): one that a racing batch committed after the reload read the
   // database would be lost by a replace. The merge adds a key that a flush committed but whose ack
   // was lost.
   if (PlayerStateComponent) {
     FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
-    Snapshot.CurrencyAmount = Balance;
-    Snapshot.bCurrencyAmountUnknown = false;
+    Snapshot.CurrencyBalances = Balances;
+    Snapshot.bCurrencyBalancesUnknown = false;
     MergeGrantKeys(Snapshot.GrantKeys, GrantKeys);
   }
 
-  CharacterComponent->OnCurrencyRebased.Broadcast(Balance);
+  CharacterComponent->OnCurrencyRebased.Broadcast(Balances);
   return true;
 }
 
@@ -3888,9 +3890,9 @@ void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
     GameInstance->GetTimerManager().ClearTimer(Reload->RetryTimer);
   }
 
-  int64 Balance = 0;
+  FRedwoodCurrencyBalances Balances;
   TArray<FString> GrantKeys;
-  switch (ParseCurrencyReloadReply(Reply, Balance, GrantKeys)) {
+  switch (ParseCurrencyReloadReply(Reply, Balances, GrantKeys)) {
     case ERedwoodCurrencyReloadResult::GiveUp: {
       // Another session owns the character, as a flush reply's writerFenceLost says. Every
       // component held here stops sending, exactly as after that flush reply: otherwise each one
@@ -3925,7 +3927,7 @@ void URedwoodServerGameSubsystem::HandleCurrencyReloadReply(
     // the balance already counts. It asks for a reload again once its probe has settled.
     if (IsValid(Component) && Component->IsCurrencyRebaseRequired() &&
         !Component->IsItemFlushInFlight() && !Component->IsCurrencyBatchUnconfirmed() &&
-        !ApplyCurrencyReload(Component, WeakPlayerState.Get(), Balance, GrantKeys)) {
+        !ApplyCurrencyReload(Component, WeakPlayerState.Get(), Balances, GrantKeys)) {
       RetryCurrencyReload(CharacterId);
       return;
     }
@@ -4105,7 +4107,7 @@ bool URedwoodServerGameSubsystem::ApplyOfflineCurrency(
   if (StagedEntryCount == 0 && StagedGrantCount == 0) {
     return false;
   }
-  if (Character.bCurrencyAmountUnknown) {
+  if (Character.bCurrencyBalancesUnknown) {
     // Chaining from a guessed balance would write a wrong one. The entries stay staged, and the
     // file keeps the balance it has.
     UE_LOG(
@@ -4125,7 +4127,7 @@ bool URedwoodServerGameSubsystem::ApplyOfflineCurrency(
 
   // The backend's flush rules, so offline play finds the same caller bugs a live server would.
   FString Refusal;
-  int64 Balance = Character.CurrencyAmount;
+  FRedwoodCurrencyBalances Balances = Character.CurrencyBalances;
   // Ids are checked uppercase hex at the queue, so a plain (case-blind) compare is exact here.
   TArray<FString> AppliedEntryIds = Character.OfflineAppliedEntryIds;
   for (const FRedwoodCurrencyEntry &Entry : Entries) {
@@ -4133,11 +4135,16 @@ bool URedwoodServerGameSubsystem::ApplyOfflineCurrency(
       Refusal = FString::Printf(TEXT("entry %s has no reason"), *Entry.Id);
       break;
     }
+    if (Entry.Currency.IsEmpty()) {
+      Refusal = FString::Printf(TEXT("entry %s has no currency"), *Entry.Id);
+      break;
+    }
     if (AppliedEntryIds.Contains(Entry.Id)) {
       Refusal = FString::Printf(TEXT("entry %s is already applied"), *Entry.Id);
       break;
     }
     AppliedEntryIds.Add(Entry.Id);
+    int64 &Balance = Balances.FindOrAdd(Entry.Currency, 0);
     // Balance is never negative here, so only a credit can pass int64.
     if (Entry.Delta > 0 && Balance > MAX_int64 - Entry.Delta) {
       Refusal = FString::Printf(TEXT("entry %s takes the balance past int64"), *Entry.Id);
@@ -4175,7 +4182,7 @@ bool URedwoodServerGameSubsystem::ApplyOfflineCurrency(
     return false;
   }
 
-  Character.CurrencyAmount = Balance;
+  Character.CurrencyBalances = MoveTemp(Balances);
   Character.GrantKeys.Append(GrantKeys);
   Character.OfflineAppliedEntryIds = MoveTemp(AppliedEntryIds);
   return true;
@@ -4355,8 +4362,9 @@ bool URedwoodServerGameSubsystem::PrepareItemTradeSide(
   OutSide.CharacterComponent = CharacterComponent;
   OutSide.PlayerStateComponent = PlayerStateComponent;
   OutSide.SeqBefore = CharacterComponent->GetLastCommittedItemSeq();
-  // Only read when the side pays or is paid; ChainTradeCurrency refuses an unknown balance then.
-  OutSide.BalanceBefore = Snapshot.bCurrencyAmountUnknown ? -1 : Snapshot.CurrencyAmount;
+  // Only read when the side pays or is paid; ChainTradeCurrency refuses unknown balances then.
+  OutSide.bBalancesKnown = !Snapshot.bCurrencyBalancesUnknown;
+  OutSide.BalancesBefore = Snapshot.CurrencyBalances;
   return true;
 }
 
@@ -4369,9 +4377,9 @@ bool URedwoodServerGameSubsystem::ChainTradeCurrency(
   // Each check here is one the backend makes too; refusing first spares both players a refusal
   // alert for a trade that could never apply.
   TArray<FString> SeenIds;
-  int64 Sum = 0;
-  int64 FromRunning = From.BalanceBefore;
-  int64 ToRunning = To.BalanceBefore;
+  FRedwoodCurrencyBalances Sums;
+  FRedwoodCurrencyBalances FromRunning;
+  FRedwoodCurrencyBalances ToRunning;
   TArray<FRedwoodCurrencyEntry> FromEntries;
   TArray<FRedwoodCurrencyEntry> ToEntries;
   for (const TPair<FString, FRedwoodCurrencyEntry> &Pair : CurrencyByCharacter) {
@@ -4399,12 +4407,26 @@ bool URedwoodServerGameSubsystem::ChainTradeCurrency(
       OutError = FString::Printf(TEXT("currency entry %s has a zero delta"), *Entry.Id);
       return false;
     }
-    // BalanceBefore is -1 when the snapshot's balance is unknown: nothing can be chained from it.
-    int64 &Running = bFrom ? FromRunning : ToRunning;
-    if (Running < 0) {
+    if (Entry.Currency.IsEmpty()) {
+      OutError = FString::Printf(TEXT("currency entry %s names no currency"), *Entry.Id);
+      return false;
+    }
+    const FRedwoodItemTradeSide &Side = bFrom ? From : To;
+    if (!Side.bBalancesKnown) {
       OutError = FString::Printf(TEXT("the balance of character %s is not known"), *Pair.Key);
       return false;
     }
+    FRedwoodCurrencyBalances &SideRunning = bFrom ? FromRunning : ToRunning;
+    // The backend takes one entry per side per currency.
+    if (SideRunning.Contains(Entry.Currency)) {
+      OutError = FString::Printf(
+        TEXT("character %s has more than one entry of currency %s"), *Pair.Key, *Entry.Currency
+      );
+      return false;
+    }
+    SideRunning.Add(Entry.Currency, GetCurrencyBalance(Side.BalancesBefore, Entry.Currency));
+    int64 &Running = SideRunning[Entry.Currency];
+    int64 &Sum = Sums.FindOrAdd(Entry.Currency, 0);
     const bool bOverflows = Entry.Delta > 0 ? Running > MAX_int64 - Entry.Delta : false;
     const bool bSumOverflows = Entry.Delta > 0 ? Sum > MAX_int64 - Entry.Delta
                                                : Sum < MIN_int64 - Entry.Delta;
@@ -4422,9 +4444,13 @@ bool URedwoodServerGameSubsystem::ChainTradeCurrency(
     FRedwoodCurrencyEntry &Chained = (bFrom ? FromEntries : ToEntries).Add_GetRef(Entry);
     Chained.BalanceAfter = Running;
   }
-  if (Sum != 0) {
-    OutError = FString::Printf(TEXT("trade currency does not sum to zero (%lld)"), Sum);
-    return false;
+  for (const TPair<FString, int64> &Sum : Sums) {
+    if (Sum.Value != 0) {
+      OutError = FString::Printf(
+        TEXT("trade currency %s does not sum to zero (%lld)"), *Sum.Key, Sum.Value
+      );
+      return false;
+    }
   }
   From.Entries = MoveTemp(FromEntries);
   To.Entries = MoveTemp(ToEntries);
@@ -4450,18 +4476,29 @@ bool URedwoodServerGameSubsystem::HasUnconfirmedCurrencyBatch(const FString &Cha
   return true;
 }
 
-bool URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalance(
-  const FString &CharacterId, int64 &OutFloorBalance
+void URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalances(
+  const FString &CharacterId, FRedwoodCurrencyBalances &OutFloorBalances
 ) const {
+  OutFloorBalances.Reset();
   for (const TPair<FString, FRedwoodPendingItemTrade> &Pair : PendingItemTrades) {
     for (const FRedwoodItemTradeSide *Side : {&Pair.Value.From, &Pair.Value.To}) {
-      if (Side->CharacterId == CharacterId && Side->Entries.Num() > 0) {
-        OutFloorBalance = FMath::Min(Side->BalanceBefore, Side->Entries.Last().BalanceAfter);
-        return true;
+      if (Side->CharacterId != CharacterId || Side->Entries.Num() == 0) {
+        continue;
       }
+      // In chain order, so the last entry of each currency gives the balance after the trade.
+      FRedwoodCurrencyBalances After;
+      for (const FRedwoodCurrencyEntry &Entry : Side->Entries) {
+        After.Add(Entry.Currency, Entry.BalanceAfter);
+      }
+      for (const TPair<FString, int64> &Balance : After) {
+        OutFloorBalances.Add(
+          Balance.Key,
+          FMath::Min(GetCurrencyBalance(Side->BalancesBefore, Balance.Key), Balance.Value)
+        );
+      }
+      return;
     }
   }
-  return false;
 }
 
 FRedwoodPendingItemTrade *URedwoodServerGameSubsystem::FindItemTradeOfCharacter(
@@ -4716,7 +4753,7 @@ void URedwoodServerGameSubsystem::HandleItemsTradeReply(
   for (const FRedwoodItemTradeSide &Side : Sides) {
     URedwoodCharacterComponent *Component = Side.CharacterComponent.Get();
     if (IsValid(Component) && Side.Entries.Num() > 0) {
-      Component->RechainCurrencyAfterTrade(Side.BalanceBefore);
+      Component->RechainCurrencyAfterTrade(Side.BalancesBefore);
     }
   }
   FinishItemsTrade(TradeId, Parsed.Error, -1, -1);
@@ -4813,9 +4850,8 @@ void URedwoodServerGameSubsystem::CommitItemsTrade(
     AsFlushReply.CommittedSeq = CommittedSeq;
     FRedwoodItemFlushSent AsFlushSent;
     AsFlushSent.BatchSeq = Side.SeqBefore + 1;
-    AsFlushSent.bHasBalanceAfter = Side.Entries.Num() > 0;
-    if (AsFlushSent.bHasBalanceAfter) {
-      AsFlushSent.BalanceAfter = Side.Entries.Last().BalanceAfter;
+    for (const FRedwoodCurrencyEntry &Entry : Side.Entries) {
+      AsFlushSent.BalancesAfter.Add(Entry.Currency, Entry.BalanceAfter);
     }
     if (URedwoodPlayerStateComponent *PlayerStateComponent = Side.PlayerStateComponent.Get()) {
       WriteCommittedFlushToSnapshot(PlayerStateComponent->RedwoodCharacter, AsFlushReply, AsFlushSent);
@@ -4825,11 +4861,14 @@ void URedwoodServerGameSubsystem::CommitItemsTrade(
       return;
     }
     Component->AdoptCommittedItemSeq(CommittedSeq);
-    if (!AsFlushSent.bHasBalanceAfter) {
+    if (AsFlushSent.BalancesAfter.Num() == 0) {
       return;
     }
     if (CommittedSeq == AsFlushSent.BatchSeq) {
-      Component->RechainCurrencyAfterTrade(AsFlushSent.BalanceAfter);
+      // Every balance after the trade: the moved currencies from its entries, the rest as before.
+      FRedwoodCurrencyBalances BalancesAfter = Side.BalancesBefore;
+      BalancesAfter.Append(AsFlushSent.BalancesAfter);
+      Component->RechainCurrencyAfterTrade(BalancesAfter);
     } else {
       Component->RequireCurrencyReload();
     }

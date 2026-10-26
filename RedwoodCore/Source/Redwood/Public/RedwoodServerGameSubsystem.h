@@ -124,12 +124,14 @@ struct FRedwoodItemTradeSide {
   FString CharacterId;
   TWeakObjectPtr<URedwoodCharacterComponent> CharacterComponent;
   TWeakObjectPtr<URedwoodPlayerStateComponent> PlayerStateComponent;
-  // The committed seq and balance when the trade went out. Nothing else of this character can
+  // The committed seq and balances when the trade went out. Nothing else of this character can
   // commit while the trade holds it, so the trade's own commit is SeqBefore + 1.
   int64 SeqBefore = 0;
-  int64 BalanceBefore = 0;
-  // This side's entries, with BalanceAfter chained from BalanceBefore. They are never in the flush
-  // queues: the trade is its own atomic write.
+  FRedwoodCurrencyBalances BalancesBefore;
+  // False when the snapshot did not know the balances: such a side can neither pay nor be paid.
+  bool bBalancesKnown = false;
+  // This side's entries, each with BalanceAfter chained from BalancesBefore of its currency. They
+  // are never in the flush queues: the trade is its own atomic write.
   TArray<FRedwoodCurrencyEntry> Entries;
 };
 
@@ -380,8 +382,8 @@ public:
   // FORK(hollowed-oath): offline/PIE counterpart of the currency half of the item flush. Takes the
   // component's staged entries and grant keys and applies them to the character snapshot, which
   // the save then writes to the file (URedwoodCommonGameSubsystem::WriteOfflineCurrency). It refuses the whole batch, as the
-  // backend would, when an entry would take the balance below zero or past int64, does not end at
-  // its BalanceAfter, has no reason or an id the file already applied, or a key is already used: the refused batch is dropped and
+  // backend would, when an entry would take the balance of its currency below zero or past int64,
+  // does not end at its BalanceAfter, has no currency, no reason or an id the file already applied, or a key is already used: the refused batch is dropped and
   // logged, and the balance does not move. An unknown balance applies nothing and keeps the
   // queues. Returns true when the snapshot changed.
   static bool ApplyOfflineCurrency(
@@ -399,9 +401,11 @@ public:
   // FORK(hollowed-oath): the trade also moves currency, and this function owns both characters'
   // flush lanes while it runs.
   //  - CurrencyByCharacter: each entry names its character (From or To). Give each entry its Id
-  //    (MakeCurrencyEntryId), Delta and the reason Currency.Reason.Trade; the deltas must sum to
-  //    zero. BalanceAfter is ignored: it is chained here from the committed balance on the
-  //    character's snapshot, the only balance the backend can check it against. A side that pays
+  //    (MakeCurrencyEntryId), Currency, Delta and the reason Currency.Reason.Trade; a side offers
+  //    any number of currencies, at most one entry each, and the deltas of each currency must sum
+  //    to zero.
+  //    BalanceAfter is ignored: it is chained here from the committed balance of its currency on
+  //    the character's snapshot, the only balance the backend can check it against. A side that pays
   //    or is paid must have no currency staged at send time (flush it first): the trade commits
   //    before anything staged, so a staged debit could go below zero once the trade has applied.
   //  - TradeId: the game's id for the trade (32 uppercase hex digits). Make a FRESH one for every
@@ -490,10 +494,10 @@ public:
   );
 
   // FORK(hollowed-oath): checks the trade currency and chains each side's BalanceAfter from its
-  // BalanceBefore, into the sides' Entries. Refuses (false, with OutError) what the backend would
-  // refuse: an entry for a character outside the trade, a bad or repeated id, a reason other than
-  // TradeCurrencyReason, a zero delta, a balance that would go below zero or past int64, or deltas
-  // that do not sum to zero.
+  // BalancesBefore, per currency, into the sides' Entries. Refuses (false, with OutError) what the
+  // backend would refuse: an entry for a character outside the trade, a bad or repeated id, no
+  // currency, a second entry of one currency for one side, a reason other than TradeCurrencyReason, a zero delta, a balance that would go below
+  // zero or past int64, or deltas of one currency that do not sum to zero.
   static bool ChainTradeCurrency(
     const TArray<TPair<FString, FRedwoodCurrencyEntry>> &CurrencyByCharacter,
     FRedwoodItemTradeSide &From,
@@ -501,12 +505,14 @@ public:
     FString &OutError
   );
 
-  // FORK(hollowed-oath): the lowest balance this character can hold once its unsettled trade
-  // settles: the balance after the trade when it pays, the balance before it when it is paid.
-  // Entries staged meanwhile are re-chained from whichever comes true, so each must fit on the
-  // lower one (QueueCurrency checks). False when no unsettled trade moves this character's
-  // currency.
-  bool GetUnsettledTradeFloorBalance(const FString &CharacterId, int64 &OutFloorBalance) const;
+  // FORK(hollowed-oath): per currency that an unsettled trade of this character moves, the lowest
+  // balance it can hold once the trade settles: the balance after the trade when it pays, the
+  // balance before it when it is paid. Entries staged meanwhile are re-chained from whichever comes
+  // true, so each must fit on the lower one (QueueCurrency checks). Empty when no unsettled trade
+  // moves this character's currency.
+  void GetUnsettledTradeFloorBalances(
+    const FString &CharacterId, FRedwoodCurrencyBalances &OutFloorBalances
+  ) const;
 
   // FORK(hollowed-oath): the sidecar's `timedOut` and `notForwarded` reply flags. On a sidecar
   // that predates them, the reply's error text is matched instead, with a Warning: these are the
@@ -607,20 +613,22 @@ public:
     const FRedwoodItemFlushSent &Sent
   );
 
-  // Reads the balance and the used grant keys off a realm:characters:items:load reply. Anything
+  // Reads the balances and the used grant keys off a realm:characters:items:load reply. Anything
   // but Applied leaves both outputs unusable.
   static ERedwoodCurrencyReloadResult ParseCurrencyReloadReply(
-    const TSharedPtr<FJsonObject> &Reply, int64 &OutBalance, TArray<FString> &OutGrantKeys
+    const TSharedPtr<FJsonObject> &Reply,
+    FRedwoodCurrencyBalances &OutBalances,
+    TArray<FString> &OutGrantKeys
   );
 
   // Applies a parsed reload to one component that asked for it: rebases its held currency from
-  // Balance, writes the balance to the snapshot and merges the grant keys into it, and tells the game
-  // (OnCurrencyRebased). Returns false when the rebase cannot apply; the component and the
+  // Balances, writes the balances to the snapshot and merges the grant keys into it, and tells the
+  // game (OnCurrencyRebased). Returns false when the rebase cannot apply; the component and the
   // snapshot are then unchanged and it stays held.
   static bool ApplyCurrencyReload(
     URedwoodCharacterComponent *CharacterComponent,
     URedwoodPlayerStateComponent *PlayerStateComponent,
-    int64 Balance,
+    const FRedwoodCurrencyBalances &Balances,
     const TArray<FString> &GrantKeys
   );
 

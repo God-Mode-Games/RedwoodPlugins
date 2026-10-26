@@ -128,17 +128,18 @@ struct FRedwoodCharacterBackend {
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
   int64 InventorySeq = 0;
 
-  // The committed currency balance, in currency units. Kept current by the item flush reply and by
-  // the currency reload, like InventorySeq, so a component recreated mid-session and the game
-  // start their balance chain from what the backend holds instead of from the login value.
+  // The committed balance of each currency, in currency units, keyed by currency name (a currency
+  // with no key holds 0). Kept current by the item flush reply and by the currency reload, like
+  // InventorySeq, so a component recreated mid-session and the game start each balance chain from
+  // what the backend holds instead of from the login value.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
-  int64 CurrencyAmount = 0;
+  TMap<FString, int64> CurrencyBalances;
 
-  // True when a reply confirmed the seq but not the balance (a replay acked behind a later fence:
-  // something else, such as a trade, committed after the batch). CurrencyAmount is then stale, and
-  // a component seeded from this snapshot must reload before it sends any currency.
+  // True when a reply confirmed the seq but not the balances (a replay acked behind a later fence:
+  // something else, such as a trade, committed after the batch). CurrencyBalances is then stale,
+  // and a component seeded from this snapshot must reload before it sends any currency.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")
-  bool bCurrencyAmountUnknown = false;
+  bool bCurrencyBalancesUnknown = false;
 
   // Set when a batch of a component that is gone (a respawn) may have committed at
   // UnconfirmedInventorySeq: no reply settled it. A component that flushes from this snapshot

@@ -866,7 +866,7 @@ bool URedwoodGameModeComponent::ApplyPlayerAuthCharacter(
   // session can commit.
   const TSharedPtr<FJsonObject> *CurrencyObject = nullptr;
   if (!Reply->TryGetObjectField(CurrencyLoadField, CurrencyObject) ||
-      !TryParseCurrencyLoad(*CurrencyObject, Character.CurrencyAmount, Character.GrantKeys)) {
+      !TryParseCurrencyLoad(*CurrencyObject, Character.CurrencyBalances, Character.GrantKeys)) {
     OutError = TEXT("The character could not be loaded (no readable currency)");
     return false;
   }
@@ -875,7 +875,7 @@ bool URedwoodGameModeComponent::ApplyPlayerAuthCharacter(
     OutError = TEXT("The character could not be loaded (no writer token)");
     return false;
   }
-  Character.bCurrencyAmountUnknown = false;
+  Character.bCurrencyBalancesUnknown = false;
 
   // Item rows ride this same reply (a sibling of "character", not nested in it), so they are on
   // the character before SetRedwoodCharacter hydrates the components below, instead of arriving
