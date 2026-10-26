@@ -163,6 +163,18 @@ struct FRedwoodCharacterBackend {
   UPROPERTY()
   TArray<FString> HandedOffGrantKeys;
 
+  // How many handed-off entries and keys, from the front, are a batch the destroyed component sent at
+  // HandedOffUnconfirmedSeq with no reply that settled it. The next component probes them at that
+  // seq: a notApplied answer puts them back in its queue, where an empty probe would lose them.
+  UPROPERTY()
+  int32 HandedOffUnconfirmedCurrencyCount = 0;
+
+  UPROPERTY()
+  int32 HandedOffUnconfirmedGrantCount = 0;
+
+  UPROPERTY()
+  int64 HandedOffUnconfirmedSeq = 0;
+
   // Set when the backend refused one of this character's flushes for good. Every component
   // hydrated from this snapshot starts frozen; only a fresh load from the database clears it.
   UPROPERTY(BlueprintReadWrite, Category = "Redwood")

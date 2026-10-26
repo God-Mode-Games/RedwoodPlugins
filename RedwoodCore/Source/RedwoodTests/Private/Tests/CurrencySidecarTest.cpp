@@ -3729,6 +3729,91 @@ bool FRedwoodCurrencySidecarEndPlayInFlightTest::RunTest(const FString &Paramete
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencySidecarEndPlayUnconfirmedTest,
+  "Redwood.Currency.Sidecar.EndPlayHandsOffUnconfirmed",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The pawn ends with a batch whose outcome is unknown. Its entry and key go to the PlayerState with
+// the batch's seq, and the next component probes them there. When the probe says the batch never
+// applied, the entry and the key are pending again and are saved: without them the probe would
+// carry nothing, and that money would be lost.
+bool FRedwoodCurrencySidecarEndPlayUnconfirmedTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencySidecarTest;
+  const FString RewardKey = TEXT("quest:Q1");
+  AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
+  AddExpectedErrorPlain(
+    TEXT("outcome UNKNOWN (it may be saved): its component ended with the batch unconfirmed"),
+    EAutomationExpectedErrorFlags::Contains,
+    2
+  );
+  FSidecarHarness Harness(*this);
+  FPawnParty Party;
+  if (!Harness.Connect() || !MakePawnParty(Harness, Party)) {
+    return false;
+  }
+  const FRedwoodCharacterBackend &Snapshot = Party.PlayerStateComponent->RedwoodCharacter;
+  Party.Component->QueueCurrency({MakeEntry(EntryIdA, 500, 1500, LootReason)}, {RewardKey});
+  Harness.Subsystem->FlushItemsForCharacterComponent(Party.PlayerStateComponent, Party.Component);
+  FRequest First;
+  if (!Harness.ReadRequest(FlushEvent, First)) {
+    return false;
+  }
+  Harness.Answer(First, TEXT(R"({"error":"Item flush request timed out.","committedSeq":-1,"timedOut":true})"));
+  Harness.PumpUntil([&Party]() { return !Party.Component->IsItemFlushInFlight(); });
+  if (!TestTrue(TEXT("The batch is unconfirmed"), Party.Component->IsCurrencyBatchUnconfirmed())) {
+    return false;
+  }
+
+  Party.DetachForEndPlay();
+  Party.Component->HandOffCurrencyAtEndPlay(EEndPlayReason::Destroyed);
+  TestEqual(TEXT("The unconfirmed entry is handed to the snapshot"), Snapshot.HandedOffCurrencyEntries.Num(), 1);
+  TestEqual(TEXT("And its key"), Snapshot.HandedOffGrantKeys.Num(), 1);
+  TestTrue(TEXT("Its seq is marked"), Snapshot.bInventorySeqUnconfirmed);
+
+  URedwoodCharacterComponent *Respawned = HydrateOnPlayerState(Party.PlayerState);
+  Harness.Subsystem->FlushItemsForCharacterComponent(Party.PlayerStateComponent, Respawned);
+  FRequest Probe;
+  if (!Harness.ReadRequest(FlushEvent, Probe)) {
+    return false;
+  }
+  TestTrue(TEXT("The respawned component probes first"), Probe.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("At the batch's seq"), BatchSeqOfFlush(Probe.Payload), SeededInventorySeq + 1);
+  TestEqual(TEXT("With the batch's entry"), CountArray(Probe.Payload, TEXT("currency")), 1);
+  TestEqual(TEXT("And its key"), CountArray(Probe.Payload, TEXT("grants")), 1);
+
+  Harness.Answer(
+    Probe,
+    FString::Printf(
+      TEXT(R"({"error":"probe not applied: batch seq consumed","committedSeq":%lld,"notApplied":true})"),
+      SeededInventorySeq + 1
+    )
+  );
+  Harness.PumpUntil([Respawned]() { return !Respawned->IsItemFlushInFlight(); });
+  TestEqual(TEXT("The entry is pending again"), Respawned->GetPendingCurrencyEntries().Num(), 1);
+  TestTrue(TEXT("And the key"), Respawned->HasGrantKey(RewardKey));
+
+  Harness.Subsystem->FlushItemsForCharacterComponent(Party.PlayerStateComponent, Respawned);
+  FRequest Load;
+  if (!Harness.ReadRequest(LoadEvent, Load)) {
+    return false;
+  }
+  Harness.Answer(Load, MakeLoadReply(TEXT("1000")));
+  FRequest Flush;
+  if (!Harness.ReadRequest(FlushEvent, Flush)) {
+    return false;
+  }
+  TestFalse(TEXT("A normal batch"), Flush.Payload->HasField(TEXT("probe")));
+  TestEqual(TEXT("After the consumed seq"), BatchSeqOfFlush(Flush.Payload), SeededInventorySeq + 2);
+  TestEqual(TEXT("The entry goes out"), CountArray(Flush.Payload, TEXT("currency")), 1);
+  TestEqual(TEXT("With its key"), CountArray(Flush.Payload, TEXT("grants")), 1);
+  Harness.Answer(Flush, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SeededInventorySeq + 2));
+  Harness.PumpUntil([Respawned]() { return !Respawned->IsItemFlushInFlight(); });
+  TestEqual(TEXT("The entry is saved"), Respawned->GetPendingCurrencyEntries().Num(), 0);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   FRedwoodCurrencySidecarRehydrateResetsTest,
   "Redwood.Currency.Sidecar.RehydrateForAnotherCharacterResets",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter

@@ -631,7 +631,7 @@ void URedwoodCharacterComponent::RedwoodPlayerStateCharacterUpdated() {
         if (RedwoodCharacterBackend.bCurrencyBalancesUnknown) {
           RequireCurrencyReload();
         }
-        // FORK(hollowed-oath): what the component this one replaces never sent, and the snapshot
+        // FORK(hollowed-oath): what the component this one replaces never sent or never had settled, and the snapshot
         // this one must reach at EndPlay.
         HydratedPlayerStateComponent = PlayerStateComponent;
         AdoptHandedOffCurrency(PlayerStateComponent->RedwoodCharacter);
@@ -1259,10 +1259,26 @@ void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay(EEndPlayReason::Type E
     PlayerStateComponent->GetOwner() != GetOwner() && IsValid(PlayerStateComponent->GetOwner()) &&
     !PlayerStateComponent->GetOwner()->IsActorBeingDestroyed();
 
+  // Entries and keys are handed off only when nothing can make their chain wrong behind the next
+  // component's back: the reload that rebases them must read a balance no open batch can still
+  // change, and a frozen or fenced character must not send at all.
+  const bool bFrozen = bFrozenAfterFinalRefusal ||
+    (ServerSubsystem && ServerSubsystem->IsCharacterFrozen(RedwoodCharacterId));
+  const bool bWorldEnding = EndPlayReason != EEndPlayReason::Destroyed &&
+    EndPlayReason != EEndPlayReason::RemovedFromWorld;
+  const TCHAR *Unsafe = bWorldEnding ? TEXT("the world is ending")
+    : !bSnapshotOutlivesComponent ? TEXT("no PlayerState of the character outlives the component")
+    : bItemFlushInFlight ? TEXT("a batch was in flight, so the balance they chain from waits on its reply")
+    : bFrozen ? TEXT("the character is frozen")
+    : bWriterFenceLost ? TEXT("the writer fence is lost")
+    : nullptr;
+
   // The front of the queues that already went out. A batch in flight is settled by its reply, as
   // a gone component's: that logs it and writes the snapshot (detached here, so the reply does
-  // not reach a component that is ending; the detach marks its seq at once). An unconfirmed batch has no reply coming: logged here
-  // as UNKNOWN, and its seq marked, so the next component probes it.
+  // not reach a component that is ending; the detach marks its seq at once). An unconfirmed batch
+  // has no reply coming: logged here as UNKNOWN, and its seq marked, so the next component probes
+  // it. When it can, the batch goes to the PlayerState with that seq, so the probe carries it and
+  // a notApplied answer puts it back in the queue.
   int32 FirstUnsentEntry = 0;
   int32 FirstUnsentGrant = 0;
   if (bItemFlushInFlight) {
@@ -1274,20 +1290,41 @@ void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay(EEndPlayReason::Type E
   } else if (bCurrencyBatchUnconfirmed) {
     FirstUnsentEntry = FMath::Clamp(UnconfirmedCurrencyCount, 0, PendingCurrencyEntries.Num());
     FirstUnsentGrant = FMath::Clamp(UnconfirmedGrantCount, 0, PendingGrantKeys.Num());
-    LogCurrencyForStaff(
-      RedwoodCharacterId,
-      TEXT("its component ended with the batch unconfirmed"),
-      MakeArrayView(PendingCurrencyEntries).Left(FirstUnsentEntry),
-      FirstUnsentEntry,
-      MakeArrayView(PendingGrantKeys).Left(FirstUnsentGrant),
-      FirstUnsentGrant
-    );
+    const TConstArrayView<FRedwoodCurrencyEntry> UnconfirmedEntries =
+      MakeArrayView(PendingCurrencyEntries).Left(FirstUnsentEntry);
+    const TConstArrayView<FString> UnconfirmedGrantKeys =
+      MakeArrayView(PendingGrantKeys).Left(FirstUnsentGrant);
     if (bSnapshotOutlivesComponent) {
       URedwoodServerGameSubsystem::MarkSnapshotSeqUnconfirmed(
         PlayerStateComponent->RedwoodCharacter,
         UnconfirmedBatchSeq,
         FirstUnsentEntry > 0 || FirstUnsentGrant > 0
       );
+    }
+    // Only at the front of an empty hand-off, and only while the snapshot probes this very seq: the
+    // next component probes whatever is at the front, at the snapshot's marked seq.
+    const bool bHandOnUnconfirmed = !Unsafe && (FirstUnsentEntry > 0 || FirstUnsentGrant > 0) &&
+      PlayerStateComponent->RedwoodCharacter.HandedOffCurrencyEntries.Num() == 0 &&
+      PlayerStateComponent->RedwoodCharacter.HandedOffGrantKeys.Num() == 0 &&
+      PlayerStateComponent->RedwoodCharacter.bInventorySeqUnconfirmed &&
+      PlayerStateComponent->RedwoodCharacter.UnconfirmedInventorySeq == UnconfirmedBatchSeq;
+    LogCurrencyForStaff(
+      RedwoodCharacterId,
+      bHandOnUnconfirmed
+        ? TEXT("its component ended with the batch unconfirmed, and it is handed to the PlayerState for the next component to probe")
+        : TEXT("its component ended with the batch unconfirmed"),
+      UnconfirmedEntries,
+      FirstUnsentEntry,
+      UnconfirmedGrantKeys,
+      FirstUnsentGrant
+    );
+    if (bHandOnUnconfirmed) {
+      FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
+      Snapshot.HandedOffCurrencyEntries.Append(UnconfirmedEntries.GetData(), UnconfirmedEntries.Num());
+      Snapshot.HandedOffGrantKeys.Append(UnconfirmedGrantKeys.GetData(), UnconfirmedGrantKeys.Num());
+      Snapshot.HandedOffUnconfirmedCurrencyCount = FirstUnsentEntry;
+      Snapshot.HandedOffUnconfirmedGrantCount = FirstUnsentGrant;
+      Snapshot.HandedOffUnconfirmedSeq = UnconfirmedBatchSeq;
     }
   }
   FirstUnsentEntry = FMath::Clamp(FirstUnsentEntry, 0, PendingCurrencyEntries.Num());
@@ -1298,19 +1335,6 @@ void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay(EEndPlayReason::Type E
     MakeArrayView(PendingGrantKeys).RightChop(FirstUnsentGrant);
 
   if (UnsentEntries.Num() > 0 || UnsentGrantKeys.Num() > 0) {
-    // The never-sent entries are handed off only when nothing can make their chain wrong behind
-    // the next component's back: the reload that rebases them must read a balance no open batch
-    // can still change, and a frozen or fenced character must not send at all.
-    const bool bFrozen = bFrozenAfterFinalRefusal ||
-      (ServerSubsystem && ServerSubsystem->IsCharacterFrozen(RedwoodCharacterId));
-    const bool bWorldEnding = EndPlayReason != EEndPlayReason::Destroyed &&
-      EndPlayReason != EEndPlayReason::RemovedFromWorld;
-    const TCHAR *Unsafe = bWorldEnding ? TEXT("the world is ending")
-      : !bSnapshotOutlivesComponent ? TEXT("no PlayerState of the character outlives the component")
-      : bItemFlushInFlight ? TEXT("a batch was in flight, so the balance they chain from waits on its reply")
-      : bFrozen ? TEXT("the character is frozen")
-      : bWriterFenceLost ? TEXT("the writer fence is lost")
-      : nullptr;
     if (Unsafe) {
       LogCurrencyForStaff(
         RedwoodCharacterId,
@@ -1392,6 +1416,36 @@ bool URedwoodCharacterComponent::AdoptHandedOffCurrency(FRedwoodCharacterBackend
       Snapshot.Id != RedwoodCharacterId || bItemFlushInFlight || bCurrencyBatchUnconfirmed) {
     return false;
   }
+  // FORK(hollowed-oath): the front may be a batch whose outcome is unknown. It is probed at its own
+  // seq while that seq is unsettled. Once something else has settled the seq, nothing here can
+  // learn whether the batch committed, and sent as new it could pay twice: it is dropped, and
+  // logged as UNKNOWN for staff.
+  const int32 HandedOffEntryCount =
+    FMath::Clamp(Snapshot.HandedOffUnconfirmedCurrencyCount, 0, Snapshot.HandedOffCurrencyEntries.Num());
+  const int32 HandedOffGrantCount =
+    FMath::Clamp(Snapshot.HandedOffUnconfirmedGrantCount, 0, Snapshot.HandedOffGrantKeys.Num());
+  const int64 UnconfirmedSeq = Snapshot.HandedOffUnconfirmedSeq;
+  Snapshot.HandedOffUnconfirmedCurrencyCount = 0;
+  Snapshot.HandedOffUnconfirmedGrantCount = 0;
+  Snapshot.HandedOffUnconfirmedSeq = 0;
+  const bool bHasUnconfirmed = HandedOffEntryCount > 0 || HandedOffGrantCount > 0;
+  const bool bProbeUnconfirmed = bHasUnconfirmed && Snapshot.bInventorySeqUnconfirmed &&
+    Snapshot.UnconfirmedInventorySeq == UnconfirmedSeq && UnconfirmedSeq > LastCommittedItemSeq;
+  if (bHasUnconfirmed && !bProbeUnconfirmed) {
+    LogCurrencyForStaff(
+      RedwoodCharacterId,
+      TEXT("its batch's seq was settled before the next component could probe it"),
+      MakeArrayView(Snapshot.HandedOffCurrencyEntries).Left(HandedOffEntryCount),
+      HandedOffEntryCount,
+      MakeArrayView(Snapshot.HandedOffGrantKeys).Left(HandedOffGrantCount),
+      HandedOffGrantCount
+    );
+    Snapshot.HandedOffCurrencyEntries.RemoveAt(0, HandedOffEntryCount);
+    Snapshot.HandedOffGrantKeys.RemoveAt(0, HandedOffGrantCount);
+    if (Snapshot.HandedOffCurrencyEntries.Num() == 0 && Snapshot.HandedOffGrantKeys.Num() == 0) {
+      return false;
+    }
+  }
   UE_LOG(
     LogRedwood,
     Log,
@@ -1408,6 +1462,9 @@ bool URedwoodCharacterComponent::AdoptHandedOffCurrency(FRedwoodCharacterBackend
   // Set directly: nothing of this component is in flight or unconfirmed (checked above), which is
   // all RequireCurrencyReload's guard is for.
   bCurrencyRebaseRequired = true;
+  if (bProbeUnconfirmed) {
+    MarkCurrencyBatchUnconfirmed(HandedOffEntryCount, HandedOffGrantCount, UnconfirmedSeq);
+  }
   return true;
 }
 

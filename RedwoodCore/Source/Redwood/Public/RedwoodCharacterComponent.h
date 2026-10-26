@@ -527,8 +527,9 @@ public:
 
   // Takes the currency a destroyed component of this character handed to Snapshot, in front of
   // its own queue, and holds all currency for a reload: the handed-off chain was built on a balance
-  // only the reload can confirm. Refused (false) while a batch of this component is in flight or
-  // unconfirmed, or for another character.
+  // only the reload can confirm. A batch the destroyed component sent with no reply that settled it
+  // becomes this component's unconfirmed batch, probed at its seq. Refused (false) while a batch of
+  // this component is in flight or unconfirmed, or for another character.
   bool AdoptHandedOffCurrency(FRedwoodCharacterBackend &Snapshot);
 
   // A batch of another component of this character may have committed at Seq (the snapshot's
