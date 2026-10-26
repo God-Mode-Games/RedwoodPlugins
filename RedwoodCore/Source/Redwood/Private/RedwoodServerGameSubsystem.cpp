@@ -211,6 +211,9 @@ void URedwoodServerGameSubsystem::Deinitialize() {
     );
   }
 
+  // FORK(hollowed-oath): no ack can come once the sidecar is released.
+  DetachedFlushSettlements.AbandonAll();
+
   if (Sidecar.IsValid()) {
     ISocketIOClientModule::Get().ReleaseNativePointer(Sidecar);
     Sidecar = nullptr;
@@ -565,6 +568,18 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
       }
     }
   );
+
+  // FORK(hollowed-oath): the socket library never calls the ack of a request sent over a socket
+  // that dropped, so settle the detached flushes that still wait on one (see
+  // FRedwoodDetachedFlushSettlements).
+  // Weak: the socket can queue this to the game thread while the subsystem is torn down.
+  TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSelf(this);
+  Sidecar->OnDisconnectedCallback =
+    [WeakSelf](const ESIOConnectionCloseReason) {
+      if (URedwoodServerGameSubsystem *Self = WeakSelf.Get()) {
+        Self->DetachedFlushSettlements.AbandonAll();
+      }
+    };
 
   Sidecar->OnConnectedCallback =
     [this](const FString &InSocketId, const FString &InSessionId) {
@@ -1556,6 +1571,12 @@ void URedwoodServerGameSubsystem::FlushPlayerCharacterData(
   }
 }
 
+namespace {
+  // How long a detached flush waits for its write acks while the sidecar stays connected. Only
+  // reached when a connected server never answers; a dropped socket settles it at once.
+  constexpr float DetachedFlushDeadlineSeconds = 30.0f;
+}
+
 // FORK(hollowed-oath): fork-added function (with EmitPlayerLeft below), not
 // in upstream Redwood — linkdead pawn retention support. See the header for
 // the contract; keep both across upstream merges.
@@ -1819,35 +1840,43 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
     return;
   }
 
-  // Settled-latch: each pending write decrements it by one; the last one to reach zero runs the
-  // release continuation. Shared by value into every async callback so it outlives this stack
-  // frame. "Settled" means the write attempt RESOLVED (success OR error), NOT that it committed --
-  // an errored write still can't be raced by the release, and the linkdead body must not be pinned
-  // forever waiting on a settle that will never upgrade to a commit.
-  TSharedRef<int32> SettleLatch = MakeShared<int32>(PendingSettles);
+  // Settled-latch, kept in DetachedFlushSettlements: each pending write ack decrements it by one;
+  // the last one runs the release continuation, then OnSettled. "Settled" means the write attempt
+  // RESOLVED (success OR error), NOT that it committed -- an errored write still can't be raced by
+  // the release, and the linkdead body must not be pinned forever waiting on a settle that will
+  // never upgrade to a commit.
+  //
+  // An ack that can never come (the socket dropped; the library never calls it) would wedge the
+  // caller's pending release. So the operation also settles WITHOUT the release when the sidecar
+  // disconnects, when it passes its deadline (a server that stays connected but never answers),
+  // and on Deinitialize. Whichever comes first wins; every later ack is ignored. Dirty flags are
+  // not touched here: a write that could not be delivered stays dirty for the next flush.
   TWeakObjectPtr<URedwoodServerGameSubsystem> WeakThis(this);
-  auto SettleOne =
-    [WeakThis,
-     SettleLatch,
-     PlayerId,
-     CharacterId,
-     bReleaseBindingWhenSettled,
-     OnSettled]() {
-      if (--(*SettleLatch) > 0) {
-        return;
-      }
-      // Last pending write settled -- releasing the binding now can no longer beat a write's auth
-      // gate. Gated on the caller's request; when not requested this is a bare countdown that fires
-      // nothing.
-      if (bReleaseBindingWhenSettled && WeakThis.IsValid()) {
+  TFunction<void()> ReleaseWhenDelivered;
+  if (bReleaseBindingWhenSettled) {
+    ReleaseWhenDelivered = [WeakThis, PlayerId, CharacterId]() {
+      if (WeakThis.IsValid()) {
         WeakThis->EmitPlayerLeft(PlayerId, CharacterId);
       }
-      // Fires after the release, even when the subsystem is gone, so a caller tracking the
-      // release never stays stuck.
-      if (OnSettled) {
-        OnSettled();
-      }
     };
+  }
+  const uint64 OperationId = DetachedFlushSettlements.Begin(
+    PendingSettles, MoveTemp(ReleaseWhenDelivered), MoveTemp(OnSettled)
+  );
+  TFunction<void()> SettleOne =
+    DetachedFlushSettlements.MakeWriteSettled(OperationId);
+  // One-shot, not cleared on settle: Abandon on a settled operation does nothing.
+  FTimerHandle DeadlineHandle;
+  World->GetTimerManager().SetTimer(
+    DeadlineHandle,
+    FTimerDelegate::CreateLambda([WeakThis, OperationId]() {
+      if (WeakThis.IsValid()) {
+        WeakThis->DetachedFlushSettlements.Abandon(OperationId);
+      }
+    }),
+    DetachedFlushDeadlineSeconds,
+    false
+  );
 
   // FORK(hollowed-oath): the settled-latch now orders the binding release behind a real DELIVERY.
   // A flush attempt that finds a batch already in flight no longer settles on the spot: it parks

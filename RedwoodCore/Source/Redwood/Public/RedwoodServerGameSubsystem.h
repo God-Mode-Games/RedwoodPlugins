@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "RedwoodDetachedFlushSettlements.h"
 #include "RedwoodGameplayTags.h"
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
@@ -331,7 +332,10 @@ public:
   // nothing dirty, offline save, and the last write ack (success OR error).
   // It reports that this flush/release EMIT is finished, NOT that the realm
   // processed the player-left, and NOT that the data was saved: the sidecar-down
-  // exit calls it too, with the data still dirty.
+  // exit calls it too, with the data still dirty. With writes in flight, a dropped
+  // sidecar socket, the deadline (DetachedFlushDeadlineSeconds in the cpp) or
+  // Deinitialize settles it WITHOUT sending the release; an ack after that is
+  // ignored, so no release can land after a replacement session took the character.
   void FlushDetachedCharacterData(
     APawn *Pawn,
     const FString &CharacterId,
@@ -549,6 +553,11 @@ private:
   );
 
   TSharedPtr<FSocketIONative> Sidecar;
+
+  // FORK(hollowed-oath): FlushDetachedCharacterData operations with writes in flight. Abandoned
+  // (OnSettled runs, no release) when the sidecar socket drops, when an operation passes its
+  // deadline, and on Deinitialize, because the socket library never calls an ack that cannot come.
+  FRedwoodDetachedFlushSettlements DetachedFlushSettlements;
 
   float UpdateSidecarRate = 3.f; // in seconds
   float UpdateSidecarLoadingRate = 0.2f; // in seconds

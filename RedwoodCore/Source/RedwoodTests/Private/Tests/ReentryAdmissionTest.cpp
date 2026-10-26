@@ -5,10 +5,13 @@
 //   1. The optional "reentryHeldCharacterId" field of the player-auth reply is stored on the
 //      player state BEFORE OnRedwoodCharacterUpdated fires, and an absent field clears it.
 //   2. The late-auth release decision (a reply that arrives after its connection left).
-//   3. FlushDetachedCharacterData runs its OnSettled callback exactly once on every exit that
-//      needs no live sidecar. The async latch path (and the sidecar-down and nothing-dirty exits)
-//      needs sidecar coverage that this file does not have; no UE/backend integration run
-//      exercises it yet.
+//   3. FRedwoodDetachedFlushSettlements, the registry behind the async part of
+//      FlushDetachedCharacterData: exactly-once settlement on the last ack, on a dropped socket
+//      or deadline (no release), and ignoring late acks.
+//   4. FlushDetachedCharacterData runs its OnSettled callback exactly once on every exit that
+//      needs no live sidecar. The wiring of the registry to a real sidecar (the OnDisconnectedCallback
+//      hook, the deadline timer, and the sidecar-down and nothing-dirty exits) needs sidecar
+//      coverage that this file does not have; no UE/backend integration run exercises it yet.
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
@@ -19,6 +22,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Misc/AutomationTest.h"
 #include "RedwoodCharacterComponent.h"
+#include "RedwoodDetachedFlushSettlements.h"
 #include "RedwoodGameModeComponent.h"
 #include "RedwoodPlayerStateComponent.h"
 #include "RedwoodServerGameSubsystem.h"
@@ -314,5 +318,145 @@ bool FRedwoodFlushDetachedSettlesOnceTest::RunTest(const FString &Parameters) {
   Subsystem->FlushDetachedCharacterData(
     Pawn, Fixture::TestCharacterId, Fixture::TestPlayerId, true
   );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodDetachedFlushSettlesOnLastAckTest,
+  "Redwood.Reentry.SettlementReleasesThenSettlesOnLastAck",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodDetachedFlushSettlesOnLastAckTest::RunTest(
+  const FString &Parameters
+) {
+  FRedwoodDetachedFlushSettlements Registry;
+  TArray<FString> Order;
+  const uint64 Id = Registry.Begin(
+    2,
+    [&Order]() { Order.Add(TEXT("release")); },
+    [&Order]() { Order.Add(TEXT("settled")); }
+  );
+  TFunction<void()> Ack = Registry.MakeWriteSettled(Id);
+
+  Ack();
+  TestEqual(TEXT("One ack of two settles nothing"), Order.Num(), 0);
+  Ack();
+  TestEqual(TEXT("Release then settled"), FString::Join(Order, TEXT(",")), FString(TEXT("release,settled")));
+  Ack();
+  Ack();
+  TestEqual(TEXT("Extra acks run nothing again"), Order.Num(), 2);
+  TestEqual(TEXT("Nothing pending"), Registry.Num(), 0);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodDetachedFlushAbandonTest,
+  "Redwood.Reentry.SettlementAbandonedWithoutReleaseIgnoresLateAck",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodDetachedFlushAbandonTest::RunTest(const FString &Parameters) {
+  FRedwoodDetachedFlushSettlements Registry;
+  int32 Releases = 0;
+  int32 SettledA = 0;
+  int32 SettledB = 0;
+  const uint64 IdA = Registry.Begin(
+    2, [&Releases]() { ++Releases; }, [&SettledA]() { ++SettledA; }
+  );
+  const uint64 IdB = Registry.Begin(
+    1, [&Releases]() { ++Releases; }, [&SettledB]() { ++SettledB; }
+  );
+  TFunction<void()> AckA = Registry.MakeWriteSettled(IdA);
+  TFunction<void()> AckB = Registry.MakeWriteSettled(IdB);
+
+  // Deadline of A only: B stays pending.
+  AckA();
+  Registry.Abandon(IdA);
+  TestEqual(TEXT("A settled once"), SettledA, 1);
+  TestEqual(TEXT("No release for an abandoned operation"), Releases, 0);
+  TestEqual(TEXT("B still pending"), Registry.Num(), 1);
+  Registry.Abandon(IdA);
+  TestEqual(TEXT("A abandoned twice settles once"), SettledA, 1);
+
+  // The late ack of A, as after a replacement session took over, must emit nothing.
+  AckA();
+  TestEqual(TEXT("Late ack emits no release"), Releases, 0);
+  TestEqual(TEXT("Late ack settles nothing again"), SettledA, 1);
+
+  // Socket dropped: B settles without release, then its own late ack is ignored.
+  Registry.AbandonAll();
+  TestEqual(TEXT("B settled once on disconnect"), SettledB, 1);
+  AckB();
+  TestEqual(TEXT("Late ack of B emits no release"), Releases, 0);
+  TestEqual(TEXT("B settled exactly once"), SettledB, 1);
+  TestEqual(TEXT("Nothing pending"), Registry.Num(), 0);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodDetachedFlushReentrantSettleTest,
+  "Redwood.Reentry.SettlementHandlerMayStartNewOperation",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodDetachedFlushReentrantSettleTest::RunTest(
+  const FString &Parameters
+) {
+  FRedwoodDetachedFlushSettlements Registry;
+  int32 SettledSecond = 0;
+  Registry.Begin(1, nullptr, [&]() {
+    // A disconnect handler that retries must stay pending for the next connection.
+    Registry.Begin(1, nullptr, [&SettledSecond]() { ++SettledSecond; });
+  });
+  Registry.AbandonAll();
+  TestEqual(TEXT("The new operation stays pending"), Registry.Num(), 1);
+  TestEqual(TEXT("The new operation has not settled"), SettledSecond, 0);
+  Registry.AbandonAll();
+  TestEqual(TEXT("It settles on the next drop"), SettledSecond, 1);
+  return true;
+}
+
+// The player-auth request uses the same registry: a reply that comes after the request was
+// abandoned must be seen as late (IsPending false), the abandon hook runs only on abandon, and the
+// settled hook runs exactly once on either path.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodAuthRequestLifetimeTest,
+  "Redwood.Reentry.AuthRequestAbandonHookAndLateReply",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodAuthRequestLifetimeTest::RunTest(const FString &Parameters) {
+  FRedwoodDetachedFlushSettlements Registry;
+  int32 Abandoned = 0;
+  int32 Settled = 0;
+  auto Begin = [&]() {
+    return Registry.Begin(
+      1, nullptr, [&Settled]() { ++Settled; }, [&Abandoned]() { ++Abandoned; }
+    );
+  };
+
+  // Reply first: no abandon hook, one settled, and the request is no longer pending.
+  const uint64 Answered = Begin();
+  TFunction<bool()> AnsweredPending = Registry.MakeIsPending(Answered);
+  TestTrue(TEXT("Pending before the reply"), AnsweredPending());
+  Registry.MakeWriteSettled(Answered)();
+  TestFalse(TEXT("Not pending after the reply"), AnsweredPending());
+  TestEqual(TEXT("Reply: no abandon hook"), Abandoned, 0);
+  TestEqual(TEXT("Reply: settled once"), Settled, 1);
+  Registry.Abandon(Answered);
+  TestEqual(TEXT("A deadline after the reply does nothing"), Abandoned + Settled, 1);
+
+  // Deadline first: abandon hook then settled, and the late reply sees it was abandoned.
+  const uint64 Lost = Begin();
+  TFunction<bool()> LostPending = Registry.MakeIsPending(Lost);
+  TFunction<void()> LateReply = Registry.MakeWriteSettled(Lost);
+  Registry.Abandon(Lost);
+  TestEqual(TEXT("Deadline: abandon hook once"), Abandoned, 1);
+  TestEqual(TEXT("Deadline: settled once more"), Settled, 2);
+  TestFalse(TEXT("The late reply sees the request as gone"), LostPending());
+  LateReply();
+  TestEqual(TEXT("Late reply: abandon hook not repeated"), Abandoned, 1);
+  TestEqual(TEXT("Late reply: not settled again"), Settled, 2);
   return true;
 }
