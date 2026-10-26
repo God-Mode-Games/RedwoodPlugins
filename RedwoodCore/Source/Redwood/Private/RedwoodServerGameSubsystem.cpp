@@ -4019,15 +4019,16 @@ namespace {
     ) {
       return false;
     }
-    // The reason is text or absent; a number here is not a reason.
+    // The reason is text or absent; a number here is not a reason (and
+    // TryGetString would print one, so the type is checked, not the read).
     FString Reason;
     const TSharedPtr<FJsonValue> ReasonValue =
       Object.TryGetField(TEXT("reason"));
-    if (
-      ReasonValue.IsValid() && ReasonValue->Type != EJson::Null &&
-      !ReasonValue->TryGetString(Reason)
-    ) {
-      return false;
+    if (ReasonValue.IsValid() && ReasonValue->Type != EJson::Null) {
+      if (ReasonValue->Type != EJson::String) {
+        return false;
+      }
+      Reason = ReasonValue->AsString();
     }
     bOutMuted = bMuted;
     OutUntil = Until;
