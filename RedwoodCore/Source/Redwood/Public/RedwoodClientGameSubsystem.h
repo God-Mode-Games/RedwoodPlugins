@@ -87,9 +87,6 @@ public:
   UFUNCTION(BlueprintPure, Category = "Redwood")
   bool IsLoggedIn();
 
-  UFUNCTION(BlueprintCallable, Category = "Redwood")
-  void CancelWaitingForAccountVerification();
-
   UFUNCTION(BlueprintPure, Category = "Redwood")
   FString GetPlayerId();
 

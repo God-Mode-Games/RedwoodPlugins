@@ -894,20 +894,11 @@ void URedwoodClientInterface::Execute(const FRedwoodSessionEffect &Effect) {
         return;
       }
       FRedwoodAuthUpdate Update;
-      switch (Effect.LoginAnswer) {
-        case ERedwoodLoginAnswer::Success:
-          Update.Type = ERedwoodAuthUpdateType::Success;
-          break;
-        case ERedwoodLoginAnswer::MustVerify:
-          // The push `player:account-verified` answers the caller later.
-          OnAccountVerified = Caller;
-          MustVerifyPlayerId = Effect.Text;
-          Update.Type = ERedwoodAuthUpdateType::MustVerifyAccount;
-          break;
-        default:
-          Update.Type = ERedwoodAuthUpdateType::Error;
-          Update.Message = Effect.Text;
-          break;
+      if (Effect.LoginAnswer == ERedwoodLoginAnswer::Success) {
+        Update.Type = ERedwoodAuthUpdateType::Success;
+      } else {
+        Update.Type = ERedwoodAuthUpdateType::Error;
+        Update.Message = Effect.Text;
       }
       Caller.ExecuteIfBound(Update);
       return;
@@ -1006,17 +997,13 @@ void URedwoodClientInterface::SendLogin(const FRedwoodSessionEffect &Effect) {
       }
       FString Reason;
       FString Message;
-      FString MustVerifyPlayer;
       Response->TryGetStringField(TEXT("reason"), Reason);
       Response->TryGetStringField(TEXT("message"), Message);
-      Response->TryGetStringField(TEXT("playerId"), MustVerifyPlayer);
       if (Reason == TEXT("not_connected")) {
         Self->Dispatch(FRedwoodSessionEvent::LoginLost(Seq));
         return;
       }
-      Self->Dispatch(FRedwoodSessionEvent::LoginRefused(
-        Seq, Reason, Message, MustVerifyPlayer
-      ));
+      Self->Dispatch(FRedwoodSessionEvent::LoginRefused(Seq, Reason, Message));
     }
   );
 }
@@ -1307,22 +1294,6 @@ FRedwoodPushDelegate &URedwoodClientInterface::OnPush(const FString &Event) {
 }
 
 void URedwoodClientInterface::BindPushHandlers() {
-  Connection->OnEvent(
-    TEXT("player:account-verified"),
-    [this](const FString &Event, const TSharedPtr<FJsonValue> &Message) {
-      TSharedPtr<FJsonObject> MessageObject = Message->AsObject();
-      FString InPlayerId = MessageObject->GetStringField(TEXT("playerId"));
-
-      if (!InPlayerId.IsEmpty() && InPlayerId == MustVerifyPlayerId) {
-        MustVerifyPlayerId.Reset();
-        FRedwoodAuthUpdate Update;
-        Update.Type = ERedwoodAuthUpdateType::Success;
-        Update.Message = TEXT("");
-        OnAccountVerified.ExecuteIfBound(Update);
-      }
-    }
-  );
-
   // FORK(hollowed-oath) BEGIN: the character friend push. A refused push is
   // logged, so a field the director renames does not stop the feature with no
   // symptom.
@@ -1577,13 +1548,6 @@ void URedwoodClientInterface::Login(
 
 FString URedwoodClientInterface::GetNickname() {
   return Session.GetNickname();
-}
-
-void URedwoodClientInterface::CancelWaitingForAccountVerification() {
-  MustVerifyPlayerId.Reset();
-  if (OnAccountVerified.IsBound()) {
-    OnAccountVerified.Unbind();
-  }
 }
 
 void URedwoodClientInterface::SearchForPlayers(

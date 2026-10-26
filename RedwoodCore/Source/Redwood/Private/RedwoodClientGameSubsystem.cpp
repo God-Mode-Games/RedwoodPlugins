@@ -234,12 +234,6 @@ FString URedwoodClientGameSubsystem::GetNickname() {
   }
 }
 
-void URedwoodClientGameSubsystem::CancelWaitingForAccountVerification() {
-  if (URedwoodCommonGameSubsystem::ShouldUseBackend(GetWorld())) {
-    ClientInterface->CancelWaitingForAccountVerification();
-  }
-}
-
 FString URedwoodClientGameSubsystem::GetPlayerId() {
   if (ClientInterface) {
     return ClientInterface->GetPlayerId();

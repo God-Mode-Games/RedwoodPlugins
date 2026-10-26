@@ -6,8 +6,8 @@
 // transport (framing, resume, push ids, heartbeat, backoff, step order);
 // this file pins what the client does with it:
 //   1. A login is the join of the session. An accepted join logs the player
-//      in; a refused one reports the director's text, and "Must verify
-//      account" is its own outcome. A login whose reply is lost with the
+//      in; a refused one reports the director's text, also for an account
+//      that has not verified its email. A login whose reply is lost with the
 //      socket is answered with the lost-reply error.
 //   2. Entering a realm is the step `session.enter-realm`. Its answer holds
 //      the regions; a refusal leaves the session in no realm. A realm request
@@ -131,20 +131,24 @@ bool FRedwoodBifrostClientLoginTest::RunTest(const FString &Parameters) {
   );
   TestFalse(TEXT("Not logged in after a refusal"), H.Client()->IsLoggedIn());
 
-  // The account must verify its email first.
+  // An account that has not verified its email is refused at the join like
+  // any other: no session exists, so no later push can finish this login.
   TCapture<FRedwoodAuthUpdate> Unverified;
   Join = H.SendLogin(Unverified);
-  H.Socket()->RefuseJoin(
-    Join, TEXT("login_failed"), TEXT("Must verify account")
-  );
-  TestEqual(TEXT("The verification refusal is answered"), Unverified.Count, 1);
+  H.Socket()->RefuseJoin(Join, TEXT("login_failed"), TEXT("Must verify email"));
   TestEqual(
-    TEXT("It is its own outcome"),
-    Unverified.Last.Type,
-    ERedwoodAuthUpdateType::MustVerifyAccount
+    TEXT("The unverified refusal is answered once"), Unverified.Count, 1
+  );
+  TestEqual(
+    TEXT("As an error"), Unverified.Last.Type, ERedwoodAuthUpdateType::Error
+  );
+  TestEqual(
+    TEXT("With the director's text"),
+    Unverified.Last.Message,
+    TEXT("Must verify email")
   );
   TestFalse(TEXT("Not logged in while unverified"), H.Client()->IsLoggedIn());
-  H.Client()->CancelWaitingForAccountVerification();
+  TestFalse(TEXT("No session for an unverified account"), H.HasSession());
 
   // The director accepts.
   TCapture<FRedwoodAuthUpdate> Accepted;
