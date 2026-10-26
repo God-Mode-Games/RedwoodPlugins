@@ -4292,24 +4292,6 @@ void URedwoodServerGameSubsystem::EmitItemsTrade(
   SendItemsTrade(TradeId);
 }
 
-void URedwoodServerGameSubsystem::EmitItemsTrade(
-  const FString &FromCharacterId,
-  const FString &ToCharacterId,
-  const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
-  TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete
-) {
-  const FString Error = TEXT(
-    "this trade call sends no writer tokens and cannot hold the flush lanes; use the overload that "
-    "takes the character components"
-  );
-  UE_LOG(
-    LogRedwood, Error, TEXT("Trade %s -> %s refused: %s"), *FromCharacterId, *ToCharacterId, *Error
-  );
-  if (OnComplete) {
-    OnComplete(Error, -1, -1);
-  }
-}
-
 bool URedwoodServerGameSubsystem::PrepareItemTradeSide(
   URedwoodCharacterComponent *CharacterComponent,
   FRedwoodItemTradeSide &OutSide,

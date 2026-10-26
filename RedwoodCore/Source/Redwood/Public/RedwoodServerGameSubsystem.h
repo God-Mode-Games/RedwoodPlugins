@@ -441,17 +441,6 @@ public:
     TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete
   );
 
-  // FORK(hollowed-oath): the old call shape, kept only so the game module builds and loads until
-  // its trade moves to the overload above (currency ledger, Phase C). It sends nothing: without the
-  // writer tokens the backend refuses every trade anyway. OnComplete gets an error before this
-  // returns. Remove it with that move.
-  void EmitItemsTrade(
-    const FString &FromCharacterId,
-    const FString &ToCharacterId,
-    const TArray<FRedwoodTradeRootPlacement> &RootPlacements,
-    TFunction<void(FString Error, int64 FromCommittedSeq, int64 ToCommittedSeq)> OnComplete
-  );
-
   // Static payload builders for the two item emits above (flush + trade), split out so
   // ItemPersistenceTest can pin the wire envelope without a live sidecar connection. The sidecar
   // validates each request against its full schema BEFORE stamping its own instanceId over "id"
