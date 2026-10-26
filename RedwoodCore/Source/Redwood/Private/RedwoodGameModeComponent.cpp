@@ -773,8 +773,8 @@ bool URedwoodGameModeComponent::ShouldReleaseLateAuth(
 }
 
 namespace {
-  // How long a player-auth request may wait for its reply while the sidecar socket stays up.
-  // A dropped socket ends it at once; this only covers a server that never answers.
+  // Bounds a missing auth reply, including a transport drop while Socket.IO reconnects.
+  // A terminal disconnect also abandons requests, but reconnect attempts bypass that callback.
   constexpr float AuthRequestDeadlineSeconds = 30.0f;
 }
 
@@ -831,26 +831,27 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
   // releases or admits by it.
   const uint64 RequestId = PendingAuthRequests.Begin(
     1,
-    nullptr,
-    [WeakThis, WeakPlayerController, CharacterId]() {
+    [WeakThis, WeakPlayerController, WeakGameMode, PlayerId, CharacterId](
+      bool bDelivered
+    ) {
+      if (!bDelivered) {
+        APlayerController *Waiting = WeakPlayerController.Get();
+        AGameModeBase *Mode = WeakGameMode.Get();
+        if (IsValid(Waiting) && IsValid(Mode) && IsValid(Mode->GameSession)) {
+          UE_LOG(
+            LogRedwood,
+            Error,
+            TEXT("Auth request for %s was lost; kicking them"),
+            *PlayerId
+          );
+          Mode->GameSession->KickPlayer(
+            Waiting, FText::FromString(TEXT("Authentication did not finish"))
+          );
+        }
+      }
       if (URedwoodGameModeComponent *Self = WeakThis.Get()) {
         Self->AuthRequestSettled.ExecuteIfBound(
           WeakPlayerController.Get(), CharacterId
-        );
-      }
-    },
-    [WeakPlayerController, WeakGameMode, PlayerId]() {
-      APlayerController *Waiting = WeakPlayerController.Get();
-      AGameModeBase *Mode = WeakGameMode.Get();
-      if (IsValid(Waiting) && IsValid(Mode) && IsValid(Mode->GameSession)) {
-        UE_LOG(
-          LogRedwood,
-          Error,
-          TEXT("Auth request for %s was lost; kicking them"),
-          *PlayerId
-        );
-        Mode->GameSession->KickPlayer(
-          Waiting, FText::FromString(TEXT("Authentication did not finish"))
         );
       }
     }
@@ -862,11 +863,7 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
   FTimerHandle AuthDeadlineHandle;
   World->GetTimerManager().SetTimer(
     AuthDeadlineHandle,
-    FTimerDelegate::CreateLambda([WeakThis, RequestId]() {
-      if (URedwoodGameModeComponent *Self = WeakThis.Get()) {
-        Self->PendingAuthRequests.Abandon(RequestId);
-      }
-    }),
+    FTimerDelegate::CreateLambda(PendingAuthRequests.MakeAbandon(RequestId)),
     AuthRequestDeadlineSeconds,
     false
   );

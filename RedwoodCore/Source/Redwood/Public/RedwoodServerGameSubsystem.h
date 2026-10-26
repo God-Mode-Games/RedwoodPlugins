@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "RedwoodDetachedFlushSettlements.h"
+#include "RedwoodPendingOperations.h"
 #include "RedwoodGameplayTags.h"
 #include "RedwoodModule.h"
 #include "Types/RedwoodTypes.h"
@@ -557,7 +557,7 @@ private:
   // FORK(hollowed-oath): FlushDetachedCharacterData operations with writes in flight. Abandoned
   // (OnSettled runs, no release) when the sidecar socket drops, when an operation passes its
   // deadline, and on Deinitialize, because the socket library never calls an ack that cannot come.
-  FRedwoodDetachedFlushSettlements DetachedFlushSettlements;
+  FRedwoodPendingOperations DetachedFlushSettlements;
 
   float UpdateSidecarRate = 3.f; // in seconds
   float UpdateSidecarLoadingRate = 0.2f; // in seconds

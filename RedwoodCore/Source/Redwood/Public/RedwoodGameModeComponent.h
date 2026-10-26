@@ -5,7 +5,7 @@
 #include "Components/ActorComponent.h"
 #include "CoreMinimal.h"
 
-#include "RedwoodDetachedFlushSettlements.h"
+#include "RedwoodPendingOperations.h"
 #include "SocketIONative.h"
 
 #include "RedwoodGameModeComponent.generated.h"
@@ -218,7 +218,7 @@ private:
   // kicked, AuthRequestSettled fired) when this component's sidecar socket drops, when a request
   // passes its deadline, and on EndPlay. A reply that comes after that is "late": it never admits
   // the kicked controller, but a late success still releases the validated ids.
-  FRedwoodDetachedFlushSettlements PendingAuthRequests;
+  FRedwoodPendingOperations PendingAuthRequests;
 
   float DatabasePersistenceInterval;
   float PostBeginPlayDelay;

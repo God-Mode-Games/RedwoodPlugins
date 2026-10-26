@@ -571,7 +571,7 @@ void URedwoodServerGameSubsystem::InitializeSidecar() {
 
   // FORK(hollowed-oath): the socket library never calls the ack of a request sent over a socket
   // that dropped, so settle the detached flushes that still wait on one (see
-  // FRedwoodDetachedFlushSettlements).
+  // FRedwoodPendingOperations).
   // Weak: the socket can queue this to the game thread while the subsystem is torn down.
   TWeakObjectPtr<URedwoodServerGameSubsystem> WeakSelf(this);
   Sidecar->OnDisconnectedCallback =
@@ -1572,8 +1572,8 @@ void URedwoodServerGameSubsystem::FlushPlayerCharacterData(
 }
 
 namespace {
-  // How long a detached flush waits for its write acks while the sidecar stays connected. Only
-  // reached when a connected server never answers; a dropped socket settles it at once.
+  // Bounds missing write acks, including a transport drop while Socket.IO reconnects.
+  // A terminal disconnect also abandons flushes, but reconnect attempts bypass that callback.
   constexpr float DetachedFlushDeadlineSeconds = 30.0f;
 }
 
@@ -1848,32 +1848,34 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
   //
   // An ack that can never come (the socket dropped; the library never calls it) would wedge the
   // caller's pending release. So the operation also settles WITHOUT the release when the sidecar
-  // disconnects, when it passes its deadline (a server that stays connected but never answers),
+  // disconnects, when it passes its deadline (including during reconnect attempts),
   // and on Deinitialize. Whichever comes first wins; every later ack is ignored. Dirty flags are
   // not touched here: a write that could not be delivered stays dirty for the next flush.
   TWeakObjectPtr<URedwoodServerGameSubsystem> WeakThis(this);
-  TFunction<void()> ReleaseWhenDelivered;
-  if (bReleaseBindingWhenSettled) {
-    ReleaseWhenDelivered = [WeakThis, PlayerId, CharacterId]() {
-      if (WeakThis.IsValid()) {
+  const uint64 OperationId = DetachedFlushSettlements.Begin(
+    PendingSettles,
+    [WeakThis,
+     PlayerId,
+     CharacterId,
+     bReleaseBindingWhenSettled,
+     OnSettled = MoveTemp(OnSettled)](bool bDelivered) {
+      if (bDelivered && bReleaseBindingWhenSettled && WeakThis.IsValid()) {
         WeakThis->EmitPlayerLeft(PlayerId, CharacterId);
       }
-    };
-  }
-  const uint64 OperationId = DetachedFlushSettlements.Begin(
-    PendingSettles, MoveTemp(ReleaseWhenDelivered), MoveTemp(OnSettled)
+      if (OnSettled) {
+        OnSettled();
+      }
+    }
   );
   TFunction<void()> SettleOne =
     DetachedFlushSettlements.MakeWriteSettled(OperationId);
-  // One-shot, not cleared on settle: Abandon on a settled operation does nothing.
+  // One-shot, not cleared on settle: abandoning a settled operation does nothing.
   FTimerHandle DeadlineHandle;
   World->GetTimerManager().SetTimer(
     DeadlineHandle,
-    FTimerDelegate::CreateLambda([WeakThis, OperationId]() {
-      if (WeakThis.IsValid()) {
-        WeakThis->DetachedFlushSettlements.Abandon(OperationId);
-      }
-    }),
+    FTimerDelegate::CreateLambda(
+      DetachedFlushSettlements.MakeAbandon(OperationId)
+    ),
     DetachedFlushDeadlineSeconds,
     false
   );

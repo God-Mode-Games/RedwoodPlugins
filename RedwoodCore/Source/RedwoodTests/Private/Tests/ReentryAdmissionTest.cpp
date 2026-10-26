@@ -5,7 +5,7 @@
 //   1. The optional "reentryHeldCharacterId" field of the player-auth reply is stored on the
 //      player state BEFORE OnRedwoodCharacterUpdated fires, and an absent field clears it.
 //   2. The late-auth release decision (a reply that arrives after its connection left).
-//   3. FRedwoodDetachedFlushSettlements, the registry behind the async part of
+//   3. FRedwoodPendingOperations, the registry behind the async part of
 //      FlushDetachedCharacterData: exactly-once settlement on the last ack, on a dropped socket
 //      or deadline (no release), and ignoring late acks.
 //   4. FlushDetachedCharacterData runs its OnSettled callback exactly once on every exit that
@@ -22,7 +22,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Misc/AutomationTest.h"
 #include "RedwoodCharacterComponent.h"
-#include "RedwoodDetachedFlushSettlements.h"
+#include "RedwoodPendingOperations.h"
 #include "RedwoodGameModeComponent.h"
 #include "RedwoodPlayerStateComponent.h"
 #include "RedwoodServerGameSubsystem.h"
@@ -330,13 +330,14 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodDetachedFlushSettlesOnLastAckTest::RunTest(
   const FString &Parameters
 ) {
-  FRedwoodDetachedFlushSettlements Registry;
+  FRedwoodPendingOperations Registry;
   TArray<FString> Order;
-  const uint64 Id = Registry.Begin(
-    2,
-    [&Order]() { Order.Add(TEXT("release")); },
-    [&Order]() { Order.Add(TEXT("settled")); }
-  );
+  const uint64 Id = Registry.Begin(2, [&Order](bool bDelivered) {
+    if (bDelivered) {
+      Order.Add(TEXT("release"));
+    }
+    Order.Add(TEXT("settled"));
+  });
   TFunction<void()> Ack = Registry.MakeWriteSettled(Id);
 
   Ack();
@@ -357,26 +358,33 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodDetachedFlushAbandonTest::RunTest(const FString &Parameters) {
-  FRedwoodDetachedFlushSettlements Registry;
+  FRedwoodPendingOperations Registry;
   int32 Releases = 0;
   int32 SettledA = 0;
   int32 SettledB = 0;
-  const uint64 IdA = Registry.Begin(
-    2, [&Releases]() { ++Releases; }, [&SettledA]() { ++SettledA; }
-  );
-  const uint64 IdB = Registry.Begin(
-    1, [&Releases]() { ++Releases; }, [&SettledB]() { ++SettledB; }
-  );
+  const uint64 IdA = Registry.Begin(2, [&Releases, &SettledA](bool bDelivered) {
+    if (bDelivered) {
+      ++Releases;
+    }
+    ++SettledA;
+  });
+  const uint64 IdB = Registry.Begin(1, [&Releases, &SettledB](bool bDelivered) {
+    if (bDelivered) {
+      ++Releases;
+    }
+    ++SettledB;
+  });
   TFunction<void()> AckA = Registry.MakeWriteSettled(IdA);
   TFunction<void()> AckB = Registry.MakeWriteSettled(IdB);
 
-  // Deadline of A only: B stays pending.
+  // Exercise the callback bound to the deadline timer: B stays pending.
+  TFunction<void()> DeadlineA = Registry.MakeAbandon(IdA);
   AckA();
-  Registry.Abandon(IdA);
+  DeadlineA();
   TestEqual(TEXT("A settled once"), SettledA, 1);
   TestEqual(TEXT("No release for an abandoned operation"), Releases, 0);
   TestEqual(TEXT("B still pending"), Registry.Num(), 1);
-  Registry.Abandon(IdA);
+  DeadlineA();
   TestEqual(TEXT("A abandoned twice settles once"), SettledA, 1);
 
   // The late ack of A, as after a replacement session took over, must emit nothing.
@@ -403,11 +411,11 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodDetachedFlushReentrantSettleTest::RunTest(
   const FString &Parameters
 ) {
-  FRedwoodDetachedFlushSettlements Registry;
+  FRedwoodPendingOperations Registry;
   int32 SettledSecond = 0;
-  Registry.Begin(1, nullptr, [&]() {
+  Registry.Begin(1, [&](bool) {
     // A disconnect handler that retries must stay pending for the next connection.
-    Registry.Begin(1, nullptr, [&SettledSecond]() { ++SettledSecond; });
+    Registry.Begin(1, [&SettledSecond](bool) { ++SettledSecond; });
   });
   Registry.AbandonAll();
   TestEqual(TEXT("The new operation stays pending"), Registry.Num(), 1);
@@ -427,13 +435,16 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 );
 
 bool FRedwoodAuthRequestLifetimeTest::RunTest(const FString &Parameters) {
-  FRedwoodDetachedFlushSettlements Registry;
+  FRedwoodPendingOperations Registry;
   int32 Abandoned = 0;
   int32 Settled = 0;
   auto Begin = [&]() {
-    return Registry.Begin(
-      1, nullptr, [&Settled]() { ++Settled; }, [&Abandoned]() { ++Abandoned; }
-    );
+    return Registry.Begin(1, [&Settled, &Abandoned](bool bDelivered) {
+      if (!bDelivered) {
+        ++Abandoned;
+      }
+      ++Settled;
+    });
   };
 
   // Reply first: no abandon hook, one settled, and the request is no longer pending.
