@@ -1233,14 +1233,30 @@ bool FRedwoodZoneTravelPartyOwnJoinTest::RunTest(const FString &Parameters) {
 
   // The own join can still wait for its answer when the notice comes: the
   // server has its ticket, or makes it before it sees the leave, so the
-  // ticket is left all the same.
+  // ticket is left all the same. At a resume the realm replays the party's
+  // assignment before the notice: it waits with the join, and the notice,
+  // which names its ticket, moves the member with it.
   TCapture<FRedwoodTicketingUpdate> Waiting;
   const FPhoenixMessage WaitingJoin = H.SendJoinQueue(Waiting);
   TestTrue(
     TEXT("The own join waits for its answer"),
     FAccess::IsJoinAwaitingReply(*H.Client())
   );
+  TestFalse(
+    TEXT("The party's assignment before the notice waits"),
+    H.AssignmentMoves(CharacterId, TEXT("t2"))
+  );
+  const int32 BeforeNotice = H.Joins->Count;
   H.PushPartyQueued(CharacterId, TEXT("t2"), TEXT("m2"));
+  TestEqual(
+    TEXT("The notice moves the member with the assignment that waited"),
+    H.Joins->Count,
+    BeforeNotice + 1
+  );
+  TestTrue(
+    TEXT("Which used the ticket up"),
+    FAccess::AcceptedPartyTicketId(*H.Client()).IsEmpty()
+  );
   const FPhoenixMessage WaitingLeave = H.Socket()->Last(LeaveEvent);
   if (!TestTrue(
         TEXT(
@@ -1252,11 +1268,13 @@ bool FRedwoodZoneTravelPartyOwnJoinTest::RunTest(const FString &Parameters) {
   }
   TestEqual(TEXT("Two leaves went out"), H.LeavesSent(), 2);
   H.Socket()->ReplyOk(WaitingJoin, NoError());
-  TestEqual(TEXT("The replaced join is answered"), Waiting.Count, 1);
   TestEqual(
-    TEXT("Its late acceptance does not take the party ticket back"),
-    FAccess::AcceptedPartyTicketId(*H.Client()),
-    TEXT("t2")
+    TEXT("The replaced join's late acceptance moves nothing"),
+    H.Joins->Count,
+    BeforeNotice + 1
+  );
+  TestEqual(
+    TEXT("And the travel had answered the game already"), Waiting.Count, 0
   );
   H.Socket()->ReplyOk(WaitingLeave, NoError());
   TestFalse(TEXT("The leave ran"), FAccess::IsLeaveTicketingOwed(*H.Client()));

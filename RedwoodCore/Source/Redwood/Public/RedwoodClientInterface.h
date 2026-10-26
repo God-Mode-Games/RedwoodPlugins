@@ -688,6 +688,8 @@ private:
   // HollowedOath#3609. See the .cpp.
   void NoteTicketingJoinSent();
   TSharedPtr<FJsonObject> NoteTicketingJoinAccepted(const FString &TicketId);
+  TSharedPtr<FJsonObject> TakeHeldAssignment(const FString &TicketId);
+  TSharedPtr<FJsonObject> TakeHeldAssignment(const FString &TicketId);
   void EndOwnJoin();
   void HandleZoneAssignment(const TSharedPtr<FJsonObject> &MessageObject);
   void HoldAssignment(

@@ -335,6 +335,10 @@ void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
   if (!AcceptedPartyTicketId.IsEmpty()) {
     EndPartyTicket(AcceptedPartyTicketId);
   }
+  // HollowedOath#3609. At a resume the realm replays the party's assignment
+  // before the notice; kept while the member's own join waited, it moves
+  // the member now that the notice names its ticket.
+  const TSharedPtr<FJsonObject> Held = TakeHeldAssignment(TicketId);
   // The notice is the server's word that the ticket exists, so it opens the
   // guard at once, where an own join waits for its reply. An owed leave
   // stays and goes now: it cannot end the leader's ticket, and the party's
@@ -346,6 +350,9 @@ void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
   AcceptedPartyTicketId = TicketId;
   if (IsRealmReady()) {
     SendOwedLeave(Session.GetPlayerId());
+  }
+  if (Held.IsValid()) {
+    HandleZoneAssignment(Held);
   }
 }
 
@@ -431,6 +438,14 @@ TSharedPtr<FJsonObject> URedwoodClientInterface::NoteTicketingJoinAccepted(
   bAbandonedQueueJoin = false;
   bLeaveTicketingOwed = false;
   OwnTicketId = TicketId;
+  return TakeHeldAssignment(TicketId);
+}
+
+// The assignment kept for the ticket the server named; the ones kept for
+// other tickets were replays, and go. Nothing stays kept: the wait is over.
+TSharedPtr<FJsonObject> URedwoodClientInterface::TakeHeldAssignment(
+  const FString &TicketId
+) {
   TSharedPtr<FJsonObject> Held;
   for (const TPair<FString, TSharedPtr<FJsonObject>> &Kept : HeldAssignments) {
     if (Kept.Key == TicketId) {
