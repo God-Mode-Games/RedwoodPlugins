@@ -1520,8 +1520,21 @@ bool FRedwoodZoneTravelJoinHeldTest::RunTest(const FString &Parameters) {
       ->GetStringField(TEXT("profileId")),
     TEXT("profile-1")
   );
+  // A matchmaking join names no ticket, in its answer and in its
+  // assignment; the assignment that beats the answer waits for it.
+  TestFalse(
+    TEXT("Its assignment before the answer does not move the player yet"),
+    H.AssignmentMoves()
+  );
+  TestEqual(TEXT("It waits"), FAccess::HeldAssignmentCount(*H.Client()), 1);
+  const int32 BeforeMatchmaking = H.Joins->Count;
   H.Socket()->ReplyOk(MatchmakingJoin, NoError());
   TestEqual(TEXT("Its answer reaches the game"), Matchmaking.Count, 1);
+  TestEqual(
+    TEXT("And the assignment that waited moves the player"),
+    H.Joins->Count,
+    BeforeMatchmaking + 1
+  );
   return true;
 }
 

@@ -715,15 +715,15 @@ private:
   // at the answer, not the send. The owed leave still waits for this join.
   // See NoteTicketingJoinSent.
   bool bJoinAwaitingReply = false;
-  // The assignments that name a ticket, pushed while the join is awaited:
-  // the realm pushes before it answers. One per ticket, the newest, oldest
-  // tickets first; the answer's ticket picks the join's own. See
+  // The assignments pushed while the join is awaited: the realm pushes
+  // before it answers. One per ticket (no ticket is one key), the newest,
+  // oldest tickets first; the answer's ticket picks the join's own. See
   // HoldAssignment.
   TArray<TPair<FString, TSharedPtr<FJsonObject>>> HeldAssignments;
   // The ticket of this client's own accepted ticketing join, from the
   // realm's answer, until its travel arrives. While it is set, another
-  // ticket's assignment is a replay. Empty for an older realm that names
-  // no ticket.
+  // ticket's assignment is a replay. Empty for a matchmaking join and for
+  // an older realm, which name no ticket.
   FString OwnTicketId;
   // The travel of an accepted assignment arrived, and the player has not
   // left the world since. A refused or ended join does not clear it: the
