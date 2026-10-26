@@ -398,13 +398,14 @@ void URedwoodClientInterface::ForgetPartyTickets() {
 
 // A join that the server refused gets no assignment, so a replay of an
 // earlier ticket must not move the player at character select. In the
-// world, the server's zone transfers must go on: the refused join replaced
-// the dropped one whose replay they were held against. Call it before the
-// game sees the reply: the game can join again then.
+// world, the server's zone transfers must go on once the dropped join's
+// ticket is left: while its leave is owed, the ticket is still the server's
+// and its assignment can still come. Call it before the game sees the
+// reply: the game can join again then.
 void URedwoodClientInterface::NoteJoinRefused() {
   EndOwnJoin();
   bAssignmentExpected = false;
-  if (bInWorld) {
+  if (bInWorld && !bLeaveTicketingOwed) {
     bAbandonedQueueJoin = false;
   }
 }
