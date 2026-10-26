@@ -488,6 +488,59 @@ public:
   // The realm's push after a GM set or cleared a mute of a player this server
   // hosts. The game's PlayerStates bind it and keep the one that names them.
   FRedwoodPlayerMuteChangedDelegate OnPlayerMuteChanged;
+
+  // Publish a chat line through the realm to Bifrost. Fork-added. A zone
+  // server has a socket to its own players only: a line for a party whose
+  // members stand on other servers, for one character wherever it is in
+  // play, or for the whole realm, has no path from here. Bifrost holds every
+  // player's chat socket, so the realm relays the line to it, and the realm
+  // checks the scope first: a server may speak only for players it hosts, so
+  // a compromised or confused zone cannot address the realm at will.
+  //
+  // The same answer contract as RequestPlayerRoleChange: OnOutput is not
+  // guaranteed to fire, and fires INLINE, with an error, when the sidecar is
+  // down or the event is refused here before it is sent. The error is empty
+  // on success; otherwise it is the realm's text word for word ("Publish is
+  // not configured" when the realm has no Bifrost URL, or its scope
+  // refusal), or one of the constants below. No game feature calls this yet;
+  // it is the API the chat features of later steps build on.
+  void PublishRealmEvent(
+    const FRedwoodRealmEvent &Event, FRedwoodErrorOutputDelegate OnOutput
+  );
+
+  // Wire name, pinned by a test against the backend's own copy.
+  static constexpr const TCHAR *PublishRealmEventName =
+    TEXT("realm:events:publish");
+
+  // The longest template Bifrost accepts, in Unicode code points: the realm
+  // declares the field as 1..256, so a longer one would be refused after a
+  // round trip with a schema error that names no field.
+  static constexpr int32 RealmEventTemplateMaxCodePoints = 256;
+
+  // The local refusals, worded for a log line, not a player.
+  static constexpr const TCHAR *RealmEventEmptyTemplateError =
+    TEXT("A realm event needs a template");
+  static constexpr const TCHAR *RealmEventTemplateTooLongError =
+    TEXT("A realm event template is longer than Bifrost accepts");
+  static constexpr const TCHAR *RealmEventNoTopicError =
+    TEXT("A topic realm event needs a topic");
+  static constexpr const TCHAR *RealmEventNoSessionError =
+    TEXT("A session realm event needs a session id");
+
+  // The three pure halves, kept apart from the socket so the automation test
+  // can reach them without a backend. CheckRealmEvent returns one of the
+  // local refusals, or an empty string when the event can be sent; the
+  // payload builder assumes a checked event and never puts a topic on a
+  // session event or a session id on a topic event.
+  static FString CheckRealmEvent(const FRedwoodRealmEvent &Event);
+  static TSharedPtr<FJsonObject> MakePublishRealmEventPayload(
+    const FRedwoodRealmEvent &Event
+  );
+  // The realm's error, empty on success; an answer that is not the realm's
+  // is reported as an error, never as a line that went out.
+  static FString ParsePublishRealmEventAnswer(
+    const TArray<TSharedPtr<FJsonValue>> &Response
+  );
   // FORK(hollowed-oath) END
 
   // The latest party data for all parties that have at least one

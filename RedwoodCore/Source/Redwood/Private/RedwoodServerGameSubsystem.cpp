@@ -22,6 +22,9 @@
   #include "RedwoodEditorSettings.h"
 #endif
 
+// FORK(hollowed-oath): StringConv::IsLowSurrogate, for the realm event
+// template length in code points.
+#include "Containers/StringConv.h"
 #include "Engine/AssetManager.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/GameSession.h"
@@ -4122,6 +4125,142 @@ void URedwoodServerGameSubsystem::RequestOnlineCharacters(
     MakeShareable(new FJsonObject),
     [OnOutput](auto Response) {
       OnOutput.ExecuteIfBound(ParseListOnlineCharacters(Response));
+    }
+  );
+}
+// FORK(hollowed-oath) END
+
+// FORK(hollowed-oath) BEGIN: publish a realm event. See the header. The
+// check, the payload and the answer are three pure functions, so the
+// automation test can pin the wire without a backend; PublishRealmEvent only
+// joins them to the socket.
+namespace {
+  // The wire words of the two enums. Spelled here, not through the enum's
+  // reflected name, so a rename in C++ cannot change the contract.
+  const TCHAR *RealmEventKindWord(ERedwoodRealmEventKind Kind) {
+    return Kind == ERedwoodRealmEventKind::Session ? TEXT("session")
+                                                   : TEXT("topic");
+  }
+
+  const TCHAR *RealmEventCategoryWord(ERedwoodRealmEventCategory Category) {
+    switch (Category) {
+      case ERedwoodRealmEventCategory::All:
+        return TEXT("all");
+      case ERedwoodRealmEventCategory::Party:
+        return TEXT("party");
+      case ERedwoodRealmEventCategory::Whisper:
+        return TEXT("whisper");
+      case ERedwoodRealmEventCategory::System:
+      default:
+        return TEXT("system");
+    }
+  }
+
+  // Code points, not TCHARs: Bifrost counts the template the way the schema
+  // does, and a TCHAR string holds a character outside the basic plane as a
+  // surrogate pair, two units for one code point. Counting units would refuse
+  // a template Bifrost accepts.
+  int32 RealmEventCodePointCount(const FString &Text) {
+    int32 Count = 0;
+    for (const TCHAR Char : Text) {
+      if (!StringConv::IsLowSurrogate(static_cast<uint32>(Char))) {
+        ++Count;
+      }
+    }
+    return Count;
+  }
+}
+
+FString URedwoodServerGameSubsystem::CheckRealmEvent(
+  const FRedwoodRealmEvent &Event
+) {
+  if (Event.Template.IsEmpty()) {
+    return RealmEventEmptyTemplateError;
+  }
+  if (
+    RealmEventCodePointCount(Event.Template) > RealmEventTemplateMaxCodePoints
+  ) {
+    return RealmEventTemplateTooLongError;
+  }
+  if (Event.Kind == ERedwoodRealmEventKind::Session) {
+    return Event.SessionId.IsEmpty() ? RealmEventNoSessionError : TEXT("");
+  }
+  return Event.Topic.IsEmpty() ? RealmEventNoTopicError : TEXT("");
+}
+
+TSharedPtr<FJsonObject>
+URedwoodServerGameSubsystem::MakePublishRealmEventPayload(
+  const FRedwoodRealmEvent &Event
+) {
+  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
+  Payload->SetStringField(TEXT("kind"), RealmEventKindWord(Event.Kind));
+  // One target field, chosen by the kind: the realm reads the field its kind
+  // names and refuses a request that carries the other.
+  if (Event.Kind == ERedwoodRealmEventKind::Session) {
+    Payload->SetStringField(TEXT("sessionId"), Event.SessionId);
+  } else {
+    Payload->SetStringField(TEXT("topic"), Event.Topic);
+  }
+  Payload->SetStringField(
+    TEXT("category"), RealmEventCategoryWord(Event.Category)
+  );
+  Payload->SetStringField(TEXT("template"), Event.Template);
+
+  TArray<TSharedPtr<FJsonValue>> Args;
+  Args.Reserve(Event.Args.Num());
+  for (const FString &Arg : Event.Args) {
+    Args.Add(MakeShareable(new FJsonValueString(Arg)));
+  }
+  Payload->SetArrayField(TEXT("args"), Args);
+
+  // The sender is optional on the wire, and a line with no sender is the
+  // server's own voice; an empty name would show as a sender with no name.
+  if (!Event.SenderName.IsEmpty()) {
+    TSharedPtr<FJsonObject> Sender = MakeShareable(new FJsonObject);
+    Sender->SetStringField(TEXT("name"), Event.SenderName);
+    Payload->SetObjectField(TEXT("sender"), Sender);
+  }
+  return Payload;
+}
+
+FString URedwoodServerGameSubsystem::ParsePublishRealmEventAnswer(
+  const TArray<TSharedPtr<FJsonValue>> &Response
+) {
+  // The realm puts an error on EVERY answer, empty when the line went out. An
+  // answer without the string is not the realm's, and must not read as an
+  // empty error: that would report a line that may never have been sent.
+  const TSharedPtr<FJsonObject> *MessageObject =
+    URedwoodCommonGameSubsystem::TryGetRedwoodAnswerObject(Response);
+  FString Error;
+  if (
+    MessageObject == nullptr ||
+    !URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
+      *MessageObject, TEXT("error"), Error
+    )
+  ) {
+    return TEXT("The backend did not answer the publish");
+  }
+  return Error;
+}
+
+void URedwoodServerGameSubsystem::PublishRealmEvent(
+  const FRedwoodRealmEvent &Event, FRedwoodErrorOutputDelegate OnOutput
+) {
+  const FString Refusal = CheckRealmEvent(Event);
+  if (!Refusal.IsEmpty()) {
+    OnOutput.ExecuteIfBound(Refusal);
+    return;
+  }
+  if (!Sidecar.IsValid() || !Sidecar->bIsConnected) {
+    OnOutput.ExecuteIfBound(TEXT("Sidecar is not connected"));
+    return;
+  }
+
+  Sidecar->Emit(
+    PublishRealmEventName,
+    MakePublishRealmEventPayload(Event),
+    [OnOutput](auto Response) {
+      OnOutput.ExecuteIfBound(ParsePublishRealmEventAnswer(Response));
     }
   );
 }
