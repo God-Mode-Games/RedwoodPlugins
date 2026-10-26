@@ -533,15 +533,15 @@ bool FRedwoodCurrencyEntryIdShapeTest::RunTest(const FString &Parameters) {
       Fixture::MakeEntry(TEXT("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"), 1, 1),
       Fixture::MakeEntry(MadeId, 1, 1),
     },
-    {}
+    {Fixture::QuestGrantKey}
   );
 
+  // All or nothing: a caller that hears false undoes its whole change, so a valid entry or a key
+  // queued beside the refused ones would be saved for a change that never happened.
   TestFalse(TEXT("The caller hears that entries were refused"), bAllQueued);
-  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
-  TestEqual(TEXT("Only the valid entry is queued"), Pending.Num(), 1);
-  if (Pending.Num() == 1) {
-    TestEqual(TEXT("The queued entry is the made one"), Pending[0].Id, MadeId);
-  }
+  TestEqual(TEXT("No entry is queued"), Component->GetPendingCurrencyEntries().Num(), 0);
+  TestEqual(TEXT("No grant key is queued"), Component->GetGrantKeysToSendCount(), 0);
+  TestFalse(TEXT("Nothing is left to flush"), Component->IsItemsDirty());
 
   return true;
 }

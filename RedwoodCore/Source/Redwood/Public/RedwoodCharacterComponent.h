@@ -375,9 +375,9 @@ public:
   // which staged change depended on the refused one. The character freezes (see
   // FreezeAfterFinalRefusal) until it is hydrated again from the database.
   //
-  // Returns false when anything was refused: every entry and key while the character is frozen or
-  // its writer fence is lost, or an entry whose id or missing currency the backend would refuse. The caller must not
-  // count a refused amount.
+  // Returns false, and queues nothing, when anything is refused: every entry and key while the
+  // character is frozen or its writer fence is lost, or all of them when one entry has an id or a
+  // missing currency the backend would refuse. The caller must not count a refused amount.
   // FORK(hollowed-oath): also a debit that would go below zero when an unsettled trade of this
   // character settles (URedwoodServerGameSubsystem::GetUnsettledTradeFloorBalances).
   bool QueueCurrency(

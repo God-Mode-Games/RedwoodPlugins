@@ -981,13 +981,13 @@ bool URedwoodCharacterComponent::QueueCurrency(
     AddToTradeFloor(Pending);
   }
 
-  // Appended, never merged or de-duplicated: the backend checks each BalanceAfter in order, and a
-  // repeated grant key must reach the backend so it refuses the second reward instead of the game
-  // server quietly paying it without its guard.
-  bool bAllQueued = true;
+  // All or nothing: every entry is checked before any is queued. A caller that hears false undoes
+  // its whole change, so an entry or a key queued beside a refused one would be saved for a change
+  // that never happened.
+  bool bAllValid = true;
   for (const FRedwoodCurrencyEntry &Entry : Entries) {
     // A bad id would make the backend refuse the whole batch for good, taking every valid entry
-    // and item row sent with it. Refuse the one entry here instead, loudly: it is a caller bug.
+    // and item row sent with it. Refuse the call here instead, loudly: it is a caller bug.
     // An Error log, not an ensure: the caller learns it from the return value.
     if (!IsValidCurrencyEntryId(Entry.Id)) {
       UE_LOG(
@@ -997,7 +997,7 @@ bool URedwoodCharacterComponent::QueueCurrency(
         *Entry.Id,
         Entry.Delta
       );
-      bAllQueued = false;
+      bAllValid = false;
       continue;
     }
     // The same: the backend refuses an entry without a currency for good.
@@ -1009,7 +1009,7 @@ bool URedwoodCharacterComponent::QueueCurrency(
         *Entry.Id,
         Entry.Delta
       );
-      bAllQueued = false;
+      bAllValid = false;
       continue;
     }
     const int64 *TradeFloor = TradeFloors.Find(Entry.Currency);
@@ -1024,14 +1024,20 @@ bool URedwoodCharacterComponent::QueueCurrency(
         *Entry.Id,
         Entry.Delta
       );
-      bAllQueued = false;
+      bAllValid = false;
       continue;
     }
     AddToTradeFloor(Entry);
-    PendingCurrencyEntries.Add(Entry);
   }
+  if (!bAllValid) {
+    return false;
+  }
+  // Appended, never merged or de-duplicated: the backend checks each BalanceAfter in order, and a
+  // repeated grant key must reach the backend so it refuses the second reward instead of the game
+  // server quietly paying it without its guard.
+  PendingCurrencyEntries.Append(Entries);
   PendingGrantKeys.Append(GrantKeys);
-  return bAllQueued;
+  return true;
 }
 
 // The unconfirmed batch first: its probe goes out unchanged even while a reload waits behind it
