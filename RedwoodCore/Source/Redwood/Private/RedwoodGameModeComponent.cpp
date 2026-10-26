@@ -678,6 +678,80 @@ APawn *URedwoodGameModeComponent::RetryFailedPawnSpawn(
 // Player auth verification against the sidecar
 // ---------------------------------------------------------------------------
 
+// FORK(hollowed-oath) BEGIN: backend item-load leg + reentry hold field. Upstream trunk here is a
+// single inline PlayerStateComponent->SetRedwoodCharacter(ParseCharacter(Character)).
+// The fork hoists the parse into ParsedCharacter so it can graft the item rows --
+// which the backend delivers as a SIBLING "items" field of the player-auth response,
+// NOT nested in "character" -- onto it BEFORE SetRedwoodCharacter fires
+// OnRedwoodCharacterUpdated. Merge must preserve that ordering (rows attached before the
+// set) so RedwoodPlayerStateCharacterUpdated has them in hand when it broadcasts.
+// (inventorySeq needs no such graft: unlike Items on THIS auth leg, the backend puts the
+// seq directly on the character object, so ParseCharacter above already picked it up. Note
+// ParseCharacter ALSO reads an inline "items" array, but only the backend character-LIST
+// response and offline saves place items there; the auth response nests nothing in
+// "character", so that inline read is a no-op here and this sibling graft is the only path
+// that populates Items on this leg. See the item-array contract in ParseCharacter.)
+void URedwoodGameModeComponent::ApplyAuthSuccessToPlayerState(
+  URedwoodPlayerStateComponent *PlayerStateComponent,
+  const TSharedPtr<FJsonObject> &MessageStruct
+) {
+  TSharedPtr<FJsonObject> Character =
+    MessageStruct->GetObjectField(TEXT("character"));
+  TSharedPtr<FJsonObject> Player = MessageStruct->GetObjectField(TEXT("player"));
+
+  PlayerStateComponent->SetRedwoodPlayer(
+    URedwoodCommonGameSubsystem::ParsePlayerData(Player)
+  );
+
+  FRedwoodCharacterBackend ParsedCharacter =
+    URedwoodCommonGameSubsystem::ParseCharacter(Character);
+
+  // Item rows ride this SAME player-auth response (a sibling field to "character", not
+  // nested inside it -- see the backend's PlayerAuth.SidecarToRealm IResponse extension
+  // that added "items" alongside "character"/"player"), so they are present before
+  // SetRedwoodCharacter fires OnRedwoodCharacterUpdated below, instead of arriving later
+  // via a separate realm:characters:items:load round trip.
+  const TArray<TSharedPtr<FJsonValue>> *ItemsJsonArray = nullptr;
+  if (MessageStruct->TryGetArrayField(TEXT("items"), ItemsJsonArray)) {
+    ParsedCharacter.Items =
+      URedwoodCommonGameSubsystem::ParseItemRecords(*ItemsJsonArray);
+  }
+
+  // Optional sibling field: the character an earlier session of this account still holds.
+  // Absent means none. Stored before SetRedwoodCharacter so its listeners already see it.
+  FString ReentryHeldCharacterId;
+  MessageStruct->TryGetStringField(
+    TEXT("reentryHeldCharacterId"), ReentryHeldCharacterId
+  );
+  PlayerStateComponent->ReentryHeldCharacterId = ReentryHeldCharacterId;
+
+  PlayerStateComponent->SetRedwoodCharacter(ParsedCharacter);
+  PlayerStateComponent->SetServerReady();
+}
+// FORK(hollowed-oath) END
+
+// FORK(hollowed-oath): see the declaration.
+bool URedwoodGameModeComponent::ShouldReleaseLateAuth(
+  const FRedwoodShouldReleaseDepartedAuth &Gate,
+  const TArray<APlayerState *> &Players,
+  const FString &PlayerId,
+  const FString &CharacterId
+) {
+  if (!Gate.IsBound()) {
+    return false;
+  }
+  for (APlayerState *Player : Players) {
+    const URedwoodPlayerStateComponent *Component = IsValid(Player)
+      ? Player->FindComponentByClass<URedwoodPlayerStateComponent>()
+      : nullptr;
+    if (Component && Component->RedwoodCharacter.Id == CharacterId) {
+      // A live player already owns this character here; releasing would cut its writes.
+      return false;
+    }
+  }
+  return Gate.Execute(PlayerId, CharacterId);
+}
+
 void URedwoodGameModeComponent::RunSidecarPlayerAuth(
   APlayerController *PlayerController,
   const FString &PlayerId,
@@ -717,18 +791,68 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
   // in the callback rather than holding raw pointers across the await.
   TWeakObjectPtr<APlayerController> WeakPlayerController(PlayerController);
   TWeakObjectPtr<AGameModeBase> WeakGameMode(GameMode);
+  TWeakObjectPtr<URedwoodGameModeComponent> WeakThis(this);
 
   Sidecar->Emit(
     TEXT("realm:servers:player-auth:game-server-to-sidecar"),
     JsonObject,
-    [PlayerId, WeakPlayerController, WeakGameMode](auto Response) {
+    [PlayerId, WeakPlayerController, WeakGameMode, WeakThis](auto Response) {
       APlayerController *PlayerController = WeakPlayerController.Get();
       AGameModeBase *GameMode = WeakGameMode.Get();
-      if (!IsValid(PlayerController) || !IsValid(GameMode)) {
+      if (!IsValid(GameMode)) {
         return;
       }
       TSharedPtr<FJsonObject> MessageStruct = Response[0]->AsObject();
       FString Error = MessageStruct->GetStringField(TEXT("error"));
+
+      // FORK(hollowed-oath) BEGIN: late auth after departure. The backend has
+      // already bound this character to this instance for the reply, but the
+      // connection left first, so no logout will ever run for it. Release the
+      // binding here unless the game says otherwise. Only the ids in the
+      // validated reply are used (never the client's URL options), and a
+      // failed reply created no binding, so it releases nothing.
+      if (!IsValid(PlayerController)) {
+        const TSharedPtr<FJsonObject> *CharacterJson = nullptr;
+        const TSharedPtr<FJsonObject> *PlayerJson = nullptr;
+        FString ReplyCharacterId;
+        FString ReplyPlayerId;
+        if (Error.IsEmpty() &&
+            MessageStruct->TryGetObjectField(TEXT("character"), CharacterJson) &&
+            MessageStruct->TryGetObjectField(TEXT("player"), PlayerJson) &&
+            (*CharacterJson)->TryGetStringField(TEXT("id"), ReplyCharacterId) &&
+            (*PlayerJson)->TryGetStringField(TEXT("id"), ReplyPlayerId) &&
+            !ReplyCharacterId.IsEmpty() && !ReplyPlayerId.IsEmpty()) {
+          URedwoodGameModeComponent *Self = WeakThis.Get();
+          URedwoodServerGameSubsystem *LateServerSubsystem =
+            IsValid(GameMode->GetGameInstance())
+            ? GameMode->GetGameInstance()
+                ->GetSubsystem<URedwoodServerGameSubsystem>()
+            : nullptr;
+          TArray<APlayerState *> Players;
+          if (IsValid(GameMode->GameState)) {
+            Players = GameMode->GameState->PlayerArray;
+          }
+          if (IsValid(Self) && IsValid(LateServerSubsystem) &&
+              ShouldReleaseLateAuth(
+                Self->ShouldReleaseDepartedAuth,
+                Players,
+                ReplyPlayerId,
+                ReplyCharacterId
+              )) {
+            UE_LOG(
+              LogRedwood,
+              Log,
+              TEXT(
+                "Auth reply for character %s arrived after the player left; releasing its binding"
+              ),
+              *ReplyCharacterId
+            );
+            LateServerSubsystem->EmitPlayerLeft(ReplyPlayerId, ReplyCharacterId);
+          }
+        }
+        return;
+      }
+      // FORK(hollowed-oath) END
 
       if (Error.IsEmpty()) {
         TSharedPtr<FJsonObject> Character =
@@ -751,40 +875,7 @@ void URedwoodGameModeComponent::RunSidecarPlayerAuth(
             *CharacterId
           );
 
-          PlayerStateComponent->SetRedwoodPlayer(
-            URedwoodCommonGameSubsystem::ParsePlayerData(Player)
-          );
-
-          // FORK(hollowed-oath) BEGIN: backend item-load leg. Upstream trunk here is a
-          // single inline PlayerStateComponent->SetRedwoodCharacter(ParseCharacter(Character)).
-          // The fork hoists the parse into ParsedCharacter so it can graft the item rows --
-          // which the backend delivers as a SIBLING "items" field of the player-auth response,
-          // NOT nested in "character" -- onto it BEFORE SetRedwoodCharacter fires
-          // OnRedwoodCharacterUpdated. Merge must preserve that ordering (rows attached before the
-          // set) so RedwoodPlayerStateCharacterUpdated has them in hand when it broadcasts.
-          // (inventorySeq needs no such graft: unlike Items on THIS auth leg, the backend puts the
-          // seq directly on the character object, so ParseCharacter above already picked it up. Note
-          // ParseCharacter ALSO reads an inline "items" array, but only the backend character-LIST
-          // response and offline saves place items there; the auth response nests nothing in
-          // "character", so that inline read is a no-op here and this sibling graft is the only path
-          // that populates Items on this leg. See the item-array contract in ParseCharacter.)
-          FRedwoodCharacterBackend ParsedCharacter =
-            URedwoodCommonGameSubsystem::ParseCharacter(Character);
-
-          // Item rows ride this SAME player-auth response (a sibling field to "character", not
-          // nested inside it -- see the backend's PlayerAuth.SidecarToRealm IResponse extension
-          // that added "items" alongside "character"/"player"), so they are present before
-          // SetRedwoodCharacter fires OnRedwoodCharacterUpdated below, instead of arriving later
-          // via a separate realm:characters:items:load round trip.
-          const TArray<TSharedPtr<FJsonValue>> *ItemsJsonArray = nullptr;
-          if (MessageStruct->TryGetArrayField(TEXT("items"), ItemsJsonArray)) {
-            ParsedCharacter.Items =
-              URedwoodCommonGameSubsystem::ParseItemRecords(*ItemsJsonArray);
-          }
-
-          PlayerStateComponent->SetRedwoodCharacter(ParsedCharacter);
-          // FORK(hollowed-oath) END
-          PlayerStateComponent->SetServerReady();
+          ApplyAuthSuccessToPlayerState(PlayerStateComponent, MessageStruct);
 
           // The realm backend pushes party data to this server when the
           // player authenticates, but that push races with this auth

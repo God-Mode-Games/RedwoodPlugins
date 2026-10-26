@@ -1565,8 +1565,29 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
   const FString &PlayerId,
   bool bReleaseBindingWhenSettled
 ) {
+  FlushDetachedCharacterData(
+    Pawn, CharacterId, PlayerId, bReleaseBindingWhenSettled, nullptr
+  );
+}
+
+void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
+  APawn *Pawn,
+  const FString &CharacterId,
+  const FString &PlayerId,
+  bool bReleaseBindingWhenSettled,
+  TFunction<void()> OnSettled
+) {
+  // FORK(hollowed-oath): OnSettled must run exactly once on every exit below, so each
+  // synchronous exit goes through this. The async exit hands OnSettled to SettleOne.
+  auto NotifySettled = [&OnSettled]() {
+    if (OnSettled) {
+      OnSettled();
+    }
+  };
+
   UWorld *World = GetWorld();
   if (!IsValid(World) || CharacterId.IsEmpty()) {
+    NotifySettled();
     return;
   }
 
@@ -1585,16 +1606,18 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
       bReleaseBindingWhenSettled ? TEXT(" and binding release") : TEXT(""),
       *CharacterId
     );
+    NotifySettled();
     return;
   }
 
   // Skip paths that put no write in flight have nothing to order the release
   // behind, so the caller-requested binding release can go out immediately.
   auto ReleaseBindingNow =
-    [this, &PlayerId, &CharacterId, bReleaseBindingWhenSettled]() {
+    [this, &PlayerId, &CharacterId, bReleaseBindingWhenSettled, &NotifySettled]() {
       if (bReleaseBindingWhenSettled) {
         EmitPlayerLeft(PlayerId, CharacterId);
       }
+      NotifySettled();
     };
 
   if (!IsValid(Pawn)) {
@@ -1804,7 +1827,12 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
   TSharedRef<int32> SettleLatch = MakeShared<int32>(PendingSettles);
   TWeakObjectPtr<URedwoodServerGameSubsystem> WeakThis(this);
   auto SettleOne =
-    [WeakThis, SettleLatch, PlayerId, CharacterId, bReleaseBindingWhenSettled]() {
+    [WeakThis,
+     SettleLatch,
+     PlayerId,
+     CharacterId,
+     bReleaseBindingWhenSettled,
+     OnSettled]() {
       if (--(*SettleLatch) > 0) {
         return;
       }
@@ -1813,6 +1841,11 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
       // nothing.
       if (bReleaseBindingWhenSettled && WeakThis.IsValid()) {
         WeakThis->EmitPlayerLeft(PlayerId, CharacterId);
+      }
+      // Fires after the release, even when the subsystem is gone, so a caller tracking the
+      // release never stays stuck.
+      if (OnSettled) {
+        OnSettled();
       }
     };
 

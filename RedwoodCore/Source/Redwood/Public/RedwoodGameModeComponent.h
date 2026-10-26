@@ -9,6 +9,9 @@
 
 #include "RedwoodGameModeComponent.generated.h"
 
+class APlayerState;
+class FJsonObject;
+class URedwoodPlayerStateComponent;
 class URedwoodServerGameSubsystem;
 
 // FORK(hollowed-oath): fork-added delegate, not in upstream Redwood. Part of
@@ -25,6 +28,17 @@ class URedwoodServerGameSubsystem;
 // the character actually leaves the world, releasing the binding.
 DECLARE_DELEGATE_RetVal_OneParam(
   bool, FRedwoodShouldRetainCharacterBinding, APlayerController *
+);
+
+// FORK(hollowed-oath): fork-added delegate, not in upstream Redwood. Called
+// when a player-auth reply arrives AFTER its connection already left. The
+// backend has bound the reply's (PlayerId, CharacterId) to this instance for a
+// player that no longer exists here, so nothing else would ever release it.
+// Return true to let the component emit a releasing player-left for the pair.
+// Both ids come from the validated reply, never from the client's URL options.
+// Unbound = no release (stock behavior).
+DECLARE_DELEGATE_RetVal_TwoParams(
+  bool, FRedwoodShouldReleaseDepartedAuth, const FString &, const FString &
 );
 
 UCLASS()
@@ -133,6 +147,29 @@ public:
   // presence outlives the connection (e.g. linkdead body retention).
   // Unbound = stock behavior.
   FRedwoodShouldRetainCharacterBinding ShouldRetainCharacterBinding;
+
+  // FORK(hollowed-oath): see FRedwoodShouldReleaseDepartedAuth above.
+  FRedwoodShouldReleaseDepartedAuth ShouldReleaseDepartedAuth;
+
+  // FORK(hollowed-oath): the two decisions of the player-auth reply, split out
+  // of the async callback so tests can reach them without a live sidecar.
+  //
+  // Stores the reply's account data on the player state. Order matters:
+  // "reentryHeldCharacterId" and the item rows are set BEFORE
+  // SetRedwoodCharacter, so OnRedwoodCharacterUpdated listeners see them.
+  static void ApplyAuthSuccessToPlayerState(
+    URedwoodPlayerStateComponent *PlayerStateComponent,
+    const TSharedPtr<FJsonObject> &MessageStruct
+  );
+
+  // True when a departed player's late auth reply must be released: the game
+  // gate allows it AND no player state in Players carries the character.
+  static bool ShouldReleaseLateAuth(
+    const FRedwoodShouldReleaseDepartedAuth &Gate,
+    const TArray<APlayerState *> &Players,
+    const FString &PlayerId,
+    const FString &CharacterId
+  );
 
   UFUNCTION()
   void FlushPersistence();

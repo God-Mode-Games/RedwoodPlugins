@@ -324,6 +324,22 @@ public:
     bool bReleaseBindingWhenSettled = false
   );
 
+  // Native overload of the above (UFUNCTIONs cannot take a TFunction, so the
+  // Blueprint-visible form stays as it is and forwards here with no callback).
+  // OnSettled runs EXACTLY ONCE on every exit, after the release was sent when
+  // one was requested: bad world or id, sidecar down, no usable pawn,
+  // nothing dirty, offline save, and the last write ack (success OR error).
+  // It reports that this flush/release EMIT is finished, NOT that the realm
+  // processed the player-left, and NOT that the data was saved: the sidecar-down
+  // exit calls it too, with the data still dirty.
+  void FlushDetachedCharacterData(
+    APawn *Pawn,
+    const FString &CharacterId,
+    const FString &PlayerId,
+    bool bReleaseBindingWhenSettled,
+    TFunction<void()> OnSettled
+  );
+
   // FORK(hollowed-oath): fork-added API (see FlushDetachedCharacterData
   // above). Keep across upstream merges.
   //
