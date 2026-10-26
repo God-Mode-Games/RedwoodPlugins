@@ -24,7 +24,9 @@ public:
 
   void Add(TFunction<void()> Request);
 
-  // The session is back: every held request runs again, and goes out.
+  // The session is back, or what a held request waited for has come
+  // (HollowedOath#3609): every held request runs again, and takes its gate
+  // again.
   void Release();
 
   // The grace ran out, or the session ended: every held request runs again,
