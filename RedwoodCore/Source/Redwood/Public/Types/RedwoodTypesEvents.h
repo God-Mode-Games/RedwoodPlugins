@@ -5,6 +5,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "RedwoodModule.h"
 
 #include "RedwoodTypesEvents.generated.h"
 
@@ -67,9 +68,10 @@ struct REDWOOD_API FRedwoodRealmEvent {
 
   // The three helpers refuse an id that is empty or holds a `/`: the topic
   // would then name nobody, or a different topic than the caller meant, and
-  // Bifrost would store the line under it for good. They raise an ensure and
+  // Bifrost would store the line under it for good. They log a warning and
   // leave the Topic empty, so CheckRealmEvent refuses the event and nothing
-  // is sent.
+  // is sent. A warning, not an ensure: an ensure's report is several log
+  // lines the automation framework counts as errors one by one.
 
   // A line for every player on the realm, under the "all" category.
   static FRedwoodRealmEvent RealmWide(
@@ -120,12 +122,14 @@ private:
   static FString RealmTopic(
     const FString &RealmId, const FString &Suffix, bool bIdIsGood
   ) {
-    if (!ensureAlwaysMsgf(
-          IsTopicId(RealmId) && bIdIsGood,
-          TEXT("Refused the realm topic '%s' for realm '%s'"),
-          *Suffix,
-          *RealmId
-        )) {
+    if (!IsTopicId(RealmId) || !bIdIsGood) {
+      UE_LOG(
+        LogRedwood,
+        Warning,
+        TEXT("Refused the realm topic '%s' for realm '%s'"),
+        *Suffix,
+        *RealmId
+      );
       return FString();
     }
     return RealmTopicPrefix + RealmId + TEXT("/") + Suffix;
