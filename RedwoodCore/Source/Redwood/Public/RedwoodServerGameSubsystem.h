@@ -512,26 +512,43 @@ public:
   static constexpr const TCHAR *PublishRealmEventName =
     TEXT("realm:events:publish");
 
-  // The longest template Bifrost accepts, in Unicode code points: the realm
-  // declares the field as 1..256, so a longer one would be refused after a
-  // round trip with a schema error that names no field.
+  // The most Bifrost accepts, in Unicode code points: the realm declares the
+  // template as 1..256 and bounds the args the same way, so a longer one would
+  // be refused after a round trip with a schema error that names no field.
+  // The args bound also keeps one line from carrying a payload of its own.
   static constexpr int32 RealmEventTemplateMaxCodePoints = 256;
+  static constexpr int32 RealmEventArgsMax = 16;
+  static constexpr int32 RealmEventArgMaxCodePoints = 256;
 
   // The local refusals, worded for a log line, not a player.
   static constexpr const TCHAR *RealmEventEmptyTemplateError =
     TEXT("A realm event needs a template");
   static constexpr const TCHAR *RealmEventTemplateTooLongError =
     TEXT("A realm event template is longer than Bifrost accepts");
+  static constexpr const TCHAR *RealmEventTooManyArgsError =
+    TEXT("A realm event has more args than Bifrost accepts");
+  static constexpr const TCHAR *RealmEventArgTooLongError =
+    TEXT("A realm event arg is longer than Bifrost accepts");
   static constexpr const TCHAR *RealmEventNoTopicError =
     TEXT("A topic realm event needs a topic");
+  static constexpr const TCHAR *RealmEventBadTopicError =
+    TEXT("A realm event topic has a part with no id");
   static constexpr const TCHAR *RealmEventNoSessionError =
     TEXT("A session realm event needs a session id");
 
   // The three pure halves, kept apart from the socket so the automation test
   // can reach them without a backend. CheckRealmEvent returns one of the
-  // local refusals, or an empty string when the event can be sent; the
-  // payload builder assumes a checked event and never puts a topic on a
-  // session event or a session id on a topic event.
+  // local refusals, or an empty string when the event can be sent. A topic
+  // is refused when a `/` part of it is empty or ends in `:`, the shape an
+  // empty realm, character or party id leaves behind; the helpers on
+  // FRedwoodRealmEvent refuse such an id before that.
+  //
+  // The payload builder assumes a checked event. It writes the one target
+  // field the kind names: a Topic event with a SessionId set, or a Session
+  // event with a Topic set, goes out WITHOUT the stray field, on purpose. The
+  // kind alone decides where the line goes, and a request that carries both
+  // fields would make the realm guess, or refuse the whole line for a value
+  // nobody meant to send.
   static FString CheckRealmEvent(const FRedwoodRealmEvent &Event);
   static TSharedPtr<FJsonObject> MakePublishRealmEventPayload(
     const FRedwoodRealmEvent &Event

@@ -65,12 +65,18 @@ struct REDWOOD_API FRedwoodRealmEvent {
   static constexpr const TCHAR *CharacterTopicWord = TEXT("char:");
   static constexpr const TCHAR *PartyTopicWord = TEXT("party:");
 
+  // The three helpers refuse an id that is empty or holds a `/`: the topic
+  // would then name nobody, or a different topic than the caller meant, and
+  // Bifrost would store the line under it for good. They raise an ensure and
+  // leave the Topic empty, so CheckRealmEvent refuses the event and nothing
+  // is sent.
+
   // A line for every player on the realm, under the "all" category.
   static FRedwoodRealmEvent RealmWide(
     const FString &RealmId, const FString &InTemplate
   ) {
     return ForTopic(
-      RealmTopic(RealmId, AllTopicWord),
+      RealmTopic(RealmId, AllTopicWord, true),
       ERedwoodRealmEventCategory::All,
       InTemplate
     );
@@ -84,7 +90,9 @@ struct REDWOOD_API FRedwoodRealmEvent {
     const FString &InTemplate
   ) {
     return ForTopic(
-      RealmTopic(RealmId, CharacterTopicWord + CharacterId),
+      RealmTopic(
+        RealmId, CharacterTopicWord + CharacterId, IsTopicId(CharacterId)
+      ),
       ERedwoodRealmEventCategory::System,
       InTemplate
     );
@@ -95,14 +103,31 @@ struct REDWOOD_API FRedwoodRealmEvent {
     const FString &RealmId, const FString &PartyId, const FString &InTemplate
   ) {
     return ForTopic(
-      RealmTopic(RealmId, PartyTopicWord + PartyId),
+      RealmTopic(RealmId, PartyTopicWord + PartyId, IsTopicId(PartyId)),
       ERedwoodRealmEventCategory::Party,
       InTemplate
     );
   }
 
 private:
-  static FString RealmTopic(const FString &RealmId, const FString &Suffix) {
+  // An id is one topic part: not empty, and no `/`, which is the separator.
+  static bool IsTopicId(const FString &Id) {
+    return !Id.IsEmpty() && !Id.Contains(TEXT("/"));
+  }
+
+  // Empty for a bad id, so the event fails CheckRealmEvent and nothing is
+  // sent. The caller judges its own id; the realm id is judged here.
+  static FString RealmTopic(
+    const FString &RealmId, const FString &Suffix, bool bIdIsGood
+  ) {
+    if (!ensureAlwaysMsgf(
+          IsTopicId(RealmId) && bIdIsGood,
+          TEXT("Refused the realm topic '%s' for realm '%s'"),
+          *Suffix,
+          *RealmId
+        )) {
+      return FString();
+    }
     return RealmTopicPrefix + RealmId + TEXT("/") + Suffix;
   }
 
