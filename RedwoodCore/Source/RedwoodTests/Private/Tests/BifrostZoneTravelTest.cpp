@@ -672,7 +672,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodZoneTravelInWorldTest::RunTest(const FString &Parameters) {
   using namespace RedwoodBifrostZoneTravelTest;
   ExpectDrop(*this);
-  ExpectIgnoredAssignments(*this, 2);
+  ExpectIgnoredAssignments(*this, 3);
   FZoneHarness H(*this);
   H.EnterSessionWithCharacter();
 
@@ -720,8 +720,8 @@ bool FRedwoodZoneTravelInWorldTest::RunTest(const FString &Parameters) {
   );
 
   // A join lost in the world: the replay of its assignment could come, so
-  // zone transfers wait. A join refused after it replaces the dropped join,
-  // and the transfers go on.
+  // zone transfers wait. A join refused after it replaces the dropped join
+  // once the lost ticket is left, and the transfers go on.
   TCapture<FRedwoodTicketingUpdate> Lost;
   H.SendJoinQueue(Lost);
   H.Drop();
@@ -731,10 +731,27 @@ bool FRedwoodZoneTravelInWorldTest::RunTest(const FString &Parameters) {
     FAccess::IsQueueJoinAbandoned(*H.Client())
   );
   TestFalse(TEXT("A dropped join blocks a zone transfer"), H.AssignmentMoves());
+  const FPhoenixMessage OwedInWorld = H.Socket()->Last(LeaveEvent);
+  if (!TestTrue(
+        TEXT("The resume pays the lost ticket's leave"), OwedInWorld.IsValid()
+      )) {
+    return false;
+  }
+  TCapture<FRedwoodTicketingUpdate> RefusedEarly;
+  H.Socket()->ReplyWithError(H.SendJoinQueue(RefusedEarly), TEXT("refused"));
+  TestTrue(
+    TEXT("A join refused while the leave is still owed keeps the dropped join"),
+    FAccess::IsQueueJoinAbandoned(*H.Client())
+  );
+  TestFalse(
+    TEXT("The lost ticket's assignment still does not move the player"),
+    H.AssignmentMoves()
+  );
+  H.Socket()->ReplyOk(OwedInWorld, NoError());
   TCapture<FRedwoodTicketingUpdate> RefusedAgain;
   H.Socket()->ReplyWithError(H.SendJoinQueue(RefusedAgain), TEXT("refused"));
   TestFalse(
-    TEXT("A join refused in the world replaces the dropped join"),
+    TEXT("A join refused once the leave ran replaces the dropped join"),
     FAccess::IsQueueJoinAbandoned(*H.Client())
   );
   TestTrue(TEXT("A zone transfer moves the player again"), H.AssignmentMoves());
