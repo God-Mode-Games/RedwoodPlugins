@@ -129,6 +129,13 @@ public:
     const FJsonObject &Object, const TCHAR *FieldName, int64 &OutValue
   );
 
+  // FJsonObject::TryGetBoolField reads the string "false" as a boolean, so a
+  // field of the wrong type must be refused by its type, not by its read: a
+  // mute flag that is not the backend's boolean must not read as "not muted".
+  static bool TryGetRedwoodBoolField(
+    const FJsonObject &Object, const TCHAR *FieldName, bool &bOutValue
+  );
+
   // FORK(hollowed-oath): one text for every character friend call whose
   // realm answer cannot be read.
   static constexpr const TCHAR *BadRealmAnswerError =

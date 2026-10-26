@@ -4006,24 +4006,33 @@ namespace {
     int64 &OutUntil,
     FString &OutReason
   ) {
+    // Read into locals: the outputs are written only by a whole good answer,
+    // so a bad `until` cannot leave a `muted` already set behind.
+    bool bMuted = false;
+    int64 Until = 0;
     if (
-      !Object.TryGetBoolField(TEXT("muted"), bOutMuted) ||
+      !URedwoodCommonGameSubsystem::TryGetRedwoodBoolField(
+        Object, TEXT("muted"), bMuted
+      ) ||
       !URedwoodCommonGameSubsystem::TryGetRedwoodUnixMsField(
-        Object, TEXT("until"), OutUntil
+        Object, TEXT("until"), Until
       )
     ) {
       return false;
     }
     // The reason is text or absent; a number here is not a reason.
-    OutReason.Empty();
+    FString Reason;
     const TSharedPtr<FJsonValue> ReasonValue =
       Object.TryGetField(TEXT("reason"));
     if (
       ReasonValue.IsValid() && ReasonValue->Type != EJson::Null &&
-      !ReasonValue->TryGetString(OutReason)
+      !ReasonValue->TryGetString(Reason)
     ) {
       return false;
     }
+    bOutMuted = bMuted;
+    OutUntil = Until;
+    OutReason = Reason;
     return true;
   }
 }

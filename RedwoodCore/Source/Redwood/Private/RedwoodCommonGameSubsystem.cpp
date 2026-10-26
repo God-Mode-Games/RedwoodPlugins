@@ -1382,15 +1382,29 @@ bool URedwoodCommonGameSubsystem::TryGetRedwoodStringField(
 bool URedwoodCommonGameSubsystem::TryGetRedwoodUnixMsField(
   const FJsonObject &Object, const TCHAR *FieldName, int64 &OutValue
 ) {
+  // TryGetNumberField parses a numeric string, so the type is checked first.
+  const TSharedPtr<FJsonValue> Field = Object.TryGetField(FieldName);
   double Value = 0.0;
   if (
-    !Object.TryGetNumberField(FieldName, Value) || !FMath::IsFinite(Value) ||
+    !Field.IsValid() || Field->Type != EJson::Number ||
+    !Field->TryGetNumber(Value) || !FMath::IsFinite(Value) ||
     Value < 0.0 || Value > static_cast<double>(MAX_int64) ||
     Value != FMath::FloorToDouble(Value)
   ) {
     return false;
   }
   OutValue = static_cast<int64>(Value);
+  return true;
+}
+
+bool URedwoodCommonGameSubsystem::TryGetRedwoodBoolField(
+  const FJsonObject &Object, const TCHAR *FieldName, bool &bOutValue
+) {
+  const TSharedPtr<FJsonValue> Field = Object.TryGetField(FieldName);
+  if (!Field.IsValid() || Field->Type != EJson::Boolean) {
+    return false;
+  }
+  bOutValue = Field->AsBool();
   return true;
 }
 // FORK(hollowed-oath) END
