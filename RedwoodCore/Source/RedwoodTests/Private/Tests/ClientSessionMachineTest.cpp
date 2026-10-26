@@ -57,7 +57,6 @@ namespace RedwoodSessionMachineTest {
     ClosedReconnect,
     LoginOk,
     LoginRefused,
-    LoginMustVerify,
     LoginLost,
     LoginOldSeq,
     EnterOk,
@@ -88,7 +87,6 @@ namespace RedwoodSessionMachineTest {
       TEXT("ClosedReconnect"),
       TEXT("LoginOk"),
       TEXT("LoginRefused"),
-      TEXT("LoginMustVerify"),
       TEXT("LoginLost"),
       TEXT("LoginOldSeq"),
       TEXT("EnterOk"),
@@ -145,10 +143,6 @@ namespace RedwoodSessionMachineTest {
       case EVariant::LoginRefused:
         return FRedwoodSessionEvent::LoginRefused(
           Join, TEXT("login_failed"), Refusal
-        );
-      case EVariant::LoginMustVerify:
-        return FRedwoodSessionEvent::LoginRefused(
-          Join, TEXT("login_failed"), TEXT("Must verify account")
         );
       case EVariant::LoginLost:
         return FRedwoodSessionEvent::LoginLost(Join);
@@ -585,12 +579,6 @@ namespace RedwoodSessionMachineTest {
     );
     T.Add(
       {EPhase::LoggingIn,
-       EVariant::LoginMustVerify,
-       EPhase::Online,
-       {FExpect(EKind::AnswerLogin, EAnswer::MustVerify, FString())}}
-    );
-    T.Add(
-      {EPhase::LoggingIn,
        EVariant::LoginLost,
        EPhase::Online,
        {LoginError(Lost)}}
@@ -607,14 +595,6 @@ namespace RedwoodSessionMachineTest {
        EPhase::Online,
        Cat(End, {FExpect(EKind::BroadcastAuthFailed, Refusal)})}
     );
-    T.Add(
-      {EPhase::Relogging,
-       EVariant::LoginMustVerify,
-       EPhase::Online,
-       Cat(
-         End, {FExpect(EKind::BroadcastAuthFailed, TEXT("Must verify account"))}
-       )}
-    );
     T.Add({EPhase::Relogging, EVariant::LoginLost, EPhase::ReloginPending, {}});
     for (const EVariant Variant : {EVariant::LoginOk}) {
       T.Add(
@@ -625,9 +605,7 @@ namespace RedwoodSessionMachineTest {
       );
     }
     for (const EVariant Variant :
-         {EVariant::LoginRefused,
-          EVariant::LoginMustVerify,
-          EVariant::LoginLost}) {
+         {EVariant::LoginRefused, EVariant::LoginLost}) {
       T.Add({EPhase::LoggingOut, Variant, EPhase::Online, {}});
     }
 

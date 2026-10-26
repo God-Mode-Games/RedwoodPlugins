@@ -23,7 +23,6 @@ const TCHAR *const FRedwoodClientSession::EntryNotReadyError =
   TEXT("Not connected or authenticated to Director.");
 
 namespace {
-  const TCHAR *const MustVerifyMessage = TEXT("Must verify account");
   const TCHAR *const LocalProvider = TEXT("local");
 }
 
@@ -87,10 +86,7 @@ FRedwoodSessionEvent FRedwoodSessionEvent::LoginOk(
 }
 
 FRedwoodSessionEvent FRedwoodSessionEvent::LoginRefused(
-  uint32 Seq,
-  const FString &Reason,
-  const FString &Message,
-  const FString &PlayerId
+  uint32 Seq, const FString &Reason, const FString &Message
 ) {
   FRedwoodSessionEvent Event;
   Event.Kind = ERedwoodSessionEventKind::LoginReply;
@@ -98,7 +94,6 @@ FRedwoodSessionEvent FRedwoodSessionEvent::LoginRefused(
   Event.Outcome = ERedwoodReplyOutcome::Refused;
   Event.Reason = Reason;
   Event.Message = Message;
-  Event.PlayerId = PlayerId;
   return Event;
 }
 
@@ -215,7 +210,6 @@ FString FRedwoodSessionEffect::ToString() const {
   }
   if (Kind == ERedwoodSessionEffectKind::AnswerLogin) {
     Result += LoginAnswer == ERedwoodLoginAnswer::Success ? TEXT(" success")
-      : LoginAnswer == ERedwoodLoginAnswer::MustVerify    ? TEXT(" must-verify")
                                                           : TEXT(" error");
   }
   if (!Text.IsEmpty()) {
@@ -634,12 +628,6 @@ void FRedwoodClientSession::OnLoginReply(const FRedwoodSessionEvent &Event) {
           Request,
           ERedwoodLoginAnswer::Error,
           FRedwoodPendingReplies::LostReplyError
-        );
-        return;
-      }
-      if (Event.Message == MustVerifyMessage) {
-        EmitAnswerLogin(
-          Request, ERedwoodLoginAnswer::MustVerify, Event.PlayerId
         );
         return;
       }
