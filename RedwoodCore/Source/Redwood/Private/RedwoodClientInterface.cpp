@@ -273,9 +273,11 @@ namespace {
     return !MessageId.IsEmpty() && !RememberRecentId(RecentIds, MessageId);
   }
 
-  // HollowedOath#3609. Tickets whose assignment waits for the join's answer:
-  // the join's own and the replays of a drop or two. Beyond that the oldest
-  // goes.
+  // HollowedOath#3609. Tickets whose assignment waits for the join's answer.
+  // The fork's realm keeps one replayed assignment per player, so the store
+  // never holds more than two: the join's own ticket and that replay. The
+  // bound is for a realm that floods pushes, where the oldest goes and the
+  // join's own can go with it; nothing better is known to do then.
   constexpr int32 MaxHeldAssignments = 8;
 
   // The handler's refusal of a zone assignment; the tests count it.
@@ -284,7 +286,7 @@ namespace {
       LogRedwood,
       Warning,
       TEXT(
-        "Ignoring a zone assignment for a dropped queue request or another character."
+        "Ignoring a zone assignment for a dropped queue request, another ticket, or another character."
       )
     );
   }
