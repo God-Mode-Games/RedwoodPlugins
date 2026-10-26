@@ -194,15 +194,18 @@ namespace RedwoodBifrostZoneTravelTest {
       Push(TEXT("realm:ticketing:ticket-error"), Notice);
     }
 
-    // Sends a queue join and returns its rpc, unanswered.
+    // Sends a queue join and returns its rpc, unanswered; invalid when the
+    // call sent nothing (held or refused), even if an earlier join is still
+    // the socket's last one.
     FPhoenixMessage SendJoinQueue(
       TCapture<FRedwoodTicketingUpdate> &Update,
       bool bTransferWholeParty = false
     ) {
+      const int32 Before = Socket()->CountSent(JoinQueueEvent);
       Client()->JoinQueue(
         ProxyId, ZoneName, bTransferWholeParty, false, Update.Delegate()
       );
-      return Socket()->Last(JoinQueueEvent);
+      return SentSince(JoinQueueEvent, Before);
     }
 
     // Sends a queue join and the realm accepts it.
@@ -210,10 +213,17 @@ namespace RedwoodBifrostZoneTravelTest {
       Socket()->ReplyOk(SendJoinQueue(Ticketing), NoError());
     }
 
-    // Sends the game's leave and returns its rpc, unanswered.
+    // Sends the game's leave and returns its rpc, unanswered; invalid when
+    // the call sent nothing.
     FPhoenixMessage SendLeave(TCapture<FString> &Left) {
+      const int32 Before = Socket()->CountSent(LeaveEvent);
       Client()->LeaveTicketing(Left.Delegate());
-      return Socket()->Last(LeaveEvent);
+      return SentSince(LeaveEvent, Before);
+    }
+
+    FPhoenixMessage SentSince(const FString &Event, int32 Before) const {
+      return Socket()->CountSent(Event) > Before ? Socket()->Last(Event)
+                                                 : FPhoenixMessage();
     }
 
     // Sends the game's leave and the realm accepts it.
