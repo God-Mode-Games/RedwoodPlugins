@@ -3317,12 +3317,12 @@ void URedwoodClientInterface::HandleZoneAssignment(
   // HollowedOath#3609. The realm pushes a ticket's assignment before it
   // answers the join that made the ticket, and the push and the answer
   // travel on their own paths. While this client's own ticketing join waits
-  // for its answer, an assignment that names a ticket is the new join's or
-  // the replay of a dropped one; the answer's ticket tells which, so each
-  // ticket's is kept until then, in whatever order they came. One with no
-  // ticket is an old server's, and is judged as before.
-  if (bJoinAwaitingReply && !AssignedTicketId.IsEmpty() &&
-      !bForAnotherCharacter && !bEndedTicket) {
+  // for its answer, an assignment is the new join's or the replay of a
+  // dropped one; the answer's ticket tells which, so each ticket's is kept
+  // until then, in whatever order they came. A matchmaking join and an old
+  // server name no ticket, in the assignment and in the answer alike: that
+  // assignment waits under no ticket, and an answer with none takes it.
+  if (bJoinAwaitingReply && !bForAnotherCharacter && !bEndedTicket) {
     HoldAssignment(AssignedTicketId, MessageObject);
     return;
   }
