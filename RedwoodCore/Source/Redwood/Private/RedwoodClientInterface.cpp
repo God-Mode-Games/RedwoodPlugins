@@ -24,6 +24,10 @@ void URedwoodClientInterface::Deinitialize() {
   // answers what was in flight. Nothing is said to the game.
   Replies.Reset();
   HeldRequests.Reset();
+  // HollowedOath#3609. The joins and leaves those tracked are gone with them.
+  TicketingJoin = FRedwoodTicketingJoin();
+  LeavesInFlight = 0;
+  JoinsInFlight = 0;
   LoginCallers.Reset();
   EntryCallers.Reset();
   EntryRealms.Reset();
@@ -343,7 +347,8 @@ void URedwoodClientInterface::AcceptPartyTicket(const FString &TicketId) {
   const TSharedPtr<FJsonObject> Held = TakeHeldAssignment(TicketId);
   // The notice is the server's word that the ticket exists, so it opens the
   // guard at once, where an own join waits for its reply. An owed leave
-  // stays and goes now: it cannot end the leader's ticket, and the party's
+  // stays and goes now, or at the answer of an own join that is still out
+  // (SendOwedLeave): it cannot end the leader's ticket, and the party's
   // travel would erase it.
   ++JoinSequence;
   EndOwnJoin();
@@ -464,7 +469,14 @@ TSharedPtr<FJsonObject> URedwoodClientInterface::TakeHeldAssignment(
 // Only for the latest join: an older join's answer must not open or close
 // the guard for a newer one. Bifrost answers `unavailable` when the realm
 // did not answer in time; the realm may have made the ticket all the same,
-// so that is a lost reply, not a refusal.
+// so that is a lost reply, not a refusal. HollowedOath#3609: only the
+// pending join's caller hears its answer; an older join's caller heard its
+// loss when the newer join replaced it. A refusal is the join's final
+// answer, so nothing of the join stays bound before the caller hears it; an
+// acceptance keeps the delegate for the ticket's updates, but the join is
+// answered, so a join the caller makes from its handler takes the slot in
+// silence. The answer pays an owed leave that waited for this join, before
+// the caller can join again.
 void URedwoodClientInterface::HandleTicketingJoinReply(
   const TSharedPtr<FJsonObject> &Reply, uint32 Sequence
 ) {
@@ -474,6 +486,7 @@ void URedwoodClientInterface::HandleTicketingJoinReply(
     FailTicketingJoin(Sequence);
     return;
   }
+  --JoinsInFlight;
   const FString Error = Reply->GetStringField(TEXT("error"));
   TSharedPtr<FJsonObject> Held;
   if (Sequence == JoinSequence) {
@@ -485,13 +498,19 @@ void URedwoodClientInterface::HandleTicketingJoinReply(
       Held = NoteTicketingJoinAccepted(TicketId);
     }
   }
+  if (IsRealmReady()) {
+    SendOwedLeave(Session.GetPlayerId());
+  }
   FRedwoodTicketingUpdate Update;
   Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
   Update.Message = Error;
-  OnTicketingUpdate.ExecuteIfBound(Update);
-
-  if (!Error.IsEmpty()) {
-    OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+  if (TicketingJoin.bAwaitingAnswer && Sequence == TicketingJoin.Sequence) {
+    if (!Error.IsEmpty()) {
+      EndTicketingJoin(Update);
+    } else {
+      TicketingJoin.bAwaitingAnswer = false;
+      TicketingJoin.OnUpdate.ExecuteIfBound(Update);
+    }
   }
   // The assignment the realm pushed before its answer, after the game has
   // seen the answer, as the game expects them. Not when the game joined
@@ -525,42 +544,129 @@ TFunction<void()> URedwoodClientInterface::MakeLostProxyJoin(
   };
 }
 
-// Only for the latest join: a newer join owns the flags and the update.
+// A ticketing join lost in a drop, or answered `unavailable`. Only the
+// latest join owns the flags; only the pending join's caller hears the loss
+// (HollowedOath#3609), with nothing of the join bound by then.
 void URedwoodClientInterface::FailTicketingJoin(uint32 Sequence) {
-  if (Sequence != JoinSequence) {
-    return;
+  --JoinsInFlight;
+  if (Sequence == JoinSequence) {
+    NoteJoinLost();
   }
-  NoteJoinLost();
   // Bifrost's `unavailable` answer comes on a live socket, where no realm
   // entry follows to pay the leave; a reply lost with the socket finds the
   // realm gone, and its leave waits for the entry.
   if (IsRealmReady()) {
     SendOwedLeave(Session.GetPlayerId());
   }
+  if (!TicketingJoin.bAwaitingAnswer || Sequence != TicketingJoin.Sequence) {
+    return;
+  }
   FRedwoodTicketingUpdate Update;
   Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
   Update.Message = FRedwoodPendingReplies::LostReplyError;
-  OnTicketingUpdate.ExecuteIfBound(Update);
-  OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+  EndTicketingJoin(Update);
 }
 
-// HollowedOath#2929. The realm gate for a join attempt that answers through
-// OnTicketingUpdate. A held attempt keeps the delegate for its re-run; a
-// failed one is the join's final answer, so the delegate is unbound before
-// the caller hears it, and a join the caller makes from its handler keeps
-// its own.
+// HollowedOath#2929, #3609. The realm gate for a ticketing join attempt.
+// Held while the session comes back, and held while a leave is out: the
+// realm runs each request of a session as its own task, so a leave it runs
+// after the join would delete the join's ticket. The leave's answer releases
+// the hold (SendLeave). The hold holds one ticketing join: a newer join
+// takes the slot (BeginTicketingJoin), and an older attempt does nothing
+// when it runs again. A failed attempt is the join's final answer: nothing
+// of the join stays bound before the caller hears it, so a join the caller
+// makes from its handler keeps its own delegate.
 bool URedwoodClientInterface::GateTicketingAttempt(
   TFunction<void()> Attempt
 ) {
-  return GateRealm(
-    MoveTemp(Attempt),
-    FRedwoodTicketingUpdateDelegate::CreateLambda(
-      [this](const FRedwoodTicketingUpdate &Update) {
-        const FRedwoodTicketingUpdateDelegate Caller = OnTicketingUpdate;
-        OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
-        Caller.ExecuteIfBound(Update);
-      }
-    )
+  ERedwoodGateDecision Decision = Session.Gate(ERedwoodRequestKind::Realm);
+  if (Decision == ERedwoodGateDecision::Send && LeavesInFlight > 0) {
+    Decision = ERedwoodGateDecision::Hold;
+  }
+  switch (Decision) {
+    case ERedwoodGateDecision::Send:
+      return false;
+    case ERedwoodGateDecision::Hold:
+      HeldRequests.Add(
+        [this, Id = TicketingJoin.Id, Attempt = MoveTemp(Attempt)]() {
+          if (Id == TicketingJoin.Id) {
+            Attempt();
+          }
+        }
+      );
+      return true;
+    default: {
+      FRedwoodTicketingUpdate Update;
+      SetRedwoodGateError(
+        Update, FRedwoodClientSession::NotConnectedToRealm
+      );
+      EndTicketingJoin(Update);
+      return true;
+    }
+  }
+}
+
+// HollowedOath#3609. A new ticketing join takes the one slot. An older join
+// whose caller has not heard its answer is lost to it: that caller hears so
+// first, with nothing of the old join bound, so a join it makes from its
+// handler takes the slot in its turn; this join is then the older one, and
+// answers false. An older join that was accepted keeps nothing: its caller
+// heard its answer, and the new join replaces its ticket at the realm.
+bool URedwoodClientInterface::BeginTicketingJoin(
+  const FRedwoodTicketingUpdateDelegate &OnUpdate
+) {
+  FRedwoodTicketingUpdate Replaced;
+  Replaced.Type = ERedwoodTicketingUpdateType::JoinResponse;
+  Replaced.Message = FRedwoodTicketingJoin::ReplacedError;
+  if (TicketingJoin.bAwaitingAnswer) {
+    EndTicketingJoin(Replaced);
+    if (TicketingJoin.bAwaitingAnswer) {
+      OnUpdate.ExecuteIfBound(Replaced);
+      return false;
+    }
+  }
+  ++TicketingJoin.Id;
+  TicketingJoin.OnUpdate = OnUpdate;
+  TicketingJoin.Sequence = 0;
+  TicketingJoin.bAwaitingAnswer = true;
+  return true;
+}
+
+// The join's final answer (a refusal, a loss, a ticket error, the gate's
+// refusal): nothing of the join stays bound before the caller hears it, so
+// a join the caller makes from its handler keeps its own delegate.
+void URedwoodClientInterface::EndTicketingJoin(
+  const FRedwoodTicketingUpdate &Update
+) {
+  const FRedwoodTicketingUpdateDelegate Caller = TicketingJoin.OnUpdate;
+  ForgetTicketingJoin();
+  Caller.ExecuteIfBound(Update);
+}
+
+// The join is over with no word to its caller: its assignment moved the
+// player. Id stays, so a held attempt of the join stays stale.
+void URedwoodClientInterface::ForgetTicketingJoin() {
+  TicketingJoin.OnUpdate = FRedwoodTicketingUpdateDelegate();
+  TicketingJoin.Sequence = 0;
+  TicketingJoin.bAwaitingAnswer = false;
+}
+
+// The one place a ticketing join goes out. The record takes the join's
+// count, so its reply finds its caller; the joins out hold the owed leave
+// back until the reply (SendOwedLeave).
+void URedwoodClientInterface::SendTicketingJoin(
+  const TCHAR *Event, const TSharedPtr<FJsonObject> &Payload
+) {
+  NoteTicketingJoinSent(); // HollowedOath#2886, #3609.
+  TicketingJoin.Sequence = JoinSequence;
+  ++JoinsInFlight;
+  // HollowedOath#2886. See TrackReply.
+  Connection->Rpc(
+    Event,
+    Payload,
+    Replies.Track([this, Sequence = JoinSequence](auto Response) {
+      HandleTicketingJoinReply(Response[0]->AsObject(), Sequence);
+    }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
   );
 }
 // FORK(hollowed-oath) END
@@ -3369,7 +3475,7 @@ void URedwoodClientInterface::HandleZoneAssignment(
     OnRequestToJoinServer.Broadcast(ConsoleCommand);
   }
 
-  OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+  ForgetTicketingJoin(); // FORK(hollowed-oath): HollowedOath#3609.
 }
 
 // FORK(hollowed-oath): the realm's pushes, bound once on the one connection.
@@ -3387,7 +3493,7 @@ void URedwoodClientInterface::BindRealmPushHandlers() {
       FRedwoodTicketingUpdate Update;
       Update.Type = ERedwoodTicketingUpdateType::Update;
       Update.Message = Message->AsObject()->GetStringField(TEXT("message"));
-      OnTicketingUpdate.ExecuteIfBound(Update);
+      TicketingJoin.OnUpdate.ExecuteIfBound(Update);
     }
   );
 
@@ -3403,9 +3509,9 @@ void URedwoodClientInterface::BindRealmPushHandlers() {
       // own answer, if it is still to come, opens nothing.
       bAssignmentExpected = false;
       EndOwnJoin();
-      OnTicketingUpdate.ExecuteIfBound(Update);
-
-      OnTicketingUpdate = FRedwoodTicketingUpdateDelegate();
+      // HollowedOath#3609. The join's final answer: nothing of it stays
+      // bound before the caller hears it.
+      EndTicketingJoin(Update);
     }
   );
 
@@ -3841,24 +3947,58 @@ void URedwoodClientInterface::SendSelectCharacter() {
 void URedwoodClientInterface::SendOwedLeave(
   const FString &AsPlayerId, bool bForce
 ) {
-  // Only this client's own join, out or accepted, would lose its ticket to
-  // the leave; a party join is the leader's ticket (HollowedOath#3002).
-  if (!bLeaveTicketingOwed ||
-      ((bAssignmentExpected || bJoinAwaitingReply) &&
+  // Only this client's own join, accepted and not yet travelling, would lose
+  // its ticket to the leave; a party join is the leader's ticket
+  // (HollowedOath#3002). HollowedOath#3609: not while a leave or a join is
+  // out either. The realm may run two requests of one session in either
+  // order, so the leave waits for the join's answer, which sends it again;
+  // a second leave beside the first is one too many, and the first's answer
+  // pays or re-owes it (SendLeave).
+  if (!bLeaveTicketingOwed || LeavesInFlight > 0 || JoinsInFlight > 0 ||
+      (bAssignmentExpected && !bTravelPending &&
        AcceptedPartyTicketId.IsEmpty()) ||
       (!bForce && !IsRealmConnected())) {
     return;
   }
+  SendLeave(AsPlayerId, FRedwoodErrorOutputDelegate());
+}
+
+// HollowedOath#3609. The one place a leave goes out, the game's and the owed
+// one alike, counted until the realm answers. The realm's ok is the leave's
+// enqueue: it ends whatever ticket the player holds, so it pays the owed
+// leave; the realm has no "no ticket" refusal. A leave lost with the socket
+// may not have run, so it is owed, unless a join since replaced the ticket
+// it was for. The answer releases a ticketing join that waited for it
+// (GateTicketingAttempt); a loss does not: the socket is down, and the
+// resume releases the hold.
+void URedwoodClientInterface::SendLeave(
+  const FString &AsPlayerId, FRedwoodErrorOutputDelegate OnOutput
+) {
+  ++LeavesInFlight;
   TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
   Payload->SetStringField(TEXT("playerId"), AsPlayerId);
+  // HollowedOath#2886. See TrackReply.
   Connection->Rpc(
     TEXT("realm:ticketing:leave"),
     Payload,
-    Replies.Track([this](auto Response) {
-      if (Response[0]->AsObject()->GetStringField(TEXT("error")).IsEmpty()) {
+    Replies.Track([this, OnOutput](auto Response) {
+      --LeavesInFlight;
+      const FString Error =
+        Response[0]->AsObject()->GetStringField(TEXT("error"));
+      if (Error.IsEmpty()) {
         bLeaveTicketingOwed = false;
       }
-    }, []() {})
+      OnOutput.ExecuteIfBound(Error);
+      if (LeavesInFlight == 0) {
+        HeldRequests.Release();
+      }
+    }, [this, Sequence = JoinSequence, OnLost = MakeLostReply(OnOutput)]() {
+      --LeavesInFlight;
+      if (Sequence == JoinSequence) {
+        bLeaveTicketingOwed = true;
+      }
+      OnLost();
+    })
   );
 }
 
@@ -3877,9 +4017,12 @@ void URedwoodClientInterface::JoinMatchmaking(
     return;
   }
 
+  // FORK(hollowed-oath): HollowedOath#3609. One join at a time.
+  if (!BeginTicketingJoin(OnUpdate)) {
+    return;
+  }
   TicketingProfileId = ProfileId;
   TicketingRegions = InRegions;
-  OnTicketingUpdate = OnUpdate;
   AttemptJoinMatchmaking();
 }
 
@@ -3901,14 +4044,28 @@ void URedwoodClientInterface::JoinQueue(
     return;
   }
 
-  // FORK(hollowed-oath): HollowedOath#2929. Held while the session comes
-  // back, like every realm request; the join goes out, and NoteJoinSent
-  // runs, only then.
-  if (GateRealm([=, this]() {
-        JoinQueue(
-          ProxyId, ZoneName, bTransferWholeParty, bFavorLastZone, OnUpdate
+  // FORK(hollowed-oath): HollowedOath#3609. One join at a time; the attempt
+  // takes the gate.
+  if (!BeginTicketingJoin(OnUpdate)) {
+    return;
+  }
+  AttemptJoinQueue(ProxyId, ZoneName, bTransferWholeParty, bFavorLastZone);
+}
+
+// FORK(hollowed-oath): HollowedOath#2929, #3609. Held while the session
+// comes back, and while a leave is out, like the other attempts; the join
+// goes out, and NoteTicketingJoinSent runs, only then.
+void URedwoodClientInterface::AttemptJoinQueue(
+  FString ProxyId,
+  FString ZoneName,
+  bool bTransferWholeParty,
+  bool bFavorLastZone
+) {
+  if (GateTicketingAttempt([=, this]() {
+        AttemptJoinQueue(
+          ProxyId, ZoneName, bTransferWholeParty, bFavorLastZone
         );
-      }, OnUpdate)) {
+      })) {
     return;
   }
 
@@ -3929,17 +4086,8 @@ void URedwoodClientInterface::JoinQueue(
 
   Payload->SetObjectField(TEXT("data"), QueueData);
 
-  OnTicketingUpdate = OnUpdate;
-
-  NoteTicketingJoinSent(); // FORK(hollowed-oath): HollowedOath#2886, #3609.
-  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
-  Connection->Rpc(
-    TEXT("realm:ticketing:join:queue"),
-    Payload,
-    Replies.Track([this, Sequence = JoinSequence](auto Response) {
-      HandleTicketingJoinReply(Response[0]->AsObject(), Sequence);
-    }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
-  );
+  // FORK(hollowed-oath): HollowedOath#3609.
+  SendTicketingJoin(TEXT("realm:ticketing:join:queue"), Payload);
 }
 
 void URedwoodClientInterface::JoinCustom(
@@ -3955,16 +4103,19 @@ void URedwoodClientInterface::JoinCustom(
     return;
   }
 
+  // FORK(hollowed-oath): HollowedOath#3609. One join at a time.
+  if (!BeginTicketingJoin(OnUpdate)) {
+    return;
+  }
   TicketingRegions = InRegions;
-  OnTicketingUpdate = OnUpdate;
   bTicketingTransferWholeParty = bTransferWholeParty;
   AttemptJoinCustom();
 }
 
 void URedwoodClientInterface::AttemptJoinCustom() {
-  // FORK(hollowed-oath): HollowedOath#2929. Held while the session comes
-  // back; the ping wait below keeps its own timer, and an attempt it re-arms
-  // during a drop is held here too.
+  // FORK(hollowed-oath): HollowedOath#2929, #3609. Held while the session
+  // comes back, and while a leave is out; the ping wait below keeps its own
+  // timer, and an attempt it re-arms during a drop is held here too.
   if (GateTicketingAttempt([this]() { AttemptJoinCustom(); })) {
     return;
   }
@@ -3973,7 +4124,7 @@ void URedwoodClientInterface::AttemptJoinCustom() {
     FRedwoodTicketingUpdate Update;
     Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
     Update.Message = TEXT("Please select a character before joining.");
-    OnTicketingUpdate.ExecuteIfBound(Update);
+    EndTicketingJoin(Update); // FORK(hollowed-oath): HollowedOath#3609.
     return;
   }
 
@@ -4028,15 +4179,8 @@ void URedwoodClientInterface::AttemptJoinCustom() {
   }
   Payload->SetArrayField(TEXT("regions"), DesiredRegions);
 
-  NoteTicketingJoinSent(); // FORK(hollowed-oath): HollowedOath#2886, #3609.
-  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
-  Connection->Rpc(
-    TEXT("realm:ticketing:join:custom"),
-    Payload,
-    Replies.Track([this, Sequence = JoinSequence](auto Response) {
-      HandleTicketingJoinReply(Response[0]->AsObject(), Sequence);
-    }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
-  );
+  // FORK(hollowed-oath): HollowedOath#3609.
+  SendTicketingJoin(TEXT("realm:ticketing:join:custom"), Payload);
 }
 
 void URedwoodClientInterface::LeaveTicketing(
@@ -4070,27 +4214,9 @@ void URedwoodClientInterface::LeaveTicketing(
       break;
   }
 
-  TSharedPtr<FJsonObject> Payload = MakeShareable(new FJsonObject);
-  Payload->SetStringField(TEXT("playerId"), Session.GetPlayerId());
-
-  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
-  Connection->Rpc(
-    TEXT("realm:ticketing:leave"),
-    Payload,
-    Replies.Track([this, OnOutput](auto Response) {
-      TSharedPtr<FJsonObject> MessageObject = Response[0]->AsObject();
-      FString Error = MessageObject->GetStringField(TEXT("error"));
-
-      if (Error.IsEmpty()) {
-        bLeaveTicketingOwed = false;
-      }
-      OnOutput.ExecuteIfBound(Error);
-    }, [this, OnLost = MakeLostReply(OnOutput)]() {
-      // A leave that may not have run is owed.
-      bLeaveTicketingOwed = true;
-      OnLost();
-    })
-  );
+  // FORK(hollowed-oath): HollowedOath#3609. Counted while it is out, so no
+  // join goes out beside it.
+  SendLeave(Session.GetPlayerId(), OnOutput);
 }
 
 void URedwoodClientInterface::ListProxies(
@@ -4331,7 +4457,7 @@ void URedwoodClientInterface::StopProxy(
 }
 
 void URedwoodClientInterface::AttemptJoinMatchmaking() {
-  // FORK(hollowed-oath): HollowedOath#2929. As AttemptJoinCustom.
+  // FORK(hollowed-oath): HollowedOath#2929, #3609. As AttemptJoinCustom.
   if (GateTicketingAttempt([this]() { AttemptJoinMatchmaking(); })) {
     return;
   }
@@ -4394,15 +4520,8 @@ void URedwoodClientInterface::AttemptJoinMatchmaking() {
 
   Payload->SetObjectField(TEXT("data"), MatchmakingData);
 
-  NoteTicketingJoinSent(); // FORK(hollowed-oath): HollowedOath#2886, #3609.
-  // FORK(hollowed-oath): HollowedOath#2886. See TrackReply.
-  Connection->Rpc(
-    TEXT("realm:ticketing:join:matchmaking"),
-    Payload,
-    Replies.Track([this, Sequence = JoinSequence](auto Response) {
-      HandleTicketingJoinReply(Response[0]->AsObject(), Sequence);
-    }, [this, Sequence = JoinSequence]() { FailTicketingJoin(Sequence); })
-  );
+  // FORK(hollowed-oath): HollowedOath#3609.
+  SendTicketingJoin(TEXT("realm:ticketing:join:matchmaking"), Payload);
 }
 
 void URedwoodClientInterface::GetOrCreateParty(

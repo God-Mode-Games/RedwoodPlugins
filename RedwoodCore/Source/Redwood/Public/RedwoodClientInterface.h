@@ -54,6 +54,25 @@ typedef TDelegate<void(const FRedwoodChatSendOutput &)>
   FRedwoodChatSendDelegate;
 // FORK(hollowed-oath) END
 
+// FORK(hollowed-oath): HollowedOath#3609. The one ticketing join (queue,
+// custom or matchmaking) the game has going, and the caller that hears about
+// it. A newer join takes the slot; a caller that has not heard its answer
+// hears the loss first, so one join has one caller. Sequence is the join's
+// count in JoinSequence once it is out, 0 before: a reply with another count
+// is an older join's and is answered to nobody. Id tells a held attempt
+// whether it is still this join when it runs again.
+struct FRedwoodTicketingJoin {
+  static constexpr const TCHAR *ReplacedError =
+    TEXT("A newer join replaced this one before the server answered.");
+
+  FRedwoodTicketingUpdateDelegate OnUpdate;
+  uint32 Id = 0;
+  uint32 Sequence = 0;
+  // Held, waiting for its pings, or out: the caller has not heard the join's
+  // answer. False once it has; the delegate stays for the ticket's updates.
+  bool bAwaitingAnswer = false;
+};
+
 // This class is separated from URedwoodClientGameSubsystem
 // so that we can use it in automated tests without instantiating
 // a whole world.
@@ -661,8 +680,25 @@ private:
     const TDelegate<void(const TOutput &)> &OnOutput
   );
   void FailTicketingJoin(uint32 Sequence);
-  // FORK(hollowed-oath): HollowedOath#2929. See the .cpp.
+  // FORK(hollowed-oath): HollowedOath#2929, #3609. See the .cpp.
   bool GateTicketingAttempt(TFunction<void()> Attempt);
+  // FORK(hollowed-oath) BEGIN: HollowedOath#3609. See the .cpp.
+  bool BeginTicketingJoin(const FRedwoodTicketingUpdateDelegate &OnUpdate);
+  void EndTicketingJoin(const FRedwoodTicketingUpdate &Update);
+  void ForgetTicketingJoin();
+  void SendTicketingJoin(
+    const TCHAR *Event, const TSharedPtr<FJsonObject> &Payload
+  );
+  void AttemptJoinQueue(
+    FString ProxyId,
+    FString ZoneName,
+    bool bTransferWholeParty,
+    bool bFavorLastZone
+  );
+  void SendLeave(
+    const FString &AsPlayerId, FRedwoodErrorOutputDelegate OnOutput
+  );
+  // FORK(hollowed-oath) END
   friend class FRedwoodClientTestAccess; // FORK(hollowed-oath): the tests.
   FRedwoodHeldRequests HeldRequests;
   // FORK(hollowed-oath) BEGIN: HollowedOath#2886. The requests still waiting
@@ -730,6 +766,16 @@ private:
   bool bInWorld = false;
   // A lost join left a ticket on the server. See SendOwedLeave.
   bool bLeaveTicketingOwed = false;
+  // HollowedOath#3609. The leave rpcs out, counted until the realm answers
+  // each one. The realm runs each request of a session as its own task, so
+  // a join sent while a leave is out could lose its new ticket to the
+  // leave: a ticketing join waits in the hold while this is above zero, and
+  // the leave's answer releases it (GateTicketingAttempt, SendLeave). The
+  // owed leave is not sent while one is out, and only an answer pays it.
+  int32 LeavesInFlight = 0;
+  // The ticketing join rpcs out, the same way: the owed leave waits for
+  // their answers, and a join's answer pays it (SendOwedLeave).
+  int32 JoinsInFlight = 0;
   // An accepted assignment's travel has not arrived yet. See
   // NoteArrivedInWorld. LeaveTicketing keeps it: the game's timer can fire
   // during the travel, which can still arrive.
@@ -775,7 +821,9 @@ private:
 
   void AttemptJoinMatchmaking();
   void AttemptJoinCustom();
-  FRedwoodTicketingUpdateDelegate OnTicketingUpdate;
+  // FORK(hollowed-oath): HollowedOath#3609. Was one delegate, which a newer
+  // join took over in silence. See BeginTicketingJoin.
+  FRedwoodTicketingJoin TicketingJoin;
   FString TicketingProfileId;
   TArray<FString> TicketingRegions;
   bool bTicketingTransferWholeParty = false;
