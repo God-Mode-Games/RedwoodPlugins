@@ -517,6 +517,6 @@ bool FRedwoodCurrencyQueueRefusesNoCurrencyTest::RunTest(const FString &Paramete
     TEXT("A mixed call reports the refusal"),
     Component->QueueCurrency({MakeEntry(EntryIdA, 500, 500, LootReason), NoCurrency}, {})
   );
-  TestEqual(TEXT("Only the valid entry is queued"), Component->GetPendingCurrencyEntries().Num(), 1);
+  TestEqual(TEXT("Nothing of a mixed call is queued"), Component->GetPendingCurrencyEntries().Num(), 0);
   return true;
 }
