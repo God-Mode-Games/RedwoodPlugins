@@ -43,25 +43,6 @@ void FMockAuthRegisterRegisterError::Initialize() {
   );
 }
 
-DEFINE_REDWOOD_LATENT_AUTOMATION_COMMAND(FMockAuthRegisterRegisterVerifyAccount
-);
-void FMockAuthRegisterRegisterVerifyAccount::Initialize() {
-  Redwood->Register(
-    "mock-register-verify",
-    "password",
-    FRedwoodAuthUpdateDelegate::CreateLambda(
-      [this](const FRedwoodAuthUpdate &Result) {
-        CurrentTest->TestEqual(
-          TEXT("Register sends verify account"),
-          Result.Type,
-          ERedwoodAuthUpdateType::MustVerifyAccount
-        );
-        Context->bIsCurrentTestComplete = true;
-      }
-    )
-  );
-}
-
 DEFINE_REDWOOD_LATENT_AUTOMATION_COMMAND(FMockAuthRegisterRegisterSuccess);
 void FMockAuthRegisterRegisterSuccess::Initialize() {
   Redwood->Register(
@@ -98,13 +79,10 @@ bool FMockAuthRegister::RunTest(const FString &Parameters) {
     FMockAuthRegisterRegisterError(Redwood, Context, 1)
   );
   ADD_LATENT_AUTOMATION_COMMAND(
-    FMockAuthRegisterRegisterVerifyAccount(Redwood, Context, 2)
-  );
-  ADD_LATENT_AUTOMATION_COMMAND(
-    FMockAuthRegisterRegisterSuccess(Redwood, Context, 3)
+    FMockAuthRegisterRegisterSuccess(Redwood, Context, 2)
   );
 
-  ADD_LATENT_AUTOMATION_COMMAND(FWaitForEnd(Redwood, Context, 4));
+  ADD_LATENT_AUTOMATION_COMMAND(FWaitForEnd(Redwood, Context, 3));
 
   Context->Start();
 

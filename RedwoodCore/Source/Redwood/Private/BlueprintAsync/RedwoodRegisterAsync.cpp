@@ -23,10 +23,7 @@ void URedwoodRegisterAsync::Activate() {
     Password,
     FRedwoodAuthUpdateDelegate::CreateLambda([this](FRedwoodAuthUpdate Update) {
       OnUpdate.Broadcast(Update);
-
-      if (Update.Type != ERedwoodAuthUpdateType::MustVerifyAccount) {
-        SetReadyToDestroy();
-      }
+      SetReadyToDestroy();
     })
   );
 }
