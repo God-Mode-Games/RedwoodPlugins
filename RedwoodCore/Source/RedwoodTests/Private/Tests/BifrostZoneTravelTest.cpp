@@ -422,6 +422,21 @@ bool FRedwoodZoneTravelLostJoinTest::RunTest(const FString &Parameters) {
   TestTrue(
     TEXT("Its leave is owed"), FAccess::IsLeaveTicketingOwed(*H.Client())
   );
+  // The socket is up and the realm knows the player: the leave goes now,
+  // not at a realm entry that may never come.
+  const FPhoenixMessage PaidAtOnce = H.Socket()->Last(LeaveEvent);
+  if (!TestTrue(
+        TEXT("The owed leave goes out at once"),
+        PaidAtOnce.IsValid() && PaidAtOnce.Ref != Leave.Ref
+      )) {
+    return false;
+  }
+  TestEqual(TEXT("As the second leave on this socket"), H.LeavesSent(), 2);
+  H.Socket()->ReplyOk(PaidAtOnce, NoError());
+  TestFalse(
+    TEXT("A leave that ran is not owed"),
+    FAccess::IsLeaveTicketingOwed(*H.Client())
+  );
   return true;
 }
 

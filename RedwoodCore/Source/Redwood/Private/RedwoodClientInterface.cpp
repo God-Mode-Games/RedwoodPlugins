@@ -528,6 +528,12 @@ void URedwoodClientInterface::FailTicketingJoin(uint32 Sequence) {
     return;
   }
   NoteJoinLost();
+  // Bifrost's `unavailable` answer comes on a live socket, where no realm
+  // entry follows to pay the leave; a reply lost with the socket finds the
+  // realm gone, and its leave waits for the entry.
+  if (IsRealmReady()) {
+    SendOwedLeave(Session.GetPlayerId());
+  }
   FRedwoodTicketingUpdate Update;
   Update.Type = ERedwoodTicketingUpdateType::JoinResponse;
   Update.Message = FRedwoodPendingReplies::LostReplyError;
