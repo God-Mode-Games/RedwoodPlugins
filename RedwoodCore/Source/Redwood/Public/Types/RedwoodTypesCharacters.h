@@ -132,8 +132,10 @@ struct FRedwoodCharacterBackend {
   // with no key holds 0). Kept current by the item flush reply and by the currency reload, like
   // InventorySeq, so a component recreated mid-session and the game start each balance chain from
   // what the backend holds instead of from the login value.
-  UPROPERTY(BlueprintReadWrite, Category = "Redwood")
-  TMap<FString, int64> CurrencyBalances;
+  // Not a UPROPERTY: reflection takes only a TMap with the default key funcs, and those ignore case
+  // (see FRedwoodCurrencyKeyFuncs). Nothing reads it through reflection; the offline file writes it
+  // with MakeCurrencyLoadObject.
+  FRedwoodCurrencyBalances CurrencyBalances;
 
   // True when a reply confirmed the seq but not the balances (a replay acked behind a later fence:
   // something else, such as a trade, committed after the batch). CurrencyBalances is then stale,

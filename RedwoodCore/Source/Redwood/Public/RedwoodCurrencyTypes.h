@@ -13,9 +13,22 @@
 
 #include "RedwoodCurrencyTypes.generated.h"
 
+// Currency names compare case-sensitively, as the backend's currency column does. FString's own
+// hash and == ignore case, so "Currency.gold" would read and overwrite the balance of
+// "Currency.Gold", which the backend keeps apart.
+struct FRedwoodCurrencyKeyFuncs : TDefaultMapKeyFuncs<FString, int64, false> {
+  static bool Matches(const FString &A, const FString &B) {
+    return A.Equals(B, ESearchCase::CaseSensitive);
+  }
+  static uint32 GetKeyHash(const FString &Key) {
+    return FCrc::StrCrc32(*Key);
+  }
+};
+
 // The balance of each currency, keyed by the game's currency name (a gameplay tag name such as
 // "Currency.Gold"; the plugin never reads it). A currency with no key holds 0.
-using FRedwoodCurrencyBalances = TMap<FString, int64>;
+using FRedwoodCurrencyBalances =
+  TMap<FString, int64, FDefaultSetAllocator, FRedwoodCurrencyKeyFuncs>;
 
 inline int64 GetCurrencyBalance(const FRedwoodCurrencyBalances &Balances, const FString &Currency) {
   const int64 *Balance = Balances.Find(Currency);

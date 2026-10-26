@@ -116,6 +116,20 @@ bool FRedwoodCurrencyLoadParseTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("No rows"), Balances.Num(), 0);
   TestEqual(TEXT("No keys"), GrantKeys.Num(), 0);
 
+  // The backend keys a balance on the exact currency name, so two names that differ only in case are
+  // two balances: neither a duplicate row nor one balance read for the other.
+  TestTrue(
+    TEXT("Two currencies that differ only in case are read"),
+    TryParseCurrencyLoad(
+      ParseJson(TEXT(R"({"balances":[{"currency":"Currency.Gold","amount":"5"},{"currency":"Currency.GOLD","amount":"6"}],"grantKeys":[]})")),
+      Balances,
+      GrantKeys
+    )
+  );
+  TestEqual(TEXT("As two balances"), Balances.Num(), 2);
+  TestEqual(TEXT("Each keeps its own amount"), GetCurrencyBalance(Balances, TEXT("Currency.GOLD")), (int64)6);
+  TestEqual(TEXT("A third spelling holds zero"), GetCurrencyBalance(Balances, TEXT("currency.gold")), (int64)0);
+
   const TCHAR *Refused[] = {
     TEXT(R"({"grantKeys":[]})"),
     TEXT(R"({"balances":[]})"),
