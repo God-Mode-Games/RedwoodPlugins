@@ -4183,10 +4183,31 @@ FString URedwoodServerGameSubsystem::CheckRealmEvent(
   ) {
     return RealmEventTemplateTooLongError;
   }
+  if (Event.Args.Num() > RealmEventArgsMax) {
+    return RealmEventTooManyArgsError;
+  }
+  for (const FString &Arg : Event.Args) {
+    if (RealmEventCodePointCount(Arg) > RealmEventArgMaxCodePoints) {
+      return RealmEventArgTooLongError;
+    }
+  }
   if (Event.Kind == ERedwoodRealmEventKind::Session) {
     return Event.SessionId.IsEmpty() ? RealmEventNoSessionError : TEXT("");
   }
-  return Event.Topic.IsEmpty() ? RealmEventNoTopicError : TEXT("");
+  if (Event.Topic.IsEmpty()) {
+    return RealmEventNoTopicError;
+  }
+  // `r:<realmId>/char:<id>`: every `/` part carries a word and an id, so a
+  // part that is empty or ends in `:` is an id that was never filled in. Such
+  // a topic names nobody, and Bifrost would store the line under it for good.
+  TArray<FString> Parts;
+  Event.Topic.ParseIntoArray(Parts, TEXT("/"), /*InCullEmpty=*/ false);
+  for (const FString &Part : Parts) {
+    if (Part.IsEmpty() || Part.EndsWith(TEXT(":"))) {
+      return RealmEventBadTopicError;
+    }
+  }
+  return TEXT("");
 }
 
 TSharedPtr<FJsonObject>
