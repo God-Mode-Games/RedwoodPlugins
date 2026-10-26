@@ -1261,7 +1261,10 @@ void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay(EEndPlayReason::Type E
 
   // Entries and keys are handed off only when nothing can make their chain wrong behind the next
   // component's back: the reload that rebases them must read a balance no open batch can still
-  // change, and a frozen or fenced character must not send at all.
+  // change, and a frozen or fenced character must not send at all. Nor when item rows are staged:
+  // the rows end with this component (the next one hydrates from the snapshot, which never had
+  // them), and a key or a payment saved without the rows it pays for is half a transaction. A key
+  // saved alone would also block that reward for good.
   const bool bFrozen = bFrozenAfterFinalRefusal ||
     (ServerSubsystem && ServerSubsystem->IsCharacterFrozen(RedwoodCharacterId));
   const bool bWorldEnding = EndPlayReason != EEndPlayReason::Destroyed &&
@@ -1271,6 +1274,8 @@ void URedwoodCharacterComponent::HandOffCurrencyAtEndPlay(EEndPlayReason::Type E
     : bItemFlushInFlight ? TEXT("a batch was in flight, so the balance they chain from waits on its reply")
     : bFrozen ? TEXT("the character is frozen")
     : bWriterFenceLost ? TEXT("the writer fence is lost")
+    : DirtyItemGenerations.Num() > 0 || PendingDeletedItemGenerations.Num() > 0
+      ? TEXT("item rows staged with them end with the component")
     : nullptr;
 
   // The front of the queues that already went out. A batch in flight is settled by its reply, as
