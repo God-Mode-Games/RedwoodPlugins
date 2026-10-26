@@ -26,8 +26,8 @@ namespace RedwoodCurrencyLoadTest {
   const FString EntryIdC = TEXT("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
   const FString GoldCurrency = TEXT("Currency.Gold");
   const FString MarksCurrency = TEXT("Currency.FactionMarks");
-  const FString LootReason = TEXT("Currency.Reason.Loot");
-  const FString BuyReason = TEXT("Currency.Reason.Merchant.Buy");
+  const FString LootReason = TEXT("CurrencyReason.Loot");
+  const FString BuyReason = TEXT("CurrencyReason.Merchant.Buy");
   const FString QuestGrantKey = TEXT("quest:Q1");
   // Kept in the outputs of a refused parse, to show that it wrote nothing.
   constexpr int64 UntouchedAmount = 77;

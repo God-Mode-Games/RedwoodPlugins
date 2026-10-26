@@ -401,7 +401,7 @@ public:
   // FORK(hollowed-oath): the trade also moves currency, and this function owns both characters'
   // flush lanes while it runs.
   //  - CurrencyByCharacter: each entry names its character (From or To). Give each entry its Id
-  //    (MakeCurrencyEntryId), Currency, Delta and the reason Currency.Reason.Trade; a side offers
+  //    (MakeCurrencyEntryId), Currency, Delta and the reason CurrencyReason.Trade; a side offers
   //    any number of currencies, at most one entry each, and the deltas of each currency must sum
   //    to zero.
   //    BalanceAfter is ignored: it is chained here from the committed balance of its currency on
@@ -542,7 +542,7 @@ public:
   static constexpr const TCHAR *TradeIdReusedError = TEXT("trade id reused with different contents");
 
   // The only reason the backend takes on a trade entry.
-  static constexpr const TCHAR *TradeCurrencyReason = TEXT("Currency.Reason.Trade");
+  static constexpr const TCHAR *TradeCurrencyReason = TEXT("CurrencyReason.Trade");
   // The sidecar's text when its realm request for a trade timed out. Read only from a sidecar too
   // old to send the `timedOut` flag (see ReadSidecarDeliveryFlags).
   static constexpr const TCHAR *TradeTimedOutError = TEXT("Item trade request timed out.");

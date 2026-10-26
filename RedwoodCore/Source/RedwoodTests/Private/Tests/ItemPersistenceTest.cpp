@@ -521,7 +521,7 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     Debit.Currency = TEXT("Currency.Gold");
     Debit.Delta = -250;
     Debit.BalanceAfter = 750;
-    Debit.Reason = TEXT("Currency.Reason.Merchant.Buy");
+    Debit.Reason = TEXT("CurrencyReason.Merchant.Buy");
     const FString WriterToken = TEXT("writer-token-1");
 
     TSharedPtr<FJsonObject> Payload =
@@ -706,14 +706,14 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     Paid.Currency = TEXT("Currency.Gold");
     Paid.Delta = -300;
     Paid.BalanceAfter = 700;
-    Paid.Reason = TEXT("Currency.Reason.Trade");
+    Paid.Reason = TEXT("CurrencyReason.Trade");
     Paid.SourceRef = TEXT("trade:offer-1");
     FRedwoodCurrencyEntry Received;
     Received.Id = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
     Received.Currency = TEXT("Currency.Gold");
     Received.Delta = 300;
     Received.BalanceAfter = 500;
-    Received.Reason = TEXT("Currency.Reason.Trade");
+    Received.Reason = TEXT("CurrencyReason.Trade");
     const FString TradeId = TEXT("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
 
     TSharedPtr<FJsonObject> Payload =
@@ -793,7 +793,7 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
         TestEqual(
           FString::Printf(TEXT("trade: currency[%d].entry.reason"), Index),
           (*SideEntry)->GetStringField(TEXT("reason")),
-          FString(TEXT("Currency.Reason.Trade"))
+          FString(TEXT("CurrencyReason.Trade"))
         );
       }
       const TSharedPtr<FJsonObject> *ReceivedEntry = nullptr;

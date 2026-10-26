@@ -19,7 +19,7 @@
 namespace RedwoodCurrencyFlushTest {
   const FString EntryIdA = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
   const FString EntryIdB = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
-  const FString LootReason = TEXT("Currency.Reason.Loot");
+  const FString LootReason = TEXT("CurrencyReason.Loot");
   const FString GoldCurrency = TEXT("Currency.Gold");
   const FString MarksCurrency = TEXT("Currency.FactionMarks");
   const FString QuestGrantKey = TEXT("quest:Q1");
@@ -146,7 +146,7 @@ bool FRedwoodItemFlushReplyParseTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyFlushTest;
 
   const FRedwoodItemFlushReply Success = URedwoodServerGameSubsystem::ParseItemsFlushReply(
-    Fixture::ParseJson(TEXT(R"({"error":null,"committedSeq":7,"alerts":[{"kind":"income","detail":{"reason":"Currency.Reason.Loot"}}]})"))
+    Fixture::ParseJson(TEXT(R"({"error":null,"committedSeq":7,"alerts":[{"kind":"income","detail":{"reason":"CurrencyReason.Loot"}}]})"))
   );
   TestTrue(TEXT("A null error is success"), Success.Error.IsEmpty());
   TestEqual(TEXT("committedSeq"), Success.CommittedSeq, (int64)7);

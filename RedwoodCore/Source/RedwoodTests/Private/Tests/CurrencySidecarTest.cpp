@@ -117,8 +117,8 @@ namespace RedwoodCurrencySidecarTest {
   const FString CreditEntryId = TEXT("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
   const FString GoldCurrency = TEXT("Currency.Gold");
   const FString MarksCurrency = TEXT("Currency.FactionMarks");
-  const FString LootReason = TEXT("Currency.Reason.Loot");
-  const FString SellReason = TEXT("Currency.Reason.Merchant.Sell");
+  const FString LootReason = TEXT("CurrencyReason.Loot");
+  const FString SellReason = TEXT("CurrencyReason.Merchant.Sell");
   const FString OwnedItemId = TEXT("11111111-1111-1111-1111-111111111111");
   const FString PurchasedItemId = TEXT("22222222-2222-2222-2222-222222222222");
   const FString LaterItemId = TEXT("33333333-3333-3333-3333-333333333333");
@@ -633,13 +633,13 @@ bool FRedwoodCurrencySidecarSaleCreditNeverLeavesTest::RunTest(const FString &Pa
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -2000 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -2000 reason CurrencyReason.Loot, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
   // The credit is dropped, and logged so staff can see it never committed.
   AddExpectedErrorPlain(
-    TEXT("entry CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC currency Currency.Gold delta 25 reason Currency.Reason.Merchant.Sell, NOT saved: dropped by the freeze"),
+    TEXT("entry CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC currency Currency.Gold delta 25 reason CurrencyReason.Merchant.Sell, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -890,7 +890,7 @@ bool FRedwoodCurrencySidecarGiveUpTest::RunTest(const FString &Parameters) {
     TEXT("gave up (6 attempts failed). Its held flushes now settle."), EAutomationExpectedErrorFlags::Contains, 1
   );
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, NOT saved: held by a currency reload that gave up (6 attempts failed)"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason CurrencyReason.Loot, NOT saved: held by a currency reload that gave up (6 attempts failed)"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -951,7 +951,7 @@ bool FRedwoodCurrencySidecarWriterFenceLostTest::RunTest(const FString &Paramete
   );
   // Logged once, by the lost fence; the give-up does not log it a second time.
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, NOT saved: writer fence lost"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason CurrencyReason.Loot, NOT saved: writer fence lost"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -1145,7 +1145,7 @@ bool FRedwoodCurrencySidecarFreezeWaitsForReplyTest::RunTest(const FString &Para
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -2000 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -2000 reason CurrencyReason.Loot, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -1212,7 +1212,7 @@ bool FRedwoodCurrencySidecarFlushWriterFenceLostTest::RunTest(const FString &Par
   );
   // The kept entry is logged once, the way a freeze logs it, for staff.
   AddExpectedErrorPlain(
-    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, NOT saved: writer fence lost, another session owns the character. A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason CurrencyReason.Loot, NOT saved: writer fence lost, another session owns the character. A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -1522,7 +1522,7 @@ bool FRedwoodCurrencySidecarComponentGoneErrorTest::RunTest(const FString &Param
     TEXT("Failed to flush items (component gone): concurrent flush"), EAutomationExpectedErrorFlags::Contains, 1
   );
   AddExpectedErrorPlain(
-    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
+    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason CurrencyReason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -1587,7 +1587,7 @@ namespace RedwoodCurrencyTradeTest {
   const FString FreshTradeId = TEXT("D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0");
   const FString PaidEntryId = TEXT("EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE");
   const FString ReceivedEntryId = TEXT("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
-  const FString TradeReason = TEXT("Currency.Reason.Trade");
+  const FString TradeReason = TEXT("CurrencyReason.Trade");
   const TCHAR *const TradeEvent = TEXT("realm:characters:items:trade");
   constexpr int64 FromSeq = 4;
   constexpr int64 FromBalance = 1000;
@@ -3391,7 +3391,7 @@ bool FRedwoodCurrencySidecarGoneUnknownProbesFirstTest::RunTest(const FString &P
     TEXT("Failed to flush items (component gone): Item flush request timed out."), EAutomationExpectedErrorFlags::Contains, 1
   );
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason CurrencyReason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3483,7 +3483,7 @@ bool FRedwoodCurrencySidecarReconnectGoneComponentTest::RunTest(const FString &P
   using namespace RedwoodCurrencySidecarTest;
   const FString RewardKey = TEXT("quest:Q1");
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone and its reply was lost with the connection"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason CurrencyReason.Loot, outcome UNKNOWN (it may be saved): its component is gone and its reply was lost with the connection"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3587,7 +3587,7 @@ bool FRedwoodCurrencySidecarEndPlayHandsOffTest::RunTest(const FString &Paramete
   using namespace RedwoodCurrencySidecarTest;
   const FString RewardKey = TEXT("quest:Q1");
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, NOT saved: its component ended, and they are handed to the PlayerState"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason CurrencyReason.Loot, NOT saved: its component ended, and they are handed to the PlayerState"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3661,7 +3661,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencySidecarEndPlayInFlightTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedErrorPlain(
-    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 200 reason Currency.Reason.Loot, NOT saved: its component ended and they cannot be handed on: a batch was in flight"),
+    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 200 reason CurrencyReason.Loot, NOT saved: its component ended and they cannot be handed on: a batch was in flight"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3669,7 +3669,7 @@ bool FRedwoodCurrencySidecarEndPlayInFlightTest::RunTest(const FString &Paramete
     TEXT("Failed to flush items (component gone): Item flush request timed out."), EAutomationExpectedErrorFlags::Contains, 1
   );
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason CurrencyReason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3833,12 +3833,12 @@ bool FRedwoodCurrencySidecarRehydrateResetsTest::RunTest(const FString &Paramete
   AddExpectedErrorPlain(TEXT("outcome UNKNOWN (it may be saved): writer fence lost"), EAutomationExpectedErrorFlags::Contains, 1);
   AddExpectedErrorPlain(TEXT("NOT saved: writer fence lost"), EAutomationExpectedErrorFlags::Contains, 1);
   AddExpectedErrorPlain(
-    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component now plays character character-2"),
+    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason CurrencyReason.Loot, outcome UNKNOWN (it may be saved): its component now plays character character-2"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
   AddExpectedErrorPlain(
-    TEXT("character character-1 entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 200 reason Currency.Reason.Loot, NOT saved: its component now plays character character-2"),
+    TEXT("character character-1 entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 200 reason CurrencyReason.Loot, NOT saved: its component now plays character character-2"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3985,7 +3985,7 @@ bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &
     TEXT("Failed to flush items (component gone): balance below zero"), EAutomationExpectedErrorFlags::Contains, 1
   );
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -2000 reason Currency.Reason.Loot, NOT saved: its component is gone"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -2000 reason CurrencyReason.Loot, NOT saved: its component is gone"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );

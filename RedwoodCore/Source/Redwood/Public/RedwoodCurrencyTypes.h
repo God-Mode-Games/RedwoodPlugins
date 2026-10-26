@@ -60,7 +60,7 @@ struct REDWOOD_API FRedwoodCurrencyEntry {
   UPROPERTY()
   int64 BalanceAfter = 0;
 
-  // A tag under Currency.Reason.
+  // A tag under CurrencyReason.
   UPROPERTY()
   FString Reason;
 

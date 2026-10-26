@@ -13,7 +13,7 @@
 namespace RedwoodCurrencyPersistenceTest {
   const FString EntryIdA = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
   const FString EntryIdB = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
-  const FString LootReason = TEXT("Currency.Reason.Loot");
+  const FString LootReason = TEXT("CurrencyReason.Loot");
   const FString GoldCurrency = TEXT("Currency.Gold");
   const FString MarksCurrency = TEXT("Currency.FactionMarks");
   const FString QuestGrantKey = TEXT("quest:Q1");
@@ -490,12 +490,12 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencyFreezeMarksUnknownOutcomeTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyPersistenceTest;
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): dropped by the freeze after a final refusal (refused). A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason CurrencyReason.Loot, outcome UNKNOWN (it may be saved): dropped by the freeze after a final refusal (refused). A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
   AddExpectedErrorPlain(
-    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 200 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
+    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 200 reason CurrencyReason.Loot, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -615,12 +615,12 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencyIdentityMismatchDropsTogetherTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyPersistenceTest;
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -300 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): dropped by the save, which skips a component that does not play the PlayerState's character character-2"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -300 reason CurrencyReason.Loot, outcome UNKNOWN (it may be saved): dropped by the save, which skips a component that does not play the PlayerState's character character-2"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
   AddExpectedErrorPlain(
-    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 100 reason Currency.Reason.Loot, NOT saved: dropped by the save"),
+    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 100 reason CurrencyReason.Loot, NOT saved: dropped by the save"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
