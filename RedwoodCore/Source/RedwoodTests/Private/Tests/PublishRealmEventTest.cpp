@@ -11,8 +11,10 @@
 //      args in order, and a sender only when there is a name.
 //   3. CheckRealmEvent refuses, before anything is sent, an empty template, a
 //      template over 256 code points (code points, not TCHARs: a surrogate
-//      pair is one), a topic event with no topic and a session event with no
-//      session id.
+//      pair is one), more than 16 args or an arg over 256 code points, a
+//      topic event with no topic or with a part that has no id, and a session
+//      event with no session id. The helpers refuse an empty id or one with a
+//      `/` in it, with an ensure and an empty topic.
 //   4. ParsePublishRealmEventAnswer carries the realm's error through word for
 //      word, empty on success, and reports an answer that is not the realm's
 //      as an error, never as a line that went out.
@@ -34,11 +36,22 @@ namespace RedwoodPublishRealmEventTest {
   // tests whose anonymous namespaces define their own helpers.
   const TCHAR *const RealmId = TEXT("realm-1");
 
-  // One character outside the basic plane: two TCHARs on a 16-bit platform,
-  // one code point everywhere.
-  const TCHAR *const AstralCharacter = TEXT("\U0001F600");
+  // One character outside the basic plane. On a 16-bit TCHAR platform it is
+  // a surrogate pair, built from its two units so the test cannot depend on
+  // how a compiler encodes a `\U` escape; on a 32-bit TCHAR platform there is
+  // no pair, and the test then only shows that the plain count still holds.
+  FString AstralCharacter() {
+    FString Text;
+    if constexpr (sizeof(TCHAR) == 2) {
+      Text.AppendChar(static_cast<TCHAR>(0xD83D));
+      Text.AppendChar(static_cast<TCHAR>(0xDE00));
+    } else {
+      Text = TEXT("\U0001F600");
+    }
+    return Text;
+  }
 
-  FString Repeated(const TCHAR *Piece, int32 Times) {
+  FString Repeated(const FString &Piece, int32 Times) {
     FString Text;
     for (int32 Index = 0; Index < Times; ++Index) {
       Text += Piece;
@@ -159,6 +172,44 @@ bool FRedwoodPublishRealmEventHelpersTest::RunTest(const FString &Parameters) {
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodPublishRealmEventBadIdTest,
+  "Redwood.PublishRealmEvent.BadId",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodPublishRealmEventBadIdTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodPublishRealmEventTest;
+  // Each refusal below raises an ensure on purpose: a topic with no id, or
+  // with a `/` in an id, names nobody or someone else, and Bifrost would
+  // store the line under it for good.
+  AddExpectedError(
+    TEXT("Ensure condition failed"), EAutomationExpectedErrorFlags::Contains, 0
+  );
+  AddExpectedError(
+    TEXT("Refused the realm topic"), EAutomationExpectedErrorFlags::Contains, 0
+  );
+
+  const FRedwoodRealmEvent Refused[] = {
+    FRedwoodRealmEvent::RealmWide(FString(), TEXT("t")),
+    FRedwoodRealmEvent::RealmWide(TEXT("realm/1"), TEXT("t")),
+    FRedwoodRealmEvent::ForCharacter(RealmId, FString(), TEXT("t")),
+    FRedwoodRealmEvent::ForCharacter(RealmId, TEXT("c/1"), TEXT("t")),
+    FRedwoodRealmEvent::ForParty(RealmId, FString(), TEXT("t")),
+    FRedwoodRealmEvent::ForParty(RealmId, TEXT("p/1"), TEXT("t")),
+    FRedwoodRealmEvent::ForParty(FString(), TEXT("p1"), TEXT("t")),
+  };
+  for (const FRedwoodRealmEvent &Event : Refused) {
+    TestEqual(TEXT("A bad id leaves no topic"), Event.Topic, FString());
+    TestEqual(
+      TEXT("So the event is refused before it is sent"),
+      URedwoodServerGameSubsystem::CheckRealmEvent(Event),
+      FString(URedwoodServerGameSubsystem::RealmEventNoTopicError)
+    );
+  }
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
   FRedwoodPublishRealmEventPayloadTest,
   "Redwood.PublishRealmEvent.Payload",
   EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
@@ -245,10 +296,21 @@ bool FRedwoodPublishRealmEventPayloadTest::RunTest(const FString &Parameters) {
     TEXT("system")
   );
 
-  // A session event: the session id, and no topic.
+  // A stray target is stripped, not sent: the kind alone decides where the
+  // line goes, and a request with both fields would make the realm guess.
+  FRedwoodRealmEvent StrayTopic =
+    FRedwoodRealmEvent::RealmWide(RealmId, TEXT("server.restart"));
+  StrayTopic.SessionId = TEXT("s1");
+  TestFalse(
+    TEXT("A topic event drops a stray session id"),
+    PayloadFor(StrayTopic)->HasField(TEXT("sessionId"))
+  );
+
+  // A session event: the session id, and no topic, even one set by mistake.
   FRedwoodRealmEvent Session;
   Session.Kind = ERedwoodRealmEventKind::Session;
   Session.SessionId = TEXT("s1");
+  Session.Topic = TEXT("r:realm-1/all");
   Session.Category = ERedwoodRealmEventCategory::Whisper;
   Session.Template = TEXT("whisper.offline");
   const TSharedPtr<FJsonObject> SessionPayload = PayloadFor(Session);
@@ -311,10 +373,11 @@ bool FRedwoodPublishRealmEventCheckTest::RunTest(const FString &Parameters) {
   // Code points, not TCHARs. The same count of astral characters is twice as
   // many TCHARs on a 16-bit platform, and must still pass; a count of TCHARs
   // would refuse a template Bifrost accepts.
-  const FString Astral = Repeated(AstralCharacter, Max);
-  TestTrue(
-    TEXT("The astral template is at least as long in TCHARs"),
-    Astral.Len() >= Max
+  const FString Astral = Repeated(AstralCharacter(), Max);
+  TestEqual(
+    TEXT("The astral template holds one unit per code point, or two"),
+    Astral.Len(),
+    Max * (sizeof(TCHAR) == 2 ? 2 : 1)
   );
   TestEqual(
     TEXT("A template of astral characters at the limit passes"),
@@ -326,10 +389,67 @@ bool FRedwoodPublishRealmEventCheckTest::RunTest(const FString &Parameters) {
   TestEqual(
     TEXT("One astral character over the limit is refused"),
     URedwoodServerGameSubsystem::CheckRealmEvent(
-      FRedwoodRealmEvent::RealmWide(RealmId, Astral + AstralCharacter)
+      FRedwoodRealmEvent::RealmWide(RealmId, Astral + AstralCharacter())
     ),
     FString(URedwoodServerGameSubsystem::RealmEventTemplateTooLongError)
   );
+
+  // The args: at most 16, each at most 256 code points, counted the same way.
+  const int32 MaxArgs = URedwoodServerGameSubsystem::RealmEventArgsMax;
+  const int32 MaxArg = URedwoodServerGameSubsystem::RealmEventArgMaxCodePoints;
+  FRedwoodRealmEvent ManyArgs =
+    FRedwoodRealmEvent::RealmWide(RealmId, TEXT("t"));
+  for (int32 Index = 0; Index < MaxArgs; ++Index) {
+    ManyArgs.Args.Add(TEXT("a"));
+  }
+  TestEqual(
+    TEXT("The most args pass"),
+    URedwoodServerGameSubsystem::CheckRealmEvent(ManyArgs),
+    FString()
+  );
+  ManyArgs.Args.Add(TEXT("a"));
+  TestEqual(
+    TEXT("One arg too many is refused"),
+    URedwoodServerGameSubsystem::CheckRealmEvent(ManyArgs),
+    FString(URedwoodServerGameSubsystem::RealmEventTooManyArgsError)
+  );
+
+  FRedwoodRealmEvent LongArg =
+    FRedwoodRealmEvent::RealmWide(RealmId, TEXT("t"));
+  LongArg.Args.Add(Repeated(AstralCharacter(), MaxArg));
+  TestEqual(
+    TEXT("An arg at the limit passes, in code points"),
+    URedwoodServerGameSubsystem::CheckRealmEvent(LongArg),
+    FString()
+  );
+  LongArg.Args[0] += TEXT("a");
+  TestEqual(
+    TEXT("An arg one over the limit is refused"),
+    URedwoodServerGameSubsystem::CheckRealmEvent(LongArg),
+    FString(URedwoodServerGameSubsystem::RealmEventArgTooLongError)
+  );
+
+  // A topic with a part that has no id, as an empty realm, character or party
+  // id would leave it. These reach the check only when a caller builds the
+  // topic by hand; the helpers refuse the id first (the BadId test).
+  const TCHAR *const BadTopics[] = {
+    TEXT("r:/all"),
+    TEXT("r:realm-1/char:"),
+    TEXT("r:realm-1//all"),
+    TEXT("r:realm-1/party:/x"),
+    TEXT("r:realm-1/")
+  };
+  for (const TCHAR *BadTopic : BadTopics) {
+    FRedwoodRealmEvent Event;
+    Event.Kind = ERedwoodRealmEventKind::Topic;
+    Event.Topic = BadTopic;
+    Event.Template = TEXT("t");
+    TestEqual(
+      *FString::Printf(TEXT("The topic '%s' is refused"), BadTopic),
+      URedwoodServerGameSubsystem::CheckRealmEvent(Event),
+      FString(URedwoodServerGameSubsystem::RealmEventBadTopicError)
+    );
+  }
 
   // A kind without its target. The payload builder never writes the other
   // field, so this is the only place a mismatch can be caught.
@@ -382,8 +502,8 @@ bool FRedwoodPublishRealmEventAnswerTest::RunTest(const FString &Parameters) {
   );
   TestEqual(
     TEXT("A scope refusal is carried"),
-    ParseObject(MakeAnswerObj(TEXT("This server does not host that party"))),
-    TEXT("This server does not host that party")
+    ParseObject(MakeAnswerObj(TEXT("not hosted"))),
+    TEXT("not hosted")
   );
 
   // Every answer that is not the realm's is an error, so a line that may
