@@ -610,8 +610,11 @@ bool URedwoodClientInterface::GateTicketingAttempt(
 // whose caller has not heard its answer is lost to it: that caller hears so
 // first, with nothing of the old join bound, so a join it makes from its
 // handler takes the slot in its turn; this join is then the older one, and
-// answers false. An older join that was accepted keeps nothing: its caller
-// heard its answer, and the new join replaces its ticket at the realm.
+// answers false. An older join that is out loses the guard's flags as well:
+// its late acceptance must not open the guard for a ticket the game was told
+// is replaced, while this join still waits to go out. An older join that was
+// accepted keeps nothing: its caller heard its answer, and the new join
+// replaces its ticket at the realm.
 bool URedwoodClientInterface::BeginTicketingJoin(
   const FRedwoodTicketingUpdateDelegate &OnUpdate
 ) {
@@ -619,6 +622,9 @@ bool URedwoodClientInterface::BeginTicketingJoin(
   Replaced.Type = ERedwoodTicketingUpdateType::JoinResponse;
   Replaced.Message = FRedwoodTicketingJoin::ReplacedError;
   if (TicketingJoin.bAwaitingAnswer) {
+    if (TicketingJoin.Sequence != 0) {
+      EndOwnJoin();
+    }
     EndTicketingJoin(Replaced);
     if (TicketingJoin.bAwaitingAnswer) {
       OnUpdate.ExecuteIfBound(Replaced);
@@ -643,9 +649,11 @@ void URedwoodClientInterface::EndTicketingJoin(
   Caller.ExecuteIfBound(Update);
 }
 
-// The join is over with no word to its caller: its assignment moved the
-// player. Id stays, so a held attempt of the join stays stale.
+// The join is over, with no word to its caller when its assignment moved
+// the player. A held attempt of the join, or its wait for the pings, finds
+// the id changed and does nothing.
 void URedwoodClientInterface::ForgetTicketingJoin() {
+  ++TicketingJoin.Id;
   TicketingJoin.OnUpdate = FRedwoodTicketingUpdateDelegate();
   TicketingJoin.Sequence = 0;
   TicketingJoin.bAwaitingAnswer = false;
@@ -4141,8 +4149,17 @@ void URedwoodClientInterface::AttemptJoinCustom() {
       Regions.Num()
     );
 
+    // FORK(hollowed-oath): HollowedOath#3609. Not for a join that a newer
+    // one replaced, or that the game left, in the meantime.
     TimerManager.SetTimer(
-      PingTimer, this, &URedwoodClientInterface::AttemptJoinCustom, 2.f, false
+      PingTimer,
+      FTimerDelegate::CreateLambda([this, Id = TicketingJoin.Id]() {
+        if (Id == TicketingJoin.Id) {
+          AttemptJoinCustom();
+        }
+      }),
+      2.f,
+      false
     );
     return;
   }
@@ -4194,6 +4211,12 @@ void URedwoodClientInterface::LeaveTicketing(
   bAbandonedQueueJoin = true;
   bAssignmentExpected = false;
   EndOwnJoin();
+  // HollowedOath#3609. A join that has not gone out (held behind a leave or
+  // the session, or waiting for its pings) must not go out after the game
+  // gave up on it.
+  if (TicketingJoin.bAwaitingAnswer && TicketingJoin.Sequence == 0) {
+    ForgetTicketingJoin();
+  }
 
   // FORK(hollowed-oath): HollowedOath#2929. Held while the session comes
   // back, like every realm request, and the held leave pays what was owed:
@@ -4475,10 +4498,14 @@ void URedwoodClientInterface::AttemptJoinMatchmaking() {
       Regions.Num()
     );
 
+    // FORK(hollowed-oath): HollowedOath#3609. As AttemptJoinCustom.
     TimerManager.SetTimer(
       PingTimer,
-      this,
-      &URedwoodClientInterface::AttemptJoinMatchmaking,
+      FTimerDelegate::CreateLambda([this, Id = TicketingJoin.Id]() {
+        if (Id == TicketingJoin.Id) {
+          AttemptJoinMatchmaking();
+        }
+      }),
       2.f,
       false
     );
