@@ -12,6 +12,8 @@
 //      needs no live sidecar. The wiring of the registry to a real sidecar (the OnDisconnectedCallback
 //      hook, the deadline timer, and the sidecar-down and nothing-dirty exits) needs sidecar
 //      coverage that this file does not have; no UE/backend integration run exercises it yet.
+//   5. A detached item retry cannot run after its operation was abandoned; live and tick retries
+//      still run, and the older batch's acknowledgment cannot clear a newer mutation.
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
@@ -469,5 +471,83 @@ bool FRedwoodAuthRequestLifetimeTest::RunTest(const FString &Parameters) {
   LateReply();
   TestEqual(TEXT("Late reply: abandon hook not repeated"), Abandoned, 1);
   TestEqual(TEXT("Late reply: not settled again"), Settled, 2);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodDetachedItemRetryLifetimeTest,
+  "Redwood.Reentry.DetachedItemRetryHonorsAbandonment",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodDetachedItemRetryLifetimeTest::RunTest(const FString &Parameters) {
+  struct FRetryCase {
+    const TCHAR *Name;
+    bool bGuarded;
+    bool bAbandon;
+  };
+  const FRetryCase Cases[] = {
+    {TEXT("Abandoned detached save"), true, true},
+    {TEXT("Live detached save"), true, false},
+    {TEXT("Ordinary tick retry"), false, true}
+  };
+  const FString ItemId = TEXT("detached-retry-item");
+
+  for (const FRetryCase &Case : Cases) {
+    const FString Prefix = FString(Case.Name) + TEXT(": ");
+    TStrongObjectPtr<URedwoodCharacterComponent> Component(
+      NewObject<URedwoodCharacterComponent>()
+    );
+    Component->bUseItems = true;
+    Component->MarkItemsDirty({ItemId});
+    const TArray<TPair<FString, uint64>> SentUpserts = {
+      {ItemId, Component->GetDirtyItemGenerations().FindChecked(ItemId)}
+    };
+    int64 BatchSeq = 0;
+    if (!TestTrue(Prefix + TEXT("an earlier batch is in flight"),
+        Component->TryBeginItemFlush(BatchSeq))) {
+      return false;
+    }
+    // The earlier batch cannot acknowledge the mutation waiting behind it.
+    Component->MarkItemsDirty({ItemId});
+
+    FRedwoodPendingOperations Operations;
+    int32 Settled = 0;
+    bool bDelivered = false;
+    const uint64 OperationId = Operations.Begin(
+      1, [&Settled, &bDelivered](bool bWasDelivered) {
+        ++Settled;
+        bDelivered = bWasDelivered;
+      }
+    );
+    TFunction<void()> SettleRetry = Operations.MakeWriteSettled(OperationId);
+    TFunction<bool()> ShouldRun;
+    if (Case.bGuarded) {
+      ShouldRun = Operations.MakeIsPending(OperationId);
+    }
+    int32 RetryCount = 0;
+    Component->SetPendingItemFlushRetry(
+      [&RetryCount, SettleRetry]() {
+        ++RetryCount;
+        SettleRetry();
+      },
+      MoveTemp(ShouldRun)
+    );
+    TestTrue(Prefix + TEXT("the retry is parked"), Component->HasPendingItemFlushRetry());
+    if (Case.bAbandon) {
+      Operations.Abandon(OperationId);
+    }
+
+    Component->CompleteItemFlush(FString(), BatchSeq, SentUpserts, {});
+    const int32 ExpectedRetries = Case.bGuarded && Case.bAbandon ? 0 : 1;
+    TestEqual(Prefix + TEXT("only a permitted retry runs"), RetryCount, ExpectedRetries);
+    TestFalse(Prefix + TEXT("the parked slot is cleared"), Component->HasPendingItemFlushRetry());
+    TestTrue(Prefix + TEXT("the newer item mutation stays dirty"),
+      Component->GetDirtyItemGenerations().Contains(ItemId));
+    TestEqual(Prefix + TEXT("the operation settles once"), Settled, 1);
+    TestEqual(Prefix + TEXT("abandonment does not become delivery"), bDelivered, !Case.bAbandon);
+    Component->CompleteItemFlush(FString(), BatchSeq, SentUpserts, {});
+    TestEqual(Prefix + TEXT("another acknowledgment cannot repeat the retry"), RetryCount, ExpectedRetries);
+  }
   return true;
 }

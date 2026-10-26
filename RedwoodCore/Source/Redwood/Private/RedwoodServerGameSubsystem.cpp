@@ -1897,7 +1897,10 @@ void URedwoodServerGameSubsystem::FlushDetachedCharacterData(
   // against a concurrent tick flush. OnAckSettled decrements the latch when the flush settles (or
   // synchronously if it sends nothing) -- guaranteed exactly once, so the latch can never wedge.
   if (bItemsLegPending) {
-    FlushItemsForCharacterComponent(nullptr, CharacterComponent, SettleOne);
+    FlushItemsForCharacterComponent(
+      nullptr, CharacterComponent, SettleOne,
+      DetachedFlushSettlements.MakeIsPending(OperationId)
+    );
   }
 
   if (bSetServerPending) {
@@ -2612,14 +2615,13 @@ TSharedPtr<FJsonObject> URedwoodServerGameSubsystem::BuildItemsTradePayload(
 void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
   URedwoodPlayerStateComponent *PlayerStateComponent,
   URedwoodCharacterComponent *CharacterComponent,
-  TFunction<void()> OnAckSettled
+  TFunction<void()> OnAckSettled,
+  TFunction<bool()> ShouldRun
 ) {
-  // OnAckSettled must fire EXACTLY ONCE on every path through this function -- the detached-flush
-  // release barrier (FlushDetachedCharacterData) counts on it to know this flush attempt has
-  // SETTLED before it releases the character's write binding. "Settled" = the in-flight attempt
-  // resolved (success OR error), NOT that it committed. Every early-return below settles
-  // synchronously via this helper; the sole sending path settles inside the async ack callback.
-  // Null for the ordinary tick-flush caller, where this is a no-op.
+  // Every exit settles or parks this attempt. An abandoned operation separately settles its
+  // caller, so its guard may discard a parked retry without calling OnAckSettled again.
+  // An acknowledgement proves the attempt ended, not that it committed. Ordinary tick flushes
+  // need no completion callback.
   auto Settle = [&OnAckSettled]() {
     if (OnAckSettled) {
       OnAckSettled();
@@ -2690,7 +2692,7 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
       TWeakObjectPtr<URedwoodCharacterComponent> WeakCharacter(CharacterComponent);
       TFunction<void()> DeferredSettle = OnAckSettled;
       CharacterComponent->SetPendingItemFlushRetry(
-        [WeakSubsystem, WeakPlayerState, WeakCharacter, DeferredSettle]() {
+        [WeakSubsystem, WeakPlayerState, WeakCharacter, DeferredSettle, ShouldRun]() {
           if (!WeakSubsystem.IsValid() || !WeakCharacter.IsValid()) {
             // The component or subsystem went away before the slot freed; settle so a barrier
             // waiting on this attempt can never wedge.
@@ -2700,9 +2702,10 @@ void URedwoodServerGameSubsystem::FlushItemsForCharacterComponent(
             return;
           }
           WeakSubsystem->FlushItemsForCharacterComponent(
-            WeakPlayerState.Get(), WeakCharacter.Get(), DeferredSettle
+            WeakPlayerState.Get(), WeakCharacter.Get(), DeferredSettle, ShouldRun
           );
-        }
+        },
+        ShouldRun
       );
       return;
     }

@@ -482,8 +482,21 @@ public:
   /** Whether a flush attempt is already parked waiting for the in-flight batch's ack (#1534). */
   bool HasPendingItemFlushRetry() const { return static_cast<bool>(PendingItemFlushRetry); }
   /** Park a flush attempt to run when the in-flight batch completes. Overwrites nothing: callers
-   *  check HasPendingItemFlushRetry first and settle immediately rather than displacing one. */
-  void SetPendingItemFlushRetry(TFunction<void()> Retry) {
-    PendingItemFlushRetry = MoveTemp(Retry);
+   *  check HasPendingItemFlushRetry first and settle immediately rather than displacing one.
+   *  An optional guard prevents an abandoned detached save from sending a new write. */
+  void SetPendingItemFlushRetry(
+    TFunction<void()> Retry,
+    TFunction<bool()> ShouldRun = nullptr
+  ) {
+    if (!Retry || !ShouldRun) {
+      PendingItemFlushRetry = MoveTemp(Retry);
+      return;
+    }
+    PendingItemFlushRetry =
+      [Retry = MoveTemp(Retry), ShouldRun = MoveTemp(ShouldRun)]() {
+        if (ShouldRun()) {
+          Retry();
+        }
+      };
   }
 };
