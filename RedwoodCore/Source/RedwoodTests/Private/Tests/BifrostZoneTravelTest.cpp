@@ -62,7 +62,9 @@
 //      while it is out: no second leave goes beside it, only its answer
 //      pays the owed leave, and a lost one is owed again. A join never goes
 //      out beside a leave: a held join waits for the leave's answer, and the
-//      owed leave waits for the answer of a join that is out.
+//      owed leave waits for the answer of a join that is out. An attempt of
+//      a join the game replaced or left sends nothing, and a leave sent
+//      beside the game's own join does not pay that join's debt.
 
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
@@ -2255,5 +2257,176 @@ bool FRedwoodZoneTravelOneLeaveTest::RunTest(const FString &Parameters) {
   TestFalse(
     TEXT("The answer pays it"), FAccess::IsLeaveTicketingOwed(*H.Client())
   );
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodZoneTravelStaleAttemptsTest,
+  "Redwood.Bifrost.ZoneTravel.StaleJoinAttemptsSendNothing",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+bool FRedwoodZoneTravelStaleAttemptsTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodBifrostZoneTravelTest;
+  ExpectDrop(*this);
+  ExpectIgnoredAssignments(*this, 1);
+  FZoneHarness H(*this);
+  H.Open();
+  H.LoginOk();
+  // The realm names a region. The test pings nothing (FNoPingsGuard), so a
+  // custom join waits for its pings for ever.
+  TCapture<FRedwoodSocketConnected> Entered;
+  const FPhoenixMessage Step = H.SendEnterRealm(Entered);
+  TSharedPtr<FJsonObject> Region = MakeShared<FJsonObject>();
+  Region->SetStringField(TEXT("name"), TEXT("us-east"));
+  Region->SetStringField(TEXT("ping"), TEXT("ping.test"));
+  TArray<TSharedPtr<FJsonValue>> RealmRegions;
+  RealmRegions.Add(MakeShared<FJsonValueObject>(Region));
+  TSharedPtr<FJsonObject> Started = NoError();
+  Started->SetArrayField(TEXT("regions"), RealmRegions);
+  H.Socket()->ReplyOk(Step, Started);
+  H.SelectCharacterOk();
+  const TCHAR *const JoinCustomEvent = TEXT("realm:ticketing:join:custom");
+
+  // HollowedOath#3609. A queue join is out when a custom join replaces it,
+  // and the custom join waits for its pings. The queue join's late
+  // acceptance opens nothing: the game was told the join is replaced.
+  TCapture<FRedwoodTicketingUpdate> First;
+  const FPhoenixMessage FirstJoin = H.SendJoinQueue(First);
+  TCapture<FRedwoodTicketingUpdate> Second;
+  TArray<FString> Regions;
+  Regions.Add(TEXT("us-east"));
+  H.Client()->JoinCustom(false, Regions, Second.Delegate());
+  TestEqual(TEXT("The first caller hears its loss"), First.Count, 1);
+  TestFalse(
+    TEXT("The custom join waits for its pings"),
+    H.Socket()->Last(JoinCustomEvent).IsValid()
+  );
+  TestFalse(
+    TEXT("The replaced join no longer waits for its answer"),
+    FAccess::IsJoinAwaitingReply(*H.Client())
+  );
+  H.Socket()->ReplyOk(FirstJoin, AcceptedJoin(TEXT("t1")));
+  TestEqual(TEXT("Its late acceptance reaches nobody"), First.Count, 1);
+  TestFalse(
+    TEXT("And opens no guard"), FAccess::IsAssignmentExpected(*H.Client())
+  );
+  TestFalse(
+    TEXT("Its ticket's assignment does not move the player"),
+    H.AssignmentMoves(CharacterId, TEXT("t1"))
+  );
+
+  // A queue join replaces the waiting custom join, whose ping retry then
+  // sends nothing.
+  TCapture<FRedwoodTicketingUpdate> Third;
+  const FPhoenixMessage ThirdJoin = H.SendJoinQueue(Third);
+  TestEqual(TEXT("The custom caller hears its loss"), Second.Count, 1);
+  H.Advance(2.1f);
+  TestEqual(
+    TEXT("The replaced custom join's retry sends nothing"),
+    H.Socket()->CountSent(JoinCustomEvent),
+    0
+  );
+  H.Socket()->ReplyOk(ThirdJoin, NoError());
+  TestEqual(TEXT("The queue join's answer reaches its caller"), Third.Count, 1);
+  TestEqual(TEXT("And not the custom one"), Second.Count, 1);
+
+  // The game's leave goes out while its own join is out: the realm may run
+  // the leave first, so the leave's ok does not pay what the join's loss
+  // owes, and the debt goes out once the join is answered.
+  TCapture<FRedwoodTicketingUpdate> Beside;
+  const FPhoenixMessage BesideJoin = H.SendJoinQueue(Beside);
+  TCapture<FString> Left;
+  const FPhoenixMessage GameLeave = H.SendLeave(Left);
+  if (!TestTrue(
+        TEXT("The game's leave goes out beside its join"), GameLeave.IsValid()
+      )) {
+    return false;
+  }
+  H.Socket()->Refuse(
+    BesideJoin, TEXT("unavailable"), TEXT("The realm did not answer.")
+  );
+  TestEqual(TEXT("The lost join is answered"), Beside.Count, 1);
+  TestTrue(TEXT("It owes a leave"), FAccess::IsLeaveTicketingOwed(*H.Client()));
+  TestEqual(
+    TEXT("No second leave goes out beside the first"), H.LeavesSent(), 1
+  );
+  H.Socket()->ReplyOk(GameLeave, NoError());
+  TestEqual(TEXT("The game's leave is answered"), Left.Count, 1);
+  TestTrue(
+    TEXT("Its ok does not pay the join's debt"),
+    FAccess::IsLeaveTicketingOwed(*H.Client())
+  );
+  const FPhoenixMessage Debt = H.Socket()->Last(LeaveEvent);
+  if (!TestTrue(
+        TEXT("The debt goes out once the join is answered"),
+        Debt.IsValid() && Debt.Ref != GameLeave.Ref
+      )) {
+    return false;
+  }
+  H.Socket()->ReplyOk(Debt, NoError());
+  TestFalse(
+    TEXT("And its answer pays it"), FAccess::IsLeaveTicketingOwed(*H.Client())
+  );
+
+  // A join held behind the owed leave of a lost join, and the game gives up
+  // on it: the leave's answer sends no join.
+  TCapture<FRedwoodTicketingUpdate> Lost;
+  H.SendJoinQueue(Lost);
+  H.Drop();
+  H.ReopenAndResume();
+  const FPhoenixMessage Owed = H.Socket()->Last(LeaveEvent);
+  if (!TestTrue(
+        TEXT("The resume pays the lost join's leave"), Owed.IsValid()
+      )) {
+    return false;
+  }
+  TCapture<FRedwoodTicketingUpdate> Held;
+  TestFalse(
+    TEXT("A join while the leave is out is held"),
+    H.SendJoinQueue(Held).IsValid()
+  );
+  TCapture<FString> GaveUp;
+  const FPhoenixMessage SecondLeave = H.SendLeave(GaveUp);
+  if (!TestTrue(TEXT("The game's leave goes out"), SecondLeave.IsValid())) {
+    return false;
+  }
+  H.Socket()->ReplyOk(Owed, NoError());
+  H.Socket()->ReplyOk(SecondLeave, NoError());
+  TestEqual(
+    TEXT("The left join does not go out"),
+    H.Socket()->CountSent(JoinQueueEvent),
+    0
+  );
+  TestEqual(TEXT("Nothing is held"), H.HeldCount(), 0);
+  TestEqual(TEXT("The game hears no more of it"), Held.Count, 0);
+
+  // A join held behind the leave a party notice owes, and the party's
+  // assignment moves the member first: the leave's answer sends no join.
+  H.JoinQueueOk();
+  H.PushPartyQueued(CharacterId, TEXT("t2"), TEXT("m1"));
+  const FPhoenixMessage PartyLeave = H.Socket()->Last(LeaveEvent);
+  if (!TestTrue(
+        TEXT("The notice leaves the own ticket"),
+        PartyLeave.IsValid() && PartyLeave.Ref != SecondLeave.Ref
+      )) {
+    return false;
+  }
+  TCapture<FRedwoodTicketingUpdate> HeldToo;
+  TestFalse(
+    TEXT("A join while that leave is out is held"),
+    H.SendJoinQueue(HeldToo).IsValid()
+  );
+  TestTrue(
+    TEXT("The party's assignment moves the member"),
+    H.AssignmentMoves(CharacterId, TEXT("t2"))
+  );
+  H.Socket()->ReplyOk(PartyLeave, NoError());
+  TestEqual(
+    TEXT("The held join of a member the party moved does not go out"),
+    H.Socket()->CountSent(JoinQueueEvent),
+    1
+  );
+  TestEqual(TEXT("Nothing is held"), H.HeldCount(), 0);
   return true;
 }
