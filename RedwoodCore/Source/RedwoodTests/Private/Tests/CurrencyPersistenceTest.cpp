@@ -14,12 +14,17 @@ namespace RedwoodCurrencyPersistenceTest {
   const FString EntryIdA = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
   const FString EntryIdB = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
   const FString LootReason = TEXT("Currency.Reason.Loot");
+  const FString GoldCurrency = TEXT("Currency.Gold");
+  const FString MarksCurrency = TEXT("Currency.FactionMarks");
   const FString QuestGrantKey = TEXT("quest:Q1");
   const FString ItemId = TEXT("11111111-1111-1111-1111-111111111111");
 
-  FRedwoodCurrencyEntry MakeEntry(const FString &Id, int64 Delta, int64 BalanceAfter) {
+  FRedwoodCurrencyEntry MakeEntry(
+    const FString &Id, int64 Delta, int64 BalanceAfter, const FString &Currency = GoldCurrency
+  ) {
     FRedwoodCurrencyEntry Entry;
     Entry.Id = Id;
+    Entry.Currency = Currency;
     Entry.Delta = Delta;
     Entry.BalanceAfter = BalanceAfter;
     Entry.Reason = LootReason;
@@ -220,7 +225,7 @@ bool FRedwoodCurrencyErrorKeepsEntriesTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("No currency is sent before the rebase"), Component->GetCurrencyEntriesToSendCount(), 0);
 
   // The trade took the backend balance to 2000. Every BalanceAfter is re-chained from it.
-  Component->RebaseCurrency(2000);
+  Component->RebaseCurrency({{Fixture::GoldCurrency, 2000}});
   const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
   if (Pending.Num() == 2) {
     TestEqual(TEXT("A re-chained from the reloaded balance"), Pending[0].BalanceAfter, (int64)2500);
@@ -266,7 +271,7 @@ bool FRedwoodCurrencyUnknownErrorKeepsBatchTest::RunTest(const FString &Paramete
   // IsExpectedMessage at 2700-2708). Occurrences 0 means "at least once", so the refusal must
   // happen for the test to pass.
   AddExpectedError(TEXT("no rebase is required"), EAutomationExpectedErrorFlags::Contains, 0);
-  Component->RebaseCurrency(500);
+  Component->RebaseCurrency({{Fixture::GoldCurrency, 500}});
   if (Pending.Num() == 1) {
     TestEqual(TEXT("A stray rebase leaves BalanceAfter alone"), Pending[0].BalanceAfter, (int64)500);
   }
@@ -552,12 +557,12 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencyFreezeMarksUnknownOutcomeTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyPersistenceTest;
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): dropped by the freeze after a final refusal (refused). A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): dropped by the freeze after a final refusal (refused). A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
   AddExpectedErrorPlain(
-    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB delta 200 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
+    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 200 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -642,10 +647,10 @@ bool FRedwoodCurrencyRechainBelowZeroTest::RunTest(const FString &Parameters) {
   // A purchase staged while 300 was still there.
   Component->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, -100, 200)}, {});
   int32 RebasedCount = 0;
-  Component->OnCurrencyRebased.AddLambda([&RebasedCount](int64) { ++RebasedCount; });
+  Component->OnCurrencyRebased.AddLambda([&RebasedCount](const FRedwoodCurrencyBalances &) { ++RebasedCount; });
 
   // The trade took all 300.
-  Component->RechainCurrencyAfterTrade(0);
+  Component->RechainCurrencyAfterTrade({});
   const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
   if (!TestEqual(TEXT("The purchase is kept"), Pending.Num(), 1)) {
     return false;
@@ -656,10 +661,10 @@ bool FRedwoodCurrencyRechainBelowZeroTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("The game is not told a balance"), RebasedCount, 0);
 
   // A reload that still cannot pay leaves it held; one that can re-chains it.
-  Component->RebaseCurrency(50);
+  Component->RebaseCurrency({{Fixture::GoldCurrency, 50}});
   TestEqual(TEXT("A short reload writes nothing"), Pending[0].BalanceAfter, (int64)200);
   TestTrue(TEXT("It stays held"), Component->IsCurrencyRebaseRequired());
-  Component->RebaseCurrency(100);
+  Component->RebaseCurrency({{Fixture::GoldCurrency, 100}});
   TestEqual(TEXT("A reload that pays re-chains it"), Pending[0].BalanceAfter, (int64)0);
   TestFalse(TEXT("And releases it"), Component->IsCurrencyRebaseRequired());
   return true;
@@ -677,12 +682,12 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencyIdentityMismatchDropsTogetherTest::RunTest(const FString &Parameters) {
   namespace Fixture = RedwoodCurrencyPersistenceTest;
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta -300 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): dropped by the save, which skips a component that does not play the PlayerState's character character-2"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -300 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): dropped by the save, which skips a component that does not play the PlayerState's character character-2"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
   AddExpectedErrorPlain(
-    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB delta 100 reason Currency.Reason.Loot, NOT saved: dropped by the save"),
+    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 100 reason Currency.Reason.Loot, NOT saved: dropped by the save"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -707,5 +712,62 @@ bool FRedwoodCurrencyIdentityMismatchDropsTogetherTest::RunTest(const FString &P
   TestFalse(TEXT("With the row"), Component->GetDirtyItemGenerations().Contains(Fixture::ItemId));
   TestFalse(TEXT("And the unconfirmed batch"), Component->IsCurrencyBatchUnconfirmed());
   TestFalse(TEXT("So the component is clean"), Component->IsItemsDirty());
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyRebaseTwoCurrenciesTest,
+  "Redwood.Currency.RebaseTwoCurrencies",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// Each currency is its own chain on a rebase: a held entry re-chains from the balance of its own
+// currency in the map, a currency the map lacks chains from 0, and a debit that another currency
+// could pay is still held when its own currency cannot.
+bool FRedwoodCurrencyRebaseTwoCurrenciesTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyPersistenceTest;
+  AddExpectedErrorPlain(TEXT("below zero; currency stays held"), EAutomationExpectedErrorFlags::Contains, 1);
+  const FString EntryIdC = TEXT("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
+  const FString EntryIdD = TEXT("DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD");
+
+  URedwoodCharacterComponent *Component = Fixture::MakeTestComponent();
+  Component->SeedItemSeqFromCharacter(4);
+  Component->QueueCurrency(
+    {Fixture::MakeEntry(Fixture::EntryIdA, 500, 1500),
+     Fixture::MakeEntry(Fixture::EntryIdB, 7, 57, Fixture::MarksCurrency),
+     Fixture::MakeEntry(EntryIdC, -200, 1300),
+     Fixture::MakeEntry(EntryIdD, -3, 54, Fixture::MarksCurrency)},
+    {}
+  );
+  int64 BatchSeq = 0;
+  TestTrue(TEXT("Claim succeeds"), Component->TryBeginItemFlush(BatchSeq));
+  Component->CompleteItemFlush(
+    Fixture::MakeRebaseReply(TEXT("batch seq was used by a trade"), BatchSeq), Fixture::MakeSent(4, 0)
+  );
+  TestTrue(TEXT("A rebase is required"), Component->IsCurrencyRebaseRequired());
+
+  // The map lacks marks: they hold 0.
+  Component->RebaseCurrency({{Fixture::GoldCurrency, 2000}});
+  TestFalse(TEXT("The rebase is done"), Component->IsCurrencyRebaseRequired());
+  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
+  if (TestEqual(TEXT("No entry is dropped"), Pending.Num(), 4)) {
+    TestEqual(TEXT("Gold credit chains from gold"), Pending[0].BalanceAfter, (int64)2500);
+    TestEqual(TEXT("Marks credit chains from 0"), Pending[1].BalanceAfter, (int64)7);
+    TestEqual(TEXT("Gold debit chains after the gold credit"), Pending[2].BalanceAfter, (int64)2300);
+    TestEqual(TEXT("Marks debit chains after the marks credit"), Pending[3].BalanceAfter, (int64)4);
+  }
+
+  // A marks debit with rich gold: 5000 gold cannot pay for marks that are not there.
+  URedwoodCharacterComponent *Other = Fixture::MakeTestComponent();
+  Other->SeedItemSeqFromCharacter(4);
+  Other->QueueCurrency({Fixture::MakeEntry(Fixture::EntryIdA, -3, 0, Fixture::MarksCurrency)}, {});
+  int64 OtherSeq = 0;
+  TestTrue(TEXT("The second claim succeeds"), Other->TryBeginItemFlush(OtherSeq));
+  Other->CompleteItemFlush(
+    Fixture::MakeRebaseReply(TEXT("batch seq was used by a trade"), OtherSeq), Fixture::MakeSent(1, 0)
+  );
+  Other->RebaseCurrency({{Fixture::GoldCurrency, 5000}});
+  TestTrue(TEXT("The marks debit stays held"), Other->IsCurrencyRebaseRequired());
+  TestEqual(TEXT("Its BalanceAfter is unchanged"), Other->GetPendingCurrencyEntries()[0].BalanceAfter, (int64)0);
   return true;
 }

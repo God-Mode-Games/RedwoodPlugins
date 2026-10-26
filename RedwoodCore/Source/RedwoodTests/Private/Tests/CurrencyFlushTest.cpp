@@ -20,11 +20,16 @@ namespace RedwoodCurrencyFlushTest {
   const FString EntryIdA = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
   const FString EntryIdB = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
   const FString LootReason = TEXT("Currency.Reason.Loot");
+  const FString GoldCurrency = TEXT("Currency.Gold");
+  const FString MarksCurrency = TEXT("Currency.FactionMarks");
   const FString QuestGrantKey = TEXT("quest:Q1");
 
-  FRedwoodCurrencyEntry MakeEntry(const FString &Id, int64 Delta, int64 BalanceAfter) {
+  FRedwoodCurrencyEntry MakeEntry(
+    const FString &Id, int64 Delta, int64 BalanceAfter, const FString &Currency = GoldCurrency
+  ) {
     FRedwoodCurrencyEntry Entry;
     Entry.Id = Id;
+    Entry.Currency = Currency;
     Entry.Delta = Delta;
     Entry.BalanceAfter = BalanceAfter;
     Entry.Reason = LootReason;
@@ -43,8 +48,12 @@ namespace RedwoodCurrencyFlushTest {
   URedwoodPlayerStateComponent *MakePlayerStateComponent(int64 InventorySeq, int64 CurrencyAmount) {
     URedwoodPlayerStateComponent *Component = NewObject<URedwoodPlayerStateComponent>();
     Component->RedwoodCharacter.InventorySeq = InventorySeq;
-    Component->RedwoodCharacter.CurrencyAmount = CurrencyAmount;
+    Component->RedwoodCharacter.CurrencyBalances.Add(GoldCurrency, CurrencyAmount);
     return Component;
+  }
+
+  int64 GoldBalance(const FRedwoodCharacterBackend &Snapshot) {
+    return GetCurrencyBalance(Snapshot.CurrencyBalances, GoldCurrency);
   }
 
   // Claims a batch the way FlushItemsForCharacterComponent does: the seq, then exactly the
@@ -57,9 +66,9 @@ namespace RedwoodCurrencyFlushTest {
     URedwoodServerGameSubsystem::ClaimCurrencyToSend(Component, Entries, GrantKeys);
     Sent.CurrencyCount = Entries.Num();
     Sent.GrantKeys = GrantKeys;
-    if (Entries.Num() > 0) {
-      Sent.bHasBalanceAfter = true;
-      Sent.BalanceAfter = Entries.Last().BalanceAfter;
+    // In queue order, so the last entry of each currency wins, as the flush itself does.
+    for (const FRedwoodCurrencyEntry &Entry : Entries) {
+      Sent.BalancesAfter.Add(Entry.Currency, Entry.BalanceAfter);
     }
     return Sent;
   }
@@ -248,7 +257,7 @@ bool FRedwoodCurrencyClaimTakesToSendCountsTest::RunTest(const FString &Paramete
   const FRedwoodItemFlushSent First = Fixture::ClaimBatch(*this, Component);
   TestEqual(TEXT("The first batch carries the entry"), First.CurrencyCount, 1);
   TestEqual(TEXT("The first batch carries the key"), First.GrantKeys.Num(), 1);
-  TestEqual(TEXT("The balance the batch commits"), First.BalanceAfter, (int64)500);
+  TestEqual(TEXT("The balance the batch commits"), GetCurrencyBalance(First.BalancesAfter, Fixture::GoldCurrency), (int64)500);
 
   // The outcome is unknown, and B is staged before the retry.
   URedwoodServerGameSubsystem::ApplyItemsFlushReply(
@@ -260,7 +269,9 @@ bool FRedwoodCurrencyClaimTakesToSendCountsTest::RunTest(const FString &Paramete
   TestEqual(TEXT("The retry carries only the unconfirmed entry"), Retry.CurrencyCount, 1);
   TestEqual(TEXT("The retry carries the unconfirmed key"), Retry.GrantKeys.Num(), 1);
   TestEqual(TEXT("The retry goes under the same seq"), Retry.BatchSeq, First.BatchSeq);
-  TestEqual(TEXT("The retry's balance is A's, not B's"), Retry.BalanceAfter, (int64)500);
+  TestEqual(
+    TEXT("The retry's balance is A's, not B's"), GetCurrencyBalance(Retry.BalancesAfter, Fixture::GoldCurrency), (int64)500
+  );
 
   return true;
 }
@@ -287,7 +298,7 @@ bool FRedwoodCurrencyFlushSuccessWritesSnapshotTest::RunTest(const FString &Para
   );
 
   TestEqual(TEXT("The snapshot seq moves to the commit"), PlayerState->RedwoodCharacter.InventorySeq, (int64)4);
-  TestEqual(TEXT("The snapshot balance is the committed one"), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)750);
+  TestEqual(TEXT("The snapshot balance is the committed one"), Fixture::GoldBalance(PlayerState->RedwoodCharacter), (int64)750);
   const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
   TestEqual(TEXT("Only the mid-flight entry remains"), Pending.Num(), 1);
   if (Pending.Num() == 1) {
@@ -302,10 +313,10 @@ bool FRedwoodCurrencyFlushSuccessWritesSnapshotTest::RunTest(const FString &Para
   );
   TestEqual(TEXT("The entry is saved"), Component->GetPendingCurrencyEntries().Num(), 0);
   TestEqual(
-    TEXT("A balance behind a later fence is not written"), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)750
+    TEXT("A balance behind a later fence is not written"), Fixture::GoldBalance(PlayerState->RedwoodCharacter), (int64)750
   );
   TestEqual(TEXT("The seq still moves"), PlayerState->RedwoodCharacter.InventorySeq, Second.BatchSeq + 1);
-  TestTrue(TEXT("The snapshot says its balance is stale"), PlayerState->RedwoodCharacter.bCurrencyAmountUnknown);
+  TestTrue(TEXT("The snapshot says its balance is stale"), PlayerState->RedwoodCharacter.bCurrencyBalancesUnknown);
   TestTrue(TEXT("The component reloads before it sends more currency"), Component->IsCurrencyRebaseRequired());
 
   return true;
@@ -334,7 +345,7 @@ bool FRedwoodCurrencyFlushErrorIsNotSavedTest::RunTest(const FString &Parameters
 
   TestEqual(TEXT("The entry is kept"), Component->GetPendingCurrencyEntries().Num(), 1);
   TestEqual(TEXT("The key is kept"), Component->GetPendingGrantKeys().Num(), 1);
-  TestEqual(TEXT("The snapshot balance is unchanged"), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)1000);
+  TestEqual(TEXT("The snapshot balance is unchanged"), Fixture::GoldBalance(PlayerState->RedwoodCharacter), (int64)1000);
   TestEqual(TEXT("The snapshot seq is unchanged"), PlayerState->RedwoodCharacter.InventorySeq, (int64)3);
   TestFalse(TEXT("No rebase without the backend's flag"), Component->IsCurrencyRebaseRequired());
 
@@ -432,9 +443,9 @@ bool FRedwoodCurrencyReloadRebasesTest::RunTest(const FString &Parameters) {
   URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(4);
   URedwoodPlayerStateComponent *PlayerState = Fixture::MakePlayerStateComponent(4, 1000);
 
-  int64 RebasedBalance = -1;
-  Component->OnCurrencyRebased.AddLambda([&RebasedBalance](int64 Balance) {
-    RebasedBalance = Balance;
+  FRedwoodCurrencyBalances Rebased;
+  Component->OnCurrencyRebased.AddLambda([&Rebased](const FRedwoodCurrencyBalances &Balances) {
+    Rebased = Balances;
   });
 
   Component->QueueCurrency(
@@ -447,15 +458,15 @@ bool FRedwoodCurrencyReloadRebasesTest::RunTest(const FString &Parameters) {
   URedwoodServerGameSubsystem::ApplyItemsFlushReply(Component, PlayerState, Refusal, Sent);
   TestTrue(TEXT("The refusal holds the entries for a reload"), Component->IsCurrencyRebaseRequired());
 
-  int64 Balance = 0;
+  FRedwoodCurrencyBalances Balances;
   TArray<FString> GrantKeys;
   const ERedwoodCurrencyReloadResult Result = URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
-    Fixture::ParseJson(TEXT(R"({"error":null,"items":[],"currency":{"amount":"2000","grants":["quest:Q1"]}})")),
-    Balance,
+    Fixture::ParseJson(TEXT(R"({"error":null,"items":[],"currency":{"balances":[{"currency":"Currency.Gold","amount":"2000"}],"grantKeys":["quest:Q1"]}})")),
+    Balances,
     GrantKeys
   );
   TestTrue(TEXT("The reply parses"), Result == ERedwoodCurrencyReloadResult::Applied);
-  TestEqual(TEXT("The balance is read exactly"), Balance, (int64)2000);
+  TestEqual(TEXT("The balance is read exactly"), GetCurrencyBalance(Balances, Fixture::GoldCurrency), (int64)2000);
   TestTrue(TEXT("The used keys are read"), GrantKeys == TArray<FString>{Fixture::QuestGrantKey});
   // A key a racing batch committed after the reload read the database: on the snapshot, not in
   // the reply. Keys are never removed, so it must stay.
@@ -463,7 +474,7 @@ bool FRedwoodCurrencyReloadRebasesTest::RunTest(const FString &Parameters) {
   PlayerState->RedwoodCharacter.GrantKeys = {RacedGrantKey};
   TestTrue(
     TEXT("The reload applies"),
-    URedwoodServerGameSubsystem::ApplyCurrencyReload(Component, PlayerState, Balance, GrantKeys)
+    URedwoodServerGameSubsystem::ApplyCurrencyReload(Component, PlayerState, Balances, GrantKeys)
   );
   // A key that a batch committed while its ack was lost reaches the snapshot only through here.
   TestTrue(
@@ -478,8 +489,8 @@ bool FRedwoodCurrencyReloadRebasesTest::RunTest(const FString &Parameters) {
     TestEqual(TEXT("A re-chained from the reloaded balance"), Pending[0].BalanceAfter, (int64)2500);
     TestEqual(TEXT("B re-chained after A"), Pending[1].BalanceAfter, (int64)2300);
   }
-  TestEqual(TEXT("The snapshot takes the reloaded balance"), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)2000);
-  TestEqual(TEXT("The game hears the reloaded balance"), RebasedBalance, (int64)2000);
+  TestEqual(TEXT("The snapshot takes the reloaded balance"), Fixture::GoldBalance(PlayerState->RedwoodCharacter), (int64)2000);
+  TestEqual(TEXT("The game hears the reloaded balance"), GetCurrencyBalance(Rebased, Fixture::GoldCurrency), (int64)2000);
   TestEqual(TEXT("Both entries go in the next batch"), Component->GetCurrencyEntriesToSendCount(), 2);
 
   return true;
@@ -499,40 +510,41 @@ bool FRedwoodCurrencyReloadReplyParseTest::RunTest(const FString &Parameters) {
   AddExpectedError(TEXT("Currency reload failed"), EAutomationExpectedErrorFlags::Contains, 0);
 
   const TCHAR *RetriedReplies[] = {
-    TEXT(R"({"error":"Item load request timed out.","items":[],"currency":{"amount":"0","grants":[]}})"),
-    TEXT(R"({"error":"character not bound to this instance","items":[],"currency":{"amount":"0","grants":[]}})"),
-    TEXT(R"({"error":"character not bound to this instance","writerFenceLost":false,"items":[],"currency":{"amount":"0","grants":[]}})"),
+    TEXT(R"({"error":"Item load request timed out.","items":[],"currency":{"balances":[],"grantKeys":[]}})"),
+    TEXT(R"({"error":"character not bound to this instance","items":[],"currency":{"balances":[],"grantKeys":[]}})"),
+    TEXT(R"({"error":"character not bound to this instance","writerFenceLost":false,"items":[],"currency":{"balances":[],"grantKeys":[]}})"),
     TEXT(R"({"error":null,"items":[]})"),
-    TEXT(R"({"error":null,"items":[],"currency":{"amount":"1e3","grants":[]}})"),
-    TEXT(R"({"error":null,"items":[],"currency":{"amount":"-5","grants":[]}})"),
-    TEXT(R"({"error":null,"items":[],"currency":{"amount":2000,"grants":[]}})"),
-    TEXT(R"({"items":[],"currency":{"amount":"2000","grants":[]}})"),
+    TEXT(R"({"error":null,"items":[],"currency":{"balances":[{"currency":"Currency.Gold","amount":"1e3"}],"grantKeys":[]}})"),
+    TEXT(R"({"error":null,"items":[],"currency":{"balances":[{"currency":"Currency.Gold","amount":"-5"}],"grantKeys":[]}})"),
+    TEXT(R"({"error":null,"items":[],"currency":{"balances":[{"currency":"Currency.Gold","amount":2000}],"grantKeys":[]}})"),
+    TEXT(R"({"error":null,"items":[],"currency":{"balances":[{"currency":"Currency.Gold","amount":"1"},{"currency":"Currency.Gold","amount":"2"}],"grantKeys":[]}})"),
+    TEXT(R"({"items":[],"currency":{"balances":[{"currency":"Currency.Gold","amount":"2000"}],"grantKeys":[]}})"),
     // The keys are part of the loaded state, so a reply without readable keys fails too.
-    TEXT(R"({"error":null,"items":[],"currency":{"amount":"2000"}})"),
-    TEXT(R"({"error":null,"items":[],"currency":{"amount":"2000","grants":[5]}})"),
+    TEXT(R"({"error":null,"items":[],"currency":{"balances":[{"currency":"Currency.Gold","amount":"2000"}]}})"),
+    TEXT(R"({"error":null,"items":[],"currency":{"balances":[{"currency":"Currency.Gold","amount":"2000"}],"grantKeys":[5]}})"),
   };
   for (const TCHAR *ReplyText : RetriedReplies) {
-    int64 Balance = 0;
+    FRedwoodCurrencyBalances Balances;
     TArray<FString> GrantKeys;
     TestTrue(
       FString::Printf(TEXT("Retried: %s"), ReplyText),
-      URedwoodServerGameSubsystem::ParseCurrencyReloadReply(Fixture::ParseJson(ReplyText), Balance, GrantKeys) ==
+      URedwoodServerGameSubsystem::ParseCurrencyReloadReply(Fixture::ParseJson(ReplyText), Balances, GrantKeys) ==
         ERedwoodCurrencyReloadResult::Retry
     );
   }
 
-  int64 Balance = 0;
+  FRedwoodCurrencyBalances Balances;
   TArray<FString> GrantKeys;
   TestTrue(
     TEXT("An unreadable reply is retried"),
-    URedwoodServerGameSubsystem::ParseCurrencyReloadReply(TSharedPtr<FJsonObject>(), Balance, GrantKeys) ==
+    URedwoodServerGameSubsystem::ParseCurrencyReloadReply(TSharedPtr<FJsonObject>(), Balances, GrantKeys) ==
       ERedwoodCurrencyReloadResult::Retry
   );
   TestTrue(
     TEXT("A lost writer fence gives up at once"),
     URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
-      Fixture::ParseJson(TEXT(R"({"error":"character not bound to this instance","writerFenceLost":true,"items":[],"currency":{"amount":"0","grants":[]}})")),
-      Balance,
+      Fixture::ParseJson(TEXT(R"({"error":"character not bound to this instance","writerFenceLost":true,"items":[],"currency":{"balances":[],"grantKeys":[]}})")),
+      Balances,
       GrantKeys
     ) == ERedwoodCurrencyReloadResult::GiveUp
   );
@@ -604,7 +616,7 @@ bool FRedwoodCurrencyFlushCommitAddsGrantKeysTest::RunTest(const FString &Parame
   NotApplied.bNotApplied = true;
   URedwoodServerGameSubsystem::ApplyItemsFlushReply(Component, PlayerState, NotApplied, Probe);
   TestEqual(TEXT("A batch that never applied adds no key"), PlayerState->RedwoodCharacter.GrantKeys.Num(), 0);
-  TestEqual(TEXT("Nor moves the snapshot balance"), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)1000);
+  TestEqual(TEXT("Nor moves the snapshot balance"), Fixture::GoldBalance(PlayerState->RedwoodCharacter), (int64)1000);
 
   const FRedwoodItemFlushSent Normal = Fixture::ClaimBatch(*this, Component);
   // A later fence: a trade committed after this batch, which still committed.
@@ -711,7 +723,7 @@ bool FRedwoodCurrencyFlushNoFenceReplyTest::RunTest(const FString &Parameters) {
     TestEqual(Label + TEXT(": the entry is kept"), Component->GetPendingCurrencyEntries().Num(), 1);
     TestEqual(Label + TEXT(": the lane keeps its seq"), Component->GetLastCommittedItemSeq(), SeqBefore);
     TestEqual(Label + TEXT(": the snapshot keeps its seq"), PlayerState->RedwoodCharacter.InventorySeq, SeqBefore);
-    TestEqual(Label + TEXT(": the snapshot keeps its balance"), PlayerState->RedwoodCharacter.CurrencyAmount, (int64)1000);
+    TestEqual(Label + TEXT(": the snapshot keeps its balance"), Fixture::GoldBalance(PlayerState->RedwoodCharacter), (int64)1000);
     Sent = Fixture::ClaimBatch(*this, Component);
     TestEqual(Label + TEXT(": the next batch keeps the seq"), Sent.BatchSeq, SeqBefore + 1);
   }
@@ -729,5 +741,108 @@ bool FRedwoodCurrencyFlushNoFenceReplyTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("A schema error leaves the batch unconfirmed"), Component->IsCurrencyBatchUnconfirmed());
   Fixture::ClaimBatch(*this, Component);
   TestTrue(TEXT("Its next attempt is a probe"), Component->IsItemFlushReplayProbe());
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyFlushTwoCurrenciesTest,
+  "Redwood.Currency.FlushTwoCurrencies",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A batch with two currencies claims every entry in queue order, and its commit writes the last
+// BalanceAfter of each currency to the snapshot. A currency the batch did not carry keeps the
+// balance it had.
+bool FRedwoodCurrencyFlushTwoCurrenciesTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyFlushTest;
+  const FString UntouchedCurrency = TEXT("Currency.Untouched");
+  URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(3);
+  URedwoodPlayerStateComponent *PlayerState = Fixture::MakePlayerStateComponent(3, 1000);
+  PlayerState->RedwoodCharacter.CurrencyBalances.Add(Fixture::MarksCurrency, 50);
+  PlayerState->RedwoodCharacter.CurrencyBalances.Add(UntouchedCurrency, 9);
+
+  // Gold goes 1000 -> 1500 -> 1300 around one marks credit: each currency is its own chain.
+  Component->QueueCurrency(
+    {Fixture::MakeEntry(Fixture::EntryIdA, 500, 1500),
+     Fixture::MakeEntry(Fixture::EntryIdB, 5, 55, Fixture::MarksCurrency),
+     Fixture::MakeEntry(TEXT("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"), -200, 1300)},
+    {}
+  );
+  const FRedwoodItemFlushSent Sent = Fixture::ClaimBatch(*this, Component);
+  TestEqual(TEXT("All three entries are claimed"), Sent.CurrencyCount, 3);
+  TestEqual(TEXT("Two currencies are named"), Sent.BalancesAfter.Num(), 2);
+  TestEqual(TEXT("Gold's last balance"), GetCurrencyBalance(Sent.BalancesAfter, Fixture::GoldCurrency), (int64)1300);
+  TestEqual(TEXT("Marks' last balance"), GetCurrencyBalance(Sent.BalancesAfter, Fixture::MarksCurrency), (int64)55);
+
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(
+    Component, PlayerState, Fixture::MakeReply(TEXT(""), Sent.BatchSeq), Sent
+  );
+  const FRedwoodCharacterBackend &Snapshot = PlayerState->RedwoodCharacter;
+  TestEqual(TEXT("The snapshot takes gold"), Fixture::GoldBalance(Snapshot), (int64)1300);
+  TestEqual(TEXT("The snapshot takes marks"), GetCurrencyBalance(Snapshot.CurrencyBalances, Fixture::MarksCurrency), (int64)55);
+  TestEqual(
+    TEXT("A currency the batch did not carry is untouched"), GetCurrencyBalance(Snapshot.CurrencyBalances, UntouchedCurrency), (int64)9
+  );
+  TestFalse(TEXT("The balances are known"), Snapshot.bCurrencyBalancesUnknown);
+  TestEqual(TEXT("Nothing stays queued"), Component->GetPendingCurrencyEntries().Num(), 0);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyReloadTwoCurrenciesTest,
+  "Redwood.Currency.ReloadTwoCurrencies",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A reload carries every committed balance. The held entries of each currency are re-chained from
+// that currency's own balance, a currency the reload does not list chains from 0, the snapshot takes
+// the whole map (a currency the reload dropped is gone), and the game hears the whole map.
+bool FRedwoodCurrencyReloadTwoCurrenciesTest::RunTest(const FString &Parameters) {
+  namespace Fixture = RedwoodCurrencyFlushTest;
+  URedwoodCharacterComponent *Component = Fixture::MakeCharacterComponent(4);
+  URedwoodPlayerStateComponent *PlayerState = Fixture::MakePlayerStateComponent(4, 1000);
+  PlayerState->RedwoodCharacter.CurrencyBalances.Add(TEXT("Currency.Stale"), 3);
+
+  FRedwoodCurrencyBalances Rebased;
+  Component->OnCurrencyRebased.AddLambda([&Rebased](const FRedwoodCurrencyBalances &Balances) {
+    Rebased = Balances;
+  });
+
+  Component->QueueCurrency(
+    {Fixture::MakeEntry(Fixture::EntryIdA, 500, 1500),
+     Fixture::MakeEntry(Fixture::EntryIdB, 7, 57, Fixture::MarksCurrency)},
+    {}
+  );
+  const FRedwoodItemFlushSent Sent = Fixture::ClaimBatch(*this, Component);
+  FRedwoodItemFlushReply Refusal = Fixture::MakeReply(TEXT("batch seq was used by a trade"), Sent.BatchSeq);
+  Refusal.bRebaseRequired = true;
+  URedwoodServerGameSubsystem::ApplyItemsFlushReply(Component, PlayerState, Refusal, Sent);
+
+  // The reload lists gold only, so marks hold 0 and chain from it.
+  FRedwoodCurrencyBalances Balances;
+  TArray<FString> GrantKeys;
+  TestTrue(
+    TEXT("The reply parses"),
+    URedwoodServerGameSubsystem::ParseCurrencyReloadReply(
+      Fixture::ParseJson(TEXT(R"({"error":null,"items":[],"currency":{"balances":[{"currency":"Currency.Gold","amount":"2000"}],"grantKeys":[]}})")),
+      Balances,
+      GrantKeys
+    ) == ERedwoodCurrencyReloadResult::Applied
+  );
+  TestTrue(
+    TEXT("The reload applies"),
+    URedwoodServerGameSubsystem::ApplyCurrencyReload(Component, PlayerState, Balances, GrantKeys)
+  );
+
+  const TArray<FRedwoodCurrencyEntry> &Pending = Component->GetPendingCurrencyEntries();
+  if (TestEqual(TEXT("No entry is dropped"), Pending.Num(), 2)) {
+    TestEqual(TEXT("Gold chains from its balance"), Pending[0].BalanceAfter, (int64)2500);
+    TestEqual(TEXT("Marks chain from 0"), Pending[1].BalanceAfter, (int64)7);
+  }
+  const FRedwoodCharacterBackend &Snapshot = PlayerState->RedwoodCharacter;
+  TestEqual(TEXT("The snapshot takes gold"), Fixture::GoldBalance(Snapshot), (int64)2000);
+  TestEqual(TEXT("The snapshot holds nothing it was not given"), Snapshot.CurrencyBalances.Num(), 1);
+  TestEqual(TEXT("The game hears the whole map"), Rebased.Num(), 1);
+  TestEqual(TEXT("It carries gold"), GetCurrencyBalance(Rebased, Fixture::GoldCurrency), (int64)2000);
   return true;
 }

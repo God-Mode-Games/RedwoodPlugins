@@ -518,6 +518,7 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     // FORK(hollowed-oath): one debit with no optional fields, and one grant key.
     FRedwoodCurrencyEntry Debit;
     Debit.Id = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    Debit.Currency = TEXT("Currency.Gold");
     Debit.Delta = -250;
     Debit.BalanceAfter = 750;
     Debit.Reason = TEXT("Currency.Reason.Merchant.Buy");
@@ -589,6 +590,9 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
       TestEqual(
         TEXT("flush: currency[0].reason"), (*Entry)->GetStringField(TEXT("reason")), Debit.Reason
       );
+      TestEqual(
+        TEXT("flush: currency[0].currency"), (*Entry)->GetStringField(TEXT("currency")), Debit.Currency
+      );
       TestFalse(
         TEXT("flush: an empty sourceRef is left out, never null"),
         (*Entry)->HasField(TEXT("sourceRef"))
@@ -610,6 +614,40 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
       );
     } else {
       AddError(TEXT("flush: expected exactly one grant key"));
+    }
+
+    // Each entry names its own currency, so a batch of two currencies stays two chains.
+    FRedwoodCurrencyEntry MarksCredit = Debit;
+    MarksCredit.Id = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+    MarksCredit.Currency = TEXT("Currency.FactionMarks");
+    MarksCredit.Delta = 5;
+    MarksCredit.BalanceAfter = 55;
+    TSharedPtr<FJsonObject> TwoCurrencyPayload = URedwoodServerGameSubsystem::BuildItemsFlushPayload(
+      CharacterId, 9, {}, {}, {Debit, MarksCredit}, {}, WriterToken
+    );
+    const TArray<TSharedPtr<FJsonValue>> *TwoCurrencies = nullptr;
+    if (TwoCurrencyPayload->TryGetArrayField(TEXT("currency"), TwoCurrencies) && TwoCurrencies->Num() == 2) {
+      const FString ExpectedCurrencies[] = {Debit.Currency, MarksCredit.Currency};
+      const FString ExpectedBalances[] = {TEXT("750"), TEXT("55")};
+      for (int32 Index = 0; Index < 2; ++Index) {
+        const TSharedPtr<FJsonObject> *TwoEntry = nullptr;
+        if ((*TwoCurrencies)[Index]->TryGetObject(TwoEntry)) {
+          TestEqual(
+            FString::Printf(TEXT("flush: two currencies: currency[%d].currency"), Index),
+            (*TwoEntry)->GetStringField(TEXT("currency")),
+            ExpectedCurrencies[Index]
+          );
+          TestEqual(
+            FString::Printf(TEXT("flush: two currencies: currency[%d].balanceAfter"), Index),
+            (*TwoEntry)->GetStringField(TEXT("balanceAfter")),
+            ExpectedBalances[Index]
+          );
+        } else {
+          AddError(FString::Printf(TEXT("flush: two currencies: currency[%d] is not an object"), Index));
+        }
+      }
+    } else {
+      AddError(TEXT("flush: expected two currency entries"));
     }
 
     // A filled optional field goes out as a string, and a large amount keeps every digit.
@@ -665,12 +703,14 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
     // FORK(hollowed-oath): both sides' entries, the giver's with a source ref.
     FRedwoodCurrencyEntry Paid;
     Paid.Id = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    Paid.Currency = TEXT("Currency.Gold");
     Paid.Delta = -300;
     Paid.BalanceAfter = 700;
     Paid.Reason = TEXT("Currency.Reason.Trade");
     Paid.SourceRef = TEXT("trade:offer-1");
     FRedwoodCurrencyEntry Received;
     Received.Id = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+    Received.Currency = TEXT("Currency.Gold");
     Received.Delta = 300;
     Received.BalanceAfter = 500;
     Received.Reason = TEXT("Currency.Reason.Trade");
@@ -744,6 +784,11 @@ bool FRedwoodItemEmitEnvelopeTest::RunTest(const FString &Parameters) {
           FString::Printf(TEXT("trade: currency[%d].entry.balanceAfter"), Index),
           (*SideEntry)->GetStringField(TEXT("balanceAfter")),
           FString(ExpectedBalances[Index])
+        );
+        TestEqual(
+          FString::Printf(TEXT("trade: currency[%d].entry.currency"), Index),
+          (*SideEntry)->GetStringField(TEXT("currency")),
+          FString(TEXT("Currency.Gold"))
         );
         TestEqual(
           FString::Printf(TEXT("trade: currency[%d].entry.reason"), Index),
@@ -860,18 +905,24 @@ bool FRedwoodParseCharacterInlineItemsTest::RunTest(const FString &Parameters) {
   // FORK(hollowed-oath): the offline file's currency object, in the auth reply's shape.
   CharacterObj->SetObjectField(
     TEXT("currency"),
-    Fixture::ParseJsonObject(TEXT(R"({"amount":"1500000","grants":["quest:Q1"]})"))
+    Fixture::ParseJsonObject(
+      TEXT(R"({"balances":[{"currency":"Currency.Gold","amount":"1500000"}],"grantKeys":["quest:Q1"]})")
+    )
   );
 
   FRedwoodCharacterBackend Parsed =
     URedwoodCommonGameSubsystem::ParseCharacter(CharacterObj);
 
-  TestEqual(TEXT("The balance is read from its string"), Parsed.CurrencyAmount, (int64)1500000);
+  TestEqual(
+    TEXT("The balance is read from its string"),
+    GetCurrencyBalance(Parsed.CurrencyBalances, TEXT("Currency.Gold")),
+    (int64)1500000
+  );
   TestEqual(TEXT("One grant key is read"), Parsed.GrantKeys.Num(), 1);
   if (Parsed.GrantKeys.Num() == 1) {
     TestEqual(TEXT("The grant key survives"), Parsed.GrantKeys[0], FString(TEXT("quest:Q1")));
   }
-  TestFalse(TEXT("A read balance is known"), Parsed.bCurrencyAmountUnknown);
+  TestFalse(TEXT("A read balance is known"), Parsed.bCurrencyBalancesUnknown);
 
   TestEqual(TEXT("Inline items parsed onto the struct"), Parsed.Items.Num(), 1);
   if (Parsed.Items.Num() == 1) {
@@ -903,17 +954,19 @@ bool FRedwoodParseCharacterInlineItemsTest::RunTest(const FString &Parameters) {
     TEXT("Absent items field leaves Items empty"), ParsedNoItems.Items.Num(), 0
   );
   // FORK(hollowed-oath): no currency object is an unknown balance, never a zero one.
-  TestTrue(TEXT("Absent currency is an unknown balance"), ParsedNoItems.bCurrencyAmountUnknown);
+  TestTrue(TEXT("Absent currency is an unknown balance"), ParsedNoItems.bCurrencyBalancesUnknown);
 
   // An unreadable currency object (a JSON number, not a decimal string) is unknown too, and loud.
   AddExpectedError(TEXT("unreadable currency object"), EAutomationExpectedErrorFlags::Contains, 1);
   NoItemsObj->SetObjectField(
-    TEXT("currency"), Fixture::ParseJsonObject(TEXT(R"({"amount":500,"grants":[]})"))
+    TEXT("currency"), Fixture::ParseJsonObject(
+      TEXT(R"({"balances":[{"currency":"Currency.Gold","amount":500}],"grantKeys":[]})")
+    )
   );
   FRedwoodCharacterBackend ParsedBadCurrency =
     URedwoodCommonGameSubsystem::ParseCharacter(NoItemsObj);
-  TestTrue(TEXT("Unreadable currency is an unknown balance"), ParsedBadCurrency.bCurrencyAmountUnknown);
-  TestEqual(TEXT("Unreadable currency leaves the balance unset"), ParsedBadCurrency.CurrencyAmount, (int64)0);
+  TestTrue(TEXT("Unreadable currency is an unknown balance"), ParsedBadCurrency.bCurrencyBalancesUnknown);
+  TestEqual(TEXT("Unreadable currency leaves the balances unset"), ParsedBadCurrency.CurrencyBalances.Num(), 0);
 
   return true;
 }

@@ -115,6 +115,8 @@ namespace RedwoodCurrencySidecarTest {
   const FString EntryIdA = TEXT("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
   const FString EntryIdB = TEXT("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
   const FString CreditEntryId = TEXT("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
+  const FString GoldCurrency = TEXT("Currency.Gold");
+  const FString MarksCurrency = TEXT("Currency.FactionMarks");
   const FString LootReason = TEXT("Currency.Reason.Loot");
   const FString SellReason = TEXT("Currency.Reason.Merchant.Sell");
   const FString OwnedItemId = TEXT("11111111-1111-1111-1111-111111111111");
@@ -135,9 +137,12 @@ namespace RedwoodCurrencySidecarTest {
   const TCHAR *const FinalRefusalReply =
     TEXT(R"({"error":"balance below zero","committedSeq":4,"final":true})");
 
-  FRedwoodCurrencyEntry MakeEntry(const FString &Id, int64 Delta, int64 BalanceAfter, const FString &Reason) {
+  FRedwoodCurrencyEntry MakeEntry(
+    const FString &Id, int64 Delta, int64 BalanceAfter, const FString &Reason, const FString &Currency = GoldCurrency
+  ) {
     FRedwoodCurrencyEntry Entry;
     Entry.Id = Id;
+    Entry.Currency = Currency;
     Entry.Delta = Delta;
     Entry.BalanceAfter = BalanceAfter;
     Entry.Reason = Reason;
@@ -155,7 +160,7 @@ namespace RedwoodCurrencySidecarTest {
 
   FString MakeLoadReply(const TCHAR *Balance) {
     return FString::Printf(
-      TEXT(R"({"error":null,"items":[],"currency":{"amount":"%s","grants":[]}})"), Balance
+      TEXT(R"({"error":null,"items":[],"currency":{"balances":[{"currency":"Currency.Gold","amount":"%s"}],"grantKeys":[]}})"), Balance
     );
   }
 
@@ -628,13 +633,13 @@ bool FRedwoodCurrencySidecarSaleCreditNeverLeavesTest::RunTest(const FString &Pa
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta -2000 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -2000 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
   // The credit is dropped, and logged so staff can see it never committed.
   AddExpectedErrorPlain(
-    TEXT("entry CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC delta 25 reason Currency.Reason.Merchant.Sell, NOT saved: dropped by the freeze"),
+    TEXT("entry CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC currency Currency.Gold delta 25 reason Currency.Reason.Merchant.Sell, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -885,7 +890,7 @@ bool FRedwoodCurrencySidecarGiveUpTest::RunTest(const FString &Parameters) {
     TEXT("gave up (6 attempts failed). Its held flushes now settle."), EAutomationExpectedErrorFlags::Contains, 1
   );
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, NOT saved: held by a currency reload that gave up (6 attempts failed)"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, NOT saved: held by a currency reload that gave up (6 attempts failed)"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -903,7 +908,7 @@ bool FRedwoodCurrencySidecarGiveUpTest::RunTest(const FString &Parameters) {
   }
 
   const FString FailedLoad =
-    TEXT(R"({"error":"Item load request timed out.","items":[],"currency":{"amount":"0","grants":[]}})");
+    TEXT(R"({"error":"Item load request timed out.","items":[],"currency":{"balances":[],"grantKeys":[]}})");
   for (int32 Attempt = 1; Attempt <= URedwoodServerGameSubsystem::CurrencyReloadMaxAttempts; ++Attempt) {
     if (Attempt > 1) {
       FAccess::SendReloadNow(*Harness.Subsystem, CharacterId);
@@ -946,7 +951,7 @@ bool FRedwoodCurrencySidecarWriterFenceLostTest::RunTest(const FString &Paramete
   );
   // Logged once, by the lost fence; the give-up does not log it a second time.
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, NOT saved: writer fence lost"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, NOT saved: writer fence lost"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -968,7 +973,7 @@ bool FRedwoodCurrencySidecarWriterFenceLostTest::RunTest(const FString &Paramete
   // The binding is missing for now (a sidecar restart): retried.
   Harness.Answer(
     Load,
-    TEXT(R"({"error":"character not bound to this instance","items":[],"currency":{"amount":"0","grants":[]}})")
+    TEXT(R"({"error":"character not bound to this instance","items":[],"currency":{"balances":[],"grantKeys":[]}})")
   );
   Harness.PumpUntil([&Harness]() {
     const FRedwoodCurrencyReload *Reload = FAccess::Reload(*Harness.Subsystem, CharacterId);
@@ -983,7 +988,7 @@ bool FRedwoodCurrencySidecarWriterFenceLostTest::RunTest(const FString &Paramete
   }
   Harness.Answer(
     Load,
-    TEXT(R"({"error":"character not bound to this instance","writerFenceLost":true,"items":[],"currency":{"amount":"0","grants":[]}})")
+    TEXT(R"({"error":"character not bound to this instance","writerFenceLost":true,"items":[],"currency":{"balances":[],"grantKeys":[]}})")
   );
   TestTrue(TEXT("The held attempt settles at once"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
   TestNull(TEXT("No retry is scheduled"), FAccess::Reload(*Harness.Subsystem, CharacterId));
@@ -1140,7 +1145,7 @@ bool FRedwoodCurrencySidecarFreezeWaitsForReplyTest::RunTest(const FString &Para
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedError(TEXT("Failed to flush items"), EAutomationExpectedErrorFlags::Contains, 0);
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta -2000 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -2000 reason Currency.Reason.Loot, NOT saved: dropped by the freeze"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -1207,7 +1212,7 @@ bool FRedwoodCurrencySidecarFlushWriterFenceLostTest::RunTest(const FString &Par
   );
   // The kept entry is logged once, the way a freeze logs it, for staff.
   AddExpectedErrorPlain(
-    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, NOT saved: writer fence lost, another session owns the character. A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, NOT saved: writer fence lost, another session owns the character. A re-grant must reuse entry id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -1283,7 +1288,7 @@ bool FRedwoodCurrencySidecarAuthLoadThawsTest::RunTest(const FString &Parameters
     *OwnedItemId
   );
   const FString CurrencyField = FString::Printf(
-    TEXT(R"("currency":{"amount":"%lld","grants":["%s"]})"), LoadedBalance, *LoadedGrantKey
+    TEXT(R"("currency":{"balances":[{"currency":"Currency.Gold","amount":"%lld"}],"grantKeys":["%s"]})"), LoadedBalance, *LoadedGrantKey
   );
   const FString TokenField = FString::Printf(TEXT(R"("writerToken":"%s")"), *AuthToken);
   auto MakeReply = [&CharacterFields, &ItemsField](const FString &Currency, const FString &Token) {
@@ -1388,7 +1393,7 @@ bool FRedwoodCurrencySidecarAuthLoadThawsTest::RunTest(const FString &Parameters
     Harness.PumpUntil([Component]() { return !Component->IsItemFlushInFlight(); })
   );
   const FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
-  TestEqual(TEXT("The snapshot balance follows the commit"), Snapshot.CurrencyAmount, LoadedBalance + 500);
+  TestEqual(TEXT("The snapshot balance follows the commit"), GetCurrencyBalance(Snapshot.CurrencyBalances, GoldCurrency), LoadedBalance + 500);
   TestTrue(
     TEXT("The snapshot keeps the loaded key and adds the committed one"),
     Snapshot.GrantKeys == TArray<FString>{LoadedGrantKey, NewGrantKey}
@@ -1468,7 +1473,7 @@ bool FRedwoodCurrencySidecarComponentGoneCommitTest::RunTest(const FString &Para
   FRedwoodCharacterBackend &Snapshot = PlayerStateComponent->RedwoodCharacter;
   Snapshot.Id = CharacterId;
   Snapshot.InventorySeq = SeededInventorySeq;
-  Snapshot.CurrencyAmount = SnapshotBalance;
+  Snapshot.CurrencyBalances.Add(GoldCurrency, SnapshotBalance);
 
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Sender = Harness.MakeComponent(Actor);
@@ -1491,8 +1496,8 @@ bool FRedwoodCurrencySidecarComponentGoneCommitTest::RunTest(const FString &Para
   );
   TestTrue(TEXT("The reply settles"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
   TestEqual(TEXT("The snapshot takes the committed seq"), Snapshot.InventorySeq, SeededInventorySeq + 1);
-  TestEqual(TEXT("The snapshot takes the committed balance"), Snapshot.CurrencyAmount, SnapshotBalance + 500);
-  TestFalse(TEXT("The balance is known"), Snapshot.bCurrencyAmountUnknown);
+  TestEqual(TEXT("The snapshot takes the committed balance"), GetCurrencyBalance(Snapshot.CurrencyBalances, GoldCurrency), SnapshotBalance + 500);
+  TestFalse(TEXT("The balance is known"), Snapshot.bCurrencyBalancesUnknown);
 
   // The respawned pawn's component sees the reward as paid.
   URedwoodCharacterComponent *Respawned = NewObject<URedwoodCharacterComponent>(PlayerState);
@@ -1517,7 +1522,7 @@ bool FRedwoodCurrencySidecarComponentGoneErrorTest::RunTest(const FString &Param
     TEXT("Failed to flush items (component gone): concurrent flush"), EAutomationExpectedErrorFlags::Contains, 1
   );
   AddExpectedErrorPlain(
-    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
+    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -1537,7 +1542,7 @@ bool FRedwoodCurrencySidecarComponentGoneErrorTest::RunTest(const FString &Param
   // The flush takes the character id from the snapshot when it has one to give.
   Snapshot.Id = CharacterId;
   Snapshot.InventorySeq = SeededInventorySeq;
-  Snapshot.CurrencyAmount = SnapshotBalance;
+  Snapshot.CurrencyBalances.Add(GoldCurrency, SnapshotBalance);
 
   ARedwoodCurrencyFlushTestActor *Actor = nullptr;
   URedwoodCharacterComponent *Sender = Harness.MakeComponent(Actor);
@@ -1560,11 +1565,11 @@ bool FRedwoodCurrencySidecarComponentGoneErrorTest::RunTest(const FString &Param
   );
   TestTrue(TEXT("The reply settles"), Harness.PumpUntil([&SettleCount]() { return SettleCount > 0; }));
   TestEqual(TEXT("The seq is unchanged"), Snapshot.InventorySeq, SeededInventorySeq);
-  TestEqual(TEXT("The balance is unchanged"), Snapshot.CurrencyAmount, SnapshotBalance);
+  TestEqual(TEXT("The balance is unchanged"), GetCurrencyBalance(Snapshot.CurrencyBalances, GoldCurrency), SnapshotBalance);
   TestEqual(TEXT("No key is added"), Snapshot.GrantKeys.Num(), 0);
   TestTrue(TEXT("The seq is marked unconfirmed"), Snapshot.bInventorySeqUnconfirmed);
   TestEqual(TEXT("At the sent seq"), Snapshot.UnconfirmedInventorySeq, SeededInventorySeq + 1);
-  TestTrue(TEXT("The balance it may have moved is unknown"), Snapshot.bCurrencyAmountUnknown);
+  TestTrue(TEXT("The balance it may have moved is unknown"), Snapshot.bCurrencyBalancesUnknown);
   return true;
 }
 
@@ -1614,7 +1619,7 @@ namespace RedwoodCurrencyTradeTest {
     FRedwoodCharacterBackend &Snapshot = OutParty.PlayerStateComponent->RedwoodCharacter;
     Snapshot.Id = Id;
     Snapshot.InventorySeq = Seq;
-    Snapshot.CurrencyAmount = Balance;
+    Snapshot.CurrencyBalances.Add(GoldCurrency, Balance);
     Snapshot.WriterToken = Token;
     OutParty.Component = NewObject<URedwoodCharacterComponent>(OutParty.PlayerState);
     OutParty.Component->bUseItems = true;
@@ -1739,9 +1744,9 @@ bool FRedwoodCurrencyTradeCommitTest::RunTest(const FString &Parameters) {
   }
   int32 RebasedCount = 0;
   int64 RebasedBalance = -1;
-  From.Component->OnCurrencyRebased.AddLambda([&RebasedCount, &RebasedBalance](int64 Balance) {
+  From.Component->OnCurrencyRebased.AddLambda([&RebasedCount, &RebasedBalance](const FRedwoodCurrencyBalances &Balances) {
     ++RebasedCount;
-    RebasedBalance = Balance;
+    RebasedBalance = GetCurrencyBalance(Balances, GoldCurrency);
   });
 
   FTradeResult Result;
@@ -1791,8 +1796,8 @@ bool FRedwoodCurrencyTradeCommitTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("The payee's lane takes the fence"), To.Component->GetLastCommittedItemSeq(), ToSeq + 1);
   TestEqual(TEXT("The payer's snapshot takes the fence"), From.PlayerStateComponent->RedwoodCharacter.InventorySeq, FromSeq + 1);
   TestEqual(TEXT("The payee's snapshot takes the fence"), To.PlayerStateComponent->RedwoodCharacter.InventorySeq, ToSeq + 1);
-  TestEqual(TEXT("The payer's snapshot takes the balance"), From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, FromBalance - TradedAmount);
-  TestEqual(TEXT("The payee's snapshot takes the balance"), To.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, ToBalance + TradedAmount);
+  TestEqual(TEXT("The payer's snapshot takes the balance"), GetCurrencyBalance(From.PlayerStateComponent->RedwoodCharacter.CurrencyBalances, GoldCurrency), FromBalance - TradedAmount);
+  TestEqual(TEXT("The payee's snapshot takes the balance"), GetCurrencyBalance(To.PlayerStateComponent->RedwoodCharacter.CurrencyBalances, GoldCurrency), ToBalance + TradedAmount);
   TestEqual(TEXT("The game is told the payer's balance once"), RebasedCount, 1);
   TestEqual(TEXT("The told balance is the committed one"), RebasedBalance, FromBalance - TradedAmount);
 
@@ -1834,8 +1839,8 @@ bool FRedwoodCurrencyTradeRefusalTest::RunTest(const FString &Parameters) {
     return false;
   }
   int64 RebasedBalance = -1;
-  From.Component->OnCurrencyRebased.AddLambda([&RebasedBalance](int64 Balance) {
-    RebasedBalance = Balance;
+  From.Component->OnCurrencyRebased.AddLambda([&RebasedBalance](const FRedwoodCurrencyBalances &Balances) {
+    RebasedBalance = GetCurrencyBalance(Balances, GoldCurrency);
   });
 
   FTradeResult Result;
@@ -1857,8 +1862,8 @@ bool FRedwoodCurrencyTradeRefusalTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("The payer's lane is unchanged"), From.Component->GetLastCommittedItemSeq(), FromSeq);
   TestEqual(TEXT("The payee's lane is unchanged"), To.Component->GetLastCommittedItemSeq(), ToSeq);
   TestEqual(TEXT("The payer's snapshot seq is unchanged"), From.PlayerStateComponent->RedwoodCharacter.InventorySeq, FromSeq);
-  TestEqual(TEXT("The payer's snapshot balance is unchanged"), From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, FromBalance);
-  TestEqual(TEXT("The payee's snapshot balance is unchanged"), To.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, ToBalance);
+  TestEqual(TEXT("The payer's snapshot balance is unchanged"), GetCurrencyBalance(From.PlayerStateComponent->RedwoodCharacter.CurrencyBalances, GoldCurrency), FromBalance);
+  TestEqual(TEXT("The payee's snapshot balance is unchanged"), GetCurrencyBalance(To.PlayerStateComponent->RedwoodCharacter.CurrencyBalances, GoldCurrency), ToBalance);
   TestEqual(TEXT("The game is told the balance before the trade"), RebasedBalance, FromBalance);
   TestEqual(TEXT("The loot is kept"), From.Component->GetPendingCurrencyEntries().Num(), 1);
 
@@ -1926,7 +1931,7 @@ bool FRedwoodCurrencyTradeTimeoutResendTest::RunTest(const FString &Parameters) 
   // Everything a rebuilt payload would read changes now: the payer's snapshot balance (its
   // balanceAfter) and both writer tokens. A resend that rebuilt the request would differ from the
   // first send.
-  From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount = FromBalance * 5;
+  From.PlayerStateComponent->RedwoodCharacter.CurrencyBalances.Add(GoldCurrency, FromBalance * 5);
   From.Component->SeedWriterToken(TEXT("writer-token-from-changed"));
   To.Component->SeedWriterToken(TEXT("writer-token-to-changed"));
   FAccess::ResendTradeNow(*Harness.Subsystem, TradeId);
@@ -1951,7 +1956,7 @@ bool FRedwoodCurrencyTradeTimeoutResendTest::RunTest(const FString &Parameters) 
   TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
   TestTrue(TEXT("The replay settles it as committed"), Result.Error.IsEmpty());
   TestEqual(TEXT("The payee's lane takes the fence"), To.Component->GetLastCommittedItemSeq(), ToSeq + 1);
-  TestEqual(TEXT("The payee's snapshot takes the balance"), To.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, ToBalance + TradedAmount);
+  TestEqual(TEXT("The payee's snapshot takes the balance"), GetCurrencyBalance(To.PlayerStateComponent->RedwoodCharacter.CurrencyBalances, GoldCurrency), ToBalance + TradedAmount);
 
   FRequest Flush;
   if (!Harness.ReadRequest(FlushEvent, Flush)) {
@@ -1996,10 +2001,10 @@ bool FRedwoodCurrencyTradeLaterFenceTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
   TestEqual(TEXT("The payer's lane takes the later fence"), From.Component->GetLastCommittedItemSeq(), FromSeq + 2);
   TestEqual(TEXT("The payer's snapshot takes the later fence"), From.PlayerStateComponent->RedwoodCharacter.InventorySeq, FromSeq + 2);
-  TestTrue(TEXT("The payer's balance is unknown"), From.PlayerStateComponent->RedwoodCharacter.bCurrencyAmountUnknown);
+  TestTrue(TEXT("The payer's balance is unknown"), From.PlayerStateComponent->RedwoodCharacter.bCurrencyBalancesUnknown);
   TestTrue(TEXT("The payer waits for a reload"), From.Component->IsCurrencyRebaseRequired());
-  TestFalse(TEXT("The payee's exact fence keeps its balance known"), To.PlayerStateComponent->RedwoodCharacter.bCurrencyAmountUnknown);
-  TestEqual(TEXT("The payee's balance is committed"), To.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, ToBalance + TradedAmount);
+  TestFalse(TEXT("The payee's exact fence keeps its balance known"), To.PlayerStateComponent->RedwoodCharacter.bCurrencyBalancesUnknown);
+  TestEqual(TEXT("The payee's balance is committed"), GetCurrencyBalance(To.PlayerStateComponent->RedwoodCharacter.CurrencyBalances, GoldCurrency), ToBalance + TradedAmount);
   return true;
 }
 
@@ -2053,7 +2058,7 @@ bool FRedwoodCurrencyTradeRefusalAfterTimeoutTest::RunTest(const FString &Parame
   TestFalse(TEXT("The payer is not frozen"), Harness.Subsystem->IsCharacterFrozen(FromId));
   TestFalse(TEXT("The payee is not frozen"), Harness.Subsystem->IsCharacterFrozen(ToId));
   TestEqual(TEXT("The payer's lane is unchanged"), From.Component->GetLastCommittedItemSeq(), FromSeq);
-  TestEqual(TEXT("The payer's balance is unchanged"), From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, FromBalance);
+  TestEqual(TEXT("The payer's balance is unchanged"), GetCurrencyBalance(From.PlayerStateComponent->RedwoodCharacter.CurrencyBalances, GoldCurrency), FromBalance);
   TestEqual(TEXT("The held flush settles"), SettleCount, 1);
   return true;
 }
@@ -2264,7 +2269,7 @@ bool FRedwoodCurrencyTradeRefusedBeforeSendTest::RunTest(const FString &Paramete
     From.Component->QueueCurrency({MakeEntry(EntryIdA, LootAmount, FromBalance + LootAmount, LootReason)}, {});
   });
   ExpectRefused(TEXT("balance unknown"), [](FParty &From) {
-    From.PlayerStateComponent->RedwoodCharacter.bCurrencyAmountUnknown = true;
+    From.PlayerStateComponent->RedwoodCharacter.bCurrencyBalancesUnknown = true;
   });
 
   const TArray<TPair<FString, FRedwoodCurrencyEntry>> Overdraft =
@@ -2556,9 +2561,9 @@ bool FRedwoodCurrencyTradeOtherComponentInFlightTest::RunTest(const FString &Par
   TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
   TestFalse(
     TEXT("Its fence is its own commit, so the balance stays known"),
-    From.PlayerStateComponent->RedwoodCharacter.bCurrencyAmountUnknown
+    From.PlayerStateComponent->RedwoodCharacter.bCurrencyBalancesUnknown
   );
-  TestEqual(TEXT("The payer's balance"), From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, FromBalance + LootAmount - TradedAmount);
+  TestEqual(TEXT("The payer's balance"), GetCurrencyBalance(From.PlayerStateComponent->RedwoodCharacter.CurrencyBalances, GoldCurrency), FromBalance + LootAmount - TradedAmount);
   return true;
 }
 
@@ -2614,8 +2619,8 @@ bool FRedwoodCurrencyTradeTwoWayTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("It committed"), Result.Error.IsEmpty());
   TestEqual(TEXT("The payer's lane takes the fence"), From.Component->GetLastCommittedItemSeq(), FromSeq + 1);
   TestEqual(TEXT("The payee's lane takes the fence"), To.Component->GetLastCommittedItemSeq(), ToSeq + 1);
-  TestEqual(TEXT("The payer's balance"), From.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, FromBalance - TradedAmount);
-  TestEqual(TEXT("The payee's balance"), To.PlayerStateComponent->RedwoodCharacter.CurrencyAmount, ToBalance + TradedAmount);
+  TestEqual(TEXT("The payer's balance"), GetCurrencyBalance(From.PlayerStateComponent->RedwoodCharacter.CurrencyBalances, GoldCurrency), FromBalance - TradedAmount);
+  TestEqual(TEXT("The payee's balance"), GetCurrencyBalance(To.PlayerStateComponent->RedwoodCharacter.CurrencyBalances, GoldCurrency), ToBalance + TradedAmount);
   return true;
 }
 
@@ -2966,8 +2971,9 @@ bool FRedwoodCurrencySidecarShutdownOpenFlushTest::RunTest(const FString &Parame
   const FString RewardKey = TEXT("quest:Q1");
   AddExpectedErrorPlain(
     FString::Printf(
-      TEXT("entry %s delta 500 reason %s, outcome UNKNOWN (it may be saved): in flight when the server shut down. A re-grant must reuse entry id %s"),
+      TEXT("entry %s currency %s delta 500 reason %s, outcome UNKNOWN (it may be saved): in flight when the server shut down. A re-grant must reuse entry id %s"),
       *EntryIdA,
+      *GoldCurrency,
       *LootReason,
       *EntryIdA
     ),
@@ -3340,7 +3346,7 @@ namespace RedwoodCurrencySidecarTest {
     FRedwoodCharacterBackend &Snapshot = OutPlayerStateComponent->RedwoodCharacter;
     Snapshot.Id = CharacterId;
     Snapshot.InventorySeq = SeededInventorySeq;
-    Snapshot.CurrencyAmount = 1000;
+    Snapshot.CurrencyBalances.Add(GoldCurrency, 1000);
     Snapshot.WriterToken = WriterToken;
     return true;
   }
@@ -3385,7 +3391,7 @@ bool FRedwoodCurrencySidecarGoneUnknownProbesFirstTest::RunTest(const FString &P
     TEXT("Failed to flush items (component gone): Item flush request timed out."), EAutomationExpectedErrorFlags::Contains, 1
   );
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3421,7 +3427,7 @@ bool FRedwoodCurrencySidecarGoneUnknownProbesFirstTest::RunTest(const FString &P
   }
   TestEqual(TEXT("At the lost batch's seq"), Snapshot.UnconfirmedInventorySeq, SentSeq);
   TestEqual(TEXT("The committed seq is not guessed"), Snapshot.InventorySeq, SeededInventorySeq);
-  TestTrue(TEXT("Nor the balance"), Snapshot.bCurrencyAmountUnknown);
+  TestTrue(TEXT("Nor the balance"), Snapshot.bCurrencyBalancesUnknown);
 
   // The respawned pawn's component, and a row it changes.
   URedwoodCharacterComponent *Respawned = HydrateOnPlayerState(PlayerState);
@@ -3460,7 +3466,7 @@ bool FRedwoodCurrencySidecarGoneUnknownProbesFirstTest::RunTest(const FString &P
   Harness.Answer(Normal, FString::Printf(TEXT(R"({"error":null,"committedSeq":%lld})"), SentSeq + 1));
   Harness.PumpUntil([Respawned]() { return !Respawned->IsItemFlushInFlight(); });
   TestFalse(TEXT("The row is saved"), Respawned->GetDirtyItemGenerations().Contains(LaterItemId));
-  TestEqual(TEXT("The snapshot takes the reloaded balance"), Snapshot.CurrencyAmount, (int64)1500);
+  TestEqual(TEXT("The snapshot takes the reloaded balance"), GetCurrencyBalance(Snapshot.CurrencyBalances, GoldCurrency), (int64)1500);
   return true;
 }
 
@@ -3477,7 +3483,7 @@ bool FRedwoodCurrencySidecarReconnectGoneComponentTest::RunTest(const FString &P
   using namespace RedwoodCurrencySidecarTest;
   const FString RewardKey = TEXT("quest:Q1");
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone and its reply was lost with the connection"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone and its reply was lost with the connection"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3519,7 +3525,7 @@ bool FRedwoodCurrencySidecarReconnectGoneComponentTest::RunTest(const FString &P
   TestEqual(TEXT("Once"), SettleCount, 1);
   TestTrue(TEXT("The seq is marked unconfirmed"), Snapshot.bInventorySeqUnconfirmed);
   TestEqual(TEXT("At the lost batch's seq"), Snapshot.UnconfirmedInventorySeq, SeededInventorySeq + 1);
-  TestTrue(TEXT("The balance is unknown"), Snapshot.bCurrencyAmountUnknown);
+  TestTrue(TEXT("The balance is unknown"), Snapshot.bCurrencyBalancesUnknown);
   TestTrue(TEXT("Nothing is re-sent for a component that is gone"), Harness.IsQuiet());
   return true;
 }
@@ -3581,7 +3587,7 @@ bool FRedwoodCurrencySidecarEndPlayHandsOffTest::RunTest(const FString &Paramete
   using namespace RedwoodCurrencySidecarTest;
   const FString RewardKey = TEXT("quest:Q1");
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, NOT saved: its component ended, and they are handed to the PlayerState"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, NOT saved: its component ended, and they are handed to the PlayerState"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3655,7 +3661,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FRedwoodCurrencySidecarEndPlayInFlightTest::RunTest(const FString &Parameters) {
   using namespace RedwoodCurrencySidecarTest;
   AddExpectedErrorPlain(
-    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB delta 200 reason Currency.Reason.Loot, NOT saved: its component ended and they cannot be handed on: a batch was in flight"),
+    TEXT("entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 200 reason Currency.Reason.Loot, NOT saved: its component ended and they cannot be handed on: a batch was in flight"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3663,7 +3669,7 @@ bool FRedwoodCurrencySidecarEndPlayInFlightTest::RunTest(const FString &Paramete
     TEXT("Failed to flush items (component gone): Item flush request timed out."), EAutomationExpectedErrorFlags::Contains, 1
   );
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component is gone"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3742,12 +3748,12 @@ bool FRedwoodCurrencySidecarRehydrateResetsTest::RunTest(const FString &Paramete
   AddExpectedErrorPlain(TEXT("outcome UNKNOWN (it may be saved): writer fence lost"), EAutomationExpectedErrorFlags::Contains, 1);
   AddExpectedErrorPlain(TEXT("NOT saved: writer fence lost"), EAutomationExpectedErrorFlags::Contains, 1);
   AddExpectedErrorPlain(
-    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component now plays character character-2"),
+    TEXT("character character-1 entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta 500 reason Currency.Reason.Loot, outcome UNKNOWN (it may be saved): its component now plays character character-2"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
   AddExpectedErrorPlain(
-    TEXT("character character-1 entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB delta 200 reason Currency.Reason.Loot, NOT saved: its component now plays character character-2"),
+    TEXT("character character-1 entry BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB currency Currency.Gold delta 200 reason Currency.Reason.Loot, NOT saved: its component now plays character character-2"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -3781,7 +3787,7 @@ bool FRedwoodCurrencySidecarRehydrateResetsTest::RunTest(const FString &Paramete
   FRedwoodCharacterBackend Second;
   Second.Id = SecondCharacterId;
   Second.InventorySeq = SecondSeq;
-  Second.CurrencyAmount = 300;
+  Second.CurrencyBalances.Add(GoldCurrency, 300);
   Second.WriterToken = SecondToken;
   PlayerStateComponent->RedwoodCharacter = Second;
   Component->ProcessEvent(Component->FindFunctionChecked(TEXT("RedwoodPlayerStateCharacterUpdated")), nullptr);
@@ -3894,7 +3900,7 @@ bool FRedwoodCurrencySidecarGoneFinalRefusalFreezesTest::RunTest(const FString &
     TEXT("Failed to flush items (component gone): balance below zero"), EAutomationExpectedErrorFlags::Contains, 1
   );
   AddExpectedErrorPlain(
-    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA delta -2000 reason Currency.Reason.Loot, NOT saved: its component is gone"),
+    TEXT("entry AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA currency Currency.Gold delta -2000 reason Currency.Reason.Loot, NOT saved: its component is gone"),
     EAutomationExpectedErrorFlags::Contains,
     1
   );
@@ -4068,6 +4074,146 @@ bool FRedwoodCurrencyTradeResendFenceLostGivesUpTest::RunTest(const FString &Par
   TestTrue(TEXT("The payer freezes, so it loads from the database again"), Harness.Subsystem->IsCharacterFrozen(FromId));
   TestFalse(TEXT("The fenced payee is not frozen as well"), Harness.Subsystem->IsCharacterFrozen(ToId));
   TestTrue(TEXT("Nothing more goes out"), Harness.IsQuiet());
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradeTwoCurrenciesTest,
+  "Redwood.Currency.Trade.TwoCurrenciesChainPerCurrency",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// A trade of two currencies, one each way, chains every entry from the balance of its own currency
+// on its own side, names the currency on the wire, and on commit writes each currency of both
+// snapshots. The payer is told the balance of every currency it holds.
+bool FRedwoodCurrencyTradeTwoCurrenciesTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  const FString MarksPaidId = TEXT("A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1");
+  const FString MarksReceivedId = TEXT("B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2");
+  constexpr int64 FromMarks = 10;
+  constexpr int64 ToMarks = 100;
+  constexpr int64 TradedMarks = 40;
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+  From.PlayerStateComponent->RedwoodCharacter.CurrencyBalances.Add(MarksCurrency, FromMarks);
+  To.PlayerStateComponent->RedwoodCharacter.CurrencyBalances.Add(MarksCurrency, ToMarks);
+  FRedwoodCurrencyBalances Rebased;
+  From.Component->OnCurrencyRebased.AddLambda([&Rebased](const FRedwoodCurrencyBalances &Balances) {
+    Rebased = Balances;
+  });
+
+  // From pays gold, To pays marks.
+  const TArray<TPair<FString, FRedwoodCurrencyEntry>> Currency = {
+    TPair<FString, FRedwoodCurrencyEntry>(FromId, MakeEntry(PaidEntryId, -TradedAmount, 0, TradeReason)),
+    TPair<FString, FRedwoodCurrencyEntry>(ToId, MakeEntry(ReceivedEntryId, TradedAmount, 0, TradeReason)),
+    TPair<FString, FRedwoodCurrencyEntry>(ToId, MakeEntry(MarksPaidId, -TradedMarks, 0, TradeReason, MarksCurrency)),
+    TPair<FString, FRedwoodCurrencyEntry>(FromId, MakeEntry(MarksReceivedId, TradedMarks, 0, TradeReason, MarksCurrency)),
+  };
+  FTradeResult Result;
+  Harness.Subsystem->EmitItemsTrade(From.Component, To.Component, {}, Currency, TradeId, Capture(Result));
+  FRequest Trade;
+  if (!Harness.ReadRequest(TradeEvent, Trade)) {
+    return false;
+  }
+
+  // The payload order is not part of the contract, so each entry is found by its id.
+  auto WireField = [&Trade](const FString &EntryId, const TCHAR *Field) {
+    for (int32 Index = 0; Index < 4; ++Index) {
+      if (TradeCurrencyField(Trade.Payload, Index, TEXT("id")) == EntryId) {
+        return TradeCurrencyField(Trade.Payload, Index, Field);
+      }
+    }
+    return FString(TEXT("<missing>"));
+  };
+  TestEqual(TEXT("The payer's gold entry names gold"), WireField(PaidEntryId, TEXT("currency")), GoldCurrency);
+  TestEqual(TEXT("It chains from the payer's gold"), WireField(PaidEntryId, TEXT("balanceAfter")), FString(TEXT("700")));
+  TestEqual(TEXT("The payee's gold entry names gold"), WireField(ReceivedEntryId, TEXT("currency")), GoldCurrency);
+  TestEqual(TEXT("It chains from the payee's gold"), WireField(ReceivedEntryId, TEXT("balanceAfter")), FString(TEXT("500")));
+  TestEqual(TEXT("The payee's marks entry names marks"), WireField(MarksPaidId, TEXT("currency")), MarksCurrency);
+  TestEqual(TEXT("It chains from the payee's marks, not its gold"), WireField(MarksPaidId, TEXT("balanceAfter")), FString(TEXT("60")));
+  TestEqual(TEXT("The payer's marks entry names marks"), WireField(MarksReceivedId, TEXT("currency")), MarksCurrency);
+  TestEqual(TEXT("It chains from the payer's marks"), WireField(MarksReceivedId, TEXT("balanceAfter")), FString(TEXT("50")));
+
+  Harness.Answer(Trade, CommittedReply(FromSeq + 1, ToSeq + 1));
+  TestTrue(TEXT("The trade settles"), Harness.PumpUntil([&Result]() { return Result.Calls > 0; }));
+  TestTrue(TEXT("The trade committed"), Result.Error.IsEmpty());
+  const FRedwoodCharacterBackend &FromSnapshot = From.PlayerStateComponent->RedwoodCharacter;
+  const FRedwoodCharacterBackend &ToSnapshot = To.PlayerStateComponent->RedwoodCharacter;
+  TestEqual(TEXT("The payer's gold"), GetCurrencyBalance(FromSnapshot.CurrencyBalances, GoldCurrency), FromBalance - TradedAmount);
+  TestEqual(TEXT("The payer's marks"), GetCurrencyBalance(FromSnapshot.CurrencyBalances, MarksCurrency), FromMarks + TradedMarks);
+  TestEqual(TEXT("The payee's gold"), GetCurrencyBalance(ToSnapshot.CurrencyBalances, GoldCurrency), ToBalance + TradedAmount);
+  TestEqual(TEXT("The payee's marks"), GetCurrencyBalance(ToSnapshot.CurrencyBalances, MarksCurrency), ToMarks - TradedMarks);
+  TestEqual(TEXT("The payer hears gold"), GetCurrencyBalance(Rebased, GoldCurrency), FromBalance - TradedAmount);
+  TestEqual(TEXT("The payer hears marks"), GetCurrencyBalance(Rebased, MarksCurrency), FromMarks + TradedMarks);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+  FRedwoodCurrencyTradePerCurrencyZeroSumTest,
+  "Redwood.Currency.Trade.EachCurrencyMustSumToZero",
+  EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter
+);
+
+// The backend balances each currency on its own, so a trade whose total is zero but whose
+// currencies are not is refused before anything is sent. So is a second entry of one currency for
+// the same side, which the backend refuses too.
+bool FRedwoodCurrencyTradePerCurrencyZeroSumTest::RunTest(const FString &Parameters) {
+  using namespace RedwoodCurrencyTradeTest;
+  AddExpectedErrorPlain(TEXT("refused before sending"), EAutomationExpectedErrorFlags::Contains, 3);
+  FSidecarHarness Harness(*this);
+  if (!Harness.Connect()) {
+    return false;
+  }
+  FParty From;
+  FParty To;
+  if (!MakeParty(Harness, FromId, FromToken, FromSeq, FromBalance, From) ||
+      !MakeParty(Harness, ToId, ToToken, ToSeq, ToBalance, To)) {
+    return false;
+  }
+
+  auto ExpectRefused = [this, &Harness, &From, &To](
+                         const TCHAR *Label, const TArray<TPair<FString, FRedwoodCurrencyEntry>> &Currency
+                       ) {
+    FTradeResult Result;
+    Harness.Subsystem->EmitItemsTrade(From.Component, To.Component, {}, Currency, TradeId, Capture(Result));
+    TestEqual(FString::Printf(TEXT("%s: the caller hears at once"), Label), Result.Calls, 1);
+    TestFalse(FString::Printf(TEXT("%s: with an error"), Label), Result.Error.IsEmpty());
+    TestNull(FString::Printf(TEXT("%s: nothing is pending"), Label), FAccess::Trade(*Harness.Subsystem, TradeId));
+  };
+
+  // -5 gold and +5 marks total zero, yet neither currency balances.
+  ExpectRefused(
+    TEXT("different currencies"),
+    {TPair<FString, FRedwoodCurrencyEntry>(FromId, MakeEntry(PaidEntryId, -5, 0, TradeReason)),
+     TPair<FString, FRedwoodCurrencyEntry>(ToId, MakeEntry(ReceivedEntryId, 5, 0, TradeReason, MarksCurrency))}
+  );
+  // Gold balances, and marks are only credited.
+  ExpectRefused(
+    TEXT("one balanced currency and one one-sided"),
+    {TPair<FString, FRedwoodCurrencyEntry>(FromId, MakeEntry(PaidEntryId, -5, 0, TradeReason)),
+     TPair<FString, FRedwoodCurrencyEntry>(ToId, MakeEntry(ReceivedEntryId, 5, 0, TradeReason)),
+     TPair<FString, FRedwoodCurrencyEntry>(
+       ToId, MakeEntry(TEXT("A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1"), 2, 0, TradeReason, MarksCurrency)
+     )}
+  );
+  // Each currency sums to zero overall, but the payer has two gold entries.
+  ExpectRefused(
+    TEXT("two entries of one currency for one side"),
+    {TPair<FString, FRedwoodCurrencyEntry>(FromId, MakeEntry(PaidEntryId, -3, 0, TradeReason)),
+     TPair<FString, FRedwoodCurrencyEntry>(FromId, MakeEntry(TEXT("A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1"), -2, 0, TradeReason)),
+     TPair<FString, FRedwoodCurrencyEntry>(ToId, MakeEntry(ReceivedEntryId, 5, 0, TradeReason))}
+  );
+
+  TestTrue(TEXT("No request leaves"), Harness.IsQuiet());
+  TestEqual(TEXT("The payer's lane is untouched"), From.Component->GetLastCommittedItemSeq(), FromSeq);
   return true;
 }
 
